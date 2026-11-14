@@ -366,18 +366,25 @@ function Do-NetStep($action, $a) {
         $m = Select-String -Path $script:log -Pattern 'confirm: dialog shown at (\d+)' | Select-Object -Last 1
         $created = if ($m) { [long]$m.Matches[0].Groups[1].Value } else { 0 }
         $samples = [System.Collections.Generic.List[object]]::new()
-        # Where to click, read before sampling starts, so the click itself leaves no gap.
+        # Where to click, read before sampling starts. The click (a cursor move and a press, with
+        # pauses) runs on a thread of its own so the sampling goes on through it.
         $r = $approve.Current.BoundingRectangle
         $clicked = $false
+        $clickJob = $null
         while ($created -and (Now-Ms) - $created -lt 1600) {
           $t = (Now-Ms) - $created
           try { $samples.Add(@{ t = $t; on = [bool]$approve.Current.IsEnabled }) } catch { break }
           if (-not $clicked -and $t -ge 300) {
             $clicked = $true
-            $res.invokedEarly = if (-not $r.IsEmpty -and [W]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))) { 'clicked' } else { 'could not click' }
+            if ($r.IsEmpty) { $res.invokedEarly = 'could not click' }
+            else { $clickJob = Start-ThreadJob -ScriptBlock { param($x, $y) [W]::Click($x, $y) } -ArgumentList ([int]($r.X + $r.Width / 2)), ([int]($r.Y + $r.Height / 2)) }
             continue
           }
           Start-Sleep -Milliseconds 40
+        }
+        if ($clickJob) {
+          $went = [bool](Receive-Job $clickJob -Wait -AutoRemoveJob)
+          $res.invokedEarly = if ($went) { 'clicked' } else { 'could not click' }
         }
         # The dialog still showing after the early click means the click did nothing.
         if ($res.invokedEarly -eq 'clicked') { $res.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' } }
