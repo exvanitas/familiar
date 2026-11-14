@@ -27,6 +27,20 @@ Small units with their I/O passed in, and contract tests for each port.
 
 Ports core sees: model, clock, store, fetch, keyring, process (server starts), notifier, decision, and in part 2 the buddy transport.
 
+## Where the data lives
+
+Decided 2026-11-14, by the maintainer: "Familiar storage, sure, A is fine, unless there are drawbacks." Option A was IndexedDB. So conversations, memory, reminders and settings live in pi-durable's own IndexedDB store, inside the app's webview. That replaced the plan's earlier "one SQLite file": pi-durable needs real transactions on a single connection, and Tauri's SQL plugin pools connections. With IndexedDB there's no storage code in the exe, so every storage fix ships as an app-folder update.
+
+Each possible drawback has a test or a check, so nobody using Familiar meets it:
+
+| Drawback | What prevents it | Checked in |
+| --- | --- | --- |
+| A changed origin or data folder starts an empty database | The app's origin and its WebView2 data folder are pinned in config. A test fails if either changes. Data survives an update, a reinstall over the top and a winget upgrade. | Step 3 (pins and test), step 13 (upgrade paths on the Windows runner) |
+| Uninstall loses data by surprise | Uninstall keeps your data unless you tick "Also delete my conversations, memory and settings", which is off by default. The README and the uninstaller both say so. | Step 12 |
+| No way to back up or move | Export writes everything to one versioned file, and import reads it back. Keys never go in the file. | Step 10, with a round-trip test |
+| A power cut loses the last writes | Every write uses strict durability, and a test checks that no transaction opens without it. The runner can't cut the power, so step 13 kills every app and WebView2 process right after a write and checks the write is there on restart. That kill check is the honest proxy for a power cut, not proof of one: a real cut still relies on WebView2 flushing strict writes to disk. | Step 5 (strict), step 13 (hard-kill check) |
+| WebView2 evicts the data when the disk is full | At start the app asks for persistent storage and checks it was granted. If WebView2 won't grant it, the app keeps a rolling backup export in its own folder: a fixed number of copies with a size cap, never any keys, its folder shown in Settings. | Step 3 (whether it's granted), step 10 (the fallback backup) |
+
 ### The model port
 
 `packages/core/src/model/port.ts`. One reply is a stream of events (thinking, text, tool calls) that ends in exactly one `done` or `error`. It never throws, and a stop signal ends it promptly with an `aborted` error. Every adapter runs the same contract (`packages/core/src/testing/model-contract.ts`): the fake model now, the pi-ai adapter over recorded responses from step 4.
@@ -71,20 +85,20 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 
 | # | Step | Done when | Hours |
 | --- | --- | --- | --- |
-| | **Part 1: Familiar on its own** | | **92** |
+| | **Part 1: Familiar on its own** | | **93** |
 | 1 | Repo, workspace, CI, fake model, fake MCP server | Typecheck and tests green on CI | 3 |
 | 2 | Spikes: pi-durable in a Tauri webview, pi-ai bundling, the installed exe starting a local MCP server | A yes or no on each, written down | 5 |
-| 3 | Tauri shell: the app loaded from a folder beside the exe, windows and capabilities, tray, credentials, SQLite, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch, the WebSocket for part 2 | Runs on the Windows runner. Then the exe settles | 8 |
+| 3 | Tauri shell: the app loaded from a folder beside the exe, its origin and WebView2 data folder pinned, persistent storage asked for, windows and capabilities, tray, credentials, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch, the WebSocket for part 2 | Runs on the Windows runner. Then the exe settles | 8 |
 | 4 | Model layer: port, pi-ai adapter, presets, model list, Test, caps | Recorded responses pass for all three APIs | 5 |
-| 5 | Turn loop and journal in core: resume rules, recorded calls, parked waits, the state it reports, the decision slot with the rules decider | Kill-mid-tool tests for every step kind | 8 |
+| 5 | Turn loop and journal in core, on pi-durable with its IndexedDB store and strict durability: resume rules, recorded calls, parked waits, the state it reports, the decision slot with the rules decider | Kill-mid-tool tests for every step kind. pi-durable's storage suite passes in CI | 8 |
 | 6 | Cards: V2/V3, lorebook, prompt building, plain helper | Sample cards round-trip, lorebook budget tests | 5 |
 | 7 | MCP client: local and remote servers, add by paste or form, Test, prerequisites, saved setups, secrets and blanking, the unpinned flag, changed-tool re-ask, time limits and Stop, restarts | Against the fake server: add, crash mid-call (never sent again), change a tool, print a secret (blanked), remove | 12 |
 | 8 | Tools, reminders, consent cards, activity list, the outside-content rule | Missed-reminder, exact-call consent, revoke and steering tests | 7 |
 | 9 | Capability matrix: the list, the Settings tab, the docs page, the setup guide | Settings and docs agree, checked in CI | 5 |
-| 10 | Memory: notes, summaries, the Memory tab, deletion | Notes survive restart and delete cleanly | 4 |
+| 10 | Memory: notes, summaries, the Memory tab, deletion. Export and import, and the fallback backup | Notes survive restart and delete cleanly. Export then import gives back the same data | 5 |
 | 11 | Chat window, first-run setup, settings | Headless screenshots, light and dark | 10 |
-| 12 | Packaging: the zip, the per-user installer and the draft release. A winget manifest for the public flip | The installer runs on a real PC with Smart App Control on, and a local server runs there | 4 |
-| 13 | What screenshots can't show: upgrades, sleep and wake, notification buttons, local servers under Smart App Control | Checked on the runner and once on a real PC. That last check gates the release | 8 |
+| 12 | Packaging: the zip, the per-user installer and the draft release, an uninstaller that keeps data unless you tick the box. A winget manifest for the public flip | The installer runs on a real PC with Smart App Control on, and a local server runs there | 4 |
+| 13 | What screenshots can't show: data through an update, a reinstall and a winget upgrade, a write surviving a hard kill, sleep and wake, notification buttons, local servers under Smart App Control | Checked on the runner and once on a real PC. That last check gates the release | 8 |
 | 14 | Codex reviews and fixes, spread over the steps | No open P1 or P2 | 8 |
 | | **Part 2: the buddy link, after Desktop Buddies' API v2 ships** | | **25** |
 | 15 | Presence protocol and buddy driver, against a fake Desktop Buddies | Contract tests for snapshots, leases, budgets, fallbacks | 6 |

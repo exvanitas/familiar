@@ -1,0 +1,7 @@
+{
+  "name": "familiar-spike-echo-args",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "bin": { "familiar-spike-echo-args": "echo-args.js" }
+}
