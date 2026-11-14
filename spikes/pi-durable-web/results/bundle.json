@@ -1,0 +1,743 @@
+[
+  {
+    "name": "pi-durable (root)",
+    "bytes": 422665,
+    "gzip": 106720,
+    "chunks": 1,
+    "assets": [],
+    "modules": 100,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/pi-durable": 376796,
+      "@earendil-works/chord": 102754,
+      "@earendil-works/pi-schema": 97293,
+      "@earendil-works/pi-ai": 25433,
+      "@earendil-works/pi-telemetry": 2207,
+      "(spike) .entries/pi-durable-root-.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/storage/indexeddb",
+    "bytes": 29521,
+    "gzip": 7274,
+    "chunks": 1,
+    "assets": [],
+    "modules": 6,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/pi-durable": 35479,
+      "@earendil-works/chord": 5293,
+      "(spike) .entries/pi-durable-storage-indexeddb.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/storage/sqlite",
+    "bytes": 39940,
+    "gzip": 9577,
+    "chunks": 1,
+    "assets": [],
+    "modules": 13,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/pi-durable": 45139,
+      "@earendil-works/chord": 7154,
+      "(spike) .entries/pi-durable-storage-sqlite.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/storage/memory",
+    "bytes": 26138,
+    "gzip": 6567,
+    "chunks": 1,
+    "assets": [],
+    "modules": 6,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/pi-durable": 27937,
+      "@earendil-works/chord": 7784,
+      "(spike) .entries/pi-durable-storage-memory.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/storage/jsonl",
+    "bytes": 44110,
+    "gzip": 10799,
+    "chunks": 1,
+    "assets": [],
+    "modules": 7,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/pi-durable": 54472,
+      "@earendil-works/chord": 7784,
+      "(spike) .entries/pi-durable-storage-jsonl.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/storage/store",
+    "bytes": 143535,
+    "gzip": 35393,
+    "chunks": 1,
+    "assets": [],
+    "modules": 48,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/chord": 82915,
+      "@earendil-works/pi-schema": 73083,
+      "@earendil-works/pi-durable": 32964,
+      "@earendil-works/pi-telemetry": 1864,
+      "(spike) .entries/pi-durable-storage-store.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/testing",
+    "bytes": 82112,
+    "gzip": 16206,
+    "chunks": 1,
+    "assets": [],
+    "modules": 13,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 1
+    },
+    "heavyIds": [
+      "@earendil-works/pi-durable/dist/env/index.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 108658,
+      "@earendil-works/chord": 1545,
+      "@earendil-works/pi-telemetry": 1100,
+      "(spike) .entries/pi-durable-testing.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/env",
+    "bytes": 3985,
+    "gzip": 1455,
+    "chunks": 1,
+    "assets": [],
+    "modules": 4,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 3
+    },
+    "heavyIds": [
+      "@earendil-works/pi-durable/dist/env/decode.js",
+      "@earendil-works/pi-durable/dist/env/line-scan.js",
+      "@earendil-works/pi-durable/dist/env/index.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 5765,
+      "(spike) .entries/pi-durable-env.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/tools",
+    "bytes": 47084,
+    "gzip": 14347,
+    "chunks": 1,
+    "assets": [],
+    "modules": 29,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 11,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 13
+    },
+    "heavyIds": [
+      "@earendil-works/pi-durable/dist/tools/env.js",
+      "@earendil-works/pi-durable/dist/tools/bash.js",
+      "diff/libesm/diff/base.js",
+      "diff/libesm/diff/character.js",
+      "diff/libesm/util/string.js",
+      "diff/libesm/diff/word.js",
+      "diff/libesm/diff/line.js",
+      "diff/libesm/diff/sentence.js",
+      "diff/libesm/diff/css.js",
+      "diff/libesm/diff/json.js",
+      "diff/libesm/diff/array.js",
+      "diff/libesm/patch/create.js",
+      "diff/libesm/index.js",
+      "@earendil-works/pi-durable/dist/tools/edit-diff.js",
+      "@earendil-works/pi-durable/dist/env/decode.js",
+      "@earendil-works/pi-durable/dist/env/index.js",
+      "@earendil-works/pi-durable/dist/tools/file-mutation-queue.js",
+      "@earendil-works/pi-durable/dist/tools/path-utils.js",
+      "@earendil-works/pi-durable/dist/tools/edit.js",
+      "@earendil-works/pi-durable/dist/tools/image.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 46037,
+      "diff": 24648,
+      "@earendil-works/pi-schema": 1232,
+      "@earendil-works/chord": 1068,
+      "(spike) .entries/pi-durable-tools.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/images",
+    "bytes": 2524988,
+    "gzip": 943414,
+    "chunks": 1,
+    "assets": [],
+    "modules": 5,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 1,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 3
+    },
+    "heavyIds": [
+      "@silvia-odwyer/photon/photon_rs.js",
+      "@earendil-works/pi-durable/dist/tools/image-processor.js",
+      "@earendil-works/pi-durable/dist/images/exif.js",
+      "@earendil-works/pi-durable/dist/images/index.js"
+    ],
+    "byPackage": {
+      "@silvia-odwyer/photon": 2525945,
+      "@earendil-works/pi-durable": 6274,
+      "(spike) .entries/pi-durable-images.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/codemode",
+    "bytes": 160426,
+    "gzip": 42338,
+    "chunks": 1,
+    "assets": [],
+    "modules": 69,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 3,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 4
+    },
+    "heavyIds": [
+      "@earendil-works/pi-codemode/dist/identifier.js",
+      "@earendil-works/pi-codemode/dist/declarations.js",
+      "@earendil-works/pi-codemode/dist/source.js",
+      "@earendil-works/pi-durable/dist/codemode/models.js",
+      "@earendil-works/pi-durable/dist/codemode/describe.js",
+      "@earendil-works/pi-durable/dist/codemode/output.js",
+      "@earendil-works/pi-durable/dist/codemode/codemode.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-schema": 98116,
+      "@earendil-works/pi-durable": 86402,
+      "@earendil-works/chord": 18167,
+      "@earendil-works/pi-codemode": 12252,
+      "@earendil-works/pi-ai": 1320,
+      "@earendil-works/pi-telemetry": 1100,
+      "(spike) .entries/pi-durable-codemode.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/tool-search",
+    "bytes": 6762,
+    "gzip": 2760,
+    "chunks": 1,
+    "assets": [],
+    "modules": 6,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 1,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [
+      "@earendil-works/pi-codemode/dist/declarations.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 7492,
+      "@earendil-works/pi-schema": 895,
+      "@earendil-works/pi-codemode": 762,
+      "(spike) .entries/pi-durable-tool-search.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/env/node",
+    "bytes": 33115,
+    "gzip": 9735,
+    "chunks": 1,
+    "assets": [],
+    "modules": 6,
+    "nodeImports": [
+      {
+        "id": "node:child_process",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:fs",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:fs/promises",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:crypto",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:path",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:url",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:os",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:path",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node-watch.js",
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:fs",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node-watch.js",
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:fs/promises",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node-watch.js",
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      },
+      {
+        "id": "node:crypto",
+        "chain": [
+          "@earendil-works/pi-durable/dist/env/node-watch.js",
+          "@earendil-works/pi-durable/dist/env/node.js"
+        ]
+      }
+    ],
+    "globals": {
+      "process": 17,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 5
+    },
+    "heavyIds": [
+      "@earendil-works/pi-durable/dist/env/decode.js",
+      "@earendil-works/pi-durable/dist/env/line-scan.js",
+      "@earendil-works/pi-durable/dist/env/index.js",
+      "@earendil-works/pi-durable/dist/env/node-watch.js",
+      "@earendil-works/pi-durable/dist/env/node.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 50301,
+      "(spike) .entries/pi-durable-env-node.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-durable/storage/sqlite/node",
+    "bytes": 43730,
+    "gzip": 10596,
+    "chunks": 1,
+    "assets": [],
+    "modules": 15,
+    "nodeImports": [
+      {
+        "id": "node:sqlite",
+        "chain": [
+          "@earendil-works/chord/dist/sqlite/node.js",
+          "@earendil-works/pi-durable/dist/storage/sqlite/node.js"
+        ]
+      },
+      {
+        "id": "node:fs/promises",
+        "chain": [
+          "@earendil-works/chord/dist/sqlite/node.js",
+          "@earendil-works/pi-durable/dist/storage/sqlite/node.js"
+        ]
+      },
+      {
+        "id": "node:path",
+        "chain": [
+          "@earendil-works/chord/dist/sqlite/node.js",
+          "@earendil-works/pi-durable/dist/storage/sqlite/node.js"
+        ]
+      }
+    ],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 0,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [],
+    "byPackage": {
+      "@earendil-works/pi-durable": 45450,
+      "@earendil-works/chord": 11822,
+      "(spike) .entries/pi-durable-storage-sqlite-node.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-ai/models",
+    "bytes": 37562,
+    "gzip": 9576,
+    "chunks": 1,
+    "assets": [],
+    "modules": 20,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 1,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [
+      "@earendil-works/pi-ai/dist/api/lazy.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-ai": 51053,
+      "@earendil-works/pi-telemetry": 2207,
+      "(spike) .entries/pi-ai-models.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "pi-ai (root)",
+    "bytes": 158497,
+    "gzip": 40153,
+    "chunks": 1,
+    "assets": [],
+    "modules": 74,
+    "nodeImports": [
+      {
+        "id": "node:fs",
+        "chain": [
+          "@earendil-works/pi-ai/dist/utils/provider-env.js",
+          "@earendil-works/pi-ai/dist/cache-warming.js",
+          "@earendil-works/pi-ai/dist/index.js"
+        ]
+      }
+    ],
+    "globals": {
+      "process": 5,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 2,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [
+      "@earendil-works/pi-ai/dist/api/lazy.js",
+      "@earendil-works/pi-ai/dist/providers/faux.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-ai": 110604,
+      "@earendil-works/pi-schema": 97293,
+      "partial-json": 7800,
+      "@earendil-works/pi-telemetry": 2207,
+      "\u0000rolldown/runtime.js": 654,
+      "(spike) .entries/pi-ai-root-.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "familiar engine + IndexedDB",
+    "bytes": 462341,
+    "gzip": 115987,
+    "chunks": 1,
+    "assets": [],
+    "modules": 111,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 1,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [
+      "@earendil-works/pi-ai/dist/api/lazy.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 376262,
+      "@earendil-works/chord": 102817,
+      "@earendil-works/pi-schema": 97293,
+      "@earendil-works/pi-ai": 74327,
+      "(spike) src/port-provider.ts": 5683,
+      "(spike) src/engine.ts": 2753,
+      "@earendil-works/pi-telemetry": 2207,
+      "(spike) .entries/familiar-engine-IndexedDB.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "familiar engine + SQLite core",
+    "bytes": 472585,
+    "gzip": 118207,
+    "chunks": 1,
+    "assets": [],
+    "modules": 118,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 1,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [
+      "@earendil-works/pi-ai/dist/api/lazy.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 385753,
+      "@earendil-works/chord": 104676,
+      "@earendil-works/pi-schema": 97293,
+      "@earendil-works/pi-ai": 74327,
+      "(spike) src/port-provider.ts": 5683,
+      "(spike) src/engine.ts": 2753,
+      "@earendil-works/pi-telemetry": 2207,
+      "(spike) .entries/familiar-engine-SQLite-core.js": 0
+    },
+    "warnings": []
+  },
+  {
+    "name": "familiar engine + both",
+    "bytes": 496855,
+    "gzip": 122818,
+    "chunks": 1,
+    "assets": [],
+    "modules": 119,
+    "nodeImports": [],
+    "globals": {
+      "process": 0,
+      "Buffer": 0,
+      "require": 0
+    },
+    "heavy": {
+      "photon": 0,
+      "pi-codemode (QuickJS)": 0,
+      "diff": 0,
+      "pi-ai providers": 1,
+      "provider SDKs": 0,
+      "pi-durable tools/env/images": 0
+    },
+    "heavyIds": [
+      "@earendil-works/pi-ai/dist/api/lazy.js"
+    ],
+    "byPackage": {
+      "@earendil-works/pi-durable": 419550,
+      "@earendil-works/chord": 104676,
+      "@earendil-works/pi-schema": 97293,
+      "@earendil-works/pi-ai": 74327,
+      "(spike) src/port-provider.ts": 5683,
+      "(spike) src/engine.ts": 2753,
+      "@earendil-works/pi-telemetry": 2207,
+      "(spike) .entries/familiar-engine-both.js": 0
+    },
+    "warnings": []
+  }
+]
