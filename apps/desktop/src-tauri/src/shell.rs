@@ -118,6 +118,8 @@ pub fn quit(app: &AppHandle, why: &str) {
         }
         shell.log.line(&format!("quit: done after {} ms", start.elapsed().as_millis()));
         shell.log.line(&shell.sink.line());
+        // Every line queued so far is written before the exit.
+        shell.log.flush();
         app.exit(0);
         thread::sleep(Duration::from_secs(3));
         std::process::exit(0);
