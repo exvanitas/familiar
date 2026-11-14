@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { judge } from '../shell-check/gate.mjs';
 import { dnsNames, judge as egress, parsePcapng } from '../shell-check/analyze.mjs';
 import { label, lanPort, ROUTES } from '../shell-check/hostile.ts';
+import { judgeLookups } from '../shell-check/net-analyze.mjs';
 
 const inventory = ['a.one', 'a.two'];
 const checks = ['m.x'];
@@ -46,7 +47,7 @@ describe('the gate', () => {
     const chk = JSON.parse(readFileSync(new URL('../shell-check/checks.json', import.meta.url), 'utf8')).ids as string[];
     expect(new Set(inv).size).toBe(inv.length);
     expect(new Set(chk).size).toBe(chk.length);
-    expect(inv.length).toBe(33);
+    expect(inv.length).toBe(53);
     for (const id of [...inv, ...chk]) expect(id).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$|^[a-z0-9-]+$/);
   });
 });
@@ -193,5 +194,19 @@ describe('the egress analysis', () => {
     const noSink = egress({ ...base, log: base.log.replace('sink refused 4', 'sink refused 0') });
     expect(line(noSink, 'controls')).toMatch(/^FAIL .*MISSING sink refusals/);
     expect(ROUTES.length).toBeGreaterThan(40);
+  });
+});
+
+describe('no lookup before Allow', () => {
+  const log = 'x NETLOOKUP never aaa\n NETLOOKUP never bbb\n NETLOOKUP never ccc\n NETLOOKUP after ddd\n NETLOOKUP flow ok\n';
+  const q = (n: string) => ({ proto: 'udp', dst: '1.1.1.1', dport: 53, names: [`${n}.familiar-check.test`], at: 1 });
+  it('passes when only the allowed name was looked up', () => {
+    expect(judgeLookups({ log, packets: [q('ddd')], dnsLog: '', run: 'r' })).toMatch(/^PASS .* run=r$/);
+  });
+  it('fails on a refused name on the wire or in the log, or an allowed one seen nowhere', () => {
+    expect(judgeLookups({ log, packets: [q('ddd'), q('bbb')], dnsLog: '', run: 'r' })).toMatch(/^FAIL .*looked up: bbb/);
+    expect(judgeLookups({ log, packets: [q('ddd')], dnsLog: 'QueryName aaa.familiar-check.test', run: 'r' })).toMatch(/^FAIL/);
+    expect(judgeLookups({ log, packets: [], dnsLog: '', run: 'r' })).toMatch(/^FAIL .*0 seen/);
+    expect(judgeLookups({ log: log.replace('NETLOOKUP flow ok', ''), packets: [q('ddd')], dnsLog: '', run: 'r' })).toMatch(/^FAIL .*never finished/);
   });
 });

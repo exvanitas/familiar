@@ -19,6 +19,7 @@ $Broken = (Resolve-Path $Broken).Path
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
 . (Join-Path $here 'win32.ps1')
+. (Join-Path $here 'driver-net.ps1')
 . (Join-Path $here 'procs.ps1')
 Add-Type -AssemblyName System.Windows.Forms
 
@@ -190,7 +191,11 @@ function Do-Step($action, $a) {
       return @{ hits = $n }
     }
     { $procSteps.ContainsKey($_) } { return (& $procSteps[$action] $a) }
-    default { throw "unknown step $action" }
+    default {
+      $r = Do-NetStep $action $a
+      if ($null -ne $r) { return $r }
+      throw "unknown step $action"
+    }
   }
 }
 
@@ -276,6 +281,7 @@ try {
   for ($i = 0; $i -lt 100 -and -not (Test-Path (Join-Path $App 'fixtures.json')); $i++) { Start-Sleep -Milliseconds 100 }
   $fx = Get-Content (Join-Path $App 'fixtures.json') -Raw | ConvertFrom-Json
   Write-Host "fixtures: run $($fx.run) http $($fx.tcp)"
+  Start-NetServer
 
   & wevtutil sl Microsoft-Windows-DNS-Client/Operational /e:true
   & wevtutil cl Microsoft-Windows-DNS-Client/Operational
@@ -299,12 +305,13 @@ try {
   New-Item -ItemType Junction -Path $junction -Target $outside | Out-Null
   $data = Join-Path $tmp 'data'
   $main = Join-Path $Out 'check.log'
-  $p = Run-Phase 'main' $main @('--app-dir', $App, '--data-dir', $data, '--log', $main, '--seconds', '600', '--phase', 'main') 660
+  $p = Run-Phase 'main' $main @('--app-dir', $App, '--data-dir', $data, '--log', $main, '--seconds', '900', '--phase', 'main') 960
   $mainMs = Quit-Ms $main
   $mainWrite = [bool](Select-String -Path $main -Pattern 'INFO quit write finished' -Quiet)
   $quitParts.main = ($p.ExitCode -eq 0 -and $mainMs -ge 0 -and $mainMs -lt 3000 -and $mainWrite)
   Write-Host "main: exit $($p.ExitCode), quit after $mainMs ms, write while quitting $mainWrite"
   $quitParts.strays = No-Strays 'the main run'
+  Net-AfterMain $data $main
   (Get-Item $junction).Delete()
 
   # Every window was hardened before its page logged anything.
@@ -501,6 +508,7 @@ finally {
   & wevtutil sl Microsoft-Windows-DNS-Client/Operational /e:false
   $marks | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $Out 'marks.json')
   if ($fixtures -and -not $fixtures.HasExited) { $fixtures.Kill() }
+  Stop-NetServer
   Get-Process familiar -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
@@ -514,6 +522,7 @@ if ($analysed -ne 0 -or $fresh.Count -ne $verdicts.Count -or $fresh.Count -eq 0)
   foreach ($id in 'controls', 'core', 'view') { Result 'FAIL' "security.egress.$id" "no analysis from this run: node exit $analysed, $($fresh.Count) of $($verdicts.Count) verdicts stamped run=$run" }
 } else { foreach ($l in $fresh) { $results.Add($l) } }
 # The gate checks each egress verdict against this line.
+Net-Lookups
 if ($run) { $results.Insert(0, "RUN $run") }
 if ($env:GITHUB_STEP_SUMMARY -and (Test-Path (Join-Path $Out 'egress.md'))) { Get-Content (Join-Path $Out 'egress.md') | Add-Content $env:GITHUB_STEP_SUMMARY }
 

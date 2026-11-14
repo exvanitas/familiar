@@ -2,10 +2,9 @@
 //! folders `open_folder` shows. Rules are shell-core's (`files`, `link`, `temp`). The dialog and
 //! replace code is Desktop Buddies'. See "5d. The rest" in docs/shell-design.md.
 
-use crate::{ask, shell::Shell};
+use crate::{confirm, shell::Shell};
 use serde::{Deserialize, Serialize};
 use shell_core::{
-    confirm,
     files::{self, Filter, Pick},
     link, temp,
 };
@@ -74,6 +73,10 @@ fn spec_header(request: &Request) -> Res<String> {
 /// Returns whether it saved.
 #[tauri::command(async)]
 pub fn save_as(request: Request, window: WebviewWindow, app: AppHandle, shell: State<Shell>) -> Res<bool> {
+    // A dialog that opens windows waits for no confirm: while one is open, nothing new opens.
+    if confirm::busy(&app) {
+        return Err(fail("busy", "a confirm is open"));
+    }
     let InvokeBody::Raw(bytes) = request.body() else { return Err(fail("invalid", "expected bytes")) };
     if bytes.len() > files::MAX_SAVE {
         return Err(fail("too-large", "at most 256 MiB"));
@@ -104,6 +107,9 @@ pub struct PickSpec {
 /// The native open dialog. A full path, or null if the person cancelled.
 #[tauri::command(async)]
 pub fn pick_path(spec: PickSpec, window: WebviewWindow, app: AppHandle) -> Res<Option<String>> {
+    if confirm::busy(&app) {
+        return Err(fail("busy", "a confirm is open"));
+    }
     let kind = Pick::parse(&spec.kind).ok_or_else(|| fail("invalid", "kind is file or folder"))?;
     files::check_filters(&spec.filters).map_err(|e| fail("invalid", e))?;
     let owner = owner(&app, &window, spec.owner.as_deref());
@@ -115,7 +121,11 @@ pub fn pick_path(spec: PickSpec, window: WebviewWindow, app: AppHandle) -> Res<O
 #[tauri::command(async)]
 pub fn open_url(url: String, owner: Option<String>, app: AppHandle, shell: State<Shell>) -> Res<()> {
     let link = link::check(&url).map_err(|_| fail("invalid", "only an https link of up to 2048 characters"))?;
-    ask::ask(&app, &confirm::open_link(&link), owner.as_deref()).map_err(|no| fail(no.kind(), "not opened"))?;
+    let ticket = confirm::reserve(&app).map_err(|e| fail(e.kind(), "the confirm can't ask now"))?;
+    // What opens is `link`, this copy made before asking.
+    if !ticket.ask(owner.as_deref(), shell_core::confirm::open_link(&link)).map_err(|e| fail(e.kind(), "the confirm failed"))? {
+        return Err(fail("declined", "not opened"));
+    }
     dialogs::shell_open(&link.url).map_err(|e| fail("failed", e))?;
     shell.log.line("open_url opened a link");
     Ok(())

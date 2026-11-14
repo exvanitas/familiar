@@ -11,8 +11,11 @@
     "global-shortcut:allow-is-registered",
     "allow-shell-info", "allow-shell-ready", "allow-log-line",
     "allow-quit", "allow-quit-ready", "allow-tray-set",
-    "allow-system", "allow-wake-at",
     "allow-view-open", "allow-window-ctl",
+    "allow-address-list", "allow-address-add", "allow-address-remove",
+    "allow-net-fetch", "allow-net-read", "allow-net-cancel",
+    "allow-secret-set", "allow-secret-status", "allow-secret-delete",
+    "allow-system", "allow-wake-at",
     "allow-server-start", "allow-server-write", "allow-server-stop", "allow-server-forget",
     "allow-pick-path", "allow-save-as", "allow-open-url", "allow-open-folder",
     "allow-autostart"

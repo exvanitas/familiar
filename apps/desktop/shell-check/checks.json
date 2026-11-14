@@ -28,6 +28,8 @@
     "sink.slow-clients",
     "queue.early",
     "start.overlap",
+    "fetch.no-lookup-flow",
+    "tls.roots",
     "system.idle",
     "wake.hidden",
     "toast.app-id",

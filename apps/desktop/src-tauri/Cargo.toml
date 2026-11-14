@@ -21,11 +21,20 @@ tauri-plugin-single-instance = "=2.5.5"
 tauri-plugin-notification = "=2.8.0"
 tauri-plugin-global-shortcut = "=2.4.1"
 shell-win = { path = "../shell-win" }
-percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Already in Tauri's tree. Only to set SO_EXCLUSIVEADDRUSE on the sink before it binds.
 socket2 = "0.6"
+# Already in Tauri's tree. Ids for saved addresses and temporary files.
+getrandom = "0.3"
+# The guarded fetch. rustls and the Windows system proxy are defaults in 0.13.
+reqwest = { version = "=0.13.5", features = ["stream", "gzip", "brotli", "deflate"] }
+# Keys, in Windows Credential Manager.
+keyring = "=4.2.0"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+bytes = "1"
+url = "2"
+percent-encoding = "2"
 
 # The copies Tauri already pulls in. The features only switch on more of their bindings.
 [target.'cfg(windows)'.dependencies]
@@ -41,6 +50,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_UI_Controls",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
   "Win32_UI_Shell_Common",

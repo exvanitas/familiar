@@ -85,12 +85,20 @@ const handlers: Record<string, (args: never) => unknown> = {
   listen: (names: string[]) => listen(names),
   heard: () => ({ ...heard }),
   'close-self': () => { setTimeout(() => shell.windowSelf('close').catch(() => {}), 100); return 'closing'; },
-  'self-op': (op: 'minimize') => shell.windowSelf(op).then(() => 'ok', e => 'failed:' + String(e)),
+  'self-op': (op: 'minimize') => shell.windowSelf(op).then(() => 'ok', e => 'failed:' + JSON.stringify(e)),
   navigate: (to: string) => { setTimeout(() => { location.href = to; }, 100); return 'navigating'; },
   permissions: () => permissions(),
   'service-workers': () => serviceWorkers(),
   'paste-ready': () => { const i = document.getElementById('paste') as HTMLInputElement; i.value = ''; i.focus(); return document.hasFocus(); },
   'paste-value': () => (document.getElementById('paste') as HTMLInputElement).value,
+  /* Settings saves what the driver typed into its password field, then clears it. The page never
+     returns the value. */
+  'save-key': async (ref: string) => {
+    const i = document.getElementById('paste') as HTMLInputElement;
+    const value = i.value;
+    i.value = '';
+    return shell.secretSet(ref, value).then(() => 'ok', e => 'failed:' + JSON.stringify(e));
+  },
   'clip-ready': (text: string) => { clip = text; return 'ready'; },
   'clip-result': () => (document.getElementById('clip') as HTMLElement).dataset.result ?? 'no click',
   violations: () => [...violations],

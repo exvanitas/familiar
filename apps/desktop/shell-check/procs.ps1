@@ -146,16 +146,6 @@ $procSteps = @{
     $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
     @{ repo = $repo; mainTs = (Join-Path $repo 'tools\fake-mcp-server\src\main.ts'); node = (Get-Command node -CommandType Application | Select-Object -First 1).Source; tmp = $tmp; exeDir = (Split-Path $Exe); smb = $script:smb }
   }
-  'dialog' = {
-    param($a)
-    $h = Find-Dialog ([int]$a.within)
-    if (-not $h) { return @{ shown = $false; text = '' } }
-    $text = [W]::DialogText($h)
-    $press = if ($a.press -eq 'yes') { 6 } else { 7 }
-    [W]::Press($h, $press)
-    for ($i = 0; $i -lt 30 -and [W]::Dialog([uint32]$script:proc.Id) -eq $h; $i++) { Start-Sleep -Milliseconds 100 }
-    @{ shown = $true; text = $text; pressed = $(if ($press -eq 6) { 'yes' } else { 'no' }) }
-  }
   'smb-save' = { param($a); $c = Save-SmbCounts $a.name; @{ opens = $c.opens } }
   'smb-compare' = {
     param($a)

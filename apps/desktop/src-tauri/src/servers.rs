@@ -4,12 +4,11 @@
 //! `redact`), and the walk's file system calls are shell-win's. The starting sequence is the
 //! mcp-start spike's. See "5b. Starting a local MCP server" in docs/shell-design.md.
 
-use crate::{ask, shell::Shell};
+use crate::{confirm, secrets, shell::Shell};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shell_core::{
     approvals::{self, Load, Store},
-    confirm,
     server_path::{self, Launch, PathError},
     setup::{self, Canonical, Event, Lines, Setup, Stream},
     temp,
@@ -121,12 +120,6 @@ impl server_path::Fs for NoFs {
     }
 }
 
-/// STAND-IN until secrets.rs is merged: no secret is ever found, so a setup that names one is
-/// refused with `no-key`. Replaced by secrets.rs's reader of `server:<id>:<NAME>`.
-fn read_secret(_setup: &str, _name: &str) -> Option<String> {
-    None
-}
-
 #[derive(Serialize)]
 pub struct Started {
     run: String,
@@ -142,6 +135,9 @@ fn run_id() -> String {
 #[tauri::command(async)]
 pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel: Channel<Value>, shell: State<Shell>, servers: State<Servers>) -> Res<Started> {
     setup::check(&setup).map_err(|e| fail(e.kind(), "the setup was refused"))?;
+    // The confirm state first, so a busy or stopped confirm refuses before the walk touches the
+    // disk. Dropped unused, for a setup approved before, it frees the state with no refusal.
+    let ticket = confirm::reserve(&app).map_err(|e| fail(e.kind(), "the confirm can't ask now"))?;
     let launch = walk(&setup.program, &setup.cwd)?;
     let form = Canonical::new(&setup, &launch);
     if lock(&servers.runs).len() >= setup::MAX_RUNNING {
@@ -152,14 +148,18 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
         load(&shell).approved(&setup.id, &form)
     };
     if approved {
+        drop(ticket);
         shell.log.line(&format!("server {}: approved before, no dialog", setup.id));
     } else {
         shell.log.line(&format!("server {}: asking", setup.id));
-        let a = confirm::start_program(&setup.label, &form);
-        ask::ask(&app, &a, owner.as_deref()).map_err(|no| {
-            shell.log.line(&format!("server {}: {}", setup.id, no.kind()));
-            fail(no.kind(), "not started")
-        })?;
+        // What runs is `form`, this copy made before asking: nothing a page sends meanwhile
+        // changes it.
+        let a = shell_core::confirm::start_program(&setup.label, &form);
+        let said = ticket.ask(owner.as_deref(), a).map_err(|e| fail(e.kind(), "the confirm failed"))?;
+        if !said {
+            shell.log.line(&format!("server {}: declined", setup.id));
+            return Err(fail("declined", "not started"));
+        }
         let _g = lock(&servers.store);
         let mut store = load(&shell);
         store.approve(&setup.id, form.clone());
@@ -170,7 +170,7 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
     server_path::recheck(&fs(), &form.launch()).map_err(path_fail)?;
     let mut secrets = Vec::new();
     for name in &setup.secrets {
-        let v = read_secret(&setup.id, name).ok_or_else(|| fail("no-key", "a secret of this setup isn't stored"))?;
+        let v = secrets::server_secret(&setup.id, name).ok_or_else(|| fail("no-key", "a secret of this setup isn't stored"))?;
         secrets.push((name.clone(), v));
     }
     let parent: Vec<(String, String)> = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();

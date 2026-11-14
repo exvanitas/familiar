@@ -17,7 +17,18 @@ interface Paths {
   smb: { unc: string; mapped: string; jShare: string; sShare: string; sMapped: string; jLocal: string; how: string };
 }
 
-interface Dialog { shown: boolean; text: string; pressed?: string }
+interface Dialog { shown: boolean; text: string }
+
+const START = ['Start it', "Don't start"] as const;
+const OPEN = ['Open', "Don't open"] as const;
+
+/* The confirm, answered by driver-net.ps1's dialog step: approve, refuse, or none (look for one,
+   and refuse it if it came). What it showed, details included. */
+async function dialog(act: 'approve' | 'refuse' | 'none', [approve, refuse]: readonly [string, string]): Promise<Dialog> {
+  const r = await step<{ found: boolean; texts: string[]; details: string; answered: string }>('dialog', { act, approve, refuse, details: act !== 'none' }, 60000);
+  if (act === 'none' && r.found) await step('dialog', { act: 'refuse', approve, refuse }, 60000);
+  return { shown: r.found, text: [...(r.texts ?? []), r.details ?? ''].join('\n') };
+}
 
 const errKind = (e: unknown) => (e && typeof e === 'object' && 'kind' in e ? String((e as { kind: unknown }).kind) : reason(e));
 
@@ -76,10 +87,10 @@ class Mcp {
 }
 
 /* Starts a setup while the driver answers its dialog. What the dialog said, and the start's outcome. */
-async function startWith(m: Mcp, setup: Setup, press: 'yes' | 'no' | 'none', within = 20000): Promise<{ dialog: Dialog; started: string }> {
+async function startWith(m: Mcp, setup: Setup, press: 'yes' | 'no' | 'none'): Promise<{ dialog: Dialog; started: string }> {
   const started = m.start(setup).then(() => 'started', e => errKind(e));
-  const dialog = await step<Dialog>('dialog', { press, within });
-  return { dialog, started: await started };
+  const d = await dialog(press === 'yes' ? 'approve' : press === 'no' ? 'refuse' : 'none', START);
+  return { dialog: d, started: await started };
 }
 
 const fakeSetup = (p: Paths, id: string, extra: Partial<Setup> = {}): Setup => ({
@@ -89,7 +100,7 @@ const fakeSetup = (p: Paths, id: string, extra: Partial<Setup> = {}): Setup => (
 /* A start that must be refused before any dialog, with this kind. */
 async function refusedBefore(setup: Setup, kind: string): Promise<string | null> {
   const m = new Mcp();
-  const r = await startWith(m, setup, 'none', 1500);
+  const r = await startWith(m, setup, 'none');
   if (r.dialog.shown) return `${setup.id}: a dialog appeared`;
   if (r.started !== kind) return `${setup.id}: ${r.started}, not ${kind}`;
   return null;
@@ -201,7 +212,7 @@ async function main(info: Info) {
     await shell.serverStop(ma.run);
     await ma.exited(5000);
     const again = new Mcp();
-    const r = await startWith(again, a, 'none', 4000);
+    const r = await startWith(again, a, 'none');
     ok(!r.dialog.shown && r.started === 'started', `the same setup again: dialog ${r.dialog.shown}, ${r.started}`);
     await again.initialize();
     // Stop while a call runs.
@@ -217,7 +228,7 @@ async function main(info: Info) {
     ok(rb.dialog.shown && rb.started === 'declined', `a changed argument: dialog ${rb.dialog.shown}, ${rb.started}`);
     // Forget while a call runs: it stops, and the next start asks again.
     const c = new Mcp();
-    const rc = await startWith(c, a, 'none', 4000);
+    const rc = await startWith(c, a, 'none');
     ok(!rc.dialog.shown && rc.started === 'started', 'the approved setup asked again: ' + rc.started);
     await c.initialize();
     void c.tool('slow', { ms: 30000 }, 40000).catch(() => 'cut off');
@@ -274,7 +285,7 @@ async function main(info: Info) {
     const limit = await step<{ done: boolean; why?: string }>('job-limit');
     if (!limit.done) skip('the driver could not limit the exe: ' + (limit.why ?? ''));
     const m2 = new Mcp();
-    const r2 = await startWith(m2, s, 'none', 3000);
+    const r2 = await startWith(m2, s, 'none');
     ok(!r2.dialog.shown && r2.started === 'start-failed', `under a job that allows no new process: ${r2.started}`);
     const left = await step<{ count: number; suspended: number }>('node-children');
     ok(left.count === 0, `${left.count} node processes left, ${left.suspended} suspended`);
@@ -288,20 +299,20 @@ async function filesAndLinks(info: Info) {
   await check('security.link.confirm', async () => {
     for (const url of ['http://example.com/', 'javascript:alert(1)', 'file:///C:/Windows/win.ini', `https://${'a'.repeat(2050)}.example`]) {
       const r = shell.openUrl(url).then(() => 'opened', e => errKind(e));
-      const dialog = await step<Dialog>('dialog', { press: 'none', within: 1500 });
-      ok(!dialog.shown, `a dialog for ${url.slice(0, 40)}`);
+      const d = await dialog('none', OPEN);
+      ok(!d.shown, `a dialog for ${url.slice(0, 40)}`);
       ok(await r === 'invalid', `${url.slice(0, 40)}: ${await r}`);
     }
     const { port } = await step<{ port: number }>('listen-start');
     const url = `https://127.0.0.1:${port}/familiar-check-${rand(6)}`;
     const no = shell.openUrl(url).then(() => 'opened', e => errKind(e));
-    const d1 = await step<Dialog>('dialog', { press: 'no' });
+    const d1 = await dialog('refuse', OPEN);
     ok(d1.shown && await no === 'declined', `Don't open: dialog ${d1.shown}, ${await no}`);
     ok(d1.text.includes('127.0.0.1'), 'the dialog does not show the host');
     const none = await step<{ count: number }>('listen-count', { ms: 4000 });
     ok(none.count === 0, `the listener saw ${none.count} connections after Don't open`);
     const yes = shell.openUrl(url).then(() => 'opened', e => errKind(e));
-    const d2 = await step<Dialog>('dialog', { press: 'yes' });
+    const d2 = await dialog('approve', OPEN);
     ok(d2.shown && await yes === 'opened', `Open: dialog ${d2.shown}, ${await yes}`);
     const seen = await step<{ count: number }>('listen-count', { ms: 30000, until: 1 });
     await step('listen-stop');
