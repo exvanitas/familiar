@@ -5,3 +5,4 @@ pub mod identity;
 pub mod paths;
 pub mod address;
 pub mod redact;
+pub mod setup;
