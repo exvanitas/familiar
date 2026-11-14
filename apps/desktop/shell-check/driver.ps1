@@ -152,6 +152,7 @@ function Answer($n, $value) {
 
 function Handle([string]$raw) {
   $line = $raw.TrimEnd()
+  if ($line -match '^\s*[\d.]+ core not ready$') { $script:notReady = $true }
   if ($line -match '^\s*[\d.]+ \[[a-z0-9-]+\] CHECK (PASS|FAIL|SKIP) (\S+) ?(.*)$') { Result $Matches[1] $Matches[2] $Matches[3] }
   elseif ($line -match '^\s*[\d.]+ \[[a-z0-9-]+\] STEP (\d+) (\S+) (.*)$') {
     $n = $Matches[1]; $action = $Matches[2]; $json = $Matches[3]
@@ -170,6 +171,7 @@ function Run-Phase([string]$name, [string]$log, [string[]]$argv, [int]$limit, [s
   $script:proc = $p
   $deadline = [DateTime]::Now.AddSeconds($limit)
   $pending = ''
+  $script:notReady = $false
   while ($true) {
     $exited = $p.HasExited
     if (Test-Path $log) {
@@ -184,6 +186,7 @@ function Run-Phase([string]$name, [string]$log, [string[]]$argv, [int]$limit, [s
       }
     }
     if ($exited) { break }
+    if ($script:notReady -and $name -ne 'not-ready') { Result 'FAIL' 'check.phase' "${name}: core never said ready"; $p.Kill(); break }
     if ([DateTime]::Now -gt $deadline) { Result 'FAIL' 'check.phase' "$name still running after $limit s"; $p.Kill(); break }
     Start-Sleep -Milliseconds 50
   }
@@ -235,7 +238,7 @@ try {
   # ---------- the main run ----------
   $data = Join-Path $tmp 'data'
   $main = Join-Path $Out 'check.log'
-  $p = Run-Phase 'main' $main @('--app-dir', $App, '--data-dir', $data, '--log', $main, '--seconds', '900', '--phase', 'main') 960
+  $p = Run-Phase 'main' $main @('--app-dir', $App, '--data-dir', $data, '--log', $main, '--seconds', '600', '--phase', 'main') 660
   $mainMs = Quit-Ms $main
   $mainWrite = [bool](Select-String -Path $main -Pattern 'INFO quit write finished' -Quiet)
   $quitParts.main = ($p.ExitCode -eq 0 -and $mainMs -ge 0 -and $mainMs -lt 3000 -and $mainWrite)
