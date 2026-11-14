@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::redact;
+use crate::server_path::Launch;
 
 pub const MAX_ARGS: usize = 64;
 pub const MAX_SETTINGS: usize = 32;
@@ -192,25 +193,46 @@ pub fn check(setup: &Setup) -> Result<(), SetupError> {
     Ok(())
 }
 
-/// What an approval binds: the resolved program, the arguments, the folder, the plain settings
-/// with their values, and the secret names. Never a secret's value, so a renewed token doesn't
-/// ask again. Settings and secret names are sorted, so their order doesn't matter.
+/// What an approval binds: the resolved program and where it really leads, the arguments, the
+/// folder and where it really leads, the plain settings with their values, and the secret
+/// names. Never a secret's value, so a renewed token doesn't ask again. Settings and secret
+/// names are sorted, so their order doesn't matter. A link pointed elsewhere asks again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Canonical {
     pub program: String,
+    pub program_target: String,
     pub args: Vec<String>,
     pub cwd: String,
+    pub cwd_target: String,
     pub env: Vec<(String, String)>,
     pub secrets: Vec<String>,
 }
 
 impl Canonical {
-    pub fn new(setup: &Setup, resolved_program: &str) -> Canonical {
+    pub fn new(setup: &Setup, launch: &Launch) -> Canonical {
         let mut env = setup.env.clone();
         env.sort_by(|a, b| fold(&a.0).cmp(&fold(&b.0)).then(a.0.cmp(&b.0)));
         let mut secrets = setup.secrets.clone();
         secrets.sort_by(|a, b| fold(a).cmp(&fold(b)).then(a.cmp(b)));
-        Canonical { program: resolved_program.to_string(), args: setup.args.clone(), cwd: setup.cwd.clone(), env, secrets }
+        Canonical {
+            program: launch.program.clone(),
+            program_target: launch.program_target.clone(),
+            args: setup.args.clone(),
+            cwd: launch.cwd.clone(),
+            cwd_target: launch.cwd_target.clone(),
+            env,
+            secrets,
+        }
+    }
+
+    /// The paths of an approved form, for the walk again just before starting.
+    pub fn launch(&self) -> Launch {
+        Launch {
+            program: self.program.clone(),
+            program_target: self.program_target.clone(),
+            cwd: self.cwd.clone(),
+            cwd_target: self.cwd_target.clone(),
+        }
     }
 
     /// The form stored in `servers.json` and compared at each start.
@@ -526,10 +548,18 @@ mod tests {
     #[test]
     fn the_canonical_form() {
         let base = setup();
-        let form = |s: &Setup| Canonical::new(s, "C:\\node\\node.exe").to_json();
+        let at = |p: &str, s: &Setup| Launch { program: p.into(), program_target: p.into(), cwd: s.cwd.clone(), cwd_target: s.cwd.clone() };
+        let form = |s: &Setup| Canonical::new(s, &at("C:\\node\\node.exe", s)).to_json();
         let b = form(&base);
         assert!(b.contains("C:\\\\node\\\\node.exe") && b.contains("LOG_LEVEL") && b.contains("FAKE_SECRET"));
-        assert_ne!(Canonical::new(&base, "C:\\other\\node.exe").to_json(), b, "the program");
+        assert_ne!(Canonical::new(&base, &at("C:\\other\\node.exe", &base)).to_json(), b, "the program");
+        let mut moved = at("C:\\node\\node.exe", &base);
+        moved.program_target = "C:\\elsewhere\\node.exe".into();
+        assert_ne!(Canonical::new(&base, &moved).to_json(), b, "where the program's link leads");
+        let mut moved = at("C:\\node\\node.exe", &base);
+        moved.cwd_target = "C:\\elsewhere".into();
+        assert_ne!(Canonical::new(&base, &moved).to_json(), b, "where the folder's link leads");
+        assert_eq!(Canonical::new(&base, &moved).launch(), moved);
         let changes: [fn(&mut Setup); 7] = [
             |s| s.args[2] = "b".into(),
             |s| s.args.push("--more".into()),

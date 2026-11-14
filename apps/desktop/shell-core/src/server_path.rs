@@ -267,18 +267,28 @@ fn candidates(base: &str, kinds: &[String]) -> Vec<String> {
     }
 }
 
+/// A program as resolved: the path as named, and where the walk found it really leads. A link
+/// can be pointed somewhere else later, so the approval binds the target too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub program: String,
+    /// The walk's final path: the program itself, a link's target, or an app execution alias.
+    pub target: String,
+}
+
 /// Resolves a setup's program to a full path. A path is checked as it is (trying PATHEXT's
 /// runnable kinds when it has none). A bare name is looked for in PATH's absolute local folders
 /// only, never the working folder, in PATHEXT order, and only as `.exe`, `.cmd` or `.bat`. A
 /// PATH entry that fails the checks is skipped, and one that fails the syntax is never opened.
-pub fn resolve(fs: &dyn Fs, program: &str, path_var: &str, pathext: Option<&str>) -> Result<String, PathError> {
+pub fn resolve(fs: &dyn Fs, program: &str, path_var: &str, pathext: Option<&str>) -> Result<Resolved, PathError> {
     let kinds = kinds(pathext);
+    let found = |c: &str, to: LocalPath| Resolved { program: normalize_drive(c), target: to.to_string_full() };
     if program.contains(['\\', '/', ':']) {
         parse(program)?;
         let mut last = PathError::NotFound;
         for c in candidates(program, &kinds) {
             match check(fs, &c, Role::Program) {
-                Ok(_) => return Ok(normalize_drive(&c)),
+                Ok(to) => return Ok(found(&c, to)),
                 Err(e) => last = e,
             }
         }
@@ -298,12 +308,39 @@ pub fn resolve(fs: &dyn Fs, program: &str, path_var: &str, pathext: Option<&str>
             continue;
         }
         for c in candidates(&format!("{dir}\\{program}"), &kinds) {
-            if check(fs, &c, Role::Program).is_ok() {
-                return Ok(normalize_drive(&c));
+            if let Ok(to) = check(fs, &c, Role::Program) {
+                return Ok(found(&c, to));
             }
         }
     }
     Err(PathError::NotFound)
+}
+
+/// What a start runs: the program and the folder as named, and where each really leads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub program: String,
+    pub program_target: String,
+    pub cwd: String,
+    pub cwd_target: String,
+}
+
+/// Resolves the program and checks the folder, before the approval is compared or asked for.
+pub fn launch(fs: &dyn Fs, program: &str, cwd: &str, path_var: &str, pathext: Option<&str>) -> Result<Launch, PathError> {
+    let r = resolve(fs, program, path_var, pathext)?;
+    let to = check(fs, cwd, Role::Folder)?;
+    Ok(Launch { program: r.program, program_target: r.target, cwd: normalize_drive(cwd), cwd_target: to.to_string_full() })
+}
+
+/// Just before starting: walks both paths again, and refuses (`unsafe-path`) if either now
+/// leads anywhere but where it led when the person approved it.
+pub fn recheck(fs: &dyn Fs, approved: &Launch) -> Result<(), PathError> {
+    let program = check(fs, &approved.program, Role::Program)?.to_string_full();
+    let cwd = check(fs, &approved.cwd, Role::Folder)?.to_string_full();
+    if program != approved.program_target || cwd != approved.cwd_target {
+        return Err(PathError::UnsafePath);
+    }
+    Ok(())
 }
 
 fn normalize_drive(p: &str) -> String {
@@ -450,7 +487,7 @@ mod tests {
             for role in [Role::Program, Role::Folder] {
                 assert_eq!(check(&fs, bad, role), Err(PathError::UnsafePath), "{bad}");
             }
-            assert_eq!(resolve(&fs, bad, "C:\\bin", None), Err(PathError::UnsafePath), "{bad}");
+            assert_eq!(named(&fs, bad, "C:\\bin", None), Err(PathError::UnsafePath), "{bad}");
         }
         assert!(fs.touches().is_empty(), "{:?}", fs.touches());
     }
@@ -583,6 +620,53 @@ mod tests {
         assert_eq!(check(&Denied, "C:\\x", Role::Folder), Err(PathError::UnsafePath));
     }
 
+    fn named(fs: &FakeFs, program: &str, path: &str, ext: Option<&str>) -> Result<String, PathError> {
+        resolve(fs, program, path, ext).map(|r| r.program)
+    }
+
+    #[test]
+    fn resolution_keeps_where_a_link_leads() {
+        let fs = FakeFs::new()
+            .dir("C:\\bin")
+            .dir("C:\\approved")
+            .dir("C:\\other")
+            .file("C:\\approved\\tool.exe")
+            .file("C:\\other\\tool.exe")
+            .file("C:\\bin\\plain.exe")
+            .link("C:\\bin\\tool.exe", sym("\\??\\C:\\approved\\tool.exe"))
+            .dir("C:\\work-real")
+            .link("C:\\work", junction("\\??\\C:\\work-real"));
+        assert_eq!(
+            resolve(&fs, "tool", "C:\\bin", None),
+            Ok(Resolved { program: "C:\\bin\\tool.exe".into(), target: "C:\\approved\\tool.exe".into() })
+        );
+        assert_eq!(resolve(&fs, "plain", "C:\\bin", None).unwrap().target, "C:\\bin\\plain.exe", "no link, the same path");
+        let approved = launch(&fs, "tool", "C:\\work", "C:\\bin", None).unwrap();
+        assert_eq!(
+            approved,
+            Launch {
+                program: "C:\\bin\\tool.exe".into(),
+                program_target: "C:\\approved\\tool.exe".into(),
+                cwd: "C:\\work".into(),
+                cwd_target: "C:\\work-real".into(),
+            }
+        );
+        assert_eq!(recheck(&fs, &approved), Ok(()));
+        // The link is pointed at another local program after approval: caught before starting.
+        let moved = fs.link("C:\\bin\\tool.exe", sym("\\??\\C:\\other\\tool.exe"));
+        assert_eq!(resolve(&moved, "tool", "C:\\bin", None).unwrap().target, "C:\\other\\tool.exe");
+        assert_eq!(recheck(&moved, &approved), Err(PathError::UnsafePath));
+        // And so is a folder junction pointed elsewhere.
+        let moved = moved.link("C:\\bin\\tool.exe", sym("\\??\\C:\\approved\\tool.exe")).link("C:\\work", junction("\\??\\C:\\other"));
+        assert_eq!(recheck(&moved, &approved), Err(PathError::UnsafePath));
+    }
+
+    #[test]
+    fn an_alias_is_its_own_target() {
+        let fs = FakeFs::new().dir("C:\\apps").link("C:\\apps\\python.exe", Link::AppExecLink);
+        assert_eq!(resolve(&fs, "python", "C:\\apps", None).unwrap().target, "C:\\apps\\python.exe");
+    }
+
     fn path_fs() -> FakeFs {
         FakeFs::new()
             .dir("C:\\node")
@@ -609,27 +693,27 @@ mod tests {
     fn path_lookup() {
         let fs = path_fs();
         let path = "C:\\node;C:\\py";
-        assert_eq!(resolve(&fs, "npx", path, Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.WSH;.MSC;.PS1")), Ok("C:\\node\\npx.cmd".into()), "npx.cmd, never npx.ps1");
-        assert_eq!(resolve(&fs, "node", path, None), Ok("C:\\node\\node.exe".into()));
-        assert_eq!(resolve(&fs, "uvx", path, None), Ok("C:\\py\\uvx.exe".into()));
-        assert_eq!(resolve(&fs, "tool", path, Some(".EXE;.CMD;.BAT")), Ok("C:\\py\\tool.cmd".into()), "PATHEXT's order");
-        assert_eq!(resolve(&fs, "tool", path, Some(".EXE;.BAT;.CMD")), Ok("C:\\py\\tool.bat".into()));
-        assert_eq!(resolve(&fs, "tool.bat", path, None), Ok("C:\\py\\tool.bat".into()));
-        assert_eq!(resolve(&fs, "only", path, None), Err(PathError::NotFound), ".com is never picked");
-        assert_eq!(resolve(&fs, "script", path, None), Err(PathError::NotFound));
-        assert_eq!(resolve(&fs, "script.ps1", path, None), Err(PathError::NotFound));
-        assert_eq!(resolve(&fs, "npx", path, Some(".PS1;.JS")), Err(PathError::NotFound), "no runnable kind in PATHEXT");
-        assert_eq!(resolve(&fs, "missing", path, None), Err(PathError::NotFound));
-        assert_eq!(resolve(&fs, "con", path, None), Err(PathError::UnsafePath));
-        assert_eq!(resolve(&fs, "a.exe.", path, None), Err(PathError::UnsafePath));
+        assert_eq!(named(&fs, "npx", path, Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.WSH;.MSC;.PS1")), Ok("C:\\node\\npx.cmd".into()), "npx.cmd, never npx.ps1");
+        assert_eq!(named(&fs, "node", path, None), Ok("C:\\node\\node.exe".into()));
+        assert_eq!(named(&fs, "uvx", path, None), Ok("C:\\py\\uvx.exe".into()));
+        assert_eq!(named(&fs, "tool", path, Some(".EXE;.CMD;.BAT")), Ok("C:\\py\\tool.cmd".into()), "PATHEXT's order");
+        assert_eq!(named(&fs, "tool", path, Some(".EXE;.BAT;.CMD")), Ok("C:\\py\\tool.bat".into()));
+        assert_eq!(named(&fs, "tool.bat", path, None), Ok("C:\\py\\tool.bat".into()));
+        assert_eq!(named(&fs, "only", path, None), Err(PathError::NotFound), ".com is never picked");
+        assert_eq!(named(&fs, "script", path, None), Err(PathError::NotFound));
+        assert_eq!(named(&fs, "script.ps1", path, None), Err(PathError::NotFound));
+        assert_eq!(named(&fs, "npx", path, Some(".PS1;.JS")), Err(PathError::NotFound), "no runnable kind in PATHEXT");
+        assert_eq!(named(&fs, "missing", path, None), Err(PathError::NotFound));
+        assert_eq!(named(&fs, "con", path, None), Err(PathError::UnsafePath));
+        assert_eq!(named(&fs, "a.exe.", path, None), Err(PathError::UnsafePath));
     }
 
     #[test]
     fn path_entries_that_fail_are_skipped_and_bad_ones_never_opened() {
         let fs = path_fs();
         let path = ".;work;\\\\server\\share\\bin;\\\\?\\C:\\bin;C:node;Z:\\bin;C:\\linked;C:\\early;;\"C:\\py\";C:\\node";
-        assert_eq!(resolve(&fs, "uvx", path, None), Ok("C:\\py\\uvx.exe".into()), "past a link to a share, to the quoted entry");
-        assert_eq!(resolve(&fs, "node", path, None), Ok("C:\\node\\node.exe".into()), "not the mapped drive, not the working folder");
+        assert_eq!(named(&fs, "uvx", path, None), Ok("C:\\py\\uvx.exe".into()), "past a link to a share, to the quoted entry");
+        assert_eq!(named(&fs, "node", path, None), Ok("C:\\node\\node.exe".into()), "not the mapped drive, not the working folder");
         for t in fs.touches() {
             assert!(!t.starts_with("Z:\\") || t == "Z:\\", "opened {t}");
             assert!(!t.starts_with("C:\\work"), "the working folder was searched: {t}");
@@ -639,14 +723,14 @@ mod tests {
     #[test]
     fn full_program_paths() {
         let fs = path_fs();
-        assert_eq!(resolve(&fs, "C:\\node\\node.exe", "", None), Ok("C:\\node\\node.exe".into()));
-        assert_eq!(resolve(&fs, "c:\\node\\node.exe", "", None), Ok("C:\\node\\node.exe".into()));
-        assert_eq!(resolve(&fs, "C:\\node\\npx", "", None), Ok("C:\\node\\npx.cmd".into()), "kinds tried in order, never the bare file");
-        assert_eq!(resolve(&fs, "C:\\py\\script.ps1", "", None), Err(PathError::NotFound));
-        assert_eq!(resolve(&fs, "Z:\\bin\\node.exe", "", None), Err(PathError::UnsafePath));
-        assert_eq!(resolve(&fs, "C:\\early\\uvx.exe", "", None), Err(PathError::UnsafePath));
-        assert_eq!(resolve(&fs, "node\\node.exe", "", None), Err(PathError::UnsafePath), "relative");
-        assert_eq!(resolve(&fs, "C:/node/node.exe", "", None), Err(PathError::UnsafePath));
+        assert_eq!(named(&fs, "C:\\node\\node.exe", "", None), Ok("C:\\node\\node.exe".into()));
+        assert_eq!(named(&fs, "c:\\node\\node.exe", "", None), Ok("C:\\node\\node.exe".into()));
+        assert_eq!(named(&fs, "C:\\node\\npx", "", None), Ok("C:\\node\\npx.cmd".into()), "kinds tried in order, never the bare file");
+        assert_eq!(named(&fs, "C:\\py\\script.ps1", "", None), Err(PathError::NotFound));
+        assert_eq!(named(&fs, "Z:\\bin\\node.exe", "", None), Err(PathError::UnsafePath));
+        assert_eq!(named(&fs, "C:\\early\\uvx.exe", "", None), Err(PathError::UnsafePath));
+        assert_eq!(named(&fs, "node\\node.exe", "", None), Err(PathError::UnsafePath), "relative");
+        assert_eq!(named(&fs, "C:/node/node.exe", "", None), Err(PathError::UnsafePath));
     }
 
     #[test]

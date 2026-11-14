@@ -90,6 +90,9 @@ pub fn start_program(server_label: &str, form: &Canonical) -> Ask {
     // The program and the folder passed the path checks, which refuse every hidden character,
     // and names are plain ASCII: all of them show as they are.
     let mut s = vec![form.program.clone()];
+    if form.program_target != form.program {
+        s.push(format!("Which leads to: {}", form.program_target));
+    }
     if !server_label.is_empty() {
         s.push(format!("For: {}", label(server_label)));
     }
@@ -99,6 +102,9 @@ pub fn start_program(server_label: &str, form: &Canonical) -> Ask {
         s.push(format!("Arguments: {}", form.args.iter().map(|a| quoted(a)).collect::<Vec<_>>().join(" ")));
     }
     s.push(format!("In: {}", form.cwd));
+    if form.cwd_target != form.cwd {
+        s.push(format!("Which leads to: {}", form.cwd_target));
+    }
     for (n, v) in &form.env {
         s.push(format!("{n}={}", escape(v)));
     }
@@ -107,9 +113,10 @@ pub fn start_program(server_label: &str, form: &Canonical) -> Ask {
     }
     s.push("It runs as you, with your files. Only start programs you trust.".into());
 
-    let mut d = vec![format!("program: {}", form.program)];
+    let mut d = vec![format!("program: {}", form.program), format!("program leads to: {}", form.program_target)];
     d.extend(form.args.iter().map(|a| format!("argument: {}", quoted(a))));
     d.push(format!("folder: {}", form.cwd));
+    d.push(format!("folder leads to: {}", form.cwd_target));
     d.extend(form.env.iter().map(|(n, v)| format!("setting: {n}={}", escape(v))));
     d.extend(form.secrets.iter().map(|n| format!("secret: {n}")));
     Ask { title: "Start a program?", summary: s.join("\n"), details: d.join("\n"), approve: "Start it", refuse: "Don't start" }
@@ -300,12 +307,22 @@ mod tests {
             }
             out
         }
-        let mut f = Canonical { program: String::new(), args: vec![], cwd: String::new(), env: vec![], secrets: vec![] };
+        let mut f = Canonical {
+            program: String::new(),
+            program_target: String::new(),
+            args: vec![],
+            cwd: String::new(),
+            cwd_target: String::new(),
+            env: vec![],
+            secrets: vec![],
+        };
         for line in details.split('\n') {
             let (k, v) = line.split_once(": ").unwrap();
             match k {
                 "program" => f.program = v.to_string(),
+                "program leads to" => f.program_target = v.to_string(),
                 "folder" => f.cwd = v.to_string(),
+                "folder leads to" => f.cwd_target = v.to_string(),
                 "argument" => f.args.push(unescape(&v[1..v.len() - 1])),
                 "setting" => {
                     let (n, val) = v.split_once('=').unwrap();
@@ -339,7 +356,9 @@ mod tests {
             let cwd = ["C:\\w", "C:\\w\\v"][next(&mut x, 2) as usize].to_string();
             let env = (0..next(&mut x, 3)).map(|i| (["A", "B", "A_B"][i as usize].to_string(), text(&mut x))).collect();
             let secrets = (0..next(&mut x, 2)).map(|_| "S".to_string()).collect();
-            let f = Canonical { program, args, cwd, env, secrets };
+            let program_target = ["C:\\a\\x.exe", "C:\\c\\y.exe"][next(&mut x, 2) as usize].to_string();
+            let cwd_target = ["C:\\w", "C:\\t"][next(&mut x, 2) as usize].to_string();
+            let f = Canonical { program, program_target, args, cwd, cwd_target, env, secrets };
             let details = start_program("", &f).details;
             assert_eq!(read_back(&details), f, "{details}");
             if let Some(other) = seen.insert(details.clone(), f.clone()) {
@@ -367,7 +386,13 @@ mod tests {
             env: vec![("LOG_LEVEL".into(), "debug".into())],
             secrets: vec!["FAKE_SECRET".into()],
         };
-        Canonical::new(&setup, "C:\\node\\node.exe")
+        let launch = crate::server_path::Launch {
+            program: "C:\\node\\node.exe".into(),
+            program_target: "C:\\node\\node.exe".into(),
+            cwd: "C:\\work".into(),
+            cwd_target: "C:\\work".into(),
+        };
+        Canonical::new(&setup, &launch)
     }
 
     #[test]
@@ -387,11 +412,13 @@ mod tests {
             ask.details,
             [
                 "program: C:\\node\\node.exe",
+                "program leads to: C:\\node\\node.exe",
                 "argument: \"main.ts\"",
                 "argument: \"two words\"",
                 "argument: \"say \\\"hi\\\"\"",
                 "argument: \"a\\u{202e}b\"",
                 "folder: C:\\work",
+                "folder leads to: C:\\work",
                 "setting: LOG_LEVEL=debug",
                 "secret: FAKE_SECRET",
             ]

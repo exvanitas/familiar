@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use shell_core::server_path::{check, resolve, DriveType, Fs, Link, Node, PathError, Role};
+use shell_core::server_path::{check, launch, recheck, resolve, DriveType, Fs, Link, Node, PathError, Role};
 use shell_win::{make_junction, WinFs};
 
 struct Fixtures {
@@ -103,18 +103,18 @@ fn share_reaching_paths_are_refused_and_a_local_junction_passes() {
 fn path_lookup_on_the_real_path() {
     let path = std::env::var("PATH").unwrap_or_default();
     let pathext = std::env::var("PATHEXT").ok();
-    let cmd = resolve(&WinFs, "cmd", &path, pathext.as_deref()).expect("cmd is on PATH");
+    let cmd = resolve(&WinFs, "cmd", &path, pathext.as_deref()).expect("cmd is on PATH").program;
     println!("RESOLVE cmd {cmd}");
     assert!(cmd.to_lowercase().ends_with("\\system32\\cmd.exe"), "{cmd}");
-    if let Ok(node) = resolve(&WinFs, "node", &path, pathext.as_deref()) {
+    if let Ok(node) = resolve(&WinFs, "node", &path, pathext.as_deref()).map(|r| r.program) {
         println!("RESOLVE node {node}");
         assert!(node.to_lowercase().ends_with("\\node.exe"), "{node}");
     }
-    if let Ok(npx) = resolve(&WinFs, "npx", &path, pathext.as_deref()) {
+    if let Ok(npx) = resolve(&WinFs, "npx", &path, pathext.as_deref()).map(|r| r.program) {
         println!("RESOLVE npx {npx}");
         assert!(npx.to_lowercase().ends_with("\\npx.cmd"), "npx.cmd, never npx.ps1: {npx}");
     }
-    assert_eq!(resolve(&WinFs, "familiar-no-such-program", &path, pathext.as_deref()), Err(PathError::NotFound));
+    assert_eq!(resolve(&WinFs, "familiar-no-such-program", &path, pathext.as_deref()).err(), Some(PathError::NotFound));
 }
 
 #[test]
@@ -140,4 +140,28 @@ fn app_execution_aliases_where_the_runner_has_one() {
         }
     }
     println!("ALIAS none found in {apps}");
+}
+
+#[test]
+fn a_retargeted_link_is_caught_before_starting() {
+    // A real file symbolic link (the runner is admin), pointed elsewhere after approval.
+    let base = std::env::temp_dir().join(format!("familiar-retarget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for d in ["approved", "other", "bin"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    std::fs::write(base.join("approved").join("tool.exe"), "a placeholder, never run").unwrap();
+    std::fs::write(base.join("other").join("tool.exe"), "a placeholder, never run").unwrap();
+    let link = base.join("bin").join("tool.exe");
+    std::os::windows::fs::symlink_file(base.join("approved").join("tool.exe"), &link).expect("make a file symbolic link");
+    let base_s = base.to_string_lossy().into_owned();
+    let bin = format!("{base_s}\\bin");
+    let approved = launch(&WinFs, "tool", &base_s, &bin, None).expect("resolve through the link");
+    println!("LAUNCH {approved:?}");
+    assert!(approved.program_target.to_lowercase().ends_with("\\approved\\tool.exe"), "{approved:?}");
+    assert_eq!(recheck(&WinFs, &approved), Ok(()));
+    std::fs::remove_file(&link).unwrap();
+    std::os::windows::fs::symlink_file(base.join("other").join("tool.exe"), &link).unwrap();
+    assert_eq!(recheck(&WinFs, &approved), Err(PathError::UnsafePath));
+    let _ = std::fs::remove_dir_all(&base);
 }
