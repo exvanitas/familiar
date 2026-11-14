@@ -30,7 +30,7 @@ Three yes-or-no checks before anything depends on them. Each has its own folder 
   - a parked reminder resumes
   - a half-streamed reply is kept as aborted, and the request is sent again
 - **Fits the design:** consent before a tool (`beforeTool`), a step cap (`maxTurns`), parked reminders (`sleepUntil`), and state to report (`watch()`).
-- **Storage, the open question:** its own conformance suite (32 cases) passes on its IndexedDB store, and on SQLite over **one** connection. It needs real interactive transactions, so SQLite through a pool fails: 0 of 32 with two connections. Tauri's SQL plugin uses a pool of up to 10 and has no transaction command. So the choice is:
+- **Storage, decided 2026-11-14: IndexedDB.** See [Where the data lives](design.md#where-the-data-lives). The question was: its own conformance suite (32 cases) passes on its IndexedDB store, and on SQLite over **one** connection. It needs real interactive transactions, so SQLite through a pool fails: 0 of 32 with two connections. Tauri's SQL plugin uses a pool of up to 10 and has no transaction command. So the choice is:
   - **IndexedDB** (its own store): no native code, and passes today. Its data sits in WebView2's own folder, tied to the app's origin. Durability on power loss needs `durability: 'strict'` forced on, and a check.
   - **One SQLite file** (as the plan said): about four small Rust commands over a single connection, roughly 130 calls per turn. It's a file Familiar controls, but transaction code in the exe is hard to fix once the exe settles.
 - **Conditions for step 5:**
