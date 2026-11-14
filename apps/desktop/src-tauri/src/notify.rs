@@ -36,9 +36,15 @@ pub fn register_app_id(shell: &Shell) {
     shell.log.line(&format!("toast app id registered: {}", r.is_ok()));
 }
 
-/// Reads, or sets then reads, whether Familiar starts at sign-in.
+/// Reads, or sets then reads, whether Familiar starts at sign-in. The registry calls run on a
+/// blocking thread, never on the async worker that awaits them.
 #[tauri::command]
 pub async fn autostart(app: AppHandle, on: Option<bool>) -> Result<bool, Fail> {
+    let work = tauri::async_runtime::spawn_blocking(move || set_autostart(&app, on));
+    work.await.map_err(|e| Fail { kind: "failed", message: e.to_string() })?
+}
+
+fn set_autostart(app: &AppHandle, on: Option<bool>) -> Result<bool, Fail> {
     let shell = app.state::<Shell>();
     let err = |e: String| Fail { kind: "failed", message: e };
     let key = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
