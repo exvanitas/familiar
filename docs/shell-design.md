@@ -17,7 +17,7 @@ The exe asks the person itself, in a native Windows dialog, in three places: bef
 The promises, each with the checks that prove it in [section 7](#7-checks-on-the-windows-runner):
 
 1. **No page reads a key back.** A key is typed into the Settings window, goes straight to Credential Manager, and from there only into requests core makes to its own saved address. After saving, pages see only that a key is set and a masked hint. Two documented exceptions: the Settings window sees a key while the person types it, and a peer's pairing token passes through core once as it arrives during pairing ([5a](#5a-credentials), [5d](#5d-the-rest)). The Settings window is kept apart so that script in the chat view can't watch a key being typed ([2](#windows)).
-2. **Data leaves only to places the person approved natively**: saved addresses through the guarded fetch, saved loopback peers through the WebSocket, and links the person confirmed. This promise is declared only once the egress checks pass on the runner, positive controls included, and not before ([2](#2-windows-capabilities-and-the-web-surface)).
+2. **Data leaves only to places the person approved natively**: saved addresses through the guarded fetch, saved loopback peers through the WebSocket, and links the person confirmed. **Declared 2026-11-14**, once the egress checks passed on the runner with their positive controls (run 43593746739 of `shell.yml`: 49 routes closed from core, a view and a view without Trusted Types). It rests on three things in the exe: the CSP, the sink proxy, and a script in every frame that removes WebRTC, because this WebView2 ignores both the CSP's `webrtc` directive and the WebRTC switches ([2](#egress-outside-fetch)). WebView2 updates itself, so the egress check runs again on every push to `main` against the newest runtime the runner has, and a route that opens fails the gate.
 3. **Only approved programs start.** Approval binds the launch: the resolved program, its arguments, its folder, its plain settings with their values, and the names of its secrets. Secret values can change without asking again. Approved programs stop with Familiar ([5b](#5b-starting-a-local-mcp-server)).
 4. **The origin and data folders never move**, so an update never starts an empty database ([3](#3-origin-and-data-folder-pinned)).
 
@@ -760,3 +760,20 @@ The first code review, of shell-core's rules and the link walk, before anything 
 | P2 the SMB verdict could pass with a missing sample | Every sample required. The measures are the connection list and the server's open count, each moved by a control. `pktmon` can't see SMB to the runner's own share |
 | P2 hop-by-hop headers | `keep-alive`, `te`, `trailer`, `upgrade` and `expect` dropped |
 | Choice | `*.localhost` is loopback with no lookup, like `localhost` |
+
+## Changes after review 4
+
+The second code review, of the exe's skeleton, its web surface and the check harness. Every fix has a test or a runner check that fails without it.
+
+| Finding | What changed |
+| --- | --- |
+| P1 egress could pass with no route records | The analyzer holds the exact route list for core, the view, the bare view and Edge. A missing, broken, empty or skipped record fails |
+| P1 the fixtures missed bare TCP and QUIC | Every TCP connection is counted and every TCP fixture port also listens for UDP, each with its own positive control |
+| P1 a failed analysis could reuse an old verdict | Fresh outputs each run, Node's exit status checked, and every egress verdict carries this run's id or fails |
+| P2 downloads weren't cancelled | The window helper cancels every download (`security.download.refused`, same-origin and `blob:` after a real click) |
+| P2 the sink could be held open | One 2-second deadline for the whole first line. 70 trickling clients, then a new request got its 403 in 13 ms |
+| P2 hardening failures left a window usable | A window opens on `about:blank` and loads its page only after hardening succeeds. On a failure it's destroyed, and for core the exe shows a box and exits 1 (`security.harden.before-page`, and the static test checks the order) |
+| P2 the app folder could reach the data folder | Overlapping app and data folders refuse to start. Each asset's final path, from its open handle, must be inside the app folder (`security.assets.inside`) |
+| P2 an early second launch was lost | Up to 8 messages wait for `shell_ready` |
+| P2 a failed log rotation broke the cap | The size resets only after a rotation that worked. Otherwise lines past the cap are dropped and counted |
+| Measured | WebRTC closed by the every-frame script (the CSP directive and the switches don't close it). `persist()` granted once kind 13 is allowed |
