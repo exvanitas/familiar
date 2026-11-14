@@ -183,6 +183,9 @@ mod win {
 #[cfg(windows)]
 pub use win::{make_junction, WinFs};
 
+#[cfg(windows)]
+pub mod start;
+
 #[cfg(test)]
 mod tests {
     use super::*;
