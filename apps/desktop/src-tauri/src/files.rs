@@ -95,9 +95,6 @@ fn spec_header(request: &Request) -> Res<String> {
 #[tauri::command(async)]
 pub fn save_as(request: Request, window: WebviewWindow, app: AppHandle, shell: State<Shell>) -> Res<bool> {
     // A dialog that opens windows waits for no confirm: while one is open, nothing new opens.
-    if confirm::busy(&app) {
-        return Err(fail("busy", "a confirm is open"));
-    }
     let InvokeBody::Raw(bytes) = request.body() else { return Err(fail("invalid", "expected bytes")) };
     if bytes.len() > files::MAX_SAVE {
         return Err(fail("too-large", "at most 256 MiB"));
@@ -106,7 +103,10 @@ pub fn save_as(request: Request, window: WebviewWindow, app: AppHandle, shell: S
     files::check_name(&spec.name).map_err(|e| fail("invalid", e))?;
     files::check_filters(&spec.filters).map_err(|e| fail("invalid", e))?;
     let owner = owner(&app, &window, spec.owner.as_deref());
-    let Some(path) = dialogs::save(&spec.name, &spec.filters, owner).map_err(|e| fail("failed", e))? else { return Ok(false) };
+    // The dialog runs as a confirm does: the gate held (nothing else opens or moves meanwhile:
+    // one native dialog at a time), every window frozen, all put back after.
+    let chosen = confirm::modal(&app, None, |_| dialogs::save(&spec.name, &spec.filters, owner)).map_err(|e| fail(e.kind(), "a confirm or another dialog is open"))?;
+    let Some(path) = chosen.map_err(|e| fail("failed", e))? else { return Ok(false) };
     if refused(&shell, &path)? {
         shell.log.line("save_as refused: the folder is Familiar's own");
         return Err(fail("refused", "Familiar doesn't save into its own folders"));
@@ -128,13 +128,10 @@ pub struct PickSpec {
 /// The native open dialog. A full path, or null if the person cancelled.
 #[tauri::command(async)]
 pub fn pick_path(spec: PickSpec, window: WebviewWindow, app: AppHandle) -> Res<Option<String>> {
-    if confirm::busy(&app) {
-        return Err(fail("busy", "a confirm is open"));
-    }
     let kind = Pick::parse(&spec.kind).ok_or_else(|| fail("invalid", "kind is file or folder"))?;
     files::check_filters(&spec.filters).map_err(|e| fail("invalid", e))?;
     let owner = owner(&app, &window, spec.owner.as_deref());
-    let path = dialogs::pick(kind, &spec.filters, owner).map_err(|e| fail("failed", e))?;
+    let path = confirm::modal(&app, None, |_| dialogs::pick(kind, &spec.filters, owner)).map_err(|e| fail(e.kind(), "a confirm or another dialog is open"))?.map_err(|e| fail("failed", e))?;
     Ok(path.map(|p| p.display().to_string()))
 }
 

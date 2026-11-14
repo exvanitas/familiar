@@ -56,6 +56,36 @@ impl Gate {
     }
 }
 
+impl Gate {
+    /// Holds the dialog slot for a native file dialog, like a reservation: window operations and
+    /// asks are `busy` until it goes. Waits for a window operation in progress. Never refused by a
+    /// stop, and never counted.
+    pub fn hold(self: &Arc<Self>) -> Result<Hold, Refused> {
+        let _w = lock(&self.windows);
+        lock(&self.throttle).hold()?;
+        Ok(Hold { gate: self.clone() })
+    }
+}
+
+/// A held file dialog. Released when it goes, on every way out.
+pub struct Hold {
+    gate: Arc<Gate>,
+}
+
+impl Hold {
+    /// Freezes the windows under the window lock, as a confirm does.
+    pub fn freeze<W: Freezable>(&self, windows: Vec<W>) -> Result<Frozen<W>, String> {
+        let _w = lock(&self.gate.windows);
+        freeze(windows)
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        lock(&self.gate.throttle).release();
+    }
+}
+
 /// One reserved confirm. Ends when it's finished or dropped, whatever happened in between.
 pub struct Reservation {
     gate: Arc<Gate>,
@@ -229,5 +259,18 @@ mod tests {
         assert!(freeze(vec![d.clone(), c.clone()]).is_err());
         assert_eq!(*d.state.borrow(), (true, true));
         assert!(log.borrow().iter().any(|l| l == "c true true"), "the one whose set failed is put back too");
+    }
+
+    #[test]
+    fn a_held_file_dialog_is_busy_for_everything_else_and_counts_nothing() {
+        let gate = Arc::new(Gate::default());
+        let hold = gate.hold().unwrap();
+        assert!(gate.busy());
+        assert_eq!(gate.window_op(|| ()).err(), Some(Refused::Busy), "no window changes behind it");
+        assert!(gate.reserve().is_err(), "no confirm meanwhile");
+        assert!(gate.hold().is_err(), "one at a time");
+        drop(hold);
+        assert!(!gate.busy() && !gate.stopped(), "released, and not a refusal");
+        assert!(gate.window_op(|| ()).is_ok());
     }
 }

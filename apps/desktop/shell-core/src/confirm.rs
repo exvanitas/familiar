@@ -234,6 +234,21 @@ impl Throttle {
         self.open
     }
 
+    /// Holds the one dialog slot for a native file dialog: `busy` if a confirm or another file
+    /// dialog has it. Unlike `begin`, a stop doesn't refuse it, since it asks nothing.
+    pub fn hold(&mut self) -> Result<(), Refused> {
+        if self.open {
+            return Err(Refused::Busy);
+        }
+        self.open = true;
+        Ok(())
+    }
+
+    /// Gives a hold back. Counts nothing.
+    pub fn release(&mut self) {
+        self.open = false;
+    }
+
     /// Whether asking has stopped, and the tray shows "Let Familiar ask again".
     pub fn stopped(&self) -> bool {
         self.refusals >= STOP_AFTER
@@ -470,6 +485,24 @@ mod tests {
         assert_eq!((ask.approve, ask.refuse), ("Open", "Don't open"));
         assert_eq!(ask.summary, "xn--bcher-kva.example\nIt opens in your browser.");
         assert_eq!(ask.details, "https://xn--bcher-kva.example/a?b=c");
+    }
+
+    #[test]
+    fn a_hold_is_busy_for_asks_and_counts_nothing() {
+        let mut t = Throttle::default();
+        t.hold().unwrap();
+        assert_eq!(t.begin(), Err(Refused::Busy));
+        assert_eq!(t.hold(), Err(Refused::Busy));
+        t.release();
+        assert!(!t.stopped() && !t.is_open());
+        for _ in 0..3 {
+            t.begin().unwrap();
+            t.end(false);
+        }
+        assert!(t.stopped());
+        assert_eq!(t.hold(), Ok(()), "a stop doesn't refuse a file dialog");
+        t.release();
+        assert_eq!(t.begin(), Err(Refused::AsksStopped));
     }
 
     #[test]

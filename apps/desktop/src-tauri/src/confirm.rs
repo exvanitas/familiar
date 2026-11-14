@@ -101,6 +101,22 @@ pub fn window_op<T>(app: &AppHandle, f: impl FnOnce() -> T) -> Result<T, AskFail
     }
 }
 
+/// Runs a native file dialog as a confirm runs: it takes the gate like a reservation, so window
+/// operations and asks are `busy` meanwhile (one native dialog at a time), freezes every window
+/// exactly as a confirm does, runs `f` with the owner's handle, and puts everything back on every
+/// way out. It counts no refusal and isn't refused by a stop, since it asks nothing.
+pub fn modal<T>(app: &AppHandle, owner: Option<&str>, f: impl FnOnce(Option<isize>) -> T) -> Result<T, AskFail> {
+    let g = gate(app).ok_or_else(|| AskFail::Failed("no confirm state".into()))?;
+    let hold = g.hold()?;
+    let owner_hwnd = owner.and_then(|l| app.get_webview_window(l)).filter(|w| w.is_visible().unwrap_or(false)).and_then(|w| platform::hwnd(&w));
+    let windows: Vec<Win> = app.webview_windows().into_values().filter_map(|w| platform::hwnd(&w).map(|h| Win { w, h })).collect();
+    let frozen = hold.freeze(windows).map_err(|e| AskFail::Failed(format!("the windows couldn't be frozen: {e}")))?;
+    let r = f(owner_hwnd);
+    drop(frozen);
+    drop(hold);
+    Ok(r)
+}
+
 /// Waits until a window's queued calls have been carried out: a read is answered only after
 /// them.
 pub fn settle(w: &WebviewWindow) {

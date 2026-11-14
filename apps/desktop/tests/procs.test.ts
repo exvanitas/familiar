@@ -36,6 +36,13 @@ describe('the file dialogs and the save', () => {
     expect(files).toMatch(/MoveFileExW\(&HSTRING::from\(temp\), &HSTRING::from\(target\), MOVEFILE_WRITE_THROUGH\)/);
   });
 
+  it('both dialogs run inside confirm::modal, and nothing checks busy and then opens outside the gate', () => {
+    expect(files).toMatch(/confirm::modal\(&app, None, \|_\| dialogs::save\(/);
+    expect(files).toMatch(/confirm::modal\(&app, None, \|_\| dialogs::pick\(/);
+    expect(files).not.toContain('confirm::busy(');
+    expect(files.match(/dialogs::(save|pick)\(/g)?.length).toBe(2);
+  });
+
   it('a save refuses anywhere remote, and refuses all when a protected folder is unknown', () => {
     const refused = files.slice(files.indexOf('fn refused('), files.indexOf('fn local_drive('));
     expect(refused).toMatch(/files::remote\(&target\.display\(\)\.to_string\(\)\) \|\| !local_drive\(dir\)/);
