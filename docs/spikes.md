@@ -6,7 +6,7 @@ Three yes-or-no checks before anything depends on them. Each has its own folder 
 | --- | --- | --- |
 | pi-ai as the provider layer in the webview | Yes, with conditions | [spikes/pi-ai-web/RESULT.md](../spikes/pi-ai-web/RESULT.md) |
 | pi-durable as the durable engine in the webview | Yes, with conditions | [spikes/pi-durable-web/RESULT.md](../spikes/pi-durable-web/RESULT.md) |
-| The installed exe starting a local MCP server | Running on the Windows runner | `spikes/mcp-start/` |
+| The installed exe starting a local MCP server | Yes, with conditions | [spikes/mcp-start/RESULT.md](../spikes/mcp-start/RESULT.md) |
 
 ## pi-ai 1.5.2: yes, with conditions
 
@@ -39,6 +39,22 @@ Three yes-or-no checks before anything depends on them. Each has its own folder 
   - Set `identity: { attribution: null }`, so no request names pi to OpenRouter.
   - Run its storage conformance suite in CI against whichever store ships.
 
+## Starting a local MCP server on Windows: yes, with conditions
+
+A small Rust command, run on GitHub's Windows runner (`.github/workflows/spike-mcp-start.yml`), starts saved setups for `node`, `npx` and `uvx` and speaks MCP to them over stdio.
+
+- **Minimal environment:** the parent had 147 settings and the server got 23. A setting only on the parent didn't reach it, and the server's own secret did. Its stderr comes back separately, with the secret blanked.
+- **Real servers:** `npx -y @modelcontextprotocol/server-everything@2026.8.31` listed 13 tools (about 30 s the first time, while it downloads). `uvx --from mcp-server-time==2026.10.28 mcp-server-time` answered in about 8 s.
+- **Quoting:** 20 kinds of argument arrived exactly, through `node`, a `.cmd` of our own and `npx.cmd`. That covers spaces, quotes, `%PATH%`, `!PATH!`, `& ^ | < >`, a trailing backslash, the empty string, Unicode and a tab. Rust refuses NUL anywhere, and CR or LF through a `.cmd`, before any process exists.
+- **Dies with the app:** with a kill-on-close job, a hard kill of the app left 0 of 14 processes after about 20 ms, grandchildren included. Without the job, a busy server's processes were still alive 5 s later.
+- **Bad starts** are reported plainly: a missing program before anything runs, a bad npm package as exit code 1 with npm's own lines. Junk on stdout is skipped and counted.
+- **No console window:** checked through the console API for the server and everything under it.
+- **Conditions for steps 3 and 7:**
+  - Resolve the program ourselves.
+  - Start it suspended and put it in the job before it runs.
+  - Reject NUL, CR and LF in arguments for every program, so a setup can't work under `node` and then fail under `npx`.
+  - Pinning an npx or uvx version pins only the top package, since its dependencies still float. Say so in the setup help.
+
 ## Not settled by any spike
 
-WebView2 itself: its storage folder, its origin and its timer throttling for a hidden window. Real Tauri IPC. LM Studio and Ollama quirks. Live Gemini through the OpenAI-compatible route. These fall to steps 3, 4 and 13.
+WebView2 itself: its storage folder, its origin and its timer throttling for a hidden window. Smart App Control's verdict on what npx and uvx download, and any console flash a person might see (only a real PC shows these). Real Tauri IPC. LM Studio and Ollama quirks. Live Gemini through the OpenAI-compatible route. These fall to steps 3, 4 and 13.
