@@ -504,4 +504,63 @@ mod tests {
             assert_eq!(got, want, "text {:?} secrets {:?}", String::from_utf8_lossy(&text), secrets);
         }
     }
+
+    #[test]
+    fn no_secret_survives_for_either_marker() {
+        // Secrets from bracket and marker letters, kept only if the value rules take them, and
+        // inputs from pieces of secrets, markers and noise, in every chunking.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let alphabet = b"[]keyhidn]a[";
+        let mut tried = 0;
+        while tried < 2000 {
+            let secrets: Vec<String> = (0..1 + next(3))
+                .map(|_| (0..8 + next(5)).map(|_| char::from(alphabet[next(alphabet.len() as u64) as usize])).collect())
+                .filter(|s: &String| crate::secret::check_value(s).is_ok())
+                .collect();
+            if secrets.is_empty() {
+                continue;
+            }
+            tried += 1;
+            let mut text = String::new();
+            for _ in 0..next(8) {
+                let s = &secrets[next(secrets.len() as u64) as usize];
+                match next(5) {
+                    0 => text.push_str(s),
+                    1 => text.push_str(&s[next(s.len() as u64) as usize..]),
+                    2 => text.push_str(&s[..next(s.len() as u64) as usize]),
+                    3 => text.push_str([KEY_MARK, HIDDEN_MARK][next(2) as usize]),
+                    _ => text.push(char::from(alphabet[next(alphabet.len() as u64) as usize])),
+                }
+            }
+            for mark in [KEY_MARK, HIDDEN_MARK] {
+                let mut r = Redactor::new(&secrets, mark);
+                let mut out = Vec::new();
+                let bytes = text.as_bytes();
+                let mut at = 0;
+                while at < bytes.len() {
+                    let n = (1 + next(5) as usize).min(bytes.len() - at);
+                    out.extend(r.feed(&bytes[at..at + n]));
+                    at += n;
+                }
+                out.extend(r.finish());
+                let out = String::from_utf8(out).unwrap();
+                for s in &secrets {
+                    assert!(!out.contains(s.as_str()), "{s:?} survives in {out:?} from {text:?} with {mark}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_review_case_is_refused_up_front() {
+        // abc[key] would be rebuilt from abcabc[key]: the value rules refuse it.
+        assert!(crate::secret::check_value("abc[key]").is_err());
+        assert!(crate::secret::check_value("[hidden]").is_err());
+    }
 }

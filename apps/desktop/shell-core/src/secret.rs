@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::address::Kind;
-use crate::setup;
+use crate::{redact, setup};
 
 /// What the app passes as a model SDK's key. The fetch swaps it for the stored one.
 pub const PLACEHOLDER: &str = "familiar-stored-key";
@@ -84,10 +84,24 @@ impl SecretRef {
     }
 }
 
-/// 8 to 1024 bytes, and no control characters (CR or LF in a key would split a header).
+/// 8 to 1024 bytes, no control characters (CR or LF in a key would split a header), and
+/// nothing a redaction marker could complete: see `touches_a_marker`. This holds for every
+/// secret: keys, server secrets and peer tokens.
 pub fn check_value(value: &str) -> Result<(), SecretError> {
-    let ok = (MIN_VALUE..=MAX_VALUE).contains(&value.len()) && !value.chars().any(char::is_control);
+    let ok = (MIN_VALUE..=MAX_VALUE).contains(&value.len())
+        && !value.chars().any(char::is_control)
+        && !touches_a_marker(value);
     ok.then_some(()).ok_or(SecretError::Invalid)
+}
+
+/// Whether a value holds a marker, starts with the end of one, or ends with the start of one.
+/// Redacted output is plain runs of the input with markers between them, and a secret in a
+/// plain run would have been redacted. So a copy of a secret in the output would have to
+/// overlap a marker, and with these refused, none can.
+pub fn touches_a_marker(value: &str) -> bool {
+    [redact::KEY_MARK, redact::HIDDEN_MARK].iter().any(|m| {
+        value.contains(m) || (1..=m.len()).any(|k| value.starts_with(&m[m.len() - k..]) || value.ends_with(&m[..k]))
+    })
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +236,23 @@ mod tests {
         assert_eq!(long.len(), MAX_REF);
         assert!(SecretRef::parse(&long).is_ok());
         assert!(SecretRef::parse(&format!("{long}N")).is_err());
+    }
+
+    #[test]
+    fn values_a_marker_could_complete_are_refused() {
+        let ok = key(10);
+        for mark in [redact::KEY_MARK, redact::HIDDEN_MARK] {
+            assert_eq!(check_value(&format!("{ok}{mark}{ok}")), Err(SecretError::Invalid), "holds {mark}");
+            assert_eq!(check_value(&format!("abc{mark}")), Err(SecretError::Invalid), "ends with {mark}");
+            assert_eq!(check_value(&format!("{mark}abc")), Err(SecretError::Invalid), "starts with {mark}");
+            for k in 1..mark.len() {
+                assert_eq!(check_value(&format!("{}{ok}", &mark[mark.len() - k..])), Err(SecretError::Invalid), "starts with the end of {mark}");
+                assert_eq!(check_value(&format!("{ok}{}", &mark[..k])), Err(SecretError::Invalid), "ends with the start of {mark}");
+            }
+        }
+        assert_eq!(check_value(redact::HIDDEN_MARK), Err(SecretError::Invalid));
+        assert!(check_value(&format!("[{ok}]x")).is_ok(), "brackets inside are fine");
+        assert!(check_value(&format!("x[{ok}")).is_ok());
     }
 
     #[test]
