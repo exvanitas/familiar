@@ -20,6 +20,7 @@ const COMMANDS: &[&str] = &[
     "net_fetch",
     "net_read",
     "net_cancel",
+    "net_proxy",
     "secret_set",
     "secret_status",
     "secret_delete",
