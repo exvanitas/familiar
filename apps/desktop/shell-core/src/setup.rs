@@ -249,6 +249,15 @@ pub fn environment<'a>(
     setup: &Setup,
     secret_values: &[(String, String)],
 ) -> Vec<(String, String)> {
+    environment_of(parent, &setup.env, &setup.secrets, secret_values)
+}
+
+fn environment_of<'a>(
+    parent: impl IntoIterator<Item = (&'a str, &'a str)>,
+    plain: &[(String, String)],
+    secrets: &[String],
+    secret_values: &[(String, String)],
+) -> Vec<(String, String)> {
     let parent: Vec<(&str, &str)> = parent.into_iter().collect();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut put = |name: &str, value: &str| {
@@ -261,15 +270,40 @@ pub fn environment<'a>(
             put(allowed, v);
         }
     }
-    for (k, v) in &setup.env {
+    for (k, v) in plain {
         put(k, v);
     }
-    for name in &setup.secrets {
+    for name in secrets {
         if let Some((_, v)) = secret_values.iter().find(|(n, _)| fold(n) == fold(name)) {
             put(name, v);
         }
     }
     env
+}
+
+/// What a start launches, built from the approved canonical form and nothing else: the program
+/// and the folder as approved (with the targets the check before resume must find again), the
+/// arguments, the plain settings and the secret names. Never from the setup a page sent, nor from
+/// a walk made after the approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub secrets: Vec<String>,
+    plain: Vec<(String, String)>,
+}
+
+impl Plan {
+    pub fn of(form: &Canonical) -> Plan {
+        Plan { program: form.program.clone(), args: form.args.clone(), cwd: form.cwd.clone(), secrets: form.secrets.clone(), plain: form.env.clone() }
+    }
+
+    /// The environment: the allowlist from Familiar's own, then the approved plain settings, then
+    /// each secret's value, by the approved secret names.
+    pub fn environment<'a>(&self, parent: impl IntoIterator<Item = (&'a str, &'a str)>, secret_values: &[(String, String)]) -> Vec<(String, String)> {
+        environment_of(parent, &self.plain, &self.secrets, secret_values)
+    }
 }
 
 /// One thing a server printed, as it goes to core.
@@ -612,6 +646,27 @@ mod tests {
             ]
         );
         assert_eq!(ENV_ALLOWLIST.len(), 22);
+    }
+
+    #[test]
+    fn the_plan_is_the_approved_form_and_nothing_else() {
+        let s = setup();
+        let launch = Launch { program: "C:\\n\\node.exe".into(), program_target: "C:\\real\\node.exe".into(), cwd: "C:\\work".into(), cwd_target: "C:\\work".into() };
+        let form = Canonical::new(&s, &launch);
+        let plan = Plan::of(&form);
+        assert_eq!((plan.program.as_str(), plan.cwd.as_str()), ("C:\\n\\node.exe", "C:\\work"));
+        assert_eq!(plan.args, s.args);
+        assert_eq!(plan.secrets, vec!["FAKE_SECRET".to_string()]);
+        // A setup changed after the approval changes nothing the plan launches.
+        let mut changed = s.clone();
+        changed.args.push("--evil".into());
+        changed.env.push(("NODE_OPTIONS".into(), "--require x".into()));
+        changed.program = "C:\\other\\x.exe".into();
+        assert_eq!(Plan::of(&form), plan, "the plan comes only from the held form");
+        let value = val("p");
+        let env = plan.environment([("Path", "C:\\bin")], &[("FAKE_SECRET".into(), value.clone())]);
+        assert_eq!(env, vec![("Path".to_string(), "C:\\bin".to_string()), ("LOG_LEVEL".into(), "debug".into()), ("FAKE_SECRET".into(), value)]);
+        assert!(!env.iter().any(|(k, _)| k == "NODE_OPTIONS"));
     }
 
     #[test]
