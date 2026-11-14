@@ -1,7 +1,9 @@
 //! Serves pages from the app folder, read from disk on each request. Every path goes through the
-//! plain-names check first. Nothing from the data folder is ever served.
+//! plain-names check first. Then the file is opened, and served only if the path that handle
+//! really has, after every link and junction, is inside the app folder's own final path; it's read
+//! from that same handle. Nothing from the data folder is ever served.
 
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, io::Read, path::PathBuf};
 use tauri::{
     utils::assets::{AssetKey, AssetsIter, CspHash},
     Assets, Runtime,
@@ -9,6 +11,8 @@ use tauri::{
 
 pub struct FolderAssets {
     pub app: PathBuf,
+    /// The app folder's final path, or None if it couldn't be found, and then nothing is served.
+    pub app_final: Option<PathBuf>,
 }
 
 impl<R: Runtime> Assets<R> for FolderAssets {
@@ -20,7 +24,14 @@ impl<R: Runtime> Assets<R> for FolderAssets {
             return None;
         }
         let path = shell_core::paths::inside(&self.app, rel)?;
-        std::fs::read(path).ok().map(Cow::Owned)
+        let mut file = std::fs::File::open(path).ok()?;
+        let real = crate::platform::final_path(&file)?;
+        if !shell_core::folders::within(&real, self.app_final.as_ref()?) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        Some(Cow::Owned(bytes))
     }
 
     fn iter(&self) -> Box<AssetsIter<'_>> {

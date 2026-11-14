@@ -14,7 +14,7 @@ mod tray;
 
 use assets::FolderAssets;
 use shell::Shell;
-use shell_core::{args::Args, identity, log::Log, run::READY_WITHIN, views};
+use shell_core::{args::Args, folders, identity, log::Log, run::READY_WITHIN, views};
 use std::{path::PathBuf, sync::Arc, thread, time::Instant};
 use tauri::{AppHandle, Manager, RunEvent};
 
@@ -53,6 +53,22 @@ fn start(app: &AppHandle, args: Args, app_dir: PathBuf, log: Arc<Log>) -> Result
             "app folder missing",
             &format!("The app folder is missing or broken. It should sit beside familiar.exe.\n\nLooked in: {}", app_dir.display()),
         );
+    }
+
+    // The app folder is served to pages, so it must not hold a data folder or be inside one.
+    // Compared on final paths, so a junction or link can't hide it.
+    let real = |p: &PathBuf| std::fs::create_dir_all(p).and_then(|_| std::fs::canonicalize(p));
+    match (std::fs::canonicalize(&app_dir), real(&data_dir), real(&webview_dir)) {
+        (Ok(app_real), Ok(data_real), Ok(webview_real)) => {
+            if folders::overlap(&app_real, &data_real) || folders::overlap(&app_real, &webview_real) {
+                give_up(
+                    &log,
+                    "app folder overlaps the data folder",
+                    &format!("The app folder and Familiar's data folder overlap, so Familiar won't start.\n\nApp folder: {}\nData folder: {}", app_dir.display(), data_dir.display()),
+                );
+            }
+        }
+        _ => give_up(&log, "folders unreadable", "Familiar couldn't read its app or data folder.\n\nSee the log for details."),
     }
 
     // Before any window: every window's proxy is this.
@@ -118,7 +134,8 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| last_words.line(&format!("error panic: {info}"))));
 
     let mut context = tauri::generate_context!();
-    context.set_assets(Box::new(FolderAssets { app: app_dir.clone() }));
+    let app_final = std::fs::canonicalize(&app_dir).ok();
+    context.set_assets(Box::new(FolderAssets { app: app_dir.clone(), app_final }));
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(second_launch))

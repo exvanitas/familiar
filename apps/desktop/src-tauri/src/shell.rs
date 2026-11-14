@@ -4,6 +4,7 @@ use serde_json::Value;
 use shell_core::{
     args::Args,
     log::{Limiter, Log},
+    queue::Pending,
     run::Run,
     sink::Counts,
 };
@@ -29,8 +30,15 @@ pub struct Shell {
     run: Mutex<Run>,
     /// Everything the exe tells core goes here. A channel's messages reach only the page that
     /// made it, unlike a Tauri event, which any window's listener can hear.
-    core: Mutex<Option<Channel<Value>>>,
+    core: Mutex<CoreLink>,
     pub limiter: Mutex<Limiter>,
+}
+
+/// The channel to core once it's ready, and what waits for it until then.
+#[derive(Default)]
+struct CoreLink {
+    channel: Option<Channel<Value>>,
+    pending: Pending<Value>,
 }
 
 /// Nothing is held across a panic that needs protecting, so a poisoned lock is still good.
@@ -62,16 +70,32 @@ impl Shell {
         lock(&self.run)
     }
 
+    /// Core is ready: what waited for it goes first, in order, under the same lock, so nothing
+    /// sent meanwhile can pass it.
     pub fn set_core(&self, channel: Channel<Value>) {
-        *lock(&self.core) = Some(channel);
-    }
-
-    /// Sends one message to core, if core has said it's ready. Before that there's no one to tell.
-    pub fn tell_core(&self, message: Value) {
-        if let Some(ch) = lock(&self.core).as_ref() {
-            if ch.send(message).is_err() {
+        let mut link = lock(&self.core);
+        let (held, dropped) = link.pending.take();
+        if dropped > 0 {
+            self.log.line(&format!("{dropped} messages for core were dropped before it was ready"));
+        }
+        for m in held {
+            if channel.send(m).is_err() {
                 self.log.line("core's channel refused a message");
             }
+        }
+        link.channel = Some(channel);
+    }
+
+    /// Sends one message to core. Before core is ready, it's held (see `shell_core::queue`).
+    pub fn tell_core(&self, message: Value) {
+        let mut link = lock(&self.core);
+        match link.channel.as_ref() {
+            Some(ch) => {
+                if ch.send(message).is_err() {
+                    self.log.line("core's channel refused a message");
+                }
+            }
+            None => link.pending.push(message),
         }
     }
 }

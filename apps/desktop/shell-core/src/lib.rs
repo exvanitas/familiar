@@ -11,6 +11,8 @@ pub mod run;
 pub mod sink;
 pub mod views;
 pub mod web;
+pub mod queue;
+pub mod folders;
 pub mod address;
 pub mod redact;
 pub mod setup;

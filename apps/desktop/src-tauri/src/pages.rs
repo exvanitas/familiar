@@ -1,25 +1,39 @@
 //! Every window comes through `window()`, because WebView2 windows sharing a data folder must share
 //! the same browser arguments, and because each must get the same pins: the data folder, the http
-//! origin, no drag and drop, its page binding, every permission denied, and no autofill.
+//! origin, no drag and drop, its page binding, every permission denied but persistent storage, no
+//! downloads, and no autofill. A window starts on `about:blank` and loads its page only once its
+//! WebView2 is hardened, so no page script runs without the pins. If hardening fails, the window is
+//! destroyed: core's failure ends the run with a message box, a view's fails `view_open`.
 
 use crate::{platform, shell::Shell};
 use serde::Deserialize;
-use shell_core::{nav, views, web};
-use std::sync::Arc;
+use shell_core::{identity, nav, views, web};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::Duration,
+};
 use tauri::{
-    webview::{NewWindowResponse, PermissionResponse},
-    AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
+    webview::{DownloadEvent, NewWindowResponse, PermissionResponse},
+    AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
 };
 
 /// Takes WebRTC's interfaces off every frame's global before page script runs.
 const NO_WEBRTC: &str = include_str!("no-webrtc.js");
+const BLANK: &str = "about:blank";
 
-fn window<'a>(app: &'a AppHandle, label: &str, page: &str) -> WebviewWindowBuilder<'a, Wry, AppHandle> {
+/// The builder, and the switch that lets the window leave `about:blank` for its page.
+fn window<'a>(app: &'a AppHandle, label: &str, page: &str) -> (WebviewWindowBuilder<'a, Wry, AppHandle>, Arc<AtomicBool>) {
     let shell = app.state::<Shell>();
     let (bound, nav_log, new_log) = (page.to_string(), shell.log.clone(), shell.log.clone());
     let who = label.to_string();
     let who_new = label.to_string();
-    WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
+    let hardened = Arc::new(AtomicBool::new(false));
+    let armed = hardened.clone();
+    let blank = Url::parse(BLANK).expect("about:blank is a URL");
+    let b = WebviewWindowBuilder::new(app, label, WebviewUrl::External(blank))
         .data_directory(shell.webview_dir.clone())
         .use_https_scheme(false)
         .disable_drag_drop_handler()
@@ -28,7 +42,12 @@ fn window<'a>(app: &'a AppHandle, label: &str, page: &str) -> WebviewWindowBuild
         .general_autofill_enabled(false)
         .initialization_script_for_all_frames(NO_WEBRTC)
         .on_navigation(move |url| {
-            let stays = nav::stays(&bound, url.scheme(), url.host_str(), url.port(), url.path(), url.query());
+            // Before hardening, only the empty start page; after it, only the window's own page.
+            let stays = if armed.load(Ordering::SeqCst) {
+                nav::stays(&bound, url.scheme(), url.host_str(), url.port(), url.path(), url.query())
+            } else {
+                url.as_str() == BLANK
+            };
             if !stays {
                 nav_log.line(&format!("navigation refused in {who}: a {} link", nav::scheme_for_log(url.scheme())));
             }
@@ -38,32 +57,62 @@ fn window<'a>(app: &'a AppHandle, label: &str, page: &str) -> WebviewWindowBuild
             new_log.line(&format!("new window refused in {who_new}: a {} link", nav::scheme_for_log(url.scheme())));
             NewWindowResponse::Deny
         })
-        // Tauri's own handler, so a request is denied from the window's first moment. The exe's
-        // handler below, added after it, has the last word.
+        // Tauri's own handlers, so a request is refused from the window's first moment. The exe's
+        // handlers, added after them by `harden`, have the last word.
         .on_permission_request(|_, _| PermissionResponse::Deny)
+        .on_download(|_, e| !matches!(e, DownloadEvent::Requested { .. }));
+    (b, hardened)
 }
 
-/// What's added once the webview exists: a permission handler registered after Tauri's own, and
-/// password saving off. Both through WebView2 itself.
-fn harden(w: &WebviewWindow, log: Arc<shell_core::log::Log>) {
+/// Hardens the window's WebView2, then loads its page. On any failure the window goes. `done`
+/// hears the outcome.
+fn harden(w: &WebviewWindow, page: &str, armed: Arc<AtomicBool>, done: impl FnOnce(Result<(), String>) + Send + 'static) {
+    let log = w.app_handle().state::<Shell>().log.clone();
     let label = w.label().to_string();
-    let log_err = log.clone();
-    let label_err = label.clone();
-    let r = w.with_webview(move |pw| {
-        if let Err(e) = platform::harden_webview(&pw, &label, log.clone()) {
-            log.line(&format!("error hardening {label}: {e}"));
+    let url = format!("{}/{page}", identity::ORIGIN);
+    let window = w.clone();
+    let done = Arc::new(std::sync::Mutex::new(Some(done)));
+    let finish = {
+        let done = done.clone();
+        let (log, label, window) = (log.clone(), label.clone(), window.clone());
+        move |r: Result<(), String>| {
+            match &r {
+                Ok(()) => {}
+                Err(e) => {
+                    log.line(&format!("error hardening {label}: {e}"));
+                    let _ = window.destroy();
+                }
+            }
+            if let Some(f) = done.lock().ok().and_then(|mut d| d.take()) {
+                f(r);
+            }
         }
+    };
+    let on_main = finish.clone();
+    let r = w.with_webview(move |pw| {
+        let r = platform::harden_webview(&pw, &label, log.clone()).map_err(|e| e.to_string()).and_then(|()| {
+            log.line(&format!("hardened {label}"));
+            armed.store(true, Ordering::SeqCst);
+            platform::navigate(&pw, &url).map_err(|e| e.to_string())
+        });
+        on_main(r);
     });
     if let Err(e) = r {
-        log_err.line(&format!("error hardening {label_err}: {e}"));
+        finish(Err(e.to_string()));
     }
 }
 
 /// The one page the exe opens by itself, hidden for the whole run, and never focusable, so it never
 /// takes the keyboard, at a sign-in start or ever.
 pub fn open_core(app: &AppHandle) -> tauri::Result<()> {
-    let w = window(app, views::CORE, views::CORE_PAGE).title("Familiar").visible(false).focused(false).focusable(false).skip_taskbar(true).build()?;
-    harden(&w, app.state::<Shell>().log.clone());
+    let (b, armed) = window(app, views::CORE, views::CORE_PAGE);
+    let w = b.title("Familiar").visible(false).focused(false).focusable(false).skip_taskbar(true).build()?;
+    harden(&w, views::CORE_PAGE, armed, |r| {
+        if r.is_err() {
+            platform::message_box("Familiar", "Familiar couldn't make its window safe to use, so it won't run.\n\nThe log says why.");
+            std::process::exit(1);
+        }
+    });
     Ok(())
 }
 
@@ -94,7 +143,8 @@ pub fn open(app: &AppHandle, spec: ViewSpec) -> Result<(), String> {
     if app.get_webview_window(&spec.label).is_some() {
         return Err("that window is already open".into());
     }
-    let mut b = window(app, &spec.label, &page)
+    let (b, armed) = window(app, &spec.label, &page);
+    let mut b = b
         .title(spec.title.as_deref().unwrap_or("Familiar"))
         .decorations(spec.decorations.unwrap_or(true))
         .transparent(spec.transparent.unwrap_or(false))
@@ -114,7 +164,18 @@ pub fn open(app: &AppHandle, spec: ViewSpec) -> Result<(), String> {
         b = b.inner_size(w, h);
     }
     let w = b.build().map_err(|e| e.to_string())?;
-    harden(&w, shell.log.clone());
+    let (tx, rx) = mpsc::channel();
+    harden(&w, &page, armed, move |r| {
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("the window couldn't be made safe: {e}")),
+        Err(_) => {
+            let _ = w.destroy();
+            return Err("the window couldn't be made safe in time".into());
+        }
+    }
     shell.log.line(&format!("opened {} with {page}", spec.label));
     Ok(())
 }

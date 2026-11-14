@@ -137,7 +137,7 @@ describe('the web surface', () => {
     expect(builders.map(([f]) => f)).toEqual(['pages.rs']);
     const pages = read('src-tauri/src/pages.rs');
     expect(pages.match(/WebviewWindowBuilder::new\(/g)?.length).toBe(1);
-    for (const pin of ['.initialization_script_for_all_frames(NO_WEBRTC)', '.data_directory(', '.use_https_scheme(false)', '.disable_drag_drop_handler()', '.additional_browser_args(&web::browser_args(', '.on_navigation(', '.on_new_window(', '.on_permission_request(', '.general_autofill_enabled(false)']) {
+    for (const pin of ['.initialization_script_for_all_frames(NO_WEBRTC)', '.on_download(', '.data_directory(', '.use_https_scheme(false)', '.disable_drag_drop_handler()', '.additional_browser_args(&web::browser_args(', '.on_navigation(', '.on_new_window(', '.on_permission_request(', '.general_autofill_enabled(false)']) {
       expect(pages, pin).toContain(pin);
     }
     expect(read('src-tauri/src/platform.rs')).toMatch(/SetIsPasswordAutosaveEnabled\(false\)/);
@@ -147,6 +147,21 @@ describe('the web surface', () => {
     expect(platform).toContain('const PERSISTENT_STORAGE: i32 = 13;');
     expect(platform).toContain('let allow = kind.0 == PERSISTENT_STORAGE;');
     expect(platform.match(/COREWEBVIEW2_PERMISSION_STATE_ALLOW/g)?.length).toBe(2);
+  });
+
+  it('a window loads its page only once it is hardened, and goes if hardening fails', () => {
+    const pages = read('src-tauri/src/pages.rs');
+    expect(pages).toContain('WebviewUrl::External(blank)');
+    expect(pages).not.toContain('WebviewUrl::App(');
+    // In `harden`: the pins first, then the switch that lets the page load, then the load.
+    const body = pages.slice(pages.indexOf('fn harden('), pages.indexOf('pub fn open_core('));
+    const [h, armed, nav] = ['platform::harden_webview(', 'armed.store(true', 'platform::navigate('].map(x => body.indexOf(x));
+    expect(h).toBeGreaterThan(0);
+    expect(armed).toBeGreaterThan(h);
+    expect(nav).toBeGreaterThan(armed);
+    expect(body).toContain('window.destroy()');
+    expect(pages.slice(pages.indexOf('pub fn open_core('))).toContain('std::process::exit(1)');
+    expect(read('src-tauri/src/platform.rs')).toMatch(/add_DownloadStarting[\s\S]*SetCancel\(true\)/);
   });
 
   it('every frame loses WebRTC before page script runs', () => {
