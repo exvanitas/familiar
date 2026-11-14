@@ -264,27 +264,24 @@ pub enum Stream {
 }
 
 /// Turns a stream's bytes into lines with every secret of the setup blanked, before anything
-/// leaves Rust. stdout: a line over 4 MiB is dropped and an `err` event says so. stderr: a line
-/// is cut at 8 KiB, after blanking, so a secret across the cut isn't left half shown.
+/// leaves Rust. Each line goes through the streaming redactor whole, with no end but the real
+/// one, and only its redacted output is ever cut. stdout: a line over 4 MiB is dropped and an
+/// `err` event says so. stderr: the redacted line is cut at 8 KiB, and the rest of it still
+/// drains through the redactor.
 pub struct Lines {
     stream: Stream,
-    secrets: Vec<Vec<u8>>,
-    buf: Vec<u8>,
-    /// Bytes kept of the current line before it is blanked.
-    keep: usize,
-    /// The current line went past what is kept: dropped (stdout) or cut (stderr).
+    redactor: redact::Redactor,
+    /// The current line's redacted output, kept up to one byte past what may be shown.
+    out: Vec<u8>,
+    /// Raw bytes of the current line so far.
+    raw: usize,
+    /// The current line went past its limit: dropped (stdout) or cut (stderr).
     over: bool,
 }
 
 impl Lines {
     pub fn new<S: AsRef<[u8]>>(stream: Stream, secrets: &[S]) -> Lines {
-        let secrets: Vec<Vec<u8>> = secrets.iter().map(|s| s.as_ref().to_vec()).collect();
-        let longest = secrets.iter().map(Vec::len).max().unwrap_or(0);
-        let keep = match stream {
-            Stream::Stdout => MAX_STDOUT_LINE,
-            Stream::Stderr => MAX_STDERR_LINE + longest,
-        };
-        Lines { stream, secrets, buf: Vec::new(), keep, over: false }
+        Lines { stream, redactor: redact::Redactor::new(secrets, redact::HIDDEN_MARK), out: Vec::new(), raw: 0, over: false }
     }
 
     pub fn feed(&mut self, mut bytes: &[u8]) -> Vec<Event> {
@@ -307,33 +304,63 @@ impl Lines {
 
     /// The stream closed: a last line with no newline still counts.
     pub fn finish(&mut self) -> Vec<Event> {
-        if self.buf.is_empty() && !self.over {
+        if self.raw == 0 {
             return Vec::new();
         }
         self.end_line().into_iter().collect()
     }
 
     fn take(&mut self, part: &[u8]) {
-        let room = self.keep.saturating_sub(self.buf.len());
-        if part.len() > room {
-            self.over = true;
+        self.raw += part.len();
+        match self.stream {
+            Stream::Stdout => {
+                if self.raw > MAX_STDOUT_LINE {
+                    // Dropped whole, so nothing of it is kept or shown.
+                    self.over = true;
+                    self.out.clear();
+                }
+                if !self.over {
+                    let o = self.redactor.feed(part);
+                    self.out.extend(o);
+                }
+            }
+            Stream::Stderr => {
+                let o = self.redactor.feed(part);
+                self.keep(&o);
+            }
         }
-        self.buf.extend_from_slice(&part[..part.len().min(room)]);
+    }
+
+    fn keep(&mut self, o: &[u8]) {
+        let room = (MAX_STDERR_LINE + 1).saturating_sub(self.out.len());
+        self.out.extend_from_slice(&o[..o.len().min(room)]);
     }
 
     fn end_line(&mut self) -> Option<Event> {
-        let mut line = std::mem::take(&mut self.buf);
+        let tail = self.redactor.finish();
         let over = std::mem::replace(&mut self.over, false);
-        if line.last() == Some(&b'\r') && !over {
-            line.pop();
-        }
+        self.raw = 0;
         match self.stream {
-            Stream::Stdout if over => Some(Event::Err(format!("a stdout line over {} MiB was dropped", MAX_STDOUT_LINE >> 20))),
-            Stream::Stdout => Some(Event::Out(text(&redact::blank_line(&line, &self.secrets)))),
+            Stream::Stdout => {
+                if over {
+                    self.out.clear();
+                    return Some(Event::Err(format!("a stdout line over {} MiB was dropped", MAX_STDOUT_LINE >> 20)));
+                }
+                self.out.extend(tail);
+                let mut line = std::mem::take(&mut self.out);
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                Some(Event::Out(text(&line)))
+            }
             Stream::Stderr => {
-                let blanked = redact::blank_line(&line, &self.secrets);
-                let cut = blanked.len() > MAX_STDERR_LINE || over;
-                let mut t = text(&blanked[..blanked.len().min(MAX_STDERR_LINE)]);
+                self.keep(&tail);
+                let mut line = std::mem::take(&mut self.out);
+                let cut = line.len() > MAX_STDERR_LINE;
+                if !cut && line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let mut t = text(&line[..line.len().min(MAX_STDERR_LINE)]);
                 if cut {
                     t = t.trim_end_matches('\u{FFFD}').to_string();
                     t.push('…');
@@ -578,6 +605,37 @@ mod tests {
         let exact = vec![b'y'; MAX_STDOUT_LINE];
         let ev = l.feed(&[exact.as_slice(), b"\n"].concat());
         assert_eq!(ev, vec![Event::Out(String::from_utf8(exact).unwrap())], "exactly 4 MiB passes");
+    }
+
+    #[test]
+    fn a_secret_past_a_long_run_of_secrets_is_still_blanked() {
+        // The review's case: 400 copies blank to one marker, so a raw cut would have kept the
+        // last copy's first 19 characters, and they'd have been shown.
+        let k: String = (b'a'..=b't').map(char::from).collect();
+        let line = format!("{}{}{k}\n", k.repeat(400), "Z".repeat(193));
+        for chunk in [1, 7, 4096, line.len()] {
+            let mut l = Lines::new(Stream::Stderr, std::slice::from_ref(&k));
+            let mut ev = Vec::new();
+            for c in line.as_bytes().chunks(chunk) {
+                ev.extend(l.feed(c));
+            }
+            assert_eq!(ev, vec![Event::Err(format!("[hidden]{}[hidden]", "Z".repeat(193)))], "chunks of {chunk}");
+        }
+        // The same on stdout.
+        let mut l = Lines::new(Stream::Stdout, std::slice::from_ref(&k));
+        assert_eq!(l.feed(line.as_bytes()), vec![Event::Out(format!("[hidden]{}[hidden]", "Z".repeat(193)))]);
+    }
+
+    #[test]
+    fn a_long_stderr_line_drains_through_the_redactor_after_the_cut() {
+        let k = val("drain");
+        let mut l = Lines::new(Stream::Stderr, std::slice::from_ref(&k));
+        let line = format!("{}{}{k}\nnext {k}\n", "p".repeat(MAX_STDERR_LINE + 10), "q".repeat(100_000));
+        let ev = l.feed(line.as_bytes());
+        assert_eq!(ev.len(), 2);
+        let Event::Err(first) = &ev[0] else { panic!() };
+        assert!(first.ends_with('…') && !first.contains(&k));
+        assert_eq!(ev[1], Event::Err("next [hidden]".into()), "the next line starts clean");
     }
 
     #[test]
