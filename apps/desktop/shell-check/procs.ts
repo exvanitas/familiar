@@ -193,6 +193,36 @@ async function main(info: Info, ctx: Ctx) {
     return `a junction and a directory link to the share and a link to the mapped drive refused; a local junction passes and starts ${name}; ${counts}`;
   });
 
+  await check('security.server.retarget', async () => {
+    // The program is j\node.exe, and the junction j leads to folder a when the walk is made and
+    // the dialog shows. While the dialog is up, j is moved to folder b, which holds another copy
+    // of node; then the start is approved. The spawn launches the held form, and the walk again
+    // before resume finds b where a was approved: refused unsafe-path, and no node is left.
+    const fx = await step<{ j: string; a: string; b: string; target: string }>('retarget-setup', {});
+    const s = fakeSetup(p, 'retarget-' + rand(4), { program: `${fx.j}\\node.exe` });
+    // The control: the same program through the junction, left alone, starts.
+    const mc = new Mcp();
+    const rc = await startWith(mc, { ...s, id: s.id + '-c' }, 'yes');
+    ok(rc.started === 'started', 'the control through the junction: ' + rc.started);
+    await shell.serverStop(mc.run);
+    await mc.exited(5000);
+    const m = new Mcp();
+    const started = m.start(s).then(() => 'started', e => errKind(e));
+    const moved = await step<{ found: boolean; target: string }>('retarget-on-dialog', { j: fx.j, to: fx.b }, 30000);
+    ok(moved.found, 'no dialog for the start');
+    const d = await dialog('approve', START);
+    const r = await started;
+    const kids = await step<{ count: number }>('node-children', {});
+    if (r === 'started') {
+      await shell.serverStop(m.run).catch(() => undefined);
+      await m.exited(5000).catch(() => undefined);
+    }
+    ok(d.shown, 'the dialog was gone before it could be approved');
+    ok(r === 'unsafe-path', `j moved from ${fx.target} to ${moved.target} after the approval's walk, and the start was ${r}, not unsafe-path`);
+    ok(kids.count === 0, `${kids.count} node children after the refused start`);
+    return `the control through j started; j moved from a to b while the dialog was up, then approved: ${r}, ${kids.count} node children`;
+  });
+
   const a = fakeSetup(p, 'fake-a');
   const ma = new Mcp();
   await check('security.server.approve', async () => {
@@ -316,10 +346,19 @@ async function main(info: Info, ctx: Ctx) {
     const r = await startWith(m, s, 'yes');
     ok(r.started === 'started', 'the start: ' + r.started);
     const chunk = new Uint8Array(1024 * 1024).fill(0x62);
-    const writes = Array.from({ length: 60 }, () => shell.serverWrite(m.run, chunk).then(() => 'written', e => errKind(e)));
+    let settled = 0;
+    const writes = Array.from({ length: 60 }, () => shell.serverWrite(m.run, chunk).then(() => 'written', e => errKind(e)).finally(() => { settled++; }));
     await sleep(1000);
+    // While the flood is held (the writes in flight still unanswered), shell_info five times,
+    // each timed alone: every one must answer in under 100 ms.
+    const infoMs: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const t = Date.now();
+      const r = await Promise.race([shell.info().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
+      infoMs.push(r === 'answered' ? Date.now() - t : Infinity);
+    }
+    const heldDuring = 60 - settled;
     const t1 = Date.now();
-    const info = await Promise.race([shell.info().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
     const sys = await Promise.race([shell.system().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
     const others = Date.now() - t1;
     const t0 = Date.now();
@@ -328,11 +367,13 @@ async function main(info: Info, ctx: Ctx) {
     await m.exited(5000);
     const outcomes = await Promise.race([Promise.all(writes), sleep(5000).then(() => ['hung'])]);
     const count = (k: string) => outcomes.filter(o => o === k).length;
-    ok(info === 'answered' && sys === 'answered', `other commands during the flood: shell_info ${info}, system ${sys}`);
+    ok(heldDuring > 0, `the flood wasn't held while shell_info was timed: all 60 writes had answered`);
+    ok(Math.max(...infoMs) < 100, `shell_info during the flood: ${infoMs.join(', ')} ms, not all under 100`);
+    ok(sys === 'answered', `system during the flood: ${sys}`);
     ok(stopped === 'stopped' && ms < 3000, `stop during the flood: ${stopped} after ${ms} ms`);
     ok(!outcomes.includes('hung'), 'some writes never answered');
     ok(count('busy') >= 40, `only ${count('busy')} of 60 writes were refused busy`);
-    return `60 writes of 1 MiB to a server that never reads: ${count('busy')} busy, ${count('failed')} failed when it stopped, ${count('written')} written; other commands answered in ${others} ms; stop took ${ms} ms`;
+    return `60 writes of 1 MiB to a server that never reads: ${count('busy')} busy, ${count('failed')} failed when it stopped, ${count('written')} written; with ${heldDuring} still held, shell_info answered in ${infoMs.join(', ')} ms (each under 100) and system in ${others} ms; stop took ${ms} ms`;
   });
 
   await check('security.server.exit-drains', async () => {

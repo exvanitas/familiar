@@ -53,6 +53,7 @@
     "server.paths",
     "server.remote-drive",
     "server.links",
+    "server.retarget",
     "server.unc-measured",
     "server.settings",
     "server.env",

@@ -305,6 +305,28 @@ $procSteps = @{
     $why = [P]::LimitJob([uint32]$script:proc.Id)
     @{ done = ($why -eq ''); why = $why }
   }
+  'retarget-setup' = {
+    param($a)
+    # Two copies of node, in folders a and b, and a junction j leading to a.
+    $fx = Join-Path $tmp ('retarget-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+    $node = (Get-Command node -CommandType Application | Select-Object -First 1).Source
+    foreach ($d in 'a', 'b') {
+      New-Item -ItemType Directory -Force "$fx\$d" | Out-Null
+      Copy-Item $node "$fx\$d\node.exe"
+    }
+    New-Item -ItemType Junction -Path "$fx\j" -Target "$fx\a" | Out-Null
+    @{ j = "$fx\j"; a = "$fx\a"; b = "$fx\b"; target = [string](Get-Item "$fx\j").Target }
+  }
+  'retarget-on-dialog' = {
+    param($a)
+    # Waits for the start's dialog, which comes after the walk, and leaves it up; then moves the
+    # junction to the other folder. Directory.Delete on a junction removes only the link.
+    $h = Wait-Dialog 15000
+    if (-not $h) { return @{ found = $false; target = '' } }
+    [IO.Directory]::Delete($a.j)
+    New-Item -ItemType Junction -Path $a.j -Target $a.to | Out-Null
+    @{ found = $true; target = [string](Get-Item $a.j).Target }
+  }
   'kill-tree' = {
     param($a)
     # The server, its child and its grandchild, each alive now, held by handle, and everything
