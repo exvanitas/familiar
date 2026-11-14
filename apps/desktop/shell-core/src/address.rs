@@ -213,6 +213,9 @@ pub fn normalize(input: &str) -> Result<Normalized, AddrError> {
         None => return Err(AddrError::Invalid),
     };
     let path = url.path().trim_end_matches('/').to_string();
+    if encoded_separator(&path) {
+        return Err(AddrError::Invalid);
+    }
     let port = url.port();
     let port_part = port.map(|p| format!(":{p}")).unwrap_or_default();
     Ok(Normalized { url: format!("{scheme}://{host}{port_part}{path}"), scheme, host, port, path, reach })
@@ -331,9 +334,20 @@ pub fn under_parsed(saved: &Normalized, target: &Url) -> bool {
         return false;
     }
     let path = target.path();
+    if encoded_separator(path) {
+        return false;
+    }
     saved.path.is_empty()
         || path == saved.path
         || path.strip_prefix(saved.path.as_str()).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// An encoded dot, slash or backslash in a path. A backend that decodes before it removes dot
+/// segments would read `/v1/%2e%2e%2fadmin` as `/admin`, so such a path is never under a saved
+/// address, and a saved address can't have one.
+pub fn encoded_separator(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    ["%2e", "%2f", "%5c"].iter().any(|e| lower.contains(e))
 }
 
 #[cfg(test)]
@@ -603,6 +617,26 @@ mod tests {
         assert_eq!(keep_answers(Reach::Public, &ips), vec![ips[0]]);
         assert_eq!(keep_answers(Reach::Loopback, &ips), vec![ips[1]]);
         assert_eq!(keep_answers(Reach::Lan, &ips), vec![ips[2], ips[4]]);
+    }
+
+    #[test]
+    fn encoded_separators_never_pass() {
+        let saved = normalize("https://api.example.com/v1").unwrap();
+        for bad in [
+            "https://api.example.com/v1/%2e%2e%2fadmin",
+            "https://api.example.com/v1/%2E%2E%2Fadmin",
+            "https://api.example.com/v1/..%2fadmin",
+            "https://api.example.com/v1/x%2Fy",
+            "https://api.example.com/v1/a%5cb",
+            "https://api.example.com/v1/a%5C..%5Cb",
+            "https://api.example.com/v1/a%2eb",
+        ] {
+            assert_eq!(under(&saved, bad).err(), Some(AddrError::NotSaved), "{bad}");
+        }
+        for bad in ["https://api.example.com/v1%2fx", "https://api.example.com/a%2E/b", "http://localhost/%5c"] {
+            assert_eq!(normalize(bad), Err(AddrError::Invalid), "{bad}");
+        }
+        assert!(under(&saved, "https://api.example.com/v1/a%20b?q=%2f").is_ok(), "other escapes, and the query, are fine");
     }
 
     #[test]

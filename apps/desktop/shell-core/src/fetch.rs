@@ -337,5 +337,8 @@ mod tests {
             assert_eq!(redirect(0, &here, &echo, &saved, &[key.as_str()]), Err(FetchError::RedirectRefused), "{echo}");
         }
         assert!(redirect(0, &here, "/v1/fine", &saved, &[key.as_str()]).is_ok());
+        for enc in ["/v1/%2e%2e%2fadmin", "/v1/%2E%2E%2Fadmin", "/v1/a%5cb", "https://api.example.com/v1/x%2fy"] {
+            assert_eq!(redirect(0, &here, enc, &saved, none), Err(FetchError::RedirectRefused), "{enc}");
+        }
     }
 }
