@@ -194,5 +194,16 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::secrets::secret_set,
         crate::secrets::secret_status,
         crate::secrets::secret_delete,
+        crate::servers::server_start,
+        crate::servers::server_write,
+        crate::servers::server_stop,
+        crate::servers::server_forget,
+        crate::system::system,
+        crate::system::wake_at,
+        crate::notify::autostart,
+        crate::files::pick_path,
+        crate::files::save_as,
+        crate::files::open_url,
+        crate::files::open_folder,
     ]
 }

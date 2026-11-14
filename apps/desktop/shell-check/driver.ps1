@@ -20,6 +20,7 @@ New-Item -ItemType Directory -Force $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
 . (Join-Path $here 'win32.ps1')
 . (Join-Path $here 'driver-net.ps1')
+. (Join-Path $here 'procs.ps1')
 Add-Type -AssemblyName System.Windows.Forms
 
 # What this driver writes. None may be left from an earlier run, so a verdict here is this run's.
@@ -189,6 +190,7 @@ function Do-Step($action, $a) {
       }
       return @{ hits = $n }
     }
+    { $procSteps.ContainsKey($_) } { return (& $procSteps[$action] $a) }
     default {
       $r = Do-NetStep $action $a
       if ($null -ne $r) { return $r }
@@ -373,6 +375,9 @@ try {
   $log = Join-Path $Out 'early.log'
   $p = Run-Phase 'early' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'early-data'), '--log', $log, '--seconds', '60', '--phase', 'early') 90
   [void](No-Strays 'early')
+
+  # ---------- server starts, links, saving, system state, wake: procs.ps1 ----------
+  Run-ProcChecks
 
   # ---------- an app folder that holds the data folder: a box, and out with 1 ----------
   $ov = Join-Path $tmp 'overlap'
