@@ -168,7 +168,9 @@ function Do-Step($action, $a) {
       try {
         $c = [Net.Sockets.TcpClient]::new('127.0.0.1', $port)
         $st = $c.GetStream(); $st.ReadTimeout = 4000
-        $req = [Text.Encoding]::ASCII.GetBytes("GET http://familiar-check.test/ HTTP/1.1`r`n`r`n")
+        # Only the first line: the sink reads nothing past it, and bytes left unread would make its
+        # close a reset that can beat the 403 to the reader.
+        $req = [Text.Encoding]::ASCII.GetBytes("GET http://familiar-check.test/ HTTP/1.1`r`n")
         $st.Write($req, 0, $req.Length)
         $buf = [byte[]]::new(64); $n = $st.Read($buf, 0, 64)
         $answered = [Text.Encoding]::ASCII.GetString($buf, 0, $n).Split("`r")[0]
