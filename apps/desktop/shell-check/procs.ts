@@ -497,38 +497,61 @@ async function filesAndLinks(info: Info) {
 }
 
 /* Forget and start interleaved 20 times: half with the setup running, half with it approved and
-   idle. Whatever order the actor sees them in, nothing runs once the forget has returned and both
-   have answered, and the next start asks. */
+   idle, in both orders. Whatever order the actor sees them in, the run from before the forget is
+   gone once both have answered, and a start after the forget asks. A racing start that asks (it
+   came after the forget) is approved, and its run is the next round's. */
 async function forgetRace() {
   const p = await step<Paths>('proc-paths', {}, 120000);
   await check('security.server.forget-race', async () => {
     const s = fakeSetup(p, 'fake-race');
     const seen: Record<string, number> = {};
+    let current: Mcp | null = null;
+    let asked = 0;
     for (let i = 0; i < 20; i++) {
-      const m = new Mcp();
-      const asked = await startWith(m, s, 'yes');
-      ok(asked.dialog.shown, `round ${i}: the start after a forget didn't ask`);
-      ok(asked.started === 'started', `round ${i}: the approved start: ${asked.started}`);
+      if (!current) {
+        const m = new Mcp();
+        const r = await startWith(m, s, 'yes');
+        ok(r.dialog.shown, `round ${i}: the start after a forget didn't ask`);
+        ok(r.started === 'started', `round ${i}: the approved start: ${r.started}`);
+        asked++;
+        current = m;
+      }
+      const before = current;
       if (i % 2) {
-        await shell.serverStop(m.run);
-        await m.exited(5000);
+        await shell.serverStop(before.run);
+        await before.exited(5000);
       }
       const racer = new Mcp();
-      const forget = () => shell.serverForget(s.id).then(() => 'forgot', e => errKind(e));
-      const start = () => racer.start(s).then(() => 'started', e => errKind(e));
-      const [f, st] = i % 4 < 2 ? await Promise.all([forget(), start()]) : (([a, b]) => [b, a])(await Promise.all([start(), forget()]));
+      const forgetP = shell.serverForget(s.id).then(() => 'forgot', e => errKind(e));
+      const startP = racer.start(s).then(() => 'started', e => errKind(e));
+      if (i % 4 >= 2) await sleep(5); // the other order, as near as the page can make it
+      const f = await forgetP;
       ok(f === 'forgot', `round ${i}: the forget: ${f}`);
-      seen[st] = (seen[st] ?? 0) + 1;
-      if (st === 'started') {
-        // It started before the forget reached the actor: the forget must have stopped it.
-        ok(racer.exit !== undefined || await racer.exited(5000).then(() => true, () => false), `round ${i}: a run that started first outlived the forget`);
+      // A start that came after the forget asks: approve it, and its run carries on.
+      const look = await step<{ found: boolean }>('dialog', { act: 'none', approve: START[0], refuse: START[1] }, 60000);
+      if (look.found) await step('dialog', { act: 'approve', approve: START[0], refuse: START[1] }, 60000);
+      const st = await startP;
+      seen[look.found ? 'asked' : st] = (seen[look.found ? 'asked' : st] ?? 0) + 1;
+      // The run from before the forget is gone.
+      ok(await before.exited(5000).then(() => true, () => false), `round ${i}: the run from before the forget outlived it`);
+      if (look.found) {
+        ok(st === 'started', `round ${i}: the start that asked: ${st}`);
+        asked++;
+        current = racer;
       } else {
-        ok(['busy', 'revoked'].includes(st), `round ${i}: the racing start: ${st}`);
+        ok(['busy', 'revoked', 'started'].includes(st), `round ${i}: the racing start: ${st}`);
+        // One that started before the forget reached the actor was stopped by it.
+        if (st === 'started') ok(await racer.exited(5000).then(() => true, () => false), `round ${i}: a run that started first outlived the forget`);
+        current = null;
       }
       const left = await step<{ count: number }>('node-children');
-      ok(left.count === 0, `round ${i}: ${left.count} node processes after the forget returned`);
+      ok(left.count === (current ? 1 : 0), `round ${i}: ${left.count} node processes after the forget, expected ${current ? 1 : 0}`);
     }
-    return `20 rounds of forget and start interleaved: the racing start was ${JSON.stringify(seen)}; nothing ran after each forget, and each next start asked`;
+    if (current) {
+      await shell.serverForget(s.id);
+      await current.exited(5000);
+    }
+    return `20 rounds of forget and start interleaved: the racing start was ${JSON.stringify(seen)}; every run from before a forget was gone, and ${asked} starts after a forget asked`;
   });
 }
 
