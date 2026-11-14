@@ -212,36 +212,39 @@ $procSteps = @{
     param($a)
     $h = Find-Dialog 15000
     if (-not $h) { return @{ shown = $false; why = 'no dialog' } }
-    # The file name box through UI Automation: the Edit with automation id 1001. Its window isn't
-    # always there to message, and the address bar has an Edit too.
-    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-    $A = [Windows.Automation.AutomationElement]
-    $root = $A::FromHandle([IntPtr]$h)
-    $cond = [Windows.Automation.AndCondition]::new(
-      [Windows.Automation.PropertyCondition]::new($A::AutomationIdProperty, '1001'),
-      [Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, [Windows.Automation.ControlType]::Edit))
-    $edit = $null
-    for ($i = 0; $i -lt 50 -and -not $edit; $i++) { $edit = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $cond); if (-not $edit) { Start-Sleep -Milliseconds 100 } }
-    $how = 'ui automation'
-    if ($edit) {
-      $value = $edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
-      $value.SetValue($a.path)
-      $typed = $value.Current.Value
-      $save = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.PropertyCondition]::new($A::AutomationIdProperty, '1'))
-      if ($save) { $save.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke() } else { [void][P]::ClickOk($h) }
-    } else {
-      # The box has the focus when the dialog opens: type the path, escaped for SendKeys, and Enter.
+    Start-Sleep -Milliseconds 500
+    # The file name box through UI Automation: the Edit with automation id 1001, never the address
+    # bar's. If that fails anywhere, the box has the focus when the dialog opens, so keystrokes.
+    $how = 'ui automation'; $typed = ''; $note = ''
+    try {
+      $root = $UIA::FromHandle([IntPtr]$h)
+      if (-not $root) { throw 'no automation element for the dialog' }
+      $edit = $null
+      for ($i = 0; $i -lt 50 -and -not $edit; $i++) {
+        $edit = @(Uia-All $root ([System.Windows.Automation.ControlType]::Edit) | Where-Object { $_.Current.AutomationId -eq '1001' }) | Select-Object -First 1
+        if (-not $edit) { Start-Sleep -Milliseconds 100 }
+      }
+      if (-not $edit) { throw 'no edit 1001' }
+      $vp = $null
+      if (-not $edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp) -or -not $vp) { throw 'no value pattern' }
+      $vp.SetValue([string]$a.path)
+      $typed = [string]$vp.Current.Value
+      $save = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object { $_.Current.AutomationId -eq '1' }) | Select-Object -First 1
+      $ip = $null
+      if ($save -and $save.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip) -and $ip) { $ip.Invoke() } else { [void][P]::ClickOk($h) }
+    } catch {
+      $note = "ui automation: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber); "
       $how = 'keystrokes'
       [void][W]::Foreground($h)
       Start-Sleep -Milliseconds 300
-      $keys = -join ($a.path.ToCharArray() | ForEach-Object { if ('+^%~(){}[]'.Contains($_)) { "{$_}" } else { "$_" } })
+      $keys = -join ([string]$a.path).ToCharArray().ForEach({ if ('+^%~(){}[]'.IndexOf([string]$_) -ge 0) { '{' + $_ + '}' } else { [string]$_ } })
       [System.Windows.Forms.SendKeys]::SendWait('^a' + $keys + '{ENTER}')
       $typed = '(typed)'
     }
     for ($i = 0; $i -lt 50 -and [W]::Dialog([uint32]$script:proc.Id) -eq $h; $i++) { Start-Sleep -Milliseconds 100 }
-    if ([W]::Dialog([uint32]$script:proc.Id) -eq $h) { [W]::Press($h, 2); return @{ shown = $false; why = "the dialog stayed ($how, the box read $typed)" } }
+    if ([W]::Dialog([uint32]$script:proc.Id) -eq $h) { [W]::Press($h, 2); return @{ shown = $false; why = "${note}the dialog stayed ($how, the box read $typed)" } }
     Start-Sleep -Milliseconds 500
-    @{ shown = $true; typed = "$typed ($how)" }
+    @{ shown = $true; typed = "$note$typed ($how)" }
   }
   'file-length' = {
     param($a)
