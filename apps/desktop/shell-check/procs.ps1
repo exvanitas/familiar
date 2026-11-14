@@ -208,16 +208,36 @@ $procSteps = @{
     param($a)
     $h = Find-Dialog 15000
     if (-not $h) { return @{ shown = $false; why = 'no dialog' } }
-    Start-Sleep -Milliseconds 500
-    $typed = [P]::SetFileName($h, $a.path)
-    if ($null -eq $typed) { [W]::Press($h, 2); return @{ shown = $false; why = 'no file name box' } }
-    Start-Sleep -Milliseconds 200
-    [void][P]::ClickOk($h)
+    # The file name box through UI Automation: the Edit with automation id 1001. Its window isn't
+    # always there to message, and the address bar has an Edit too.
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $A = [Windows.Automation.AutomationElement]
+    $root = $A::FromHandle([IntPtr]$h)
+    $cond = [Windows.Automation.AndCondition]::new(
+      [Windows.Automation.PropertyCondition]::new($A::AutomationIdProperty, '1001'),
+      [Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, [Windows.Automation.ControlType]::Edit))
+    $edit = $null
+    for ($i = 0; $i -lt 50 -and -not $edit; $i++) { $edit = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $cond); if (-not $edit) { Start-Sleep -Milliseconds 100 } }
+    $how = 'ui automation'
+    if ($edit) {
+      $value = $edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
+      $value.SetValue($a.path)
+      $typed = $value.Current.Value
+      $save = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.PropertyCondition]::new($A::AutomationIdProperty, '1'))
+      if ($save) { $save.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke() } else { [void][P]::ClickOk($h) }
+    } else {
+      # The box has the focus when the dialog opens: type the path, escaped for SendKeys, and Enter.
+      $how = 'keystrokes'
+      [void][W]::Foreground($h)
+      Start-Sleep -Milliseconds 300
+      $keys = -join ($a.path.ToCharArray() | ForEach-Object { if ('+^%~(){}[]'.Contains($_)) { "{$_}" } else { "$_" } })
+      [System.Windows.Forms.SendKeys]::SendWait('^a' + $keys + '{ENTER}')
+      $typed = '(typed)'
+    }
     for ($i = 0; $i -lt 50 -and [W]::Dialog([uint32]$script:proc.Id) -eq $h; $i++) { Start-Sleep -Milliseconds 100 }
-    $still = [W]::Dialog([uint32]$script:proc.Id) -eq $h
-    if ($still) { [W]::Press($h, 2); return @{ shown = $false; why = 'the dialog stayed: ' + [W]::DialogText($h) } }
+    if ([W]::Dialog([uint32]$script:proc.Id) -eq $h) { [W]::Press($h, 2); return @{ shown = $false; why = "the dialog stayed ($how, the box read $typed)" } }
     Start-Sleep -Milliseconds 500
-    @{ shown = $true; typed = $typed }
+    @{ shown = $true; typed = "$typed ($how)" }
   }
   'file-length' = {
     param($a)
