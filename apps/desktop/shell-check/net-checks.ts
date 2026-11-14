@@ -36,6 +36,12 @@ export async function netChecks(ctx: Ctx) {
   const base = `http://127.0.0.1:${net.http}`;
   const text = async (r: Response) => r.text();
   const outcome = (p: Promise<unknown>) => within(p.then(() => 'ok', e => kindOf(e)), 60000, 'fetch');
+  /* Reads a body through its stream, which keeps the exe's kind on the error: a stream error seen
+     through text() or json() reaches the page as a plain TypeError, without its cause. */
+  const drain = async (r: Response) => {
+    const reader = r.body!.getReader();
+    for (;;) if ((await reader.read()).done) return;
+  };
 
   /* ---------- saved addresses only ---------- */
   let A: Address | undefined;
@@ -215,11 +221,12 @@ export async function netChecks(ctx: Ctx) {
 
   await check('security.fetch.limits', async () => {
     const head = await outcome(guardedFetch(A!.id, { headersMs: 1000 })(`${base}/api/slow-head`));
-    const idle = await outcome(guardedFetch(A!.id, { idleMs: 1000 })(`${base}/api/slow-body`).then(text));
-    const big = await outcome(guardedFetch(A!.id, { maxBytes: 1024 * 1024 })(`${base}/api/big`).then(text));
-    const bomb = await outcome(guardedFetch(A!.id)(`${base}/api/gzip-bomb`).then(text));
+    const idle = await outcome(guardedFetch(A!.id, { idleMs: 1000 })(`${base}/api/slow-body`).then(drain));
+    const big = await outcome(guardedFetch(A!.id, { maxBytes: 1024 * 1024 })(`${base}/api/big`).then(drain));
+    const bomb = await outcome(guardedFetch(A!.id)(`${base}/api/gzip-bomb`).then(drain));
+    const viaText = await outcome(guardedFetch(A!.id, { maxBytes: 1024 * 1024 })(`${base}/api/big`).then(text));
     ok(head === 'timeout' && idle === 'timeout' && big === 'too-large' && bomb === 'too-large', JSON.stringify({ head, idle, big, bomb }));
-    return 'headersMs and idleMs time out; a body past maxBytes and a gzip bomb are too-large';
+    return `headersMs and idleMs time out; a body past maxBytes and a gzip bomb are too-large (through text() the same error reads as ${viaText})`;
   });
 
   await check('security.fetch.redirects', async () => {

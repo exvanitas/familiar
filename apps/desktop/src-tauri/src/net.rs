@@ -66,6 +66,9 @@ struct Request {
 pub struct Net {
     open: Mutex<HashMap<String, Arc<Request>>>,
     used: Mutex<HashSet<String>>,
+    /// Requests ended from outside, and why, so a later read says `revoked` rather than only that
+    /// the request is gone.
+    ended: Mutex<HashMap<String, FetchError>>,
     /// Lan and loopback, which never use a proxy, so they can be kept.
     local: OnceLock<[Client; 2]>,
 }
@@ -134,13 +137,18 @@ impl Net {
 /// Ends every open request under an address, with `revoked`. Called when it's removed.
 pub fn revoke(app: &AppHandle, address_id: &str) {
     let Some(net) = app.try_state::<Net>() else { return };
-    let gone: Vec<Arc<Request>> = {
+    let (ids, gone): (Vec<String>, Vec<Arc<Request>>) = {
         let mut open = lock(&net.open);
         let ids: Vec<String> = open.iter().filter(|(_, r)| r.address == address_id).map(|(id, _)| id.clone()).collect();
-        ids.iter().filter_map(|id| open.remove(id)).collect()
+        let gone = ids.iter().filter_map(|id| open.remove(id)).collect();
+        (ids, gone)
     };
+    let mut ended = lock(&net.ended);
     for r in gone {
         let _ = r.stop.send(Stop::Revoked);
+    }
+    for id in ids {
+        ended.insert(id, FetchError::Revoked);
     }
 }
 
@@ -333,7 +341,9 @@ async fn send(
 /// Up to 1 MiB of the body, after redaction. Waits for output; empty only at the real end.
 #[tauri::command]
 pub async fn net_read(net: State<'_, Net>, id: String) -> Result<Response, Fail> {
-    let req = lock(&net.open).get(&id).cloned().ok_or(fail(FetchError::Cancelled))?;
+    let Some(req) = lock(&net.open).get(&id).cloned() else {
+        return Err(fail(lock(&net.ended).get(&id).copied().unwrap_or(FetchError::Cancelled)));
+    };
     let mut stopped = req.stop.subscribe();
     let mut guard = req.body.lock().await;
     let Some(b) = guard.as_mut() else { return Err(fail(FetchError::Invalid)) };
