@@ -446,16 +446,26 @@ export async function netChecks(ctx: Ctx) {
   });
 
   await check('check.key.remove-race', async () => {
-    // A key written from Settings while core removes the address, ten times with the removal sent
-    // 0 to 9 ms after: the key must never outlive its address.
+    // A key written from Settings while core removes the address, ten times, the removal sent from
+    // 4 ms before the write to 5 ms after: the key must never outlive its address.
     const seen: string[] = [];
     let orphans = 0;
     for (let i = 0; i < 10; i++) {
       const K = await saved({ kind: 'server', url: `${base}/race${i}`, label: 'key race' });
-      const set = ctx.ask<string>('settings', 'make-key', `addr:${K.id}`);
-      if (i) await sleep(i);
-      const rm = await shell.addressRemove(K.id).then(() => 'removed', reason);
-      const s = await set;
+      const offset = i - 4;
+      const write = () => ctx.ask<string>('settings', 'make-key', `addr:${K.id}`);
+      const remove = () => shell.addressRemove(K.id).then(() => 'removed', reason);
+      let set: Promise<string>, removal: Promise<string>;
+      if (offset < 0) {
+        removal = remove();
+        await sleep(-offset);
+        set = write();
+      } else {
+        set = write();
+        if (offset) await sleep(offset);
+        removal = remove();
+      }
+      const [s, rm] = await Promise.all([set, removal]);
       const cm = await step<{ found: boolean }>('cmdkey', { target: `addr:${K.id}` });
       if (cm.found) orphans++;
       seen.push(`${s === 'ok' ? 'written' : 'refused'}+${rm === 'removed' ? 'removed' : rm}`);

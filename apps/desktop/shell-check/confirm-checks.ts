@@ -85,12 +85,15 @@ export async function confirmChecks(ctx: { ask: <T>(to: string, cmd: string, arg
   await check('check.confirm.race', async () => {
     const seen: string[] = [];
     const bad: string[] = [];
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       const title = `Familiar check race ${i}`;
+      // Sent in both orders, so both outcomes come up.
+      const open = () => shell.viewOpen({ label: `view-race${i}`, page: 'download.html', title, width: 300, height: 200, alwaysOnTop: true }).then(() => 'opened', reason);
+      const v = i % 2 ? open() : null;
       const p = outcome(add(47010 + i, 'race', 'race'));
-      const v = shell.viewOpen({ label: `view-race${i}`, page: 'download.html', title, width: 300, height: 200, alwaysOnTop: true }).then(() => 'opened', reason);
+      const v2 = v ?? open();
       const held = await dialog('hold');
-      const opened = await v;
+      const opened = await v2;
       const during = await step<WinState>('winstate', { titles: [...TITLES, title] });
       await dialog('approve');
       const r = await p;
@@ -105,7 +108,7 @@ export async function confirmChecks(ctx: { ask: <T>(to: string, cmd: string, arg
       await shell.windowCtl(`view-race${i}`, 'close').catch(() => {});
     }
     ok(bad.length === 0, bad.join('; '));
-    return `three view_open calls with always-on-top sent with an address_add: ${seen.join(', ')}; none showed on top or enabled behind the dialog`;
+    return `four view_open calls with always-on-top sent with an address_add, before and after it: ${seen.join(', ')}; none showed on top or enabled behind the dialog`;
   });
 
   // Defaults, then three refusals of three kinds, then the stop and the tray item.
