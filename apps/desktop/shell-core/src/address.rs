@@ -199,7 +199,9 @@ pub fn normalize(input: &str) -> Result<Normalized, AddrError> {
             if d.is_empty() || d.ends_with('.') {
                 return Err(AddrError::Invalid);
             }
-            let reach = (d == "localhost").then_some(Reach::Loopback);
+            // `localhost` and every name under it are this PC (RFC 6761), with no lookup. A
+            // connection to one still uses only loopback answers.
+            let reach = (d == "localhost" || d.ends_with(".localhost")).then_some(Reach::Loopback);
             (d.to_string(), reach)
         }
         // An IP is written as `url` serializes it (IPv6 compressed, in brackets).
@@ -541,7 +543,10 @@ mod tests {
         assert_eq!(normalize("http://LOCALHOST:11434").unwrap().reach, Some(Reach::Loopback));
         assert_eq!(normalize("http://localhost.").unwrap().reach, Some(Reach::Loopback));
         assert_eq!(normalize("http://localhost.example.com").unwrap().reach, None);
-        assert_eq!(normalize("http://foo.localhost").unwrap().reach, None, "only localhost itself is known without a lookup");
+        assert_eq!(normalize("http://foo.localhost").unwrap().reach, Some(Reach::Loopback), "a name under localhost is this PC too");
+        assert_eq!(normalize("http://a.b.LOCALHOST.:8080").unwrap().reach, Some(Reach::Loopback));
+        assert_eq!(normalize("http://notlocalhost").unwrap().reach, None);
+        assert!(!check_add(Kind::Model, "http://ollama.localhost:11434", "", None).unwrap().needs_lookup());
         assert_eq!(normalize("https://api.example.com").unwrap().reach, None);
     }
 
