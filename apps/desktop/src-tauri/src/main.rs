@@ -92,6 +92,7 @@ fn start(app: &AppHandle, args: Args, app_dir: PathBuf, log: Arc<Log>) -> Result
     app.manage(addresses::Addresses::load(&data_dir, log.clone()));
     app.manage(Shell::new(app_dir, data_dir, webview_dir, log_path, &args, log.clone(), sink_port, sink));
     notify::register_app_id(&app.state::<Shell>());
+    servers::sweep(&app.state::<Shell>());
     system::start(app);
 
     // The tray first, so Quit works whatever the pages do.

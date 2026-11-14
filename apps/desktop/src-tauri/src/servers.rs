@@ -10,15 +10,16 @@ use serde_json::{json, Value};
 use shell_core::{
     approvals::{self, Load, Store},
     server_path::{self, Launch, PathError},
+    runs::{Runs, RunsError, Slot},
     setup::{self, Canonical, Event, Lines, Setup, Stream},
     temp,
 };
 use std::{
-    collections::HashMap,
+    cell::RefCell,
     io::{Read, Write},
     path::PathBuf,
-    process::{ChildStdin, Command, Stdio},
-    sync::{Arc, Mutex},
+    process::{Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -39,19 +40,24 @@ fn fail(kind: &'static str, message: impl Into<String>) -> Fail {
 
 type Res<T> = Result<T, Fail>;
 
-/// What runs, by run id. One job per server: closing its handle ends the whole tree.
+/// What runs and what is starting, under one lock (see `shell_core::runs`). One job per server:
+/// closing its handle ends the whole tree.
 #[derive(Default)]
 pub struct Servers {
-    runs: Mutex<HashMap<String, Arc<Running>>>,
+    state: Mutex<Runs<Arc<Running>>>,
     /// Held for each read and write of `servers.json`, so two starts can't lose an approval.
     store: Mutex<()>,
 }
 
-struct Running {
-    setup: String,
-    job: Job,
-    stdin: Mutex<Option<ChildStdin>>,
+pub struct Running {
+    job: Arc<os::Job>,
+    /// The writer thread's queue. Dropping it closes the server's stdin once a write in flight
+    /// ends; it's never held during a write.
+    input: Mutex<Option<Input>>,
 }
+
+/// One write for the writer thread: the bytes, and where to say whether they went.
+type Input = mpsc::Sender<(Vec<u8>, mpsc::Sender<bool>)>;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -138,11 +144,11 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
     // approved form starts with no confirm state involved: the stop and a dialog that's open are
     // about asking, and starting a server opens no window. Only a new or changed form reserves.
     setup::check(&setup).map_err(|e| fail(e.kind(), "the setup was refused"))?;
+    // A slot first, under the runs lock, so concurrent starts can't pass 16. It goes back on
+    // every failure, and it remembers the setup's generation, so a forget meanwhile is seen.
+    let slot = SlotGuard { servers: &servers, slot: RefCell::new(Some(lock(&servers.state).reserve(&setup.id).map_err(|e| fail(e.kind(), "16 servers are running or starting"))?)) };
     let launch = walk(&setup.program, &setup.cwd)?;
     let form = Canonical::new(&setup, &launch);
-    if lock(&servers.runs).len() >= setup::MAX_RUNNING {
-        return Err(fail("busy", "16 servers are running"));
-    }
     let approved = {
         let _g = lock(&servers.store);
         load(&shell).approved(&setup.id, &form)
@@ -163,7 +169,12 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
             shell.log.line(&format!("server {}: declined", setup.id));
             return Err(fail("declined", "not started"));
         }
+        // A forget while the dialog was open wins: the approval isn't stored, nothing starts.
         let _g = lock(&servers.store);
+        if slot.revoked() {
+            shell.log.line(&format!("server {}: forgotten while asking", setup.id));
+            return Err(fail("revoked", "the setup was forgotten while asking"));
+        }
         let mut store = load(&shell);
         store.approve(&setup.id, form.clone());
         save(&shell, &store)?;
@@ -180,35 +191,64 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
     let env = setup::environment(parent.iter().map(|(k, v)| (k.as_str(), v.as_str())), &setup, &secrets);
     let values: Vec<String> = secrets.into_iter().map(|(_, v)| v).collect();
 
-    if lock(&servers.runs).len() >= setup::MAX_RUNNING {
-        return Err(fail("busy", "16 servers are running"));
-    }
     let mut cmd = Command::new(&form.program);
     cmd.args(&setup.args).current_dir(&form.cwd).env_clear().envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (child, job) = start_suspended(cmd).inspect_err(|e| {
-        shell.log.line(&format!("server {}: {}", setup.id, e.message));
-    })?;
     let run = run_id();
+    let record = Records::new(&shell);
+    let started = os::start(
+        cmd,
+        |pid| record.write(pid),
+        |job| {
+            // The last check, under the runs lock: a forget since the slot was taken refuses the
+            // start; otherwise the run is in the list before it resumes, so a forget from now on
+            // finds it and stops it.
+            let running = Arc::new(Running { job: job.clone(), input: Mutex::new(None) });
+            slot.commit(&run, running).map_err(|e| fail(e.kind(), "the setup was forgotten while starting"))
+        },
+    );
+    record.remove();
+    let mut child = started.inspect_err(|e| shell.log.line(&format!("server {}: {}", setup.id, e.message)))?;
+    drop(slot);
     shell.log.line(&format!("server {} started as run {run}", setup.id));
-    let running = Arc::new(Running { setup: setup.id.clone(), job, stdin: Mutex::new(None) });
-    let mut child = child;
-    *lock(&running.stdin) = child.stdin.take();
-    let out = child.stdout.take().map(|s| pump(s, Stream::Stdout, &values, channel.clone()));
-    let err = child.stderr.take().map(|s| pump(s, Stream::Stderr, &values, channel.clone()));
-    lock(&servers.runs).insert(run.clone(), running.clone());
+    let running = lock(&servers.state).get(&run).expect("committed before resume");
 
-    // When the program ends: its output drains, the rest of its tree goes with the job, and core
-    // hears the exit code.
-    let (log, run_end) = (shell.log.clone(), run.clone());
-    let app2 = app.clone();
+    // stdin through a writer thread of its own, so a write that blocks never holds anything stop
+    // needs. Closing the input is dropping its sender.
+    if let Some(stdin) = child.stdin.take() {
+        let (tx, rx) = mpsc::channel::<(Vec<u8>, mpsc::Sender<bool>)>();
+        *lock(&running.input) = Some(tx);
+        thread::spawn(move || {
+            let mut stdin = stdin;
+            for (bytes, done) in rx {
+                let ok = stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_ok();
+                let _ = done.send(ok);
+                if !ok {
+                    break;
+                }
+            }
+        });
+    }
+    let (drained_tx, drained) = mpsc::channel::<()>();
+    let pumps = [child.stdout.take().map(|s| pump(s, Stream::Stdout, &values, channel.clone(), drained_tx.clone())), child.stderr.take().map(|s| pump(s, Stream::Stderr, &values, channel.clone(), drained_tx.clone()))];
+    let pumping = pumps.iter().flatten().count();
+    drop(drained_tx);
+
+    // When the program ends: the rest of its tree goes with the job, so no grandchild holding a
+    // pipe can keep its output open; then the output drains, for a bounded time; then core hears
+    // the exit code.
+    let (log, run_end, app2) = (shell.log.clone(), run.clone(), app.clone());
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
-        for t in [out, err].into_iter().flatten() {
-            let _ = t.join();
-        }
         running.job.terminate();
+        let until = Instant::now() + DRAIN;
+        for _ in 0..pumping {
+            if drained.recv_timeout(until.saturating_duration_since(Instant::now())).is_err() {
+                log.line(&format!("server run {run_end}: its output didn't drain in time"));
+                break;
+            }
+        }
         if let Some(servers) = app2.try_state::<Servers>() {
-            lock(&servers.runs).remove(&run_end);
+            lock(&servers.state).remove(&run_end);
         }
         log.line(&format!("server run {run_end} exited with {code:?}"));
         let _ = channel.send(json!({ "t": "exit", "code": code }));
@@ -216,9 +256,37 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
     Ok(Started { run })
 }
 
+/// How long the output may take to drain after the program has ended and its job with it.
+const DRAIN: Duration = Duration::from_secs(2);
+
+/// A slot, given back on every way out unless the run took its place.
+struct SlotGuard<'a> {
+    servers: &'a Servers,
+    slot: RefCell<Option<Slot>>,
+}
+
+impl SlotGuard<'_> {
+    fn revoked(&self) -> bool {
+        self.slot.borrow().as_ref().is_some_and(|s| lock(&self.servers.state).revoked(s))
+    }
+
+    fn commit(&self, run: &str, r: Arc<Running>) -> Result<(), RunsError> {
+        let mut slot = self.slot.borrow_mut();
+        lock(&self.servers.state).commit(slot.as_mut().expect("a slot"), run, r)
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mut s) = self.slot.get_mut().take() {
+            lock(&self.servers.state).release(&mut s);
+        }
+    }
+}
+
 /// Reads one stream to its end, a line at a time, with the setup's secrets blanked before any
-/// line leaves Rust.
-fn pump(mut source: impl Read + Send + 'static, stream: Stream, secrets: &[String], channel: Channel<Value>) -> thread::JoinHandle<()> {
+/// line leaves Rust, and says when it's done.
+fn pump(mut source: impl Read + Send + 'static, stream: Stream, secrets: &[String], channel: Channel<Value>, done: mpsc::Sender<()>) -> thread::JoinHandle<()> {
     let mut lines = Lines::new(stream, secrets);
     thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
@@ -238,6 +306,7 @@ fn pump(mut source: impl Read + Send + 'static, stream: Stream, secrets: &[Strin
             }
         }
         send(lines.finish());
+        let _ = done.send(());
     })
 }
 
@@ -247,7 +316,8 @@ struct WriteSpec {
     run: String,
 }
 
-/// The body is the bytes for the server's stdin, and the `x-spec` header holds `{ run }`.
+/// The body is the bytes for the server's stdin, and the `x-spec` header holds `{ run }`. It
+/// waits for the write, which `server_stop` can always cut short by ending the job.
 #[tauri::command(async)]
 pub fn server_write(request: Request, servers: State<Servers>) -> Res<()> {
     let InvokeBody::Raw(bytes) = request.body() else { return Err(fail("invalid", "expected bytes")) };
@@ -257,17 +327,22 @@ pub fn server_write(request: Request, servers: State<Servers>) -> Res<()> {
     let header = request.headers().get("x-spec").and_then(|v| v.to_str().ok()).ok_or_else(|| fail("invalid", "no spec"))?;
     let spec = percent_encoding::percent_decode_str(header).decode_utf8().map_err(|_| fail("invalid", "bad spec"))?;
     let spec: WriteSpec = serde_json::from_str(&spec).map_err(|_| fail("invalid", "bad spec"))?;
-    let running = lock(&servers.runs).get(&spec.run).cloned().ok_or_else(|| fail("missing", "no such run"))?;
-    let mut stdin = lock(&running.stdin);
-    let pipe = stdin.as_mut().ok_or_else(|| fail("missing", "its input is closed"))?;
-    pipe.write_all(bytes).and_then(|_| pipe.flush()).map_err(|_| fail("failed", "the server isn't reading"))
+    let running = lock(&servers.state).get(&spec.run).ok_or_else(|| fail("missing", "no such run"))?;
+    let input = lock(&running.input).clone().ok_or_else(|| fail("missing", "its input is closed"))?;
+    let (done_tx, done) = mpsc::channel();
+    input.send((bytes.clone(), done_tx)).map_err(|_| fail("missing", "its input is closed"))?;
+    match done.recv() {
+        Ok(true) => Ok(()),
+        _ => Err(fail("failed", "the server isn't reading")),
+    }
 }
 
-/// Closes its input, gives it 500 ms to exit, then ends its job.
-fn stop(running: Arc<Running>, runs: &Mutex<HashMap<String, Arc<Running>>>, run: &str) {
-    lock(&running.stdin).take();
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_millis(500) && lock(runs).contains_key(run) {
+/// Closes its input, gives it 500 ms from now to exit, then ends its job. Nothing here waits on a
+/// write: the input is closed by dropping its sender, and ending the job breaks any write.
+fn stop(running: Arc<Running>, servers: &Servers, run: &str) {
+    let until = Instant::now() + Duration::from_millis(500);
+    lock(&running.input).take();
+    while Instant::now() < until && lock(&servers.state).contains(run) {
         thread::sleep(Duration::from_millis(20));
     }
     running.job.terminate();
@@ -275,21 +350,21 @@ fn stop(running: Arc<Running>, runs: &Mutex<HashMap<String, Arc<Running>>>, run:
 
 #[tauri::command(async)]
 pub fn server_stop(run: String, servers: State<Servers>, shell: State<Shell>) -> Res<()> {
-    let running = lock(&servers.runs).get(&run).cloned().ok_or_else(|| fail("missing", "no such run"))?;
-    stop(running, &servers.runs, &run);
+    let running = lock(&servers.state).get(&run).ok_or_else(|| fail("missing", "no such run"))?;
+    stop(running, &servers, &run);
     shell.log.line(&format!("server run {run} stopped"));
     Ok(())
 }
 
-/// Stops every run of the setup, and removes its approval.
+/// Revokes every start of the setup under way, stops its runs, and removes its approval.
 #[tauri::command(async)]
 pub fn server_forget(setup_id: String, servers: State<Servers>, shell: State<Shell>) -> Res<()> {
     if !setup::valid_id(&setup_id) {
         return Err(fail("invalid", "not a setup id"));
     }
-    let runs: Vec<(String, Arc<Running>)> = lock(&servers.runs).iter().filter(|(_, r)| r.setup == setup_id).map(|(k, r)| (k.clone(), r.clone())).collect();
+    let runs = lock(&servers.state).forget(&setup_id);
     for (run, r) in runs {
-        stop(r, &servers.runs, &run);
+        stop(r, &servers, &run);
     }
     let _g = lock(&servers.store);
     let mut store = load(&shell);
@@ -300,127 +375,94 @@ pub fn server_forget(setup_id: String, servers: State<Servers>, shell: State<She
     Ok(())
 }
 
-/* ---------- the spike's sequence: suspended, in a job, then resumed ---------- */
+/* ---------- children recorded between the spawn and the job ---------- */
 
-#[cfg(windows)]
-use win::{start_suspended, Job};
+/// A child is recorded from its spawn until `start` returns, so one a hard kill left outside any
+/// job can be ended at the next start (see `shell_win::start`).
+struct Records {
+    dir: PathBuf,
+    path: Mutex<Option<PathBuf>>,
+}
 
-#[cfg(windows)]
-mod win {
-    use super::{fail, Res};
-    use std::{ffi::c_void, mem::size_of, os::windows::io::AsRawHandle, os::windows::process::CommandExt, process::Child, process::Command};
-    use windows::{
-        core::PCWSTR,
-        Win32::{
-            Foundation::{CloseHandle, HANDLE},
-            System::{
-                Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32},
-                JobObjects::{
-                    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
-                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                },
-                Threading::{OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME},
-            },
-        },
-    };
+impl Records {
+    fn new(shell: &Shell) -> Records {
+        Records { dir: shell.data_dir.join("shell").join("starting"), path: Mutex::new(None) }
+    }
 
-    /// A job object. When its handle closes (on drop, or when Familiar dies in any way), Windows
-    /// ends every process in it, grandchildren included.
-    pub struct Job(HANDLE);
-
-    // A kernel object handle, usable from any thread.
-    unsafe impl Send for Job {}
-    unsafe impl Sync for Job {}
-
-    impl Job {
-        fn new() -> windows::core::Result<Job> {
-            // No name and default security: the handle isn't inheritable, so no child holds it.
-            let job = Job(unsafe { CreateJobObjectW(None, PCWSTR::null()) }?);
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            // No BREAKAWAY_OK: processes in the job can't leave it.
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-            unsafe {
-                SetInformationJobObject(
-                    job.0,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const c_void,
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            }?;
-            Ok(job)
-        }
-
-        pub fn terminate(&self) {
-            let _ = unsafe { TerminateJobObject(self.0, 1) };
+    fn write(&self, pid: u32) {
+        let Some(created) = os::creation_time(pid) else { return };
+        let path = self.dir.join(format!("{pid}.json"));
+        let body = json!({ "pid": pid, "created": created }).to_string();
+        if std::fs::create_dir_all(&self.dir).is_ok() && temp::write_atomic(&path, body.as_bytes()).is_ok() {
+            *lock(&self.path) = Some(path);
         }
     }
 
-    impl Drop for Job {
-        fn drop(&mut self) {
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    /// Resumes the threads of a process made with CREATE_SUSPENDED. std's Child doesn't give the
-    /// main thread's handle, so they're found in a snapshot. A new suspended process has one.
-    fn resume(pid: u32) -> windows::core::Result<usize> {
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?;
-        let mut resumed = 0;
-        let mut entry = THREADENTRY32 { dwSize: size_of::<THREADENTRY32>() as u32, ..Default::default() };
-        let mut more = unsafe { Thread32First(snap, &mut entry) }.is_ok();
-        while more {
-            if entry.th32OwnerProcessID == pid {
-                if let Ok(t) = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) } {
-                    if unsafe { ResumeThread(t) } != u32::MAX {
-                        resumed += 1;
-                    }
-                    let _ = unsafe { CloseHandle(t) };
-                }
-            }
-            more = unsafe { Thread32Next(snap, &mut entry) }.is_ok();
-        }
-        let _ = unsafe { CloseHandle(snap) };
-        if resumed == 0 {
-            return Err(windows::core::Error::from_thread());
-        }
-        Ok(resumed)
-    }
-
-    /// Starts suspended with no console window, puts the process in a new job, then lets it run.
-    /// If anything after the spawn fails, the suspended process is ended and nothing is left.
-    pub fn start_suspended(mut cmd: Command) -> Res<(Child, Job)> {
-        cmd.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidInput {
-                fail("unsafe-argument", "this setup can't be started safely")
-            } else {
-                fail("start-failed", format!("the program couldn't start: {e}"))
-            }
-        })?;
-        let attach = || -> windows::core::Result<Job> {
-            let job = Job::new()?;
-            unsafe { AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle())) }?;
-            resume(child.id())?;
-            Ok(job)
-        };
-        match attach() {
-            Ok(job) => Ok((child, job)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(fail("start-failed", format!("the server's job couldn't be made: {e}")))
-            }
+    fn remove(&self) {
+        if let Some(p) = lock(&self.path).take() {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
 
-#[cfg(not(windows))]
-use other::{start_suspended, Job};
+/// At each start: ends any child a hard kill left between its spawn and its job, then forgets the
+/// records.
+pub fn sweep(shell: &Shell) {
+    let dir = shell.data_dir.join("shell").join("starting");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let mut records = Vec::new();
+    for e in entries.flatten() {
+        let v: Option<Value> = std::fs::read(e.path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some((pid, created)) = v.and_then(|v| Some((v.get("pid")?.as_u64()? as u32, v.get("created")?.as_u64()?))) {
+            records.push((pid, created));
+        }
+        let _ = std::fs::remove_file(e.path());
+    }
+    if !records.is_empty() {
+        let ended = os::sweep(&records);
+        shell.log.line(&format!("servers: {} start records left by a hard kill, {ended} children ended", records.len()));
+    }
+}
+
+/* ---------- the OS side, shell-win's start sequence ---------- */
+
+#[cfg(windows)]
+mod os {
+    use super::{fail, Fail, Res};
+    use shell_win::start::{self, RealOs, StartError};
+    use std::{
+        process::{Child, Command},
+        sync::Arc,
+    };
+
+    pub use shell_win::start::Job;
+
+    pub fn start(cmd: Command, spawned: impl FnOnce(u32), before_resume: impl FnOnce(&Arc<Job>) -> Result<(), Fail>) -> Res<Child> {
+        match start::start(&RealOs, cmd, |c| spawned(c.id()), before_resume) {
+            Ok((child, _job)) => Ok(child),
+            Err(StartError::InvalidInput) => Err(fail("unsafe-argument", "this setup can't be started safely")),
+            Err(StartError::Spawn(e)) => Err(fail("start-failed", format!("the program couldn't start: {e}"))),
+            Err(StartError::Stage(stage, e)) => Err(fail("start-failed", format!("the server's {stage} step failed: {e}"))),
+            Err(StartError::Refused(f)) => Err(f),
+        }
+    }
+
+    pub fn creation_time(pid: u32) -> Option<u64> {
+        start::creation_time(pid)
+    }
+
+    pub fn sweep(records: &[(u32, u64)]) -> usize {
+        start::sweep(records)
+    }
+}
 
 #[cfg(not(windows))]
-mod other {
-    use super::{fail, Res};
-    use std::process::{Child, Command};
+mod os {
+    use super::{fail, Fail, Res};
+    use std::{
+        process::{Child, Command},
+        sync::Arc,
+    };
 
     pub struct Job;
 
@@ -428,7 +470,15 @@ mod other {
         pub fn terminate(&self) {}
     }
 
-    pub fn start_suspended(_: Command) -> Res<(Child, Job)> {
+    pub fn start(_: Command, _: impl FnOnce(u32), _: impl FnOnce(&Arc<Job>) -> Result<(), Fail>) -> Res<Child> {
         Err(fail("start-failed", "servers start on Windows only"))
+    }
+
+    pub fn creation_time(_: u32) -> Option<u64> {
+        None
+    }
+
+    pub fn sweep(_: &[(u32, u64)]) -> usize {
+        0
     }
 }
