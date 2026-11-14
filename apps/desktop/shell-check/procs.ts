@@ -531,13 +531,18 @@ async function forgetRace() {
       const look = await step<{ found: boolean }>('dialog', { act: 'none', approve: START[0], refuse: START[1] }, 60000);
       if (look.found) await step('dialog', { act: 'approve', approve: START[0], refuse: START[1] }, 60000);
       const st = await startP;
-      seen[look.found ? 'asked' : st] = (seen[look.found ? 'asked' : st] ?? 0) + 1;
+      const how = look.found ? `asked then ${st}` : st;
+      seen[how] = (seen[how] ?? 0) + 1;
       // The run from before the forget is gone.
       ok(await before.exited(5000).then(() => true, () => false), `round ${i}: the run from before the forget outlived it`);
-      if (look.found) {
-        ok(st === 'started', `round ${i}: the start that asked: ${st}`);
+      if (look.found && st === 'started') {
+        // It came after the forget, and asked.
         asked++;
         current = racer;
+      } else if (look.found) {
+        // It came before the forget, and its ask outlived it: revoked, never started.
+        ok(st === 'revoked', `round ${i}: a start from before the forget that asked: ${st}`);
+        current = null;
       } else {
         ok(['busy', 'revoked', 'started'].includes(st), `round ${i}: the racing start: ${st}`);
         // One that started before the forget reached the actor was stopped by it.
