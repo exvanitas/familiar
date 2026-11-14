@@ -365,8 +365,21 @@ async function wake(messages: CoreMessage[]) {
     const at = Date.now() + 10 * 60 * 1000;
     await shell.wakeAt(Date.now() + 3_600_000);
     await shell.wakeAt(at);
-    const got = await until(() => messages.find(m => m.t === 'wake'), 11 * 60 * 1000, 'the wake') as { at: number; now: number };
-    const late = Date.now() - at;
+    // A hidden page's timers are throttled to about once a minute, so the wake is caught as its
+    // message arrives, not by polling.
+    let arrived = 0;
+    const heard = new Promise<void>(done => {
+      const push = messages.push.bind(messages);
+      messages.push = (...m: CoreMessage[]) => {
+        const n = push(...m);
+        if (m.some(x => x.t === 'wake')) { arrived = Date.now(); done(); }
+        return n;
+      };
+    });
+    const timedOut = await Promise.race([heard.then(() => false), sleep(11 * 60 * 1000).then(() => true)]);
+    ok(!timedOut, 'no wake within 11 minutes');
+    const got = messages.find(m => m.t === 'wake') as { at: number; now: number };
+    const late = arrived - at;
     ok(got.at === at, 'the wake was for another deadline');
     ok(got.now - at < 1000 && late < 1500, `the wake came ${got.now - at} ms late by the exe, ${late} ms by the page`);
     const twice = messages.filter(m => m.t === 'wake').length;
