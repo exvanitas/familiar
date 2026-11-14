@@ -31,6 +31,24 @@ public static class WN {
   public static bool Topmost(long h) { return (GetLong(new IntPtr(h), -20).ToInt64() & 0x8) != 0; }
   public static bool Enabled(long h) { return IsWindowEnabled(new IntPtr(h)); }
   public static string TitleOf(long h) { return Text(new IntPtr(h)); }
+  [DllImport("user32")] static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32")] static extern int GetMenuItemCount(IntPtr m);
+  [DllImport("user32")] static extern uint GetMenuItemID(IntPtr m, int i);
+  [DllImport("user32", CharSet=CharSet.Unicode)] static extern int GetMenuStringW(IntPtr m, uint item, StringBuilder s, int n, uint flags);
+  /* The texts of an open popup menu's items, and the command id of the one whose text (access
+     keys aside) is `want`, or -1. */
+  public static long MenuItem(long menuWnd, string want, out string seen) {
+    var hm = SendMessageW(new IntPtr(menuWnd), 0x01E1, IntPtr.Zero, IntPtr.Zero); /* MN_GETHMENU */
+    var names = new System.Collections.Generic.List<string>(); long found = -1;
+    int n = hm == IntPtr.Zero ? 0 : GetMenuItemCount(hm);
+    for (int i = 0; i < n; i++) {
+      var sb = new StringBuilder(256); GetMenuStringW(hm, (uint)i, sb, 256, 0x400); /* MF_BYPOSITION */
+      var t = sb.ToString().Replace("&", ""); names.Add(t);
+      if (t == want) found = GetMenuItemID(hm, i);
+    }
+    seen = string.Join(", ", names);
+    return found;
+  }
   [DllImport("user32")] static extern IntPtr SendMessageTimeoutW(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint ms, out IntPtr r);
   /* whether the window's thread answers within 2 s */
   public static bool Responds(long h) { IntPtr r; return SendMessageTimeoutW(new IntPtr(h), 0, IntPtr.Zero, IntPtr.Zero, 2, 2000, out r) != IntPtr.Zero; }
@@ -299,16 +317,18 @@ function Do-NetStep($action, $a) {
       for ($i = 0; $i -lt 50 -and -not $menu; $i++) { Start-Sleep -Milliseconds 100; $menu = [WN]::Shown([uint32]$script:proc.Id, '#32768') }
       if (-not $menu) { return @{ done = $false; how = 'no menu appeared' } }
       Start-Sleep -Milliseconds 300
-      $el = $UIA::FromHandle([IntPtr]$menu)
-      $items = @($el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition))
-      $item = $items | Where-Object { ($_.Current.Name -replace '&', '') -eq 'Let Familiar ask again' } | Select-Object -First 1
-      $how = ''
-      try { if ($item -and (Invoke-El $item)) { $how = 'picked from the tray menu through UI Automation' } } catch { }
-      if (-not $how) {
-        # Its access key, from the keyboard, as a person could.
-        [System.Windows.Forms.SendKeys]::SendWait('a')
-        $how = "its access key (UI Automation saw: $(($items | ForEach-Object { $_.Current.Name }) -join ', '))"
+      # The item's command id, read from the open menu, sent to the tray's window as the menu
+      # itself sends it when the item is picked; then the menu is closed.
+      $seen = ''
+      $id = [WN]::MenuItem($menu, 'Let Familiar ask again', [ref]$seen)
+      if ($id -lt 0) {
+        [void][W]::Post($h, 0x1F, 0, 0)
+        return @{ done = $false; how = "the menu has no such item: $seen" }
       }
+      [void][W]::Post($h, 0x111, $id, 0)
+      Start-Sleep -Milliseconds 200
+      [void][W]::Post($h, 0x1F, 0, 0)
+      $how = "picked from the tray menu ($seen) by its command"
       Start-Sleep -Milliseconds 500
       return @{ done = -not [WN]::Shown([uint32]$script:proc.Id, '#32768'); how = $how }
     }
