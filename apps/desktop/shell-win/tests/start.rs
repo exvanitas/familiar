@@ -142,3 +142,11 @@ fn the_sweep_ends_a_child_left_outside_a_job_and_nothing_else() {
     drop(watch);
     assert_eq!(sweep_one(pid, created), Swept::Gone, "once ended, gone");
 }
+
+#[test]
+fn the_sweep_keeps_a_record_it_cant_prove_gone() {
+    // The System process (id 4) can't be opened by a user: access denied proves nothing about a
+    // child of ours, so the record is kept, whatever its creation time.
+    assert_eq!(sweep_one(4, 0), Swept::Failed, "access denied is not gone");
+    assert_eq!(sweep_one(4, u64::MAX), Swept::Failed, "nor with any creation time");
+}

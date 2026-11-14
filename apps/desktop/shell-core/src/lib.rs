@@ -29,3 +29,4 @@ pub mod system;
 pub mod approvals;
 pub mod files;
 pub mod actor;
+pub mod records;

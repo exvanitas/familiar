@@ -20,7 +20,7 @@ use std::{
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0},
         System::{
             Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32},
             JobObjects::{
@@ -188,9 +188,12 @@ pub fn creation_time(pid: u32) -> Option<u64> {
 pub enum Swept {
     /// It was still the recorded child, and it's ended.
     Ended,
-    /// It's gone, or its id now belongs to another process, which is left alone.
+    /// Proven gone: no process has its id (`OpenProcess` says `ERROR_INVALID_PARAMETER`), or the
+    /// id now belongs to a process made at another time, which is left alone.
     Gone,
-    /// It's there and couldn't be ended: keep the record and try again at the next start.
+    /// Anything else: it couldn't be opened for another reason (access denied, say), its creation
+    /// time couldn't be read, or it's there and couldn't be ended. Keep the record and try again
+    /// at the next start.
     Failed,
 }
 
@@ -199,8 +202,10 @@ pub enum Swept {
 pub fn sweep_one(pid: u32, created: u64) -> Swept {
     let h = match unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) } {
         Ok(h) => h,
-        // No such process. (Access denied would mean another user's, so not our child either.)
-        Err(_) => return Swept::Gone,
+        // Only "no such process" proves it gone. Access denied or any other failure proves
+        // nothing about our child, so the record stays.
+        Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Swept::Gone,
+        Err(_) => return Swept::Failed,
     };
     let r = match times(h) {
         Some(t) if t == created => {
