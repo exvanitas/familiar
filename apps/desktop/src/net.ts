@@ -54,7 +54,12 @@ export function guardedFetch(address: string, opts: GuardedOptions = {}, shell: 
     const headers: [string, string][] = [...new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)).entries()];
     let head: NetHead;
     try {
-      const body = await bodyBytes(init.body ?? null);
+      // Raced against the abort: a body stream that never finishes can't hold the fetch open.
+      const body = await new Promise<Uint8Array>((resolve, reject) => {
+        rejectHead = reject;
+        bodyBytes(init.body ?? null).then(resolve, reject);
+      });
+      rejectHead = undefined;
       // Checked again right before the exe is asked: an abort during the body's preparation stops
       // it here.
       if (signal?.aborted) throw abort();

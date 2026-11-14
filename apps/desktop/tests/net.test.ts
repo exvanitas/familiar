@@ -80,6 +80,18 @@ describe('guardedFetch', () => {
     expect(f.calls).toEqual([]);
   });
 
+  it('an abort while an upload stream is still unfinished rejects at once, and never reaches the exe', async () => {
+    const f = fakeShell({});
+    const c = new AbortController();
+    // A body that sends one chunk and then never ends.
+    const body = new ReadableStream<Uint8Array>({ start(ctl) { ctl.enqueue(new Uint8Array([1, 2, 3])); } });
+    const p = guardedFetch('a', {}, f.shell)('https://x.example', { method: 'POST', body, signal: c.signal, duplex: 'half' } as RequestInit);
+    setTimeout(() => c.abort(), 50);
+    const result = await Promise.race([p.then(() => 'answered', e => e.name), new Promise(res => setTimeout(() => res('hung'), 1000))]);
+    expect(result).toBe('AbortError');
+    expect(f.calls).toEqual([]);
+  });
+
   it('a read after an abort errors with AbortError, and never hangs', async () => {
     const f = fakeShell({ chunks: [text('a'), text('b')] });
     const c = new AbortController();
