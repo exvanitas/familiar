@@ -44,6 +44,8 @@
     "fetch.proxy-cold",
     "fetch.cancel-race",
     "key.remove-failed",
+    "key.remove-restart",
+    "exec.responsive",
     "fetch.revoke",
     "server.approve",
     "server.reask",

@@ -48,7 +48,7 @@ describe('the gate', () => {
     const chk = JSON.parse(readFileSync(new URL('../shell-check/checks.json', import.meta.url), 'utf8')).ids as string[];
     expect(new Set(inv).size).toBe(inv.length);
     expect(new Set(chk).size).toBe(chk.length);
-    expect(inv.length).toBe(66);
+    expect(inv.length).toBe(68);
     for (const id of [...inv, ...chk]) expect(id).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$|^[a-z0-9-]+$/);
   });
 });
@@ -247,7 +247,7 @@ describe('DNS over TCP and the check\'s DNS server', () => {
     return Buffer.concat([Buffer.from([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]), ...labels, tail]);
   };
   const framed = (name: string) => { const m = query(name); return Buffer.concat([Buffer.from([m.length >> 8, m.length & 0xff]), m]); };
-  const SYN = 0x02, FIN = 0x01, ACK = 0x10;
+  const SYN = 0x02, FIN = 0x01, RST = 0x04, ACK = 0x10;
   /* A segment of `stream` from byte `from` to `to`, on a connection whose SYN had `isn`. */
   const seg = (stream: Buffer, isn: number, from: number, to: number, at: number, flags = ACK, sport = 5000) =>
     ({ proto: 'tcp', src: 'a', dst: 'b', sport, dport: 53, names: [], seq: (isn + 1 + from) >>> 0, flags, payload: stream.subarray(from, to), at });
@@ -269,6 +269,28 @@ describe('DNS over TCP and the check\'s DNS server', () => {
     other[12] ^= 0xff;
     expect(reassembleDns([syn(7, 0), seg(stream, 7, 0, stream.length, 1), seg(other, 7, 0, 20, 2)])[0].incomplete).toMatch(/differ/);
   });
+  it('a missing tail is incomplete, though what was captured ends on a message boundary', () => {
+    const benign = framed('benign.familiar-check.test'), hidden = framed('hidden.familiar-check.test');
+    const stream = Buffer.concat([benign, hidden]);
+    // SYN, the first message whole, the second lost, then a FIN whose sequence is past it.
+    const fin = { ...seg(stream, 7, stream.length, stream.length, 3), flags: FIN | ACK };
+    const got = reassembleDns([syn(7, 0), seg(stream, 7, 0, benign.length, 1), fin]);
+    expect(got[0].names).toEqual(['benign.familiar-check.test']);
+    expect(got[0].incomplete).toMatch(new RegExp(`bytes missing before the end at byte ${stream.length}, ${hidden.length} of them`));
+    // The same, known from the server's ACK instead of a FIN.
+    const ackBack = { proto: 'tcp', src: 'b', dst: 'a', sport: 53, dport: 5000, names: [], seq: 1, ack: (7 + 1 + stream.length) >>> 0, flags: ACK, payload: Buffer.alloc(0), at: 4 };
+    expect(reassembleDns([syn(7, 0), seg(stream, 7, 0, benign.length, 1), ackBack])[0].incomplete).toMatch(/bytes missing before the end/);
+    // An RST past the captured bytes says the same.
+    const rst = { ...seg(stream, 7, stream.length, stream.length, 3), flags: RST };
+    expect(reassembleDns([syn(7, 0), seg(stream, 7, 0, benign.length, 1), rst])[0].incomplete).toMatch(/bytes missing before the end/);
+    // A FIN acked by the other side, with everything captured, is whole.
+    const finAck = { ...ackBack, ack: (7 + 1 + stream.length + 1) >>> 0 };
+    const whole = reassembleDns([syn(7, 0), seg(stream, 7, 0, stream.length, 1), fin, finAck]);
+    expect(whole[0].incomplete).toBeUndefined();
+    // A connection whose every data segment was lost is incomplete too.
+    expect(reassembleDns([syn(7, 0), fin])[0].incomplete).toMatch(/bytes missing/);
+  });
+
   it('two connections on one reused tuple stay apart', () => {
     const one = framed('first.familiar-check.test'), two = framed('second.familiar-check.test');
     const got = reassembleDns([syn(100, 0), seg(one, 100, 0, one.length, 1), { ...seg(one, 100, one.length, one.length, 2), flags: FIN | ACK }, syn(900000, 3), seg(two, 900000, 0, two.length, 4)]);
