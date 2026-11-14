@@ -381,6 +381,34 @@ async function filesAndLinks(info: Info) {
 
 }
 
+/* In a run of its own, so the refusals are counted from none: after three, an approved setup
+   still starts, and a changed one is asks-stopped with no dialog. */
+async function stoppedAsks() {
+  const p = await step<Paths>('proc-paths', {}, 120000);
+  await check('security.server.stopped-asks', async () => {
+    const a = fakeSetup(p, 'fake-st');
+    const changed = (n: number): Setup => ({ ...a, env: [['CHECK_SETTING', `changed-${n}`]] });
+    const m = new Mcp();
+    const r = await startWith(m, a, 'yes');
+    ok(r.started === 'started', 'the first start: ' + r.started);
+    await shell.serverStop(m.run);
+    await m.exited(5000);
+    for (const n of [1, 2, 3]) {
+      const rn = await startWith(new Mcp(), changed(n), 'no');
+      ok(rn.dialog.shown && rn.started === 'declined', `refusal ${n}: dialog ${rn.dialog.shown}, ${rn.started}`);
+    }
+    const again = new Mcp();
+    const r2 = await startWith(again, a, 'none');
+    ok(!r2.dialog.shown && r2.started === 'started', `the approved setup after three refusals: dialog ${r2.dialog.shown}, ${r2.started}`);
+    const name = await again.initialize();
+    await shell.serverStop(again.run);
+    await again.exited(5000);
+    const r3 = await startWith(new Mcp(), changed(4), 'none');
+    ok(!r3.dialog.shown && r3.started === 'asks-stopped', `a changed setup after three refusals: dialog ${r3.dialog.shown}, ${r3.started}`);
+    return `after three refusals the approved setup started with no dialog (${name}), and a changed one was asks-stopped with no dialog`;
+  });
+}
+
 async function recover(info: Info) {
   const p = await step<Paths>('proc-paths', {}, 120000);
   await check('security.server.store-recovery', async () => {
@@ -445,6 +473,7 @@ export async function procPhase(phase: string, info: Info, messages: CoreMessage
   if (phase === 'proc-main') await main(info, ctx);
   else if (phase === 'proc-files') await filesAndLinks(info);
   else if (phase === 'proc-recover') await recover(info);
+  else if (phase === 'proc-stopped') await stoppedAsks();
   else if (phase === 'proc-kill') await kill();
   else if (phase === 'proc-wake') await wake(messages);
 }

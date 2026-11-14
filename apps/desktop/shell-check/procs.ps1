@@ -309,6 +309,10 @@ function Run-ProcChecks {
     [void](Run-Phase 'proc-recover' $log @('--app-dir', $App, '--data-dir', $data, '--log', $log, '--seconds', '120', '--phase', 'proc-recover') 150)
     [void](No-Strays 'proc-recover')
 
+    $log = Join-Path $Out 'proc-stopped.log'
+    [void](Run-Phase 'proc-stopped' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-stopped-data'), '--log', $log, '--seconds', '240', '--phase', 'proc-stopped') 270)
+    [void](No-Strays 'proc-stopped')
+
     $log = Join-Path $Out 'proc-kill.log'
     [void](Run-Phase 'proc-kill' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-kill-data'), '--log', $log, '--seconds', '180', '--phase', 'proc-kill') 210)
     if (-not ($results | Where-Object { $_ -like '* security.server.kill *' })) { Result 'FAIL' 'security.server.kill' 'the kill never happened' }

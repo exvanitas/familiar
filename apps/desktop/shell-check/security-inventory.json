@@ -52,6 +52,7 @@
     "server.blank",
     "server.start-failed",
     "server.store-recovery",
+    "server.stopped-asks",
     "server.kill",
     "link.confirm",
     "files.save-refused"

@@ -47,7 +47,7 @@ describe('the gate', () => {
     const chk = JSON.parse(readFileSync(new URL('../shell-check/checks.json', import.meta.url), 'utf8')).ids as string[];
     expect(new Set(inv).size).toBe(inv.length);
     expect(new Set(chk).size).toBe(chk.length);
-    expect(inv.length).toBe(54);
+    expect(inv.length).toBe(55);
     for (const id of [...inv, ...chk]) expect(id).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$|^[a-z0-9-]+$/);
   });
 });
