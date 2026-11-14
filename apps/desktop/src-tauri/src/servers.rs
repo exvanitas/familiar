@@ -134,10 +134,10 @@ fn run_id() -> String {
 
 #[tauri::command(async)]
 pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel: Channel<Value>, shell: State<Shell>, servers: State<Servers>) -> Res<Started> {
+    // The syntax, then the walk (local only, it can't make network traffic), then the form. An
+    // approved form starts with no confirm state involved: the stop and a dialog that's open are
+    // about asking, and starting a server opens no window. Only a new or changed form reserves.
     setup::check(&setup).map_err(|e| fail(e.kind(), "the setup was refused"))?;
-    // The confirm state first, so a busy or stopped confirm refuses before the walk touches the
-    // disk. Dropped unused, for a setup approved before, it frees the state with no refusal.
-    let ticket = confirm::reserve(&app).map_err(|e| fail(e.kind(), "the confirm can't ask now"))?;
     let launch = walk(&setup.program, &setup.cwd)?;
     let form = Canonical::new(&setup, &launch);
     if lock(&servers.runs).len() >= setup::MAX_RUNNING {
@@ -148,9 +148,12 @@ pub fn server_start(app: AppHandle, setup: Setup, owner: Option<String>, channel
         load(&shell).approved(&setup.id, &form)
     };
     if approved {
-        drop(ticket);
         shell.log.line(&format!("server {}: approved before, no dialog", setup.id));
     } else {
+        let ticket = confirm::reserve(&app).map_err(|e| {
+            shell.log.line(&format!("server {}: {}", setup.id, e.kind()));
+            fail(e.kind(), "the confirm can't ask now")
+        })?;
         shell.log.line(&format!("server {}: asking", setup.id));
         // What runs is `form`, this copy made before asking: nothing a page sends meanwhile
         // changes it.
