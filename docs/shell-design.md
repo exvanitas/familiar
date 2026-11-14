@@ -206,7 +206,8 @@ A view can't open or touch other windows, fetch, start servers, open links, use 
 default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';
 img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:;
 connect-src 'self' ipc: http://ipc.localhost; worker-src blob:;
-frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'
+frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';
+webrtc 'block'
 ```
 
 - No inline script and no `eval`, so `javascript:` links and injected handlers don't run.

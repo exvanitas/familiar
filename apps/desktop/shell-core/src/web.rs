@@ -3,7 +3,7 @@
 //! strings from this file and compares them with `tauri.conf.json` and the design.
 
 /// The CSP, also in `tauri.conf.json` as `app.security.csp`, which is what Tauri sends.
-pub const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; worker-src blob:; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+pub const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; worker-src blob:; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; webrtc 'block'";
 
 /// Every window's browser arguments, with `{sink}` for the sink proxy's port. WebView2 windows that
 /// share a data folder must share these, so one helper builds every window.
@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn the_csp_closes_the_network_and_frames() {
-        for d in ["connect-src 'self' ipc: http://ipc.localhost;", "worker-src blob:;", "frame-src 'none'", "form-action 'none'", "object-src 'none'"] {
+        for d in ["connect-src 'self' ipc: http://ipc.localhost;", "worker-src blob:;", "frame-src 'none'", "form-action 'none'", "object-src 'none'", "webrtc 'block'"] {
             assert!(CSP.contains(d), "{d}");
         }
         assert!(!CSP.contains("unsafe-eval'") || CSP.contains("'wasm-unsafe-eval'"));

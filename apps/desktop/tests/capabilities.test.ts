@@ -33,7 +33,7 @@ function designBlock(after: string): string {
   return design.slice(open + 4, close).trim().split('\n').map(l => l.trim()).join(' ');
 }
 
-const PINNED_CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; worker-src blob:; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+const PINNED_CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; worker-src blob:; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; webrtc 'block'";
 const PINNED_ARGS = '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --proxy-server=http://127.0.0.1:<sink> --proxy-bypass-list=<-loopback> --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable';
 
 /* What each capability may ever hold, from the design. A round grants a subset: only commands that
@@ -137,11 +137,24 @@ describe('the web surface', () => {
     expect(builders.map(([f]) => f)).toEqual(['pages.rs']);
     const pages = read('src-tauri/src/pages.rs');
     expect(pages.match(/WebviewWindowBuilder::new\(/g)?.length).toBe(1);
-    for (const pin of ['.data_directory(', '.use_https_scheme(false)', '.disable_drag_drop_handler()', '.additional_browser_args(&web::browser_args(', '.on_navigation(', '.on_new_window(', '.on_permission_request(', '.general_autofill_enabled(false)']) {
+    for (const pin of ['.initialization_script_for_all_frames(NO_WEBRTC)', '.data_directory(', '.use_https_scheme(false)', '.disable_drag_drop_handler()', '.additional_browser_args(&web::browser_args(', '.on_navigation(', '.on_new_window(', '.on_permission_request(', '.general_autofill_enabled(false)']) {
       expect(pages, pin).toContain(pin);
     }
     expect(read('src-tauri/src/platform.rs')).toMatch(/SetIsPasswordAutosaveEnabled\(false\)/);
-    expect(read('src-tauri/src/platform.rs')).toMatch(/COREWEBVIEW2_PERMISSION_STATE_DENY/);
+    const platform = read('src-tauri/src/platform.rs');
+    expect(platform).toMatch(/COREWEBVIEW2_PERMISSION_STATE_DENY/);
+    // Persistent storage, kind 13, is the one kind allowed.
+    expect(platform).toContain('const PERSISTENT_STORAGE: i32 = 13;');
+    expect(platform).toContain('let allow = kind.0 == PERSISTENT_STORAGE;');
+    expect(platform.match(/COREWEBVIEW2_PERMISSION_STATE_ALLOW/g)?.length).toBe(2);
+  });
+
+  it('every frame loses WebRTC before page script runs', () => {
+    const script = read('src-tauri/src/no-webrtc.js');
+    expect(read('src-tauri/src/pages.rs')).toContain('include_str!("no-webrtc.js")');
+    for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'RTCIceCandidate', 'RTCSessionDescription', 'RTCRtpSender', 'RTCRtpReceiver', 'RTCRtpTransceiver', 'RTCIceTransport', 'RTCDtlsTransport', 'RTCSctpTransport', 'RTCCertificate']) {
+      expect(script, name).toContain(`'${name}'`);
+    }
   });
 
   it('the exe never emits a Tauri event', () => {

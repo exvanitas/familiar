@@ -11,6 +11,9 @@ use tauri::{
     AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
 };
 
+/// Takes WebRTC's interfaces off every frame's global before page script runs.
+const NO_WEBRTC: &str = include_str!("no-webrtc.js");
+
 fn window<'a>(app: &'a AppHandle, label: &str, page: &str) -> WebviewWindowBuilder<'a, Wry, AppHandle> {
     let shell = app.state::<Shell>();
     let (bound, nav_log, new_log) = (page.to_string(), shell.log.clone(), shell.log.clone());
@@ -23,6 +26,7 @@ fn window<'a>(app: &'a AppHandle, label: &str, page: &str) -> WebviewWindowBuild
         .additional_browser_args(&web::browser_args(shell.sink_port))
         .devtools(shell.devtools)
         .general_autofill_enabled(false)
+        .initialization_script_for_all_frames(NO_WEBRTC)
         .on_navigation(move |url| {
             let stays = nav::stays(&bound, url.scheme(), url.host_str(), url.port(), url.path(), url.query());
             if !stays {

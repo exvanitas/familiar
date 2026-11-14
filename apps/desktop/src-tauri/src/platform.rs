@@ -14,7 +14,8 @@ mod win {
     use super::*;
     use webview2_com::{
         Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2Settings4, COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_STATE_DENY,
+            ICoreWebView2Settings4, COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+            COREWEBVIEW2_PERMISSION_STATE_DENY,
         },
         PermissionRequestedEventHandler,
     };
@@ -22,6 +23,11 @@ mod win {
         core::{Interface, HSTRING},
         Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND},
     };
+
+    /// The kind `navigator.storage.persist()` raises. The SDK in webview2-com 0.39 has no name for
+    /// it; the runner showed it arrives with every `persist()` call. A grant gives a page no data
+    /// and no reach, and it keeps WebView2 from evicting Familiar's IndexedDB.
+    const PERSISTENT_STORAGE: i32 = 13;
 
     pub fn message_box(title: &str, text: &str) {
         unsafe { MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(title), MB_OK | MB_ICONERROR | MB_SETFOREGROUND) };
@@ -41,13 +47,14 @@ mod win {
             10 => "local-fonts",
             11 => "midi-sysex",
             12 => "window-management",
+            PERSISTENT_STORAGE => "persistent-storage",
             _ => "other",
         }
     }
 
-    /// Denies every web permission, whatever the kind, including kinds added later, and turns off
-    /// general autofill and password saving. Registered after Tauri's own handler, so it answers
-    /// last. Logs the kind only.
+    /// Denies every web permission, whatever the kind, including kinds added later, except
+    /// persistent storage, which it allows. Turns off general autofill and password saving.
+    /// Registered after Tauri's own handler, so it answers last. Logs the kind only.
     pub fn harden_webview(pw: &tauri::webview::PlatformWebview, label: &str, log: Arc<Log>) -> windows::core::Result<()> {
         let label = label.to_string();
         unsafe {
@@ -58,8 +65,10 @@ mod win {
                     let Some(args) = args else { return Ok(()) };
                     let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
                     args.PermissionKind(&mut kind)?;
-                    args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
-                    log.line(&format!("permission denied in {label}: {} ({})", kind_name(kind), kind.0));
+                    let allow = kind.0 == PERSISTENT_STORAGE;
+                    args.SetState(if allow { COREWEBVIEW2_PERMISSION_STATE_ALLOW } else { COREWEBVIEW2_PERMISSION_STATE_DENY })?;
+                    let said = if allow { "allowed" } else { "denied" };
+                    log.line(&format!("permission {said} in {label}: {} ({})", kind_name(kind), kind.0));
                     Ok(())
                 })),
                 &mut token,
