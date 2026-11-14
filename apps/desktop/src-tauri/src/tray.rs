@@ -12,6 +12,33 @@ use tauri::{
 };
 
 const ID: &str = "main";
+/// The exe's own item, shown only while three refusals have stopped the confirms.
+pub const ASK_AGAIN_ID: &str = "shell:ask-again";
+const ASK_AGAIN_LABEL: &str = "Let Familiar ask again";
+
+/// The app's last menu, so the exe can rebuild the tray when its own items change.
+static APP_ITEMS: std::sync::Mutex<Vec<Item>> = std::sync::Mutex::new(Vec::new());
+
+/// The menu as shown: the app's items, then the exe's: "Let Familiar ask again" while asking is
+/// stopped, and Quit last.
+fn full_menu(app: &AppHandle, items: Vec<Item>) -> Result<Vec<Item>, String> {
+    let mut out = menu::with_quit(items)?;
+    if crate::confirm::stopped(app) {
+        let quit = out.pop();
+        out.push(Item { id: ASK_AGAIN_ID.into(), label: ASK_AGAIN_LABEL.into(), ..Item::default() });
+        out.extend(quit);
+    }
+    Ok(out)
+}
+
+/// Rebuilds the tray menu, after the exe's own items changed.
+pub fn refresh(app: &AppHandle) {
+    let items = crate::shell::lock(&APP_ITEMS).clone();
+    let Ok(items) = full_menu(app, items) else { return };
+    if let (Some(tray), Ok(m)) = (app.tray_by_id(ID), build_menu(app, &items)) {
+        let _ = tray.set_menu(Some(m));
+    }
+}
 
 /// A menu item as a page sends it.
 #[derive(Deserialize, Default)]
@@ -73,6 +100,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     tray.on_menu_event(|app, e| {
         if e.id().as_ref() == QUIT_ID {
             shell::quit(app, "tray");
+        } else if e.id().as_ref() == ASK_AGAIN_ID {
+            crate::confirm::reenable(app);
         } else {
             app.state::<Shell>().tell_core(serde_json::json!({ "t": "tray", "id": e.id().as_ref() }));
         }
@@ -95,7 +124,9 @@ fn app_image(app: &AppHandle, file: &str) -> Result<Image<'static>, String> {
 }
 
 pub fn set(app: &AppHandle, spec: TraySpec) -> Result<(), String> {
-    let items = menu::with_quit(spec.items.into_iter().map(Item::from).collect())?;
+    let app_items: Vec<Item> = spec.items.into_iter().map(Item::from).collect();
+    let items = full_menu(app, app_items.clone())?;
+    *crate::shell::lock(&APP_ITEMS) = app_items;
     let tray = app.tray_by_id(ID).ok_or("no tray")?;
     if let Some(file) = spec.icon {
         tray.set_icon(Some(app_image(app, &file)?)).map_err(|e| e.to_string())?;

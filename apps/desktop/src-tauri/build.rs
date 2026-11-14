@@ -14,6 +14,9 @@ const COMMANDS: &[&str] = &[
     "view_open",
     "window_ctl",
     "window_self",
+    "address_list",
+    "address_add",
+    "address_remove",
 ];
 
 fn main() {

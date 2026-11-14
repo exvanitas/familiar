@@ -94,6 +94,9 @@ fn tray_set(app: AppHandle, spec: TraySpec) -> Res<()> {
 
 #[tauri::command(async)]
 fn view_open(app: AppHandle, spec: ViewSpec) -> Res<()> {
+    if crate::confirm::busy(&app) {
+        return Err(fail("busy", "a confirm is open"));
+    }
     pages::open(&app, spec).map_err(|e| fail("refused", e))
 }
 
@@ -109,6 +112,9 @@ pub struct Bounds {
 /// Show, hide, focus, close, and get or set bounds, on Settings or a view. Never core.
 #[tauri::command(async)]
 fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>) -> Res<Option<Bounds>> {
+    if crate::confirm::busy(&app) {
+        return Err(fail("busy", "a confirm is open"));
+    }
     views::ctl_target(&label).map_err(|e| fail("refused", e))?;
     let op = CtlOp::parse(&op).ok_or_else(|| fail("invalid", "unknown op"))?;
     let w = app.get_webview_window(&label).ok_or_else(|| fail("missing", "no such window"))?;
@@ -146,6 +152,9 @@ fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>)
 /// read from the request, never from what the page sent.
 #[tauri::command(async)]
 fn window_self(window: WebviewWindow, op: String) -> Res<()> {
+    if crate::confirm::busy(window.app_handle()) {
+        return Err(fail("busy", "a confirm is open"));
+    }
     if window.label() == views::CORE {
         return Err(fail("refused", "core has no window to act on"));
     }
@@ -166,5 +175,18 @@ fn window_self(window: WebviewWindow, op: String) -> Res<()> {
 }
 
 pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![shell_info, shell_ready, log_line, quit, quit_ready, tray_set, view_open, window_ctl, window_self]
+    tauri::generate_handler![
+        shell_info,
+        shell_ready,
+        log_line,
+        quit,
+        quit_ready,
+        tray_set,
+        view_open,
+        window_ctl,
+        window_self,
+        crate::addresses::address_list,
+        crate::addresses::address_add,
+        crate::addresses::address_remove,
+    ]
 }
