@@ -1,5 +1,5 @@
 //! System state and the native deadline: `system()`, a `system` message to core when the user
-//! state changes (looked at every 5 s) and on resume after sleep (`WM_POWERBROADCAST`), and
+//! state changes (looked at every 5 s) and on resume after sleep (a power notification), and
 //! `wake_at`, one pending deadline that fires within a second, also late after a resume. The rules
 //! are shell-core's `system`. See "5d. The rest" and "6." in docs/shell-design.md.
 
@@ -59,7 +59,8 @@ pub fn start(app: &AppHandle) {
         }
     });
     let a = app.clone();
-    os::on_resume(move || {
+    let log = app.state::<Shell>().log.clone();
+    os::on_resume(log, move || {
         let now = os::read();
         tell(&a, json!({ "t": "system", "resumed": true, "userState": now.user_state, "idleMs": now.idle_ms }));
         if let Some(clock) = a.try_state::<Clock>() {
@@ -88,21 +89,19 @@ fn tell(app: &AppHandle, m: serde_json::Value) {
 
 #[cfg(windows)]
 mod os {
+    use shell_core::log::Log;
     use shell_core::system::{idle_ms, user_state, System};
-    use std::{sync::OnceLock, thread};
-    use windows::{
-        core::w,
-        Win32::{
-            Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-            System::{LibraryLoader::GetModuleHandleW, SystemInformation::GetTickCount},
-            UI::{
-                Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
-                Shell::SHQueryUserNotificationState,
-                WindowsAndMessaging::{
-                    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, HWND_MESSAGE, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-                    WINDOW_EX_STYLE, WINDOW_STYLE, WM_POWERBROADCAST, WNDCLASSW,
-                },
-            },
+    use std::{ffi::c_void, sync::Arc, sync::OnceLock};
+    use windows::Win32::{
+        Foundation::{ERROR_SUCCESS, HANDLE},
+        System::{
+            Power::{PowerRegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS},
+            SystemInformation::GetTickCount,
+        },
+        UI::{
+            Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+            Shell::SHQueryUserNotificationState,
+            WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND},
         },
     };
 
@@ -115,31 +114,33 @@ mod os {
 
     static RESUMED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
-    unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-        if msg == WM_POWERBROADCAST && (w.0 as u32 == PBT_APMRESUMEAUTOMATIC || w.0 as u32 == PBT_APMRESUMESUSPEND) {
+    /// The resume callback. A message-only window gets no power broadcasts, so the exe registers
+    /// for suspend and resume directly.
+    unsafe extern "system" fn power(_context: *const c_void, kind: u32, _setting: *const c_void) -> u32 {
+        if kind == PBT_APMRESUMEAUTOMATIC || kind == PBT_APMRESUMESUSPEND {
             if let Some(f) = RESUMED.get() {
                 f();
             }
         }
-        DefWindowProcW(h, msg, w, l)
+        0
     }
 
-    /// A message-only window on its own thread, which hears power broadcasts.
-    pub fn on_resume(f: impl Fn() + Send + Sync + 'static) {
+    /// Registers for suspend and resume with `PowerRegisterSuspendResumeNotification` and a
+    /// callback. Every failure is logged: then the exe can't tell core about a resume, and says so.
+    pub fn on_resume(log: Arc<Log>, f: impl Fn() + Send + Sync + 'static) {
         if RESUMED.set(Box::new(f)).is_err() {
+            log.line("resume: already registered");
             return;
         }
-        thread::spawn(|| unsafe {
-            let Ok(module) = GetModuleHandleW(None) else { return };
-            let class = w!("FamiliarPower");
-            let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: module.into(), lpszClassName: class, ..Default::default() };
-            RegisterClassW(&wc);
-            let Ok(_h) = CreateWindowExW(WINDOW_EX_STYLE(0), class, w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(module.into()), None) else { return };
-            let mut m = MSG::default();
-            while GetMessageW(&mut m, None, 0, 0).as_bool() {
-                DispatchMessageW(&m);
-            }
-        });
+        // Kept for the whole run: Windows calls through it.
+        let params: &'static mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS { Callback: Some(power), Context: std::ptr::null_mut() }));
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        let r = unsafe { PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, HANDLE(params as *mut _ as *mut c_void), &mut handle) };
+        if r == ERROR_SUCCESS && !handle.is_null() {
+            log.line("resume: registered for power notifications");
+        } else {
+            log.line(&format!("error resume: PowerRegisterSuspendResumeNotification failed ({}), a resume won't be told to core", r.0));
+        }
     }
 }
 
@@ -151,5 +152,5 @@ mod os {
         System { user_state: "normal", idle_ms: 0 }
     }
 
-    pub fn on_resume(_: impl Fn() + Send + Sync + 'static) {}
+    pub fn on_resume(_: std::sync::Arc<shell_core::log::Log>, _: impl Fn() + Send + Sync + 'static) {}
 }
