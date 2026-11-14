@@ -40,6 +40,9 @@ pub struct Addresses {
     path: PathBuf,
     list: Mutex<Vec<Saved>>,
     log: Arc<Log>,
+    /// Held by a key write from its address check through the credential's commit, and by a
+    /// removal from its revocation through the list's save, so a key can't outlive its address.
+    keys: Mutex<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,7 +113,7 @@ impl Addresses {
                 }
             },
         };
-        Addresses { path, list: Mutex::new(list), log }
+        Addresses { path, list: Mutex::new(list), log, keys: Mutex::new(()) }
     }
 
     fn sound(a: &Saved) -> bool {
@@ -121,6 +124,11 @@ impl Addresses {
     fn save(&self, list: &[Saved]) -> Result<(), Fail> {
         let bytes = serde_json::to_vec_pretty(&File { v: 1, addresses: list.to_vec() }).map_err(|e| fail("failed", e.to_string()))?;
         write_atomic(&self.path, &bytes).map_err(|e| fail("failed", format!("the list couldn't be saved: {e}")))
+    }
+
+    /// The lock a key write and a removal share.
+    pub fn keys(&self) -> std::sync::MutexGuard<'_, ()> {
+        lock(&self.keys)
     }
 
     pub fn all(&self) -> Vec<Saved> {
@@ -195,18 +203,27 @@ pub fn address_add(app: AppHandle, kind: String, url: String, label: String, own
 #[tauri::command(async)]
 pub fn address_remove(app: AppHandle, id: String) -> Result<(), Fail> {
     let addresses = app.state::<Addresses>();
-    {
-        let mut list = lock(&addresses.list);
-        let before = list.len();
-        list.retain(|a| a.id != id);
-        if list.len() == before {
-            return Err(fail("not-saved", "no such address"));
-        }
-        addresses.save(&list)?;
+    let _keys = addresses.keys();
+    if !lock(&addresses.list).iter().any(|a| a.id == id) {
+        return Err(fail("not-saved", "no such address"));
     }
-    addresses.log.line(&format!("address removed {id}"));
-    // Its open requests end with `revoked`, and its key goes.
+    // What is always safe goes first: its requests end with `revoked`, and its key goes. Then the
+    // list is written, and only then is the address dropped from memory. If anything fails, the
+    // address stays listed, without a key, and a retry works.
     crate::net::revoke(&app, &id);
-    crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id }).map_err(|_| fail("failed", "the address went, but its key couldn't be deleted"))?;
+    if crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id: id.clone() }).is_err() {
+        crate::net::unrevoke(&app, &id);
+        return Err(fail("failed", "the address's key couldn't be deleted"));
+    }
+    let mut list = lock(&addresses.list);
+    let remaining: Vec<Saved> = list.iter().filter(|a| a.id != id).cloned().collect();
+    if let Err(e) = addresses.save(&remaining) {
+        drop(list);
+        crate::net::unrevoke(&app, &id);
+        addresses.log.line(&format!("address {id} not removed: the list couldn't be saved"));
+        return Err(e);
+    }
+    *list = remaining;
+    addresses.log.line(&format!("address removed {id}"));
     Ok(())
 }
