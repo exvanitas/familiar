@@ -11,8 +11,9 @@ use shell_core::{
 use std::path::{Path, PathBuf};
 use tauri::{
     ipc::{InvokeBody, Request},
-    AppHandle, Manager, State, WebviewWindow,
+    AppHandle, Manager, WebviewWindow,
 };
+use tokio::sync::oneshot;
 
 #[derive(Debug, Serialize)]
 pub struct Fail {
@@ -28,9 +29,20 @@ type Res<T> = Result<T, Fail>;
 
 /// The dialog's owner: the window named if it's open and showing, or else the one that asked if
 /// that's showing, or none.
-fn owner(app: &AppHandle, asked: &WebviewWindow, label: Option<&str>) -> Option<isize> {
+fn owner(app: &AppHandle, asked: &str, label: Option<&str>) -> Option<isize> {
     let showing = |w: &WebviewWindow| w.is_visible().ok().filter(|v| *v).and_then(|_| w.hwnd().ok()).map(|h| h.0 as isize);
-    label.and_then(|l| app.get_webview_window(l)).and_then(|w| showing(&w)).or_else(|| showing(asked))
+    let named = label.and_then(|l| app.get_webview_window(l)).and_then(|w| showing(&w));
+    named.or_else(|| app.get_webview_window(asked).and_then(|w| showing(&w)))
+}
+
+/// Runs blocking work (a dialog, a file write, the shell) on a thread of its own, and hands back
+/// its result to await, so no command ever blocks one of Tauri's async workers.
+async fn on_thread<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.await.map_err(|_| fail("failed", "the work stopped"))?
 }
 
 #[derive(Deserialize)]
@@ -90,11 +102,10 @@ fn spec_header(request: &Request) -> Res<String> {
 }
 
 /// The body is the file's bytes, and the `x-spec` header holds `{ name, filters, owner? }`. The
-/// file is written beside its target and swapped in, so a full disk can't leave a cut-off file.
+/// file is written beside its target and moved over it, so a full disk can't leave a cut-off file.
 /// Returns whether it saved.
-#[tauri::command(async)]
-pub fn save_as(request: Request, window: WebviewWindow, app: AppHandle, shell: State<Shell>) -> Res<bool> {
-    // A dialog that opens windows waits for no confirm: while one is open, nothing new opens.
+#[tauri::command]
+pub async fn save_as(app: AppHandle, window: WebviewWindow, request: Request<'_>) -> Res<bool> {
     let InvokeBody::Raw(bytes) = request.body() else { return Err(fail("invalid", "expected bytes")) };
     if bytes.len() > files::MAX_SAVE {
         return Err(fail("too-large", "at most 256 MiB"));
@@ -102,18 +113,23 @@ pub fn save_as(request: Request, window: WebviewWindow, app: AppHandle, shell: S
     let spec: SaveSpec = serde_json::from_str(&spec_header(&request)?).map_err(|_| fail("invalid", "bad spec"))?;
     files::check_name(&spec.name).map_err(|e| fail("invalid", e))?;
     files::check_filters(&spec.filters).map_err(|e| fail("invalid", e))?;
-    let owner = owner(&app, &window, spec.owner.as_deref());
-    // The dialog runs as a confirm does: the gate held (nothing else opens or moves meanwhile:
-    // one native dialog at a time), every window frozen, all put back after.
-    let chosen = confirm::modal(&app, None, |_| dialogs::save(&spec.name, &spec.filters, owner)).map_err(|e| fail(e.kind(), "a confirm or another dialog is open"))?;
-    let Some(path) = chosen.map_err(|e| fail("failed", e))? else { return Ok(false) };
-    if refused(&shell, &path)? {
-        shell.log.line("save_as refused: the folder is Familiar's own");
-        return Err(fail("refused", "Familiar doesn't save into its own folders"));
-    }
-    temp::save(&path, bytes, &dialogs::OsSwap).map_err(|e| fail("failed", e))?;
-    shell.log.line("save_as saved a file");
-    Ok(true)
+    let (bytes, asked) = (bytes.clone(), window.label().to_string());
+    on_thread(move || {
+        let shell = app.state::<Shell>();
+        let owner = owner(&app, &asked, spec.owner.as_deref());
+        // The dialog runs as a confirm does: the gate held (nothing else opens or moves meanwhile:
+        // one native dialog at a time), every window frozen, all put back after.
+        let chosen = confirm::modal(&app, None, |_| dialogs::save(&spec.name, &spec.filters, owner)).map_err(|e| fail(e.kind(), "a confirm or another dialog is open"))?;
+        let Some(path) = chosen.map_err(|e| fail("failed", e))? else { return Ok(false) };
+        if refused(&shell, &path)? {
+            shell.log.line("save_as refused: the folder is Familiar's own, or remote");
+            return Err(fail("refused", "Familiar saves only to local folders that aren't its own"));
+        }
+        temp::save(&path, &bytes, &dialogs::OsSwap).map_err(|e| fail("failed", e))?;
+        shell.log.line("save_as saved a file");
+        Ok(true)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -126,36 +142,46 @@ pub struct PickSpec {
 }
 
 /// The native open dialog. A full path, or null if the person cancelled.
-#[tauri::command(async)]
-pub fn pick_path(spec: PickSpec, window: WebviewWindow, app: AppHandle) -> Res<Option<String>> {
+#[tauri::command]
+pub async fn pick_path(app: AppHandle, window: WebviewWindow, spec: PickSpec) -> Res<Option<String>> {
     let kind = Pick::parse(&spec.kind).ok_or_else(|| fail("invalid", "kind is file or folder"))?;
     files::check_filters(&spec.filters).map_err(|e| fail("invalid", e))?;
-    let owner = owner(&app, &window, spec.owner.as_deref());
-    let path = confirm::modal(&app, None, |_| dialogs::pick(kind, &spec.filters, owner)).map_err(|e| fail(e.kind(), "a confirm or another dialog is open"))?.map_err(|e| fail("failed", e))?;
-    Ok(path.map(|p| p.display().to_string()))
+    let asked = window.label().to_string();
+    on_thread(move || {
+        let owner = owner(&app, &asked, spec.owner.as_deref());
+        let path = confirm::modal(&app, None, |_| dialogs::pick(kind, &spec.filters, owner)).map_err(|e| fail(e.kind(), "a confirm or another dialog is open"))?.map_err(|e| fail("failed", e))?;
+        Ok(path.map(|p| p.display().to_string()))
+    })
+    .await
 }
 
 /// The confirm, then the default browser. `https` only, refused before any dialog otherwise.
-#[tauri::command(async)]
-pub fn open_url(url: String, owner: Option<String>, app: AppHandle, shell: State<Shell>) -> Res<()> {
+#[tauri::command]
+pub async fn open_url(app: AppHandle, url: String, owner: Option<String>) -> Res<()> {
     let link = link::check(&url).map_err(|_| fail("invalid", "only an https link of up to 2048 characters"))?;
-    let ticket = confirm::reserve(&app).map_err(|e| fail(e.kind(), "the confirm can't ask now"))?;
-    // What opens is `link`, this copy made before asking.
-    if !ticket.ask(owner.as_deref(), shell_core::confirm::open_link(&link)).map_err(|e| fail(e.kind(), "the confirm failed"))? {
-        return Err(fail("declined", "not opened"));
-    }
-    dialogs::shell_open(&link.url).map_err(|e| fail("failed", e))?;
-    shell.log.line("open_url opened a link");
-    Ok(())
+    on_thread(move || {
+        let ticket = confirm::reserve(&app).map_err(|e| fail(e.kind(), "the confirm can't ask now"))?;
+        // What opens is `link`, this copy made before asking.
+        if !ticket.ask(owner.as_deref(), shell_core::confirm::open_link(&link)).map_err(|e| fail(e.kind(), "the confirm failed"))? {
+            return Err(fail("declined", "not opened"));
+        }
+        dialogs::shell_open(&link.url).map_err(|e| fail("failed", e))?;
+        app.state::<Shell>().log.line("open_url opened a link");
+        Ok(())
+    })
+    .await
 }
 
 /// Explorer at `backups` or `logs`, inside the data folder.
-#[tauri::command(async)]
-pub fn open_folder(which: String, shell: State<Shell>) -> Res<()> {
+#[tauri::command]
+pub async fn open_folder(app: AppHandle, which: String) -> Res<()> {
     let name = files::named_folder(&which).ok_or_else(|| fail("invalid", "backups or logs"))?;
-    let dir = shell.data_dir.join(name);
-    std::fs::create_dir_all(&dir).map_err(|e| fail("failed", e.to_string()))?;
-    dialogs::shell_open(&dir.display().to_string()).map_err(|e| fail("failed", e))
+    on_thread(move || {
+        let dir = app.state::<Shell>().data_dir.join(name);
+        std::fs::create_dir_all(&dir).map_err(|e| fail("failed", e.to_string()))?;
+        dialogs::shell_open(&dir.display().to_string()).map_err(|e| fail("failed", e))
+    })
+    .await
 }
 
 #[cfg(windows)]
@@ -169,7 +195,7 @@ mod dialogs {
         core::{Interface, HSTRING, PCWSTR, PWSTR},
         Win32::{
             Foundation::{ERROR_CANCELLED, HWND},
-            Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACE_FILE_FLAGS},
+            Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
             System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED},
             UI::{
                 Shell::{
@@ -259,18 +285,14 @@ mod dialogs {
         })
     }
 
-    /// The OS's own replace keeps the old file's permissions, encryption and attributes. A file
-    /// that wasn't there is moved in, written through, never over one that appeared meanwhile.
+    /// One rename on one volume, replacing whatever is at the name and written through: on a
+    /// failure the target is untouched. The old file's own ACL and alternate streams aren't kept:
+    /// the new file has its folder's.
     pub struct OsSwap;
 
     impl Swap for OsSwap {
-        fn replace(&self, target: &Path, temp: &Path) -> io::Result<()> {
-            // No backup name: a failure then leaves the target as it was or holding the new file.
-            unsafe { ReplaceFileW(&HSTRING::from(target), &HSTRING::from(temp), PCWSTR::null(), REPLACE_FILE_FLAGS(0), None, None) }.map_err(io::Error::from)
-        }
-
-        fn place(&self, temp: &Path, target: &Path) -> io::Result<()> {
-            unsafe { MoveFileExW(&HSTRING::from(temp), &HSTRING::from(target), MOVEFILE_WRITE_THROUGH) }.map_err(io::Error::from)
+        fn move_in(&self, temp: &Path, target: &Path) -> io::Result<()> {
+            unsafe { MoveFileExW(&HSTRING::from(temp), &HSTRING::from(target), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }.map_err(io::Error::from)
         }
     }
 
@@ -302,10 +324,7 @@ mod dialogs {
     }
     pub struct OsSwap;
     impl Swap for OsSwap {
-        fn replace(&self, _: &Path, _: &Path) -> io::Result<()> {
-            Err(io::Error::other("Windows only"))
-        }
-        fn place(&self, _: &Path, _: &Path) -> io::Result<()> {
+        fn move_in(&self, _: &Path, _: &Path) -> io::Result<()> {
             Err(io::Error::other("Windows only"))
         }
     }

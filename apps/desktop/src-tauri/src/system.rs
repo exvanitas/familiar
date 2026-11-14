@@ -12,7 +12,7 @@ use std::{
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Serialize)]
 pub struct Fail {
@@ -30,14 +30,15 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-#[tauri::command(async)]
-pub fn system() -> System {
+#[tauri::command]
+pub async fn system() -> System {
     os::read()
 }
 
 /// One deadline, in Unix milliseconds. Each call replaces the one before.
-#[tauri::command(async)]
-pub fn wake_at(at: u64, clock: State<Clock>) -> Result<(), Fail> {
+#[tauri::command]
+pub async fn wake_at(app: AppHandle, at: u64) -> Result<(), Fail> {
+    let clock = app.state::<Clock>();
     clock.wake.lock().unwrap_or_else(|e| e.into_inner()).set(at).map_err(|e| Fail { kind: "invalid", message: e.into() })?;
     clock.changed.notify_all();
     Ok(())
