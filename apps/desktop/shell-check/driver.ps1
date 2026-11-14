@@ -312,6 +312,8 @@ try {
   Write-Host "main: exit $($p.ExitCode), quit after $mainMs ms, write while quitting $mainWrite"
   $quitParts.strays = No-Strays 'the main run'
   Net-AfterMain $data $main
+  # ---------- a removal cut short, then a restart ----------
+  Run-RemoveRestart $data
   (Get-Item $junction).Delete()
 
   # Every window was hardened before its page logged anything.

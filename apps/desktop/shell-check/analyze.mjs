@@ -68,7 +68,8 @@ function frame(b, linktype) {
   if (proto === 6 && (sport === 53 || dport === 53)) {
     const seq = ((b[l4 + 4] << 24) | (b[l4 + 5] << 16) | (b[l4 + 6] << 8) | b[l4 + 7]) >>> 0;
     const payload = Buffer.from(b.subarray(l4 + ((b[l4 + 12] >> 4) * 4), end));
-    return { proto: 'tcp', src, dst, sport, dport, names, raw: b, seq, flags: b[l4 + 13], payload };
+    const ack = ((b[l4 + 8] << 24) | (b[l4 + 9] << 16) | (b[l4 + 10] << 8) | b[l4 + 11]) >>> 0;
+    return { proto: 'tcp', src, dst, sport, dport, names, raw: b, seq, ack, flags: b[l4 + 13], payload };
   }
   return { proto: proto === 6 ? 'tcp' : 'udp', src, dst, sport, dport, names, raw: b };
 }
@@ -80,9 +81,12 @@ function frame(b, linktype) {
    added per connection, at its first packet's time, with every name asked. A connection seen
    without its SYN, with a hole, with resent bytes that differ, ending part-way through a message,
    or holding something that isn't DNS is incomplete evidence: its entry says why in `incomplete`,
-   and the judges count it as a failed observation. */
+   and the judges count it as a failed observation. So is a connection whose end is known to lie
+   past what was captured: each direction's end is taken from its FIN, its RST, and the other
+   side's ACKs, and any byte missing before it marks the connection incomplete, even when what
+   was captured ends on a message boundary. */
 export function reassembleDns(packets) {
-  const SYN = 0x02, FIN = 0x01, RST = 0x04;
+  const SYN = 0x02, FIN = 0x01, RST = 0x04, ACK = 0x10;
   const conns = [];
   const current = new Map();
   const tcp = packets.filter(p => p.proto === 'tcp' && p.payload !== undefined).sort((x, y) => x.at - y.at);
@@ -92,12 +96,12 @@ export function reassembleDns(packets) {
     let c = current.get(key);
     if (flags & SYN) {
       if (!c || c.isn !== p.seq || c.closed) {
-        c = { key, first: p, isn: p.seq, segments: new Map(), closed: false, conflict: false };
+        c = { key, first: p, isn: p.seq, segments: new Map(), closed: false, conflict: false, fins: [], rsts: [], acks: [] };
         conns.push(c);
         current.set(key, c);
       }
     } else if (!c) {
-      c = { key, first: p, isn: null, segments: new Map(), closed: false, conflict: false };
+      c = { key, first: p, isn: null, segments: new Map(), closed: false, conflict: false, fins: [], rsts: [], acks: [] };
       conns.push(c);
       current.set(key, c);
     }
@@ -108,11 +112,16 @@ export function reassembleDns(packets) {
         c.segments.set(p.seq, p.payload);
       } else if (!had.subarray(0, p.payload.length).equals(p.payload)) c.conflict = true;
     }
+    if (flags & FIN) c.fins.push((p.seq + p.payload.length) >>> 0);
+    if (flags & RST) c.rsts.push(p.seq);
     if (flags & (FIN | RST)) c.closed = true;
+    // This side's ACK says how far the other side's bytes reached.
+    const back = current.get(`${p.dst}:${p.dport}>${p.src}:${p.sport}`);
+    if (flags & ACK && back) back.acks.push(p.ack);
   }
   const out = [];
   for (const c of conns) {
-    if (c.segments.size === 0) continue;
+    if (c.segments.size === 0 && c.isn === null) continue;
     const problems = [];
     if (c.isn === null) problems.push('no SYN seen');
     if (c.conflict) problems.push('resent bytes differ');
@@ -133,6 +142,14 @@ export function reassembleDns(packets) {
       }
       next = Math.max(next, off + data.length);
     }
+    // Where this direction is known to end, as an offset: a FIN's end, an RST, or the furthest ACK
+    // of the other side (less the FIN's own one, which an ACK of the FIN counts).
+    const offOf = q => (q - base) >>> 0;
+    const ends = [...c.fins, ...c.rsts].map(offOf).filter(o => o < 2 ** 31);
+    const finEnd = c.fins.length ? Math.max(...c.fins.map(offOf).filter(o => o < 2 ** 31), 0) : null;
+    for (const a of c.acks.map(offOf).filter(o => o < 2 ** 31)) ends.push(finEnd !== null && a === finEnd + 1 ? finEnd : a);
+    const end = ends.length ? Math.max(...ends) : 0;
+    if (end > next && !problems.some(x => x.startsWith('a gap'))) problems.push(`bytes missing before the end at byte ${end}, ${end - next} of them`);
     const stream = Buffer.concat(parts);
     const names = [];
     let o = 0;

@@ -1,7 +1,10 @@
-/* No command of the network side blocks an async worker. A sync function marked
-   `#[tauri::command(async)]` runs on one, so none is left in these files: every such command is an
-   `async fn`, and anything that waits (a dialog, a lookup, a file or credential call, a channel, a
-   join, a lock wait, a sleep) runs inside a `blocking(...)` / `spawn_blocking(...)` call. */
+/* A lint, not a proof: it reads the source for the shapes that block an async worker. A sync
+   function marked `#[tauri::command(async)]` runs on one, so none is left in these files: every
+   such command is an `async fn`, and anything that waits (a dialog, a lookup, a file or credential
+   call, a channel, a join, a lock wait, a sleep) runs inside a `blocking(...)` /
+   `spawn_blocking(...)` call. It can't see a wait hidden in a helper. The proof is the runner's
+   security.exec.responsive, which times the exe's main thread while each kind of flood is held;
+   logging never waits at all (shell-core's log queue). */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -44,7 +47,7 @@ export function commands(text: string): { name: string; attr: string; async: boo
   return out;
 }
 
-describe('no command of the network side blocks an async worker', () => {
+describe('lint: no command of the network side blocks an async worker', () => {
   for (const f of FILES) {
     it(f, () => {
       const text = readFileSync(join(SRC, f), 'utf8');

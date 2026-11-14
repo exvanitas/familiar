@@ -15,6 +15,13 @@
 //! - A key write for an address is counted while it runs. It may start only while the address is
 //!   `Saved`, and a removal deletes the key only once no write is running, so a write and a
 //!   removal are always ordered.
+//! - Each registered request's transport is one task that says when it has terminated (its
+//!   connection dropped, nothing more can be sent). Ending a request is a transition; its
+//!   termination is another, and a cancel or a removal waits for it (`running`, `settled`) before
+//!   it returns or goes on.
+//! - A removal is made durable before anything irreversible: the address is written to the list
+//!   as removing, then its key is deleted, then the list is written without it (`run_removal`). An
+//!   entry loaded as removing starts `Removing`, refusing everything, and the removal is finished.
 
 use crate::fetch::FetchError;
 use std::collections::HashMap;
@@ -66,6 +73,9 @@ struct Req {
     state: ReqState,
     /// Whether a `net_fetch` has used this id. An id is never used twice.
     used: bool,
+    /// Whether its transport task is still running: true from registration until it says it has
+    /// terminated.
+    transport: bool,
 }
 
 #[derive(Default)]
@@ -78,6 +88,11 @@ impl Ledger {
     /// A saved address, from the list at start or once a new one is durably written.
     pub fn saved(&mut self, id: &str) {
         self.addrs.entry(id.to_string()).or_insert(Addr { state: AddrState::Saved, writes: 0 });
+    }
+
+    /// An address the list holds as being removed: it starts `Removing`.
+    pub fn loaded_removing(&mut self, id: &str) {
+        self.addrs.insert(id.to_string(), Addr { state: AddrState::Removing, writes: 0 });
     }
 
     pub fn address(&self, id: &str) -> Option<AddrState> {
@@ -112,11 +127,33 @@ impl Ledger {
             _ => Some(FetchError::NotSaved),
         };
         if let Some(e) = refusal.or((self.open() >= max_open).then_some(FetchError::Busy)) {
-            self.reqs.insert(id.to_string(), Req { address: Some(address.to_string()), state: ReqState::Ended(e), used: true });
+            self.reqs.insert(id.to_string(), Req { address: Some(address.to_string()), state: ReqState::Ended(e), used: true, transport: false });
             return Err(e);
         }
-        self.reqs.insert(id.to_string(), Req { address: Some(address.to_string()), state: ReqState::Registered, used: true });
+        self.reqs.insert(id.to_string(), Req { address: Some(address.to_string()), state: ReqState::Registered, used: true, transport: true });
         Ok(())
+    }
+
+    /// The request's transport task has terminated: its connection is dropped and nothing more
+    /// can be sent. Ends the request too, if it hadn't ended.
+    pub fn terminated(&mut self, id: &str) {
+        if let Some(r) = self.reqs.get_mut(id) {
+            if !r.state.over() {
+                r.state = ReqState::Ended(FetchError::Cancelled);
+            }
+            r.transport = false;
+        }
+    }
+
+    /// Whether the request's transport is still running, so a cancel must wait for it.
+    pub fn running(&self, id: &str) -> bool {
+        self.reqs.get(id).is_some_and(|r| r.transport)
+    }
+
+    /// Whether a removal may go on: no key write is running for the address, and every request
+    /// under it has terminated.
+    pub fn settled(&self, address: &str) -> bool {
+        self.writes(address) == 0 && !self.reqs.values().any(|r| r.transport && r.address.as_deref() == Some(address))
     }
 
     /// One step forward: `Registered` to `Resolving` or `Sending`, `Resolving` to `Sending`,
@@ -176,7 +213,7 @@ impl Ledger {
             return self.end(id, FetchError::Cancelled);
         }
         if valid {
-            self.reqs.insert(id.to_string(), Req { address: None, state: ReqState::Ended(FetchError::Cancelled), used: false });
+            self.reqs.insert(id.to_string(), Req { address: None, state: ReqState::Ended(FetchError::Cancelled), used: false, transport: false });
         }
         false
     }
@@ -234,6 +271,23 @@ impl Ledger {
             a.writes = a.writes.saturating_sub(1);
         }
     }
+}
+
+/// The durable steps of a removal, each safe to repeat.
+pub trait RemovalStore {
+    /// Writes the list with the address marked as being removed.
+    fn mark_removing(&mut self, id: &str) -> Result<(), String>;
+    fn delete_key(&mut self, id: &str) -> Result<(), String>;
+    /// Writes the list without the address.
+    fn write_without(&mut self, id: &str) -> Result<(), String>;
+}
+
+/// A removal's durable part, in the one safe order: marked first, so that whatever happens after,
+/// a restart finds it removing rather than saved without its key.
+pub fn run_removal(store: &mut impl RemovalStore, id: &str) -> Result<(), String> {
+    store.mark_removing(id)?;
+    store.delete_key(id)?;
+    store.write_without(id)
 }
 
 #[cfg(test)]
@@ -390,6 +444,121 @@ mod tests {
         assert_eq!(l.begin_remove(A), Ok(vec![]), "nothing left to revoke");
         let mut l = at(ReqState::Done);
         assert_eq!(l.register("r3", A, true, 1), Ok(()), "a finished request isn't open");
+    }
+
+    #[test]
+    fn a_cancel_and_a_removal_wait_for_the_transport_to_terminate() {
+        for s in LIVE {
+            let mut l = at(s);
+            assert!(l.cancel(R, true));
+            assert_eq!(l.check(R), Err(Cancelled), "{s:?}: ended at once");
+            assert!(l.running(R), "{s:?}: but the cancel can't return yet");
+            l.terminated(R);
+            assert!(!l.running(R), "{s:?}: now it can");
+            let mut l = at(s);
+            l.begin_remove(A).unwrap();
+            assert!(!l.settled(A), "{s:?}: the removal waits for the transport");
+            l.terminated(R);
+            assert!(l.settled(A), "{s:?}: and goes on once it has terminated");
+        }
+        // A request that ended on its own still holds a removal until its task is done.
+        let mut l = at(ReqState::Streaming);
+        l.finish(R);
+        l.begin_remove(A).unwrap();
+        assert!(!l.settled(A));
+        l.terminated(R);
+        assert!(l.settled(A));
+        // A write holds it too.
+        let mut l = with_address();
+        l.begin_write(A).unwrap();
+        l.begin_remove(A).unwrap();
+        assert!(!l.settled(A));
+        l.end_write(A);
+        assert!(l.settled(A));
+        // A transport that terminates by itself ends its request.
+        let mut l = at(ReqState::Sending);
+        l.terminated(R);
+        assert_eq!(l.check(R), Err(Cancelled));
+        // Nothing waits on an id that never registered.
+        let mut l = with_address();
+        l.cancel("r9", true);
+        assert!(!l.running("r9"));
+    }
+
+    /// A list file and a credential store, where any step can fail, and a restart reads what's
+    /// durable.
+    #[derive(Clone, Default)]
+    struct Disk {
+        /// id -> marked removing
+        file: HashMap<String, bool>,
+        keys: std::collections::HashSet<String>,
+        fail_at: Option<usize>,
+        steps: usize,
+    }
+    impl Disk {
+        fn step(&mut self) -> Result<(), String> {
+            self.steps += 1;
+            if self.fail_at == Some(self.steps) {
+                return Err(format!("step {} failed", self.steps));
+            }
+            Ok(())
+        }
+        /// A restart: the ledger as the exe loads it.
+        fn restart(&self) -> Ledger {
+            let mut l = Ledger::default();
+            for (id, removing) in &self.file {
+                if *removing {
+                    l.loaded_removing(id);
+                } else {
+                    l.saved(id);
+                }
+            }
+            l
+        }
+    }
+    impl RemovalStore for Disk {
+        fn mark_removing(&mut self, id: &str) -> Result<(), String> {
+            self.step()?;
+            self.file.insert(id.to_string(), true);
+            Ok(())
+        }
+        fn delete_key(&mut self, id: &str) -> Result<(), String> {
+            self.step()?;
+            self.keys.remove(id);
+            Ok(())
+        }
+        fn write_without(&mut self, id: &str) -> Result<(), String> {
+            self.step()?;
+            self.file.remove(id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_removal_that_stops_at_any_step_never_comes_back_saved_without_its_key() {
+        for fail_at in [Some(1), Some(2), Some(3), None] {
+            let mut d = Disk { fail_at, ..Disk::default() };
+            d.file.insert(A.into(), false);
+            d.keys.insert(A.into());
+            let r = run_removal(&mut d, A);
+            assert_eq!(r.is_ok(), fail_at.is_none(), "{fail_at:?}");
+            // Restarted from what's on disk.
+            let mut l = d.restart();
+            match l.address(A) {
+                Some(AddrState::Saved) => assert!(d.keys.contains(A), "{fail_at:?}: saved again, so its key must still be there"),
+                Some(AddrState::Removing) => {
+                    assert_eq!(l.register(R, A, true, 32), Err(Revoked), "{fail_at:?}: refused until it's finished");
+                    // Startup finishes it.
+                    d.fail_at = None;
+                    run_removal(&mut d, A).unwrap();
+                    assert!(!d.file.contains_key(A) && !d.keys.contains(A), "{fail_at:?}: finished");
+                }
+                None => assert!(!d.keys.contains(A), "{fail_at:?}: gone, and its key too"),
+                Some(AddrState::Removed) => unreachable!(),
+            }
+            // Only a failure before anything durable leaves it saved.
+            assert_eq!(d.restart().address(A).is_some_and(|s| s == AddrState::Saved), fail_at == Some(1), "{fail_at:?}");
+        }
     }
 
     #[test]

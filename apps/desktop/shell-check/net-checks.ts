@@ -291,6 +291,47 @@ export async function netChecks(ctx: Ctx) {
     return `one SSE event in ${ms} ms, then the read stayed open through 30 quiet seconds`;
   });
 
+  await check('security.exec.responsive', async () => {
+    // shell_info, answered by the exe's main thread, timed while each kind of flood is held.
+    const probe = async (ms: number) => {
+      const times: number[] = [];
+      for (const end = performance.now() + ms; performance.now() < end;) {
+        const t = performance.now();
+        await shell.info();
+        times.push(performance.now() - t);
+        await sleep(50);
+      }
+      return Math.round(Math.max(...times));
+    };
+    // Open fetches at their limit, each waiting 5 s for its head.
+    const cs = Array.from({ length: 32 }, () => new AbortController());
+    const open = cs.map(c => guardedFetch(A!.id)(`${base}/api/slow-head`, { signal: c.signal }).catch(() => {}));
+    await sleep(500);
+    const over = await outcome(guardedFetch(A!.id)(`${base}/api/ok`));
+    const atLimit = await probe(2000);
+    cs.forEach(c => c.abort());
+    await Promise.all(open);
+    // A lookup that stalls for 8 s.
+    const n = `st${rand(10)}.familiar-check.test`;
+    await plan(n, [[PUB]], [0, 8000]);
+    const S = await saved({ kind: 'model', url: `https://${n}`, label: 'a stalled lookup' });
+    const c2 = new AbortController();
+    const stalled = guardedFetch(S.id)(`https://${n}/v1`, { signal: c2.signal }).catch(() => {});
+    await sleep(500);
+    const inLookup = await probe(2000);
+    c2.abort();
+    await stalled;
+    // An open confirm dialog.
+    const asked = shell.addressAdd({ kind: 'server', url: `${base}/held-open`, label: 'held open' }).then(() => 'saved', reason);
+    const [held, inDialog] = await Promise.all([dialog('hold'), sleep(400).then(() => probe(1200))]);
+    await dialog('approve');
+    const saidYes = await within(asked, 45000, 'address_add');
+    ok(over === 'busy', 'a fetch past the limit: ' + over);
+    ok(held.found && saidYes === 'saved', `the dialog: ${held.found}, ${saidYes}`);
+    ok(atLimit < 100 && inLookup < 100 && inDialog < 100, `shell_info took up to ${atLimit} ms with 32 fetches open, ${inLookup} ms in a stalled lookup, ${inDialog} ms behind a dialog`);
+    return `shell_info answered in at most ${atLimit} ms with 32 fetches open (the 33rd busy), ${inLookup} ms during an 8 s lookup, ${inDialog} ms behind an open dialog`;
+  });
+
   await check('security.fetch.limits', async () => {
     const head = await outcome(guardedFetch(A!.id, { headersMs: 1000 })(`${base}/api/slow-head`));
     const idle = await outcome(guardedFetch(A!.id, { idleMs: 1000 })(`${base}/api/slow-body`).then(drain));
@@ -441,15 +482,31 @@ export async function netChecks(ctx: Ctx) {
       await sleep(300);
       tries.push({ offset, outcome, cancelled, next: Date.now() });
     }
+    // Five more held just before sending: their lookup answers 1.5 s late, and each is cancelled
+    // while it waits. Nothing of them may reach the proxy, then or once the lookup has answered.
+    const h = `ch${rand(10)}.familiar-check.test`;
+    await plan(h, [[PUB]], [0, 1500]);
+    const H = await saved({ kind: 'model', url: `https://${h}`, label: 'held before sending' });
+    const heldOutcomes: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const id = requestId();
+      const fetched = shell.netFetch({ id, address: H.id, url: `https://${h}/v1`, method: 'GET', headers: [] }, new Uint8Array(0)).then(() => 'answered', e => (e as { kind?: string }).kind ?? reason(e));
+      await sleep(300);
+      await shell.netCancel(id);
+      heldOutcomes.push(await within(fetched, 30000, 'net_fetch'));
+      await sleep(1500);
+    }
     await sleep(1000);
     const seen = await proxyOff();
     const mine = seen.entries.filter(e => proxyHost(e.target) === n);
+    const heldSeen = seen.entries.filter(e => proxyHost(e.target) === h).length;
     const late = tries.filter(t => mine.some(e => e.at > t.cancelled && e.at <= t.next));
     const counts = Object.entries(tries.reduce<Record<string, number>>((m, t) => ({ ...m, [t.outcome]: (m[t.outcome] ?? 0) + 1 }), {})).map(([k, v]) => `${k} ${v}`).join(', ');
     ok(late.length === 0, `the proxy saw a request after its cancel returned, at offsets ${late.map(t => t.offset).join(' ')}`);
     ok(tries.filter(t => t.offset < 0).every(t => t.outcome === 'cancelled'), 'a cancel before the fetch: ' + tries.filter(t => t.offset < 0).map(t => t.outcome).join(' '));
     ok(tries.every(t => t.outcome !== 'answered'), 'a cancelled fetch answered');
-    return `20 cancels from 5 ms before the fetch to 14 ms after: ${counts}; the proxy saw ${mine.length} requests for the name, none after its cancel returned`;
+    ok(heldSeen === 0 && heldOutcomes.every(o => o === 'cancelled'), `held before sending: ${heldOutcomes.join(' ')}, and the proxy saw ${heldSeen}`);
+    return `20 cancels from 5 ms before the fetch to 14 ms after: ${counts}; the proxy saw ${mine.length} requests for the name, none after its cancel returned; 5 requests held in their lookup and cancelled ended cancelled with nothing reaching the proxy, before or after the lookup answered`;
   });
 
   /* ---------- the key goes with its address ---------- */
@@ -493,9 +550,11 @@ export async function netChecks(ctx: Ctx) {
     ok(first.startsWith('failed') && listed, `a removal that couldn't save: ${first}, still listed ${listed}`);
     ok(remembered === 'revoked' && withKey === 'revoked', `while it's failed: a keyless request answered with the old key ${remembered}, one with the key ${withKey}`);
     ok(write.includes('revoked'), 'a key write while it failed: ' + write);
-    ok(!st.present && !cm.found, `its key: status ${JSON.stringify(st)}, cmdkey ${cm.found}`);
-    ok(second === 'removed' && !after && gone === 'not-saved', `the retry: ${second}, still listed ${after}, a fetch after it ${gone}`);
-    return `with the list unwritable the removal failed (${first}) and the address stayed listed but refused everything: a keyless request to the endpoint holding its old key ${remembered}, with the key ${withKey}, a key write refused; the retry removed it and the next fetch is ${gone}`;
+    // Nothing irreversible came before the durable mark, so the key is still there.
+    ok(st.present && cm.found, `its key, before anything was marked: status ${JSON.stringify(st)}, cmdkey ${cm.found}`);
+    const cmAfter = await step<{ found: boolean }>('cmdkey', { target: `addr:${R.id}` });
+    ok(second === 'removed' && !after && gone === 'not-saved' && !cmAfter.found, `the retry: ${second}, still listed ${after}, a fetch after it ${gone}, key left ${cmAfter.found}`);
+    return `with the list unwritable the removal failed before anything irreversible (${first}): the address stayed listed with its key, refusing everything (a keyless request to the endpoint holding the key ${remembered}, with the key ${withKey}, a key write refused); the retry removed it and its key, and the next fetch is ${gone}`;
   });
 
   await check('check.key.remove-race', async () => {
@@ -537,6 +596,12 @@ export async function netChecks(ctx: Ctx) {
     ok(Object.keys(core).sort().join() === 'boundTo,hint,present' && core.hint === null, 'status: ' + JSON.stringify(core));
     return 'no command reads a key; a view reaches no key command; Settings can\'t delete; status shows present, binding and a hint only';
   });
+  // An address whose removal is cut short between its durable mark and its end, for the restart
+  // phase: the driver marks it in the list and deletes its key, as a crash there would leave it.
+  const Rr = await saved({ kind: 'server', url: `${base}/rr2`, label: 'removed across a restart' });
+  await ctx.ask<string>('settings', 'make-key', `addr:${Rr.id}`);
+  await outcome(guardedFetch(Rr.id)(`${base}/rr2/key-hash`, { headers: AUTH }));
+  await say(`NETRESTART ${Rr.id}`);
   await say('NETKEYS done');
 }
 
@@ -562,5 +627,29 @@ export async function proxyStartChecks() {
     ok(hosts.includes('example.com'), 'the public address did not use the proxy: ' + seen.targets.join(' '));
     ok(!hosts.some(h => h === '127.0.0.1' || h === 'localhost' || h === net.lanIp), 'a local address went through the proxy: ' + seen.targets.join(' '));
     return `started with the proxy already set: net_proxy ${JSON.stringify(kind)}; public through it (${seen.targets.join(' ')}), loopback direct, the lan fixture direct with ${lanConns} connections`;
+  });
+}
+
+/* The phase after the driver cut a removal short: the list holds the address as being removed
+   and its key is gone, as a crash after the durable mark leaves it. The shell folder is still
+   locked, so the start can't finish the removal either. */
+export async function removeRestartChecks(id: string, data: string) {
+  const net = (await (await fetch('net.json', { cache: 'no-store' })).json()) as Net;
+  const base = `http://127.0.0.1:${net.http}`;
+  const outcome = (p: Promise<unknown>) => within(p.then(() => 'ok', e => kindOf(e)), 60000, 'fetch');
+  await check('security.key.remove-restart', async () => {
+    const listed = (await shell.addressList()).find(a => a.id === id);
+    // The server answers this with the key the address's last request carried, before the restart.
+    const remembered = await outcome(guardedFetch(id)(`${base}/rr2/echo/remembered`));
+    const withKey = await outcome(guardedFetch(id)(`${base}/rr2/key-hash`, { headers: AUTH }));
+    const cm = await step<{ found: boolean }>('cmdkey', { target: `addr:${id}` });
+    await step('shell-lock', { data, on: false });
+    const retry = await shell.addressRemove(id).then(() => 'removed', reason);
+    const after = (await shell.addressList()).some(a => a.id === id);
+    ok(!!listed && listed.removing === true, 'loaded as: ' + JSON.stringify(listed));
+    ok(remembered === 'revoked' && withKey === 'revoked', `after the restart: a keyless request to the endpoint holding the old key ${remembered}, one with the key ${withKey}`);
+    ok(!cm.found, 'the key is back: ' + cm.found);
+    ok(retry === 'removed' && !after, `the retry: ${retry}, still listed ${after}`);
+    return `loaded as being removed with its key already gone; a keyless request to the endpoint holding the old key was ${remembered}, one with the key ${withKey}; once the folder could be written the retry finished it`;
   });
 }

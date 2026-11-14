@@ -34,6 +34,7 @@ fn beside_exe() -> PathBuf {
 /// The one thing the exe says by itself: a dead start, with no page to say it.
 fn give_up(log: &Log, why: &str, text: &str) -> ! {
     log.line(&format!("error {why}"));
+    log.flush();
     platform::message_box("Familiar", text);
     std::process::exit(1);
 }
@@ -168,7 +169,13 @@ fn main() {
         .build(context)
         .expect("the shell failed to start");
 
-    app.run(|_, event| {
+    app.run(|app, event| {
+        // Every log line queued is written before the process goes.
+        if matches!(event, RunEvent::Exit) {
+            if let Some(shell) = app.try_state::<Shell>() {
+                shell.log.flush();
+            }
+        }
         // Windows can all close while the tray stays. Only Quit ends the run.
         if let RunEvent::ExitRequested { code: None, api, .. } = event {
             api.prevent_exit();

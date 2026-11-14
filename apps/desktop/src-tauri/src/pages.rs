@@ -107,9 +107,13 @@ fn harden(w: &WebviewWindow, page: &str, armed: Arc<AtomicBool>, done: impl FnOn
 pub fn open_core(app: &AppHandle) -> tauri::Result<()> {
     let (b, armed) = window(app, views::CORE, views::CORE_PAGE);
     let w = b.title("Familiar").visible(false).focused(false).focusable(false).skip_taskbar(true).build()?;
-    harden(&w, views::CORE_PAGE, armed, |r| {
+    let handle = app.clone();
+    harden(&w, views::CORE_PAGE, armed, move |r| {
         if r.is_err() {
             platform::message_box("Familiar", "Familiar couldn't make its window safe to use, so it won't run.\n\nThe log says why.");
+            if let Some(shell) = handle.try_state::<crate::shell::Shell>() {
+                shell.log.flush();
+            }
             std::process::exit(1);
         }
     });

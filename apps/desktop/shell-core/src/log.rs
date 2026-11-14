@@ -1,13 +1,23 @@
 //! The log file. With no `--log` it's capped at 1 MB, with one old file kept, because bug reports
 //! will come with it. Pages write to it through `log_line`, so a page's line is cut to 4 KiB, can't
 //! start a line of its own, and each window gets 100 lines a second.
+//!
+//! Writing never blocks the caller: `line` stamps the time and hands the line to the log's own
+//! thread through a bounded queue. When the queue is full the line is dropped and counted, and the
+//! next line written says how many were lost. `flush` waits for the queue to drain, for the
+//! moments that can wait: tests, and just before the exe exits.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Lines the queue holds before new ones are dropped.
+pub const QUEUE: usize = 4096;
 
 pub const CAP: u64 = 1024 * 1024;
 /// The most of one page line that's kept, in bytes.
@@ -24,9 +34,24 @@ struct Sink {
     dropped: u64,
 }
 
+/// What the log's thread is handed.
+enum Msg {
+    /// A line, and how many were dropped just before it.
+    Line(String, u64),
+    Attach(Sink),
+    Flushed(mpsc::Sender<()>),
+}
+
 pub struct Log {
-    sink: Mutex<Option<Sink>>,
+    queue: SyncSender<Msg>,
     started: Instant,
+    /// Lines dropped because the queue was full.
+    busy: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    sink: std::sync::Arc<Mutex<Option<Sink>>>,
+    /// Held by a test to stall the log's thread.
+    #[cfg(test)]
+    gate: std::sync::Arc<Mutex<()>>,
 }
 
 fn open(path: &Path) -> Option<File> {
@@ -54,31 +79,90 @@ impl Sink {
 }
 
 impl Log {
-    /// A log that writes nowhere yet.
+    /// A log that writes nowhere yet, with its thread started.
     pub fn new(started: Instant) -> Log {
-        Log { sink: Mutex::new(None), started }
+        Self::with_queue(started, QUEUE)
+    }
+
+    fn with_queue(started: Instant, size: usize) -> Log {
+        let (queue, rx) = mpsc::sync_channel::<Msg>(size);
+        let busy = std::sync::Arc::new(AtomicU64::new(0));
+        let sink = std::sync::Arc::new(Mutex::new(None::<Sink>));
+        #[cfg(test)]
+        let gate = std::sync::Arc::new(Mutex::new(()));
+        let s = sink.clone();
+        #[cfg(test)]
+        let g = gate.clone();
+        std::thread::Builder::new()
+            .name("log".into())
+            .spawn(move || {
+                for m in rx {
+                    #[cfg(test)]
+                    let _held = g.lock();
+                    let Ok(mut sink) = s.lock() else { continue };
+                    match m {
+                        Msg::Attach(new) => *sink = Some(new),
+                        Msg::Flushed(done) => {
+                            let _ = done.send(());
+                        }
+                        Msg::Line(text, lost) => {
+                            let Some(sink) = sink.as_mut() else { continue };
+                            if lost > 0 {
+                                let note = format!("{:>8.2} dropped {lost} lines: the log was busy\n", started.elapsed().as_secs_f64());
+                                write(sink, &note, started);
+                            }
+                            write(sink, &text, started);
+                        }
+                    }
+                }
+            })
+            .expect("the log's thread");
+        Log {
+            queue,
+            started,
+            busy,
+            #[cfg(test)]
+            sink,
+            #[cfg(test)]
+            gate,
+        }
     }
 
     /// Starts writing to `path`. With a cap, the file rolls over to `<name>.old.log` past it.
     pub fn attach(&self, path: &Path, cap: Option<u64>) {
         let Some(file) = open(path) else { return };
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if let Ok(mut g) = self.sink.lock() {
-            *g = Some(Sink { file, path: path.to_path_buf(), size, cap, dropped: 0 });
+        let _ = self.queue.send(Msg::Attach(Sink { file, path: path.to_path_buf(), size, cap, dropped: 0 }));
+    }
+
+    /// Queues a line, stamped now. Never waits: a full queue drops it and counts it.
+    pub fn line(&self, s: &str) {
+        let text = format!("{:>8.2} {s}\n", self.started.elapsed().as_secs_f64());
+        let lost = self.busy.swap(0, Ordering::SeqCst);
+        if let Err(TrySendError::Full(_)) = self.queue.try_send(Msg::Line(text, lost)) {
+            self.busy.fetch_add(lost + 1, Ordering::SeqCst);
         }
     }
 
-    pub fn line(&self, s: &str) {
-        let Ok(mut g) = self.sink.lock() else { return };
-        let Some(sink) = g.as_mut() else { return };
-        let text = format!("{:>8.2} {s}\n", self.started.elapsed().as_secs_f64());
+    /// Waits until every line queued before this has been written.
+    pub fn flush(&self) {
+        let (done, wait) = mpsc::channel();
+        if self.queue.send(Msg::Flushed(done)).is_ok() {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
+/// One line to the file, rolling it over at the cap.
+fn write(sink: &mut Sink, text: &str, started: Instant) {
+    {
         if sink.cap.is_some_and(|cap| sink.size + text.len() as u64 > cap) {
             match sink.roll() {
                 Some((file, size)) => {
                     sink.file = file;
                     sink.size = size;
                     if sink.dropped > 0 {
-                        let note = format!("{:>8.2} dropped {} lines: the log was full and couldn't roll over\n", self.started.elapsed().as_secs_f64(), sink.dropped);
+                        let note = format!("{:>8.2} dropped {} lines: the log was full and couldn't roll over\n", started.elapsed().as_secs_f64(), sink.dropped);
                         if sink.file.write_all(note.as_bytes()).is_ok() {
                             sink.size += note.len() as u64;
                         }
@@ -166,6 +250,7 @@ mod tests {
         l.line("dropped, nothing attached yet");
         l.attach(&p, None);
         l.line("hello");
+        l.flush();
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.ends_with(" hello\n") && !text.contains("dropped"));
         fs::remove_dir_all(d).unwrap();
@@ -180,6 +265,7 @@ mod tests {
         for i in 0..40 {
             l.line(&format!("line {i}"));
         }
+        l.flush();
         assert!(fs::metadata(&p).unwrap().len() <= 100);
         let old = fs::read_to_string(d.join("app.old.log")).unwrap();
         assert!(old.len() <= 100 && old.contains("line"));
@@ -196,6 +282,7 @@ mod tests {
         let l = Log::new(Instant::now());
         l.attach(&p, Some(100));
         l.line("this one goes over");
+        l.flush();
         assert!(d.join("app.old.log").exists());
         fs::remove_dir_all(d).unwrap();
     }
@@ -211,14 +298,47 @@ mod tests {
         for i in 0..40 {
             l.line(&format!("line {i}"));
         }
+        l.flush();
         assert!(fs::metadata(&p).unwrap().len() <= 100, "the cap held");
+        l.flush();
         let dropped = l.sink.lock().unwrap().as_ref().unwrap().dropped;
         assert!(dropped > 30, "dropped {dropped}");
         // Once it can roll over again, it says how many it lost.
         fs::remove_dir_all(d.join("app.old.log")).unwrap();
         l.line("after");
+        l.flush();
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains(&format!("dropped {dropped} lines")) && text.ends_with(" after\n"), "{text}");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_full_queue_drops_and_counts_and_never_waits() {
+        let d = temp("busy");
+        let p = d.join("app.log");
+        let l = Log::with_queue(Instant::now(), 4);
+        l.attach(&p, None);
+        l.flush();
+        // The log's thread is stalled, as a slow disk would stall it.
+        let held = l.gate.lock().unwrap();
+        let t = Instant::now();
+        for i in 0..200 {
+            l.line(&format!("line {i}"));
+        }
+        assert!(t.elapsed() < Duration::from_millis(200), "line waited: {:?}", t.elapsed());
+        drop(held);
+        l.flush();
+        l.line("after");
+        l.flush();
+        let text = fs::read_to_string(&p).unwrap();
+        // Every line is either written or counted, and each count comes just before the first line
+        // kept after the drops, so the order holds.
+        let kept: Vec<usize> = text.lines().filter_map(|x| x.trim().split_once("line ").and_then(|(_, n)| n.parse().ok())).collect();
+        let lost: u64 = text.lines().filter_map(|x| x.split("dropped ").nth(1).and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<u64>().ok())).sum();
+        assert_eq!(kept.len() as u64 + lost, 200, "{text}");
+        assert!(lost >= 190, "only {lost} dropped: {text}");
+        assert!(kept.windows(2).all(|w| w[0] < w[1]), "{text}");
+        assert!(text.ends_with(" after\n"), "{text}");
         fs::remove_dir_all(d).unwrap();
     }
 
