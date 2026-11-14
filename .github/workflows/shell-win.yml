@@ -27,6 +27,20 @@ jobs:
       - name: Build, and the tests that need no fixtures
         run: cargo test --locked
 
+      # The verdict below needs every sample: a count that was never saved, or one with no open
+      # count, must throw rather than pass.
+      - name: The SMB counts can't pass unmeasured
+        run: |
+          . ./smb-counts.ps1
+          $threw = $false
+          try { Read-SmbCounts never-saved | Out-Null } catch { $threw = $true }
+          if (-not $threw) { Write-Host 'A missing sample was read as a measurement.'; exit 1 }
+          '{"pairs":[]}' | Set-Content "$env:RUNNER_TEMP\smb-no-opens.json"
+          $threw = $false
+          try { Read-SmbCounts no-opens | Out-Null } catch { $threw = $true }
+          if (-not $threw) { Write-Host 'A sample with no open count was read as a measurement.'; exit 1 }
+          Write-Host 'Missing samples throw.'
+
       - name: Make the fixtures
         run: |
           $ErrorActionPreference = 'Stop'
@@ -65,14 +79,8 @@ jobs:
 
       - name: Before, then start the capture on port 445
         run: |
-          $ErrorActionPreference = 'Stop'
-          $c = @(Get-SmbConnection)
-          $c | Format-Table ServerName, ShareName, Dialect, NumOpens
-          ($c | ForEach-Object { "$($_.ServerName)|$($_.ShareName)" }) -join ',' | Set-Content "$env:RUNNER_TEMP\smb-before.txt"
-          "SMB_BEFORE=$($c.Count)" >> $env:GITHUB_ENV
-          try { $f = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f = 'n/a' }
-          "FILES_BEFORE=$f" >> $env:GITHUB_ENV
-          Write-Host "SMB connections: $($c.Count). Server files opened: $f"
+          . ./smb-counts.ps1
+          Save-SmbCounts before | Out-Null
           pktmon filter remove | Out-Null
           pktmon filter add smb -p 445
           pktmon start --capture --pkt-size 0 --file-name "$env:RUNNER_TEMP\walk.etl"
@@ -81,42 +89,39 @@ jobs:
       - name: The reparse walk, watched
         run: cargo test --locked --offline --test reparse -- --nocapture --test-threads 1
 
+      # The verdict rests on the SMB server's open count and the SMB connections, both required.
+      # pktmon is reported too, but the share is this runner's own, so its traffic is loopback,
+      # which pktmon never sees: the control below shows that.
       - name: After, and the verdict
         if: always()
         run: |
-          pktmon counters
+          . ./smb-counts.ps1
           pktmon stop
           pktmon format "$env:RUNNER_TEMP\walk.etl" -o "$env:RUNNER_TEMP\walk.txt" | Out-Null
           $packets = @(Get-Content "$env:RUNNER_TEMP\walk.txt" | Where-Object { $_ -match '\.445[ :>]' }).Count
-          $c = @(Get-SmbConnection)
-          $c | Format-Table ServerName, ShareName, Dialect, NumOpens
-          $before = (Get-Content "$env:RUNNER_TEMP\smb-before.txt") -split ',' | Where-Object { $_ }
-          $new = @($c | Where-Object { "$($_.ServerName)|$($_.ShareName)" -notin $before })
-          try { $f = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f = 'n/a' }
+          $after = Save-SmbCounts after
+          $d = Compare-SmbCounts (Read-SmbCounts before) $after
           $lines = @(
-            "SMB connections before: $env:SMB_BEFORE, after: $($c.Count), new: $($new.Count)",
-            "Server files opened before: $env:FILES_BEFORE, after: $f",
-            "Packets on port 445 during the walk: $packets"
+            "New SMB connections during the walk: $($d.new.Count) $($d.new -join ', ')",
+            "SMB server opens during the walk: $($d.opens)",
+            "pktmon packets on port 445 during the walk: $packets"
           )
           $lines | ForEach-Object { Write-Host $_ }
-          "WALK_PACKETS=$packets" >> $env:GITHUB_ENV
           "## The reparse walk" >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
           if (Test-Path "$env:FAMILIAR_REPARSE_FIXTURES\reparse-results.txt") { Get-Content "$env:FAMILIAR_REPARSE_FIXTURES\reparse-results.txt" >> $env:GITHUB_STEP_SUMMARY }
           $lines >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
-          $failed = $new.Count -gt 0 -or $packets -gt 0
-          if ($env:FILES_BEFORE -ne 'n/a' -and $f -ne 'n/a' -and [double]$f -gt [double]$env:FILES_BEFORE) { $failed = $true }
-          if ($failed) { Write-Host 'The walk made SMB traffic.'; exit 1 }
+          if ($d.new.Count -gt 0 -or $d.opens -gt 0 -or $packets -gt 0) { Write-Host 'The walk made SMB traffic.'; exit 1 }
 
-      # A positive control: the same capture and counters while this step really uses the share,
-      # through the mapping and through a new connection. If they see nothing here, they prove
-      # nothing above, and the summary says so.
+      # A positive control: the same counts, sampled the same way, while this step really uses the
+      # share, through the mapping and through a new connection. Both must move, or they prove
+      # nothing above and the run fails.
       - name: Control, the share really used
         if: always()
         run: |
-          $before = @(Get-SmbConnection).Count
-          try { $f0 = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f0 = 'n/a' }
+          . ./smb-counts.ps1
+          $before = Save-SmbCounts control-before
           pktmon start --capture --pkt-size 0 --file-name "$env:RUNNER_TEMP\control.etl" | Out-Null
           Get-Content 'Z:\familiar-fx\tool.exe' | Out-Null
           $other = $env:FAMILIAR_REPARSE_UNC -replace '^\\\\localhost', '\\127.0.0.1'
@@ -125,26 +130,20 @@ jobs:
           pktmon stop | Out-Null
           pktmon format "$env:RUNNER_TEMP\control.etl" -o "$env:RUNNER_TEMP\control.txt" | Out-Null
           $packets = @(Get-Content "$env:RUNNER_TEMP\control.txt" | Where-Object { $_ -match '\.445[ :>]' }).Count
-          $after = @(Get-SmbConnection).Count
-          try { $f1 = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f1 = 'n/a' }
-          Write-Host 'First lines of the control capture:'
-          Get-Content "$env:RUNNER_TEMP\control.txt" -TotalCount 15
+          $d = Compare-SmbCounts $before (Save-SmbCounts control-after)
           $lines = @(
-            "Control: SMB connections $before -> $after",
-            "Control: server files opened $f0 -> $f1",
-            "Control: packets on port 445 $packets"
+            "Control: new SMB connections $($d.new.Count) $($d.new -join ', ')",
+            "Control: SMB server opens $($d.opens)",
+            "Control: pktmon packets on port 445 $packets"
           )
-          # The share is this runner's own, so SMB goes over loopback, which never reaches the
-          # network stack pktmon watches. Then a capture of 0 proves nothing, and the server's
-          # open count is the measure that must have moved here.
-          if ($packets -eq 0) { $lines += 'pktmon saw none of the control either: it is blind to loopback SMB, so its 0 above proves nothing' }
+          if ($packets -eq 0) { $lines += 'pktmon saw none of the control either: it is blind to loopback SMB, so its count above proves nothing' }
           $lines | ForEach-Object { Write-Host $_ }
           "## Control" >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
           $lines >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
-          if ($f0 -eq 'n/a' -or $f1 -eq 'n/a' -or [double]$f1 -le [double]$f0) { Write-Host 'The server open count did not move when the share was used, so it proves nothing.'; exit 1 }
-          if ($after -le $before) { Write-Host 'No new SMB connection showed when one was made, so that count proves nothing.'; exit 1 }
+          if ($d.opens -le 0) { Write-Host 'The server open count did not move when the share was used, so it proves nothing.'; exit 1 }
+          if ($d.new.Count -le 0) { Write-Host 'No new SMB connection showed when one was made, so that count proves nothing.'; exit 1 }
 
       - name: Clean up the mapping
         if: always()
