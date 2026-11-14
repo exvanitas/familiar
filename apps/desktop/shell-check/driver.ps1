@@ -381,6 +381,8 @@ try {
   $log = Join-Path $Out 'proxy-start.log'
   $p = Run-Phase 'proxy-start' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proxy-data'), '--log', $log, '--seconds', '120', '--phase', 'proxy-start') 150
   if ($null -ne $script:proxyBackup) { Restore-Proxy }
+  # The phase must have run to its end, or its check proved nothing.
+  if ($p.ExitCode -ne 0 -or -not (Select-String -Path $log -Pattern '\] DONE$' -Quiet)) { Result 'FAIL' 'check.phase' "proxy-start didn't complete: exit $($p.ExitCode)" }
   [void](No-Strays 'proxy-start')
 
   # ---------- server starts, links, saving, system state, wake: procs.ps1 ----------

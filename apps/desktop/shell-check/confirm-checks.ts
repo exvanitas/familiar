@@ -18,7 +18,7 @@ export interface Dialog {
   topmost: boolean;
   answered: string;
   /* For 'enter': the approve button sampled every 40 ms, in ms from the dialog's creation. */
-  timing?: { created: number; firstSample: number; lastOff: number; firstOn: number; samples: number; maxGap: number };
+  timing?: { enabledAt: number; created: number; firstSample: number; lastOff: number; firstOn: number; samples: number; maxGap: number };
 }
 type WinState = Record<string, { found: boolean; topmost: boolean; enabled: boolean }>;
 
@@ -120,8 +120,10 @@ export async function confirmChecks(ctx: { ask: <T>(to: string, cmd: string, arg
     const d1 = await dialog('enter');
     const r1 = await p1;
     const t = d1.timing;
-    const timing = t ? `sampled ${t.samples} times from ${t.firstSample} ms, at most ${t.maxGap} ms apart: last disabled at ${t.lastOff} ms, first enabled at ${t.firstOn} ms` : 'not sampled';
-    timingOk = !!t && t.created > 0 && t.firstSample <= 400 && t.maxGap <= 150 && t.lastOff >= 900 && t.firstOn >= 1000 && t.firstOn <= 1400;
+    const timing = t ? `the exe's timer enabled it ${t.enabledAt} ms after creation; sampled ${t.samples} times from ${t.firstSample} ms, at most ${t.maxGap} ms apart: last disabled at ${t.lastOff} ms, first enabled at ${t.firstOn} ms` : 'not sampled';
+    // The exe's own moment must be a second or more, and the samples must agree with it: off up to
+    // it, on from just after it (50 ms for reading the button through UI Automation).
+    timingOk = !!t && t.created > 0 && t.enabledAt >= 1000 && t.firstSample <= 400 && t.maxGap <= 150 && t.lastOff >= 900 && t.lastOff <= t.enabledAt + 50 && t.firstOn >= t.enabledAt - 50 && t.firstOn <= t.enabledAt + 200;
     defaults = `approve enabled at first ${d1.approveAtStart}, after a second ${d1.approveLater}, an early click ${d1.invokedEarly}, Enter gave ${r1}, top-most with no owner ${d1.topmost}; ${timing}`;
     ok(r1 === 'refused:declined: the person didn\'t allow it', 'Enter: ' + r1);
     const p2 = outcome(add(47004, 'close', 'closed'));

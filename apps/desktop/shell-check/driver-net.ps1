@@ -297,8 +297,8 @@ function Do-NetStep($action, $a) {
         return @{}
       }
       Restore-Proxy
-      $targets = @(Net-Log | Select-Object -Skip $script:proxyFrom | Where-Object { $_.proxy } | ForEach-Object { $_.target })
-      return @{ targets = $targets }
+      $seen = @(Net-Log | Select-Object -Skip $script:proxyFrom | Where-Object { $_.proxy })
+      return @{ targets = @($seen | ForEach-Object { $_.target }); entries = @($seen | ForEach-Object { @{ target = $_.target; at = $_.at } }) }
     }
     'proxy-kind' { return @{ kind = (Proxy-Kind) } }
     'net-requests' {
@@ -320,7 +320,8 @@ function Do-NetStep($action, $a) {
     'dns-canary' {
       $name = "$($a.label).familiar-check.test"
       Clear-DnsClientCache
-      Resolve-DnsName $name -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null
+      if ($a.tcp) { Resolve-DnsName $name -DnsOnly -TcpOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null }
+      else { Resolve-DnsName $name -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null }
       return @{ at = (Now-Ms) }
     }
     'conns' {
@@ -391,7 +392,14 @@ function Do-NetStep($action, $a) {
         $on = @($samples | Where-Object { $_.on })
         $off = @($samples | Where-Object { -not $_.on })
         $gaps = @(for ($i = 1; $i -lt $samples.Count; $i++) { $samples[$i].t - $samples[$i - 1].t })
+        # When the exe's own timer enabled the button, from the dialog's creation.
+        $en = $null
+        for ($i = 0; $i -lt 20 -and -not $en; $i++) {
+          $en = Select-String -Path $script:log -Pattern 'confirm: approve enabled (\d+) ms after creation' | Select-Object -Last 1
+          if (-not $en) { Start-Sleep -Milliseconds 100 }
+        }
         $res.timing = [ordered]@{
+          enabledAt = $(if ($en) { [long]$en.Matches[0].Groups[1].Value } else { -1 })
           created = $created
           firstSample = $(if ($samples.Count) { $samples[0].t } else { -1 })
           lastOff = $(if ($off.Count) { $off[-1].t } else { -1 })

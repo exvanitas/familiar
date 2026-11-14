@@ -94,6 +94,8 @@ const proxy = createServer((req, res) => { log({ proxy: 'request', target: (req.
 proxy.on('connect', (req, socket, head) => {
   log({ proxy: 'connect', target: (req.url ?? '').slice(0, 200) });
   const [host, port] = (req.url ?? '').split(':');
+  // The check's own names point nowhere real: logged, never tunnelled.
+  if (host.endsWith('.familiar-check.test')) { socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); return; }
   const up = connect(Number(port) || 443, host, () => { socket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.write(head); up.pipe(socket); socket.pipe(up); });
   up.on('error', () => socket.destroy());
   socket.on('error', () => up.destroy());

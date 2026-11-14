@@ -26,7 +26,9 @@ export function proxyHost(target: string): string {
   return target.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
 }
 /* What the logging proxy saw while it was on. */
-const proxyOff = () => step<{ targets: string[]; kind: string }>('proxy', { on: false });
+const proxyOff = () => step<{ targets: string[]; entries: { target: string; at: number }[] }>('proxy', { on: false });
+/* 128 random bits as hex: a request id of the exe's form. */
+const requestId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
 const AUTH = { authorization: `Bearer ${PLACEHOLDER}` };
 const kindOf = (e: unknown) => (e instanceof Error && typeof e.cause === 'object' && e.cause && 'kind' in e.cause ? String((e.cause as { kind: string }).kind) : e instanceof Error ? e.name : String(e));
 const within = <T>(p: Promise<T>, ms: number, what: string) => Promise.race([p, new Promise<never>((_, no) => setTimeout(() => no(new Error(`${what}: no answer in ${ms} ms`)), ms))]);
@@ -95,6 +97,10 @@ export async function netChecks(ctx: Ctx) {
     };
     const [l1, l2, l3, l4] = [label(), label(), label(), label()];
     await canary();
+    // One over TCP, which the capture must see reassembled.
+    const tcp = 't' + rand(13);
+    await step('dns-canary', { label: tcp, tcp: true });
+    await say(`NETLOOKUP tcp-canary ${tcp}`);
     const from = Date.now();
     const r1 = await added({ kind: 'model', url: url(l1), label: 'never 1' }, 'refuse');
     const r2 = await added({ kind: 'model', url: url(l2), label: 'never 2' }, 'refuse');
@@ -110,7 +116,8 @@ export async function netChecks(ctx: Ctx) {
     const to = Date.now();
     await canary();
     for (const l of [l1, l2, l3]) await say(`NETLOOKUP never ${l}`);
-    await say(`NETLOOKUP after ${l4} ${allowed.answeredAt ?? 0}`);
+    // The boundary is the exe's own log line for when its dialog returned, before this one.
+    await say(`NETLOOKUP after ${l4}`);
     await say(`NETLOOKUP window ${from} ${to}`);
     ok(String(r1).startsWith('declined') && String(r2).startsWith('declined'), `refused: ${r1}, ${r2}`);
     ok(String(r3).startsWith('asks-stopped'), 'the fourth ask: ' + r3);
@@ -118,7 +125,7 @@ export async function netChecks(ctx: Ctx) {
     ok(held.found && allowed.found && (allowed.answeredAt ?? 0) > from, 'the allowed dialog: ' + JSON.stringify({ held, allowed }));
     ok(String(r4).startsWith('blocked-address'), 'after Allow, a name with no answers: ' + JSON.stringify(r4));
     await say('NETLOOKUP flow ok');
-    return 'two refused and one stopped ask, then one held open 3 s and allowed, between two canaries; the capture decides security.fetch.no-lookup-before-allow';
+    return 'two refused and one stopped ask, then one held open 3 s and allowed, between two canaries and with one over TCP; the capture decides security.fetch.no-lookup-before-allow';
   });
 
   /* ---------- keys ---------- */
@@ -405,6 +412,46 @@ export async function netChecks(ctx: Ctx) {
     return `public through the system proxy (${seen.targets.join(' ')}); loopback and the lan fixture direct, the fixture saw ${lanConns} connections; net_proxy ${JSON.stringify(on)} with it set, ${JSON.stringify(off)} without (the runner's own setting: ${runner.kind})`;
   });
 
+  await check('security.fetch.cancel-race', async () => {
+    // A cancel sent at many points around registration: from 5 ms before the fetch to 14 ms
+    // after. With the logging proxy on, nothing may reach it once a cancel has returned.
+    const n = `cr${rand(10)}.familiar-check.test`;
+    await plan(n, [[PUB]]);
+    const C = await saved({ kind: 'model', url: `https://${n}`, label: 'cancel race' });
+    await step('proxy', { on: true });
+    const tries: { offset: number; outcome: string; cancelled: number; next: number }[] = [];
+    for (let i = 0; i < 20; i++) {
+      const offset = i - 5;
+      const id = requestId();
+      const fetchIt = () => shell.netFetch({ id, address: C.id, url: `https://${n}/v1`, method: 'GET', headers: [] }, new Uint8Array(0)).then(() => 'answered', e => (e as { kind?: string }).kind ?? reason(e));
+      let fetched: Promise<string>;
+      let cancel: Promise<void>;
+      if (offset < 0) {
+        cancel = shell.netCancel(id);
+        await sleep(-offset);
+        fetched = fetchIt();
+      } else {
+        fetched = fetchIt();
+        if (offset) await sleep(offset);
+        cancel = shell.netCancel(id);
+      }
+      await cancel;
+      const cancelled = Date.now();
+      const outcome = await within(fetched, 30000, 'net_fetch');
+      await sleep(300);
+      tries.push({ offset, outcome, cancelled, next: Date.now() });
+    }
+    await sleep(1000);
+    const seen = await proxyOff();
+    const mine = seen.entries.filter(e => proxyHost(e.target) === n);
+    const late = tries.filter(t => mine.some(e => e.at > t.cancelled && e.at <= t.next));
+    const counts = Object.entries(tries.reduce<Record<string, number>>((m, t) => ({ ...m, [t.outcome]: (m[t.outcome] ?? 0) + 1 }), {})).map(([k, v]) => `${k} ${v}`).join(', ');
+    ok(late.length === 0, `the proxy saw a request after its cancel returned, at offsets ${late.map(t => t.offset).join(' ')}`);
+    ok(tries.filter(t => t.offset < 0).every(t => t.outcome === 'cancelled'), 'a cancel before the fetch: ' + tries.filter(t => t.offset < 0).map(t => t.outcome).join(' '));
+    ok(tries.every(t => t.outcome !== 'answered'), 'a cancelled fetch answered');
+    return `20 cancels from 5 ms before the fetch to 14 ms after: ${counts}; the proxy saw ${mine.length} requests for the name, none after its cancel returned`;
+  });
+
   /* ---------- the key goes with its address ---------- */
   await check('security.key.rebind', async () => {
     if (!A) fail('no saved address');
@@ -422,27 +469,33 @@ export async function netChecks(ctx: Ctx) {
     return 'removing the address deleted its credential; the new base URL has no key and its fetch is no-key; the old address got nothing more';
   });
 
-  await check('check.address.remove-retry', async () => {
+  await check('security.key.remove-failed', async () => {
     const info = await shell.info();
     const data = info.args[info.args.indexOf('--data-dir') + 1];
-    const R = await saved({ kind: 'server', url: `${base}/rr`, label: 'removal retried' });
+    const R = await saved({ kind: 'server', url: `${base}/rr`, label: 'a removal that fails' });
     const made = await ctx.ask<string>('settings', 'make-key', `addr:${R.id}`);
-    const had = await step<{ found: boolean }>('cmdkey', { target: `addr:${R.id}` });
-    // The shell folder can't be written, so the list can't be saved.
+    // The server now holds the key, and answers /echo/remembered with it.
+    const sent = await outcome(guardedFetch(R.id)(`${base}/rr/key-hash`, { headers: AUTH }));
+    // The shell folder can't be written, so the list without the address can't be saved.
     await step('shell-lock', { data, on: true });
     const first = await shell.addressRemove(R.id).then(() => 'removed', reason);
     const listed = (await shell.addressList()).some(a => a.id === R.id);
+    const remembered = await outcome(guardedFetch(R.id)(`${base}/rr/echo/remembered`));
+    const withKey = await outcome(guardedFetch(R.id)(`${base}/rr/key-hash`, { headers: AUTH }));
+    const write = await ctx.ask<string>('settings', 'make-key', `addr:${R.id}`);
     const st = await shell.secretStatus(`addr:${R.id}`);
     const cm = await step<{ found: boolean }>('cmdkey', { target: `addr:${R.id}` });
-    const f = await outcome(guardedFetch(R.id)(`${base}/rr/key-hash`, { headers: AUTH }));
     await step('shell-lock', { data, on: false });
     const second = await shell.addressRemove(R.id).then(() => 'removed', reason);
     const after = (await shell.addressList()).some(a => a.id === R.id);
-    ok(made === 'ok' && had.found, `the key: ${made}, in cmdkey ${had.found}`);
+    const gone = await outcome(guardedFetch(R.id)(`${base}/rr/ok`));
+    ok(made === 'ok' && sent === 'ok', `the key: ${made}, sent ${sent}`);
     ok(first.startsWith('failed') && listed, `a removal that couldn't save: ${first}, still listed ${listed}`);
-    ok(!st.present && !cm.found && f === 'no-key', `its key after that: status ${JSON.stringify(st)}, cmdkey ${cm.found}, fetch ${f}`);
-    ok(second === 'removed' && !after, `the retry: ${second}, still listed ${after}`);
-    return `with the list unwritable the removal failed (${first}), the address stayed listed with its key already gone (fetch ${f}); the retry removed it`;
+    ok(remembered === 'revoked' && withKey === 'revoked', `while it's failed: a keyless request answered with the old key ${remembered}, one with the key ${withKey}`);
+    ok(write.includes('revoked'), 'a key write while it failed: ' + write);
+    ok(!st.present && !cm.found, `its key: status ${JSON.stringify(st)}, cmdkey ${cm.found}`);
+    ok(second === 'removed' && !after && gone === 'not-saved', `the retry: ${second}, still listed ${after}, a fetch after it ${gone}`);
+    return `with the list unwritable the removal failed (${first}) and the address stayed listed but refused everything: a keyless request to the endpoint holding its old key ${remembered}, with the key ${withKey}, a key write refused; the retry removed it and the next fetch is ${gone}`;
   });
 
   await check('check.key.remove-race', async () => {
@@ -487,22 +540,27 @@ export async function netChecks(ctx: Ctx) {
   await say('NETKEYS done');
 }
 
-/* The phase started with the system proxy already set: public through it, loopback direct. */
+/* The phase started with the system proxy already set: public through it, loopback and lan direct. */
 export async function proxyStartChecks() {
   const net = (await (await fetch('net.json', { cache: 'no-store' })).json()) as Net;
   const base = `http://127.0.0.1:${net.http}`;
   const outcome = (p: Promise<unknown>) => within(p.then(() => 'ok', e => kindOf(e)), 60000, 'fetch');
-  await check('check.fetch.proxy-start', async () => {
+  await check('security.fetch.proxy-cold', async () => {
     const kind = await shell.netProxy();
     const site = await saved({ kind: 'model', url: 'https://example.com', label: 'a public host' });
     const local = await saved({ kind: 'server', url: `${base}/ps`, label: 'loopback' });
+    const lan = await saved({ kind: 'server', url: `http://${net.lanIp}:${net.lan}/pc`, label: 'the lan fixture' });
+    const mark = Date.now();
     const pub = await outcome(guardedFetch(site.id, { headersMs: 15000 })('https://example.com/'));
     const loop = await outcome(guardedFetch(local.id)(`${base}/ps/ok`));
+    const lanR = await outcome(guardedFetch(lan.id)(`http://${net.lanIp}:${net.lan}/pc/ok`));
+    const lanConns = await conns('lan', mark);
     const seen = await proxyOff();
     const hosts = seen.targets.map(proxyHost);
     ok(kind.kind === 'manual' && kind.inUse, 'net_proxy at start: ' + JSON.stringify(kind));
-    ok(pub === 'ok' && loop === 'ok', `public ${pub}, loopback ${loop}`);
-    ok(hosts.includes('example.com') && !hosts.includes('127.0.0.1'), 'the proxy saw: ' + seen.targets.join(' '));
-    return `started with the proxy set: net_proxy ${JSON.stringify(kind)}; public through it (${seen.targets.join(' ')}), loopback direct`;
+    ok(pub === 'ok' && loop === 'ok' && lanR === 'ok' && lanConns >= 1, `public ${pub}, loopback ${loop}, lan ${lanR} with ${lanConns} connections at the fixture`);
+    ok(hosts.includes('example.com'), 'the public address did not use the proxy: ' + seen.targets.join(' '));
+    ok(!hosts.some(h => h === '127.0.0.1' || h === 'localhost' || h === net.lanIp), 'a local address went through the proxy: ' + seen.targets.join(' '));
+    return `started with the proxy already set: net_proxy ${JSON.stringify(kind)}; public through it (${seen.targets.join(' ')}), loopback direct, the lan fixture direct with ${lanConns} connections`;
   });
 }
