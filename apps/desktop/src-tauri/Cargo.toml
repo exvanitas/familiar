@@ -1,0 +1,39 @@
+[package]
+name = "familiar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Familiar's native shell: general native building blocks, and the gates that must not live in a webview."
+
+[[bin]]
+name = "familiar"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+shell-core = { path = "../shell-core" }
+tauri = { version = "=2.12.5", features = ["tray-icon", "image-png", "custom-protocol", "devtools"] }
+tauri-plugin-single-instance = "=2.5.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Already in Tauri's tree. Only to set SO_EXCLUSIVEADDRUSE on the sink before it binds.
+socket2 = "0.6"
+
+# The copies Tauri already pulls in. The features only switch on more of their bindings.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_UI_WindowsAndMessaging",
+] }
+webview2-com = "0.39"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 16
+strip = true

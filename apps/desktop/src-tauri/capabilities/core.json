@@ -1,0 +1,11 @@
+{
+  "identifier": "core",
+  "description": "The core window: everything native. No view gets any of this.",
+  "windows": ["core"],
+  "permissions": [
+    "core:event:allow-listen", "core:event:allow-unlisten",
+    "allow-shell-info", "allow-shell-ready", "allow-log-line",
+    "allow-quit", "allow-quit-ready", "allow-tray-set",
+    "allow-view-open", "allow-window-ctl"
+  ]
+}
