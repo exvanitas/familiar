@@ -241,6 +241,32 @@ function Net-AfterMain([string]$data, [string]$log) {
   Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.key.no-copy' "$($script:keys.Count) keys searched for in $scanned of $($files.Count) files ($bytes bytes), UTF-8 and UTF-16; the planted control was found in $((@('data', 'webview', 'log' | Where-Object { $controls[$_] })) -join ', ')$(if ($missed.Count) { ', missed in ' + ($missed -join ', ') }); $(if ($found.Count) { 'a key was found in ' + ($found -join ' ') } else { 'no key found' })$(if ($problems.Count) { '; ' + ($problems -join '; ') })"
 }
 
+# A removal cut short after its durable mark, as a crash there would leave it: the address the
+# main run left marked as being removed in the list, and its key deleted. The shell folder is
+# locked so the next start can't finish the removal; the phase checks that the address refuses
+# everything, then unlocks and retries.
+function Run-RemoveRestart([string]$data) {
+  $m = Select-String -Path (Join-Path $Out 'check.log') -Pattern 'NETRESTART ([0-9a-f]{32})' | Select-Object -Last 1
+  if (-not $m) { Result 'FAIL' 'security.key.remove-restart' 'the main run left no address for it'; return }
+  $id = $m.Matches[0].Groups[1].Value
+  $f = Join-Path $data 'shell\addresses.json'
+  $j = Get-Content $f -Raw | ConvertFrom-Json
+  foreach ($a in $j.addresses) { if ($a.id -eq $id) { $a | Add-Member -NotePropertyName removing -NotePropertyValue $true -Force } }
+  [IO.File]::WriteAllText($f, ($j | ConvertTo-Json -Depth 6))
+  $t = @(& cmdkey /list) | Where-Object { $_ -match "Target:.*addr:$id" } | Select-Object -First 1
+  if ($t) {
+    $target = ($t -replace '^\s*Target:\s*', '') -replace '^LegacyGeneric:target=', ''
+    & cmdkey "/delete:$target" | Out-Null
+  }
+  Write-Host "remove-restart: $id marked as being removed, key $(if ($t) { 'deleted' } else { 'not found' })"
+  [void](Do-NetStep 'shell-lock' @{ data = $data; on = $true })
+  $log = Join-Path $Out 'remove-restart.log'
+  $p = Run-Phase 'remove-restart' $log @('--app-dir', $App, '--data-dir', $data, '--log', $log, '--seconds', '120', '--phase', 'remove-restart', '--value', $id) 150
+  if ($script:shellLocked) { [void](Do-NetStep 'shell-lock' @{ data = $data; on = $false }) }
+  if ($p.ExitCode -ne 0 -or -not (Select-String -Path $log -Pattern '\] DONE$' -Quiet)) { Result 'FAIL' 'check.phase' "remove-restart didn't complete: exit $($p.ExitCode)" }
+  [void](No-Strays 'remove-restart')
+}
+
 # After the capture: no lookup before Allow.
 function Net-Lookups {
   $l = & node (Join-Path $here 'net-analyze.mjs') $Out
