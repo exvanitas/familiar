@@ -30,8 +30,6 @@
     "start.overlap",
     "fetch.no-lookup-flow",
     "tls.roots",
-    "fetch.proxy-start",
-    "address.remove-retry",
     "key.remove-race",
     "confirm.race",
     "system.idle",

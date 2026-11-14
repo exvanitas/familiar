@@ -50,12 +50,15 @@ function frame(b, linktype) {
   } else if (linktype === 101 || linktype === 228 || linktype === 229) {
     et = (b[0] >> 4) === 6 ? 0x86dd : 0x0800;
   } else return null;
-  let proto, src, dst, l4;
+  let proto, src, dst, l4, end;
+  // `end` is where the IP packet ends, before any link padding.
   if (et === 0x0800) {
     const ihl = (b[o] & 0x0f) * 4;
     proto = b[o + 9]; src = ip4(b, o + 12); dst = ip4(b, o + 16); l4 = o + ihl;
+    end = Math.min(b.length, o + ((b[o + 2] << 8) | b[o + 3]));
   } else if (et === 0x86dd) {
     proto = b[o + 6]; src = ip6(b, o + 8); dst = ip6(b, o + 24); l4 = o + 40;
+    end = Math.min(b.length, o + 40 + ((b[o + 4] << 8) | b[o + 5]));
   } else return null;
   if (proto !== 6 && proto !== 17) return { proto: String(proto), src, dst, sport: 0, dport: 0, names: [], raw: b };
   const sport = (b[l4] << 8) | b[l4 + 1], dport = (b[l4 + 2] << 8) | b[l4 + 3];
@@ -64,45 +67,87 @@ function frame(b, linktype) {
   // DNS over TCP can be split across segments, so its names are read after reassembly.
   if (proto === 6 && (sport === 53 || dport === 53)) {
     const seq = ((b[l4 + 4] << 24) | (b[l4 + 5] << 16) | (b[l4 + 6] << 8) | b[l4 + 7]) >>> 0;
-    const payload = Buffer.from(b.subarray(l4 + ((b[l4 + 12] >> 4) * 4)));
-    return { proto: 'tcp', src, dst, sport, dport, names, raw: b, seq, payload };
+    const payload = Buffer.from(b.subarray(l4 + ((b[l4 + 12] >> 4) * 4), end));
+    return { proto: 'tcp', src, dst, sport, dport, names, raw: b, seq, flags: b[l4 + 13], payload };
   }
   return { proto: proto === 6 ? 'tcp' : 'udp', src, dst, sport, dport, names, raw: b };
 }
 
-/* Each TCP port 53 flow, its segments put in order once each, then read as length-prefixed DNS
-   messages. A packet is added per flow, at its first segment's time, holding every name asked. */
+/* Each TCP port 53 connection, its segments put in order once each, then read as length-prefixed
+   DNS messages. A connection begins at its SYN: a SYN with another sequence number on the same
+   ports, or after a FIN or RST, is a new connection, so a reused tuple doesn't merge two. Offsets
+   are taken from the SYN modulo 2^32, so a sequence that wraps reads straight on. One entry is
+   added per connection, at its first packet's time, with every name asked. A connection seen
+   without its SYN, with a hole, with resent bytes that differ, ending part-way through a message,
+   or holding something that isn't DNS is incomplete evidence: its entry says why in `incomplete`,
+   and the judges count it as a failed observation. */
 export function reassembleDns(packets) {
-  const flows = new Map();
-  for (const p of packets) {
-    if (p.proto !== 'tcp' || !p.payload || p.payload.length === 0) continue;
+  const SYN = 0x02, FIN = 0x01, RST = 0x04;
+  const conns = [];
+  const current = new Map();
+  const tcp = packets.filter(p => p.proto === 'tcp' && p.payload !== undefined).sort((x, y) => x.at - y.at);
+  for (const p of tcp) {
     const key = `${p.src}:${p.sport}>${p.dst}:${p.dport}`;
-    if (!flows.has(key)) flows.set(key, { first: p, segments: new Map() });
-    const f = flows.get(key);
-    if (!f.segments.has(p.seq)) f.segments.set(p.seq, p.payload);
-    if (p.at < f.first.at) f.first = p;
+    const flags = p.flags ?? 0;
+    let c = current.get(key);
+    if (flags & SYN) {
+      if (!c || c.isn !== p.seq || c.closed) {
+        c = { key, first: p, isn: p.seq, segments: new Map(), closed: false, conflict: false };
+        conns.push(c);
+        current.set(key, c);
+      }
+    } else if (!c) {
+      c = { key, first: p, isn: null, segments: new Map(), closed: false, conflict: false };
+      conns.push(c);
+      current.set(key, c);
+    }
+    if (p.payload.length) {
+      const had = c.segments.get(p.seq);
+      if (!had || p.payload.length > had.length) {
+        if (had && !p.payload.subarray(0, had.length).equals(had)) c.conflict = true;
+        c.segments.set(p.seq, p.payload);
+      } else if (!had.subarray(0, p.payload.length).equals(p.payload)) c.conflict = true;
+    }
+    if (flags & (FIN | RST)) c.closed = true;
   }
   const out = [];
-  for (const { first, segments } of flows.values()) {
-    const ordered = [...segments.entries()].sort((a, b) => a[0] - b[0]);
+  for (const c of conns) {
+    if (c.segments.size === 0) continue;
+    const problems = [];
+    if (c.isn === null) problems.push('no SYN seen');
+    if (c.conflict) problems.push('resent bytes differ');
+    // Offsets from the first byte after the SYN, or with no SYN from the earliest segment.
+    const seqs = [...c.segments.keys()];
+    const base = c.isn !== null ? (c.isn + 1) >>> 0 : seqs.reduce((m, q) => (((q - m) | 0) < 0 ? q : m), seqs[0]);
+    const ordered = [...c.segments.entries()].map(([q, d]) => [(q - base) >>> 0, d]).filter(([off]) => off < 2 ** 31).sort((x, y) => x[0] - y[0]);
     const parts = [];
-    let next = ordered[0][0];
-    for (const [seq, data] of ordered) {
-      // Overlaps (a resent segment) are trimmed; a hole ends what can be read.
-      if (seq > next) break;
-      const from = next - seq;
-      if (from < data.length) parts.push(data.subarray(from));
-      next = Math.max(next, seq + data.length);
+    let next = 0;
+    for (const [off, data] of ordered) {
+      if (off > next) { problems.push(`a gap at byte ${next}`); break; }
+      const from = next - off;
+      if (from < data.length) {
+        // An overlap must hold the same bytes as what's already read.
+        const overlap = Buffer.concat(parts).subarray(off, next);
+        if (!data.subarray(0, overlap.length).equals(overlap)) problems.push('overlapping bytes differ');
+        parts.push(data.subarray(from));
+      }
+      next = Math.max(next, off + data.length);
     }
     const stream = Buffer.concat(parts);
     const names = [];
-    for (let o = 0; o + 2 <= stream.length;) {
+    let o = 0;
+    while (o + 2 <= stream.length) {
       const len = stream.readUInt16BE(o);
-      if (len === 0 || o + 2 + len > stream.length) break;
-      names.push(...dnsNames(stream.subarray(o + 2, o + 2 + len)));
+      if (len === 0) { problems.push('a message of no length'); break; }
+      if (o + 2 + len > stream.length) break;
+      const got = dnsNames(stream.subarray(o + 2, o + 2 + len));
+      if (got.length === 0) problems.push('a message that isn\'t DNS');
+      names.push(...got);
       o += 2 + len;
     }
-    if (names.length) out.push({ proto: 'tcp-dns', src: first.src, dst: first.dst, sport: first.sport, dport: first.dport, names, at: first.at });
+    if (o < stream.length && !problems.some(x => x.startsWith('a message'))) problems.push('ends part-way through a message');
+    const entry = { proto: 'tcp-dns', src: c.first.src, dst: c.first.dst, sport: c.first.sport, dport: c.first.dport, names, at: c.first.at, incomplete: problems.length ? `${c.key}: ${[...new Set(problems)].join(', ')}` : undefined };
+    out.push(entry);
   }
   return out;
 }

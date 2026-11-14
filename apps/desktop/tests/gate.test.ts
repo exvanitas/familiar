@@ -48,7 +48,7 @@ describe('the gate', () => {
     const chk = JSON.parse(readFileSync(new URL('../shell-check/checks.json', import.meta.url), 'utf8')).ids as string[];
     expect(new Set(inv).size).toBe(inv.length);
     expect(new Set(chk).size).toBe(chk.length);
-    expect(inv.length).toBe(60);
+    expect(inv.length).toBe(63);
     for (const id of [...inv, ...chk]) expect(id).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$|^[a-z0-9-]+$/);
   });
 });
@@ -199,34 +199,42 @@ describe('the egress analysis', () => {
 });
 
 describe('no lookup before Allow', () => {
-  // Canaries at 100 and 900, the window 200 to 800, ddd allowed at 500.
+  // Canaries at 100 and 900, the window 200 to 800, ddd's dialog returned at 500 by the exe's log.
   const log = [
-    'NETLOOKUP canary cfirst', 'NETLOOKUP never aaa', 'NETLOOKUP never bbb', 'NETLOOKUP never ccc',
-    'NETLOOKUP after ddd 500', 'NETLOOKUP window 200 800', 'NETLOOKUP canary clast', 'NETLOOKUP flow ok'
+    'NETLOOKUP canary cfirst', 'NETLOOKUP tcp-canary ctcp', 'NETLOOKUP never aaa', 'NETLOOKUP never bbb', 'NETLOOKUP never ccc',
+    'confirm: dialog answered at 300', 'confirm: dialog answered at 500', 'NETLOOKUP after ddd', 'NETLOOKUP window 200 800', 'NETLOOKUP canary clast', 'NETLOOKUP flow ok'
   ].map(l => `x ${l}`).join('\n');
-  const q = (n: string, at: number) => ({ proto: 'udp', dst: '1.1.1.1', dport: 53, names: [`${n}.familiar-check.test`], at });
-  const sq = (n: string, at: number) => ({ name: `${n}.familiar-check.test`, type: 1, at });
-  const packets = [q('cfirst', 100), q('ddd', 520), q('clast', 900)];
-  const server = [sq('cfirst', 99), sq('ddd', 510), sq('clast', 899)];
+  const q = (n: string, at: number, proto = 'udp') => ({ proto, dst: '1.1.1.1', dport: 53, names: [`${n}.familiar-check.test`], at });
+  const sq = (n: string, at: number, tcp = false) => ({ name: `${n}.familiar-check.test`, type: 1, tcp, at });
+  const packets = [q('cfirst', 100), q('ctcp', 150, 'tcp-dns'), q('ddd', 520), q('clast', 900)];
+  const server = [sq('cfirst', 99), sq('ctcp', 149, true), sq('ddd', 510), sq('clast', 899)];
   const judged = (o: object) => judgeLookups({ log, packets, dnsLog: '', server, run: 'r', ...o });
-  it('passes when only the allowed name was looked up, after Allow, inside seen canaries', () => {
-    expect(judged({})).toMatch(/^PASS .*first queried 10 ms after Allow.* run=r$/);
+  it('passes when only the allowed name was looked up, after the exe\'s dialog returned, inside seen canaries', () => {
+    expect(judged({})).toMatch(/^PASS .*first queried 10 ms after the exe's dialog returned.* run=r$/);
   });
   it('fails on a refused name at the server, on the wire or in the client log', () => {
     expect(judged({ packets: [...packets, q('bbb', 300)] })).toMatch(/^FAIL .*bbb looked up before any Allow \(wire\)/);
     expect(judged({ server: [...server, sq('aaa', 300)] })).toMatch(/^FAIL .*aaa looked up before any Allow \(server\)/);
     expect(judged({ dnsLog: 'QueryName ccc.familiar-check.test' })).toMatch(/^FAIL .*ccc .*client log/);
   });
-  it('fails when the allowed name was looked up before Allow, or never', () => {
-    expect(judged({ server: [...server, sq('ddd', 450)] })).toMatch(/^FAIL .*50 ms before Allow/);
+  it('fails when the allowed name was looked up before the dialog returned, or never', () => {
+    // 450 is after the driver could have clicked but before the exe's dialog returned.
+    expect(judged({ server: [...server, sq('ddd', 450)] })).toMatch(/^FAIL .*50 ms before its dialog returned/);
     expect(judged({ packets: packets.filter(p => !p.names[0].startsWith('ddd')) })).toMatch(/^FAIL .*allowed ddd was not seen/);
+    expect(judged({ log: log.replace(/x confirm: dialog answered at \d+\n/g, '') })).toMatch(/^FAIL .*no dialog answer in the exe's log before ddd/);
   });
   it('fails when the witnesses did not cover the window', () => {
     expect(judged({ packets: packets.filter(p => !p.names[0].startsWith('cfirst')) })).toMatch(/^FAIL .*opening canary was not seen/);
     expect(judged({ server: server.filter(p => !p.name.startsWith('clast')) })).toMatch(/^FAIL .*closing canary was not seen/);
-    expect(judged({ packets: [q('cfirst', 300), q('ddd', 520), q('clast', 900)] })).toMatch(/^FAIL .*capture starts after the window/);
-    expect(judged({ log: log.replace(/NETLOOKUP window.*\n/, '') })).toMatch(/^FAIL .*no window/);
+    expect(judged({ packets: [q('cfirst', 300), q('ctcp', 150, 'tcp-dns'), q('ddd', 520), q('clast', 900)] })).toMatch(/^FAIL .*capture starts after the window/);
+    expect(judged({ log: log.replace(/x NETLOOKUP window.*\n/, '') })).toMatch(/^FAIL .*no window/);
     expect(judged({ log: log.replace('NETLOOKUP flow ok', '') })).toMatch(/^FAIL .*never finished/);
+  });
+  it('fails when the TCP canary was not seen reassembled, or any TCP DNS was seen only in part', () => {
+    expect(judged({ packets: packets.filter(p => p.proto !== 'tcp-dns') })).toMatch(/^FAIL .*TCP canary was not seen \(wire 0/);
+    expect(judged({ server: server.map(x => ({ ...x, tcp: false })) })).toMatch(/^FAIL .*TCP canary was not seen \(wire 1, server 0/);
+    expect(judged({ log: log.replace('x NETLOOKUP tcp-canary ctcp\n', '') })).toMatch(/^FAIL .*no canary was looked up over TCP/);
+    expect(judged({ packets: [...packets, { ...q('zzz', 400, 'tcp-dns'), incomplete: 'a>b: a gap at byte 10' }] })).toMatch(/^FAIL .*TCP DNS seen only in part \(a>b: a gap at byte 10\)/);
   });
 });
 
@@ -238,16 +246,41 @@ describe('DNS over TCP and the check\'s DNS server', () => {
     tail.writeUInt16BE(1, 3);
     return Buffer.concat([Buffer.from([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]), ...labels, tail]);
   };
+  const framed = (name: string) => { const m = query(name); return Buffer.concat([Buffer.from([m.length >> 8, m.length & 0xff]), m]); };
+  const SYN = 0x02, FIN = 0x01, ACK = 0x10;
+  /* A segment of `stream` from byte `from` to `to`, on a connection whose SYN had `isn`. */
+  const seg = (stream: Buffer, isn: number, from: number, to: number, at: number, flags = ACK, sport = 5000) =>
+    ({ proto: 'tcp', src: 'a', dst: 'b', sport, dport: 53, names: [], seq: (isn + 1 + from) >>> 0, flags, payload: stream.subarray(from, to), at });
+  const syn = (isn: number, at: number, sport = 5000) => ({ proto: 'tcp', src: 'a', dst: 'b', sport, dport: 53, names: [], seq: isn, flags: SYN, payload: Buffer.alloc(0), at });
   it('reads a query split across segments, out of order and resent', () => {
-    const m = query('split.familiar-check.test');
-    const stream = Buffer.concat([Buffer.from([m.length >> 8, m.length & 0xff]), m]);
-    const seg = (from: number, to: number, at: number) => ({ proto: 'tcp', src: 'a', dst: 'b', sport: 5000, dport: 53, names: [], seq: 1000 + from, payload: stream.subarray(from, to), at });
-    const got = reassembleDns([seg(10, stream.length, 2), seg(0, 10, 1), seg(0, 10, 3), seg(5, 15, 4)]);
+    const stream = framed('split.familiar-check.test');
+    const got = reassembleDns([syn(1000, 0), seg(stream, 1000, 10, stream.length, 2), seg(stream, 1000, 0, 10, 1), seg(stream, 1000, 0, 10, 3), seg(stream, 1000, 5, 15, 4)]);
     expect(got).toHaveLength(1);
     expect(got[0].names).toEqual(['split.familiar-check.test']);
-    expect(got[0].at).toBe(1);
-    // A hole leaves the name unread rather than misread.
-    expect(reassembleDns([seg(0, 10, 1), seg(20, stream.length, 2)])).toHaveLength(0);
+    expect(got[0].incomplete).toBeUndefined();
+    expect(got[0].at).toBe(0);
+  });
+  it('a hole, a missing SYN, a cut-off message or resent bytes that differ are incomplete evidence', () => {
+    const stream = framed('hole.familiar-check.test');
+    expect(reassembleDns([syn(7, 0), seg(stream, 7, 0, 10, 1), seg(stream, 7, 20, stream.length, 2)])[0].incomplete).toMatch(/a gap at byte 10/);
+    expect(reassembleDns([seg(stream, 7, 0, stream.length, 1)])[0].incomplete).toMatch(/no SYN seen/);
+    expect(reassembleDns([syn(7, 0), seg(stream, 7, 0, stream.length - 3, 1)])[0].incomplete).toMatch(/ends part-way through a message/);
+    const other = Buffer.from(stream);
+    other[12] ^= 0xff;
+    expect(reassembleDns([syn(7, 0), seg(stream, 7, 0, stream.length, 1), seg(other, 7, 0, 20, 2)])[0].incomplete).toMatch(/differ/);
+  });
+  it('two connections on one reused tuple stay apart', () => {
+    const one = framed('first.familiar-check.test'), two = framed('second.familiar-check.test');
+    const got = reassembleDns([syn(100, 0), seg(one, 100, 0, one.length, 1), { ...seg(one, 100, one.length, one.length, 2), flags: FIN | ACK }, syn(900000, 3), seg(two, 900000, 0, two.length, 4)]);
+    expect(got.map(g => g.names)).toEqual([['first.familiar-check.test'], ['second.familiar-check.test']]);
+    expect(got.every(g => !g.incomplete)).toBe(true);
+  });
+  it('a sequence number that wraps past 2^32 reads straight on', () => {
+    const stream = framed('wrap.familiar-check.test');
+    const isn = 2 ** 32 - 6;
+    const got = reassembleDns([syn(isn, 0), seg(stream, isn, 8, stream.length, 2), seg(stream, isn, 0, 8, 1)]);
+    expect(got[0].names).toEqual(['wrap.familiar-check.test']);
+    expect(got[0].incomplete).toBeUndefined();
   });
   it('answers with the planned addresses of the asked type, at TTL 0', () => {
     const m = query('plan.familiar-check.test');

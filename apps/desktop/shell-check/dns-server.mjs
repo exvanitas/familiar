@@ -1,11 +1,13 @@
 // A DNS server of the check's own, run by driver.ps1 and set as the runner's resolver for the run.
 // Names in the plan (dns-plan.json in the out folder, reread on every query) get the answers the
 // plan gives for their nth A query, after its delay; every other query is forwarded to the
-// resolver the runner had, unchanged, so it still shows on the wire. Every query is written to
-// dns-log.jsonl with its time, name, type and what was answered.
+// resolver the runner had, unchanged, so it still shows on the wire. It listens on UDP and TCP;
+// a TCP query is forwarded over TCP. Every query is written to dns-log.jsonl with its time, name,
+// type, whether it came over TCP, and what was answered.
 //
 //   node dns-server.mjs <out dir> <upstream resolver ip>
 import { createSocket } from 'node:dgram';
+import { createServer, connect } from 'node:net';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -69,15 +71,15 @@ if (/(^|[\\/])dns-server\.mjs$/.test(process.argv[1] ?? '')) {
     const back = pending.get(id);
     if (back) { pending.delete(id); sock.send(reply, back.port, back.address); }
   });
-  sock.on('message', (msg, rinfo) => {
+  /* One query, over either transport: `reply` gets the answer, `forward` sends it upstream. */
+  function handle(msg, tcp, reply, forward) {
     let q;
     try { q = question(msg); } catch { return; }
     const plan = existsSync(planFile) ? JSON.parse(readFileSync(planFile, 'utf8')) : {};
     const p = plan[q.name];
     if (!p) {
-      log({ name: q.name, type: q.type, answered: 'forward' });
-      pending.set(msg.readUInt16BE(0), rinfo);
-      up.send(msg, 53, upstream);
+      log({ name: q.name, type: q.type, tcp, answered: 'forward' });
+      forward();
       return;
     }
     // The plan counts A queries; an AAAA query gets what the current step holds of its type.
@@ -85,10 +87,37 @@ if (/(^|[\\/])dns-server\.mjs$/.test(process.argv[1] ?? '')) {
     if (q.type === 1) asked.set(q.name, n + 1);
     const at = q.type === 1 ? n : Math.max(n - 1, 0);
     const step = p.answers[Math.min(at, p.answers.length - 1)];
-    log({ name: q.name, type: q.type, answered: step, n: q.type === 1 ? n + 1 : null });
+    log({ name: q.name, type: q.type, tcp, answered: step, n: q.type === 1 ? n + 1 : null });
     const delay = p.delay?.length ? p.delay[Math.min(at, p.delay.length - 1)] : 0;
-    setTimeout(() => sock.send(answer(msg, step), rinfo.port, rinfo.address), delay);
+    setTimeout(() => reply(answer(msg, step)), delay);
+  }
+  sock.on('message', (msg, rinfo) => handle(msg, false, r => sock.send(r, rinfo.port, rinfo.address), () => {
+    pending.set(msg.readUInt16BE(0), rinfo);
+    up.send(msg, 53, upstream);
+  }));
+  // TCP: length-prefixed messages; each forwarded one goes upstream on a TCP connection of its own.
+  const framed = m => Buffer.concat([Buffer.from([m.length >> 8, m.length & 0xff]), m]);
+  const tcp = createServer(c => {
+    let buf = Buffer.alloc(0);
+    c.on('error', () => {});
+    c.on('data', d => {
+      buf = Buffer.concat([buf, d]);
+      while (buf.length >= 2 && buf.length >= 2 + buf.readUInt16BE(0)) {
+        const msg = buf.subarray(2, 2 + buf.readUInt16BE(0));
+        buf = buf.subarray(2 + msg.length);
+        handle(msg, true, r => c.write(framed(r)), () => {
+          const u = connect(53, upstream, () => u.write(framed(msg)));
+          let got = Buffer.alloc(0);
+          u.on('data', x => {
+            got = Buffer.concat([got, x]);
+            if (got.length >= 2 && got.length >= 2 + got.readUInt16BE(0)) { c.write(got.subarray(0, 2 + got.readUInt16BE(0))); u.end(); }
+          });
+          u.on('error', () => c.destroy());
+        });
+      }
+    });
   });
+  tcp.listen(53, '127.0.0.1');
   sock.bind(53, '127.0.0.1', () => {
     writeFileSync(logFile, '');
     console.log(`dns server up, forwarding to ${upstream}`);
