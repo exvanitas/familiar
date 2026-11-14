@@ -111,42 +111,37 @@ pub fn class_v4(ip: Ipv4Addr) -> IpClass {
     }
 }
 
-/// An IPv6 address's class. A mapped IPv4 address is classed as its IPv4.
+/// An IPv6 address's class, by allowlist. Loopback (`::1`), lan (`fc00::/7`), a mapped IPv4
+/// address as its IPv4, and NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) by the IPv4 address
+/// inside, public only if that is. Otherwise public only inside global unicast `2000::/3`,
+/// minus its special ranges. Everything else is refused, the IPv4-translated
+/// `::ffff:0:0/96` and every range not yet assigned among them.
 pub fn class_v6(ip: Ipv6Addr) -> IpClass {
     use IpClass::*;
     if let Some(v4) = ip.to_ipv4_mapped() {
         return class_v4(v4);
     }
-    let s = ip.segments();
     if ip == Ipv6Addr::LOCALHOST {
         return Reach(self::Reach::Loopback);
     }
-    if ip.is_unspecified() {
-        return Refused;
-    }
-    // IPv4-compatible (::a.b.c.d), deprecated and never a real destination.
-    if s[..6] == [0; 6] {
-        return Refused;
-    }
-    // Translation prefixes that carry an IPv4 address: 64:ff9b::/96 (NAT64) and 2002::/16 (6to4).
-    // They reach the IPv4 address inside, so only a public one passes.
+    let s = ip.segments();
     let embedded = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
     if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0; 4] {
         return public_or_refused(class_v4(embedded(s[6], s[7])));
     }
-    if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
-        return Refused; // 64:ff9b:1::/48, local-use translation
+    if s[0] & 0xfe00 == 0xfc00 {
+        return Reach(self::Reach::Lan);
     }
-    if s[0] == 0x2002 {
-        return public_or_refused(class_v4(embedded(s[1], s[2])));
+    if s[0] & 0xe000 != 0x2000 {
+        return Refused;
     }
     match s[0] {
-        x if x & 0xfe00 == 0xfc00 => Reach(self::Reach::Lan), // fc00::/7
-        x if x & 0xffc0 == 0xfe80 => Refused,                 // fe80::/10, link-local
-        x if x & 0xffc0 == 0xfec0 => Refused,                 // fec0::/10, old site-local
-        x if x & 0xff00 == 0xff00 => Refused,                 // ff00::/8, multicast
-        0x2001 if s[1] == 0x0db8 => Refused,                  // 2001:db8::/32, documentation
-        0x3fff if s[1] & 0xf000 == 0 => Refused,              // 3fff::/20, documentation
+        0x2002 => public_or_refused(class_v4(embedded(s[1], s[2]))),
+        // 2001::/23, IETF protocol assignments: Teredo (which hides an IPv4 address),
+        // benchmarking, ORCHID and the rest.
+        0x2001 if s[1] < 0x0200 => Refused,
+        0x2001 if s[1] == 0x0db8 => Refused,  // 2001:db8::/32, documentation
+        0x3fff if s[1] & 0xf000 == 0 => Refused, // 3fff::/20, documentation
         _ => Reach(self::Reach::Public),
     }
 }
@@ -514,6 +509,18 @@ mod tests {
             ("2002:7f00:1::1", Refused),
             ("2002:808:808::1", public),
             ("2606:4700::1111", public),
+            ("::ffff:0:169.254.169.254", Refused),
+            ("::ffff:0:8.8.8.8", Refused),
+            ("::ffff:0:127.0.0.1", Refused),
+            ("100::1", Refused),
+            ("1::1", Refused),
+            ("4000::1", Refused),
+            ("e000::1", Refused),
+            ("2001::1", Refused),
+            ("2001:2::1", Refused),
+            ("2001:1ff::1", Refused),
+            ("2001:200::1", public),
+            ("2c0f:f248::1", public),
             ("2001:4860:4860::8888", public),
         ] {
             assert_eq!(c(ip), want, "{ip}");
@@ -527,6 +534,7 @@ mod tests {
         assert_eq!(normalize("http://[fd00::5]").unwrap().reach, Some(Reach::Lan));
         assert_eq!(normalize("http://192.168.1.20:1234").unwrap().reach, Some(Reach::Lan));
         assert_eq!(normalize("https://8.8.8.8").unwrap().reach, Some(Reach::Public));
+        assert_eq!(normalize("https://[::ffff:0:169.254.169.254]"), Err(AddrError::BlockedAddress));
         for bad in ["http://169.254.169.254", "http://[fe80::1]", "http://[::]", "http://0.0.0.0:80", "http://224.0.0.1", "https://192.0.2.1"] {
             assert_eq!(normalize(bad), Err(AddrError::BlockedAddress), "{bad}");
         }
