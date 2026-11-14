@@ -25,6 +25,8 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ('familiar-check-' + [guid]::NewGuid
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $results = [System.Collections.Generic.List[string]]::new()
 $marks = [ordered]@{}
+$told = @{}
+$script:folder = $tmp
 $script:log = $null
 $script:proc = $null
 function Result($state, $id, $detail) { $line = "$state $id $detail"; $results.Add($line); Write-Host $line }
@@ -75,11 +77,24 @@ function Bring-Front([string]$title) {
   return $h
 }
 
+# The WebView2 browser process's own arguments, as the OS has them: proof of what it was told.
+function Browser-Args([string]$folder) {
+  $b = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -like "*$folder*" -and $_.CommandLine -notlike '*--type=*' } | Select-Object -First 1
+  if (-not $b) { return '' }
+  return (([regex]'--[a-z0-9-]+(=("[^"]*"|\S+))?').Matches($b.CommandLine) | ForEach-Object { $_.Value } | Where-Object { $_ -notmatch '^--(user-data-dir|embedded-browser-webview|webview-exe-name|webview-exe-version|mojo|lang|noerrdialogs|field-trial|variations)' }) -join ' '
+}
+
 function Do-Step($action, $a) {
+  if (-not $told[$script:phaseName]) {
+    $told[$script:phaseName] = Browser-Args $script:folder
+    if ($script:phaseName -eq 'main' -and $told.main) { Result 'PASS' 'check.webview.args' $told.main }
+  }
   switch ($action) {
     'second-launch' {
       $t = [Diagnostics.Stopwatch]::StartNew()
-      $p = Launch $Exe @($a.args)
+      $argv = @($a.args)
+      if ($a.long) { $argv += ('x' * [int]$a.long) }
+      $p = Launch $Exe $argv
       if (-not $p.WaitForExit(15000)) { $p.Kill(); throw 'the second launch did not exit' }
       return @{ exit = $p.ExitCode; ms = $t.ElapsedMilliseconds }
     }
@@ -134,7 +149,6 @@ function Do-Step($action, $a) {
         if (-not $l) { continue }
         $h = $l | ConvertFrom-Json
         if ($h.label -and $h.label.StartsWith($a.prefix) -and (@('c', 'v', 'b') -contains $h.label.Substring($a.prefix.Length, 1))) { $n++ }
-        if (($h.kind -eq 'udp' -or $h.kind -eq 'tcp') -and $h.listener -match '^(core|view|bare)-') { $n++ }
       }
       return @{ hits = $n }
     }
@@ -164,6 +178,9 @@ function Handle([string]$raw) {
 # One run of the exe, reading its log as it goes. Returns the process.
 function Run-Phase([string]$name, [string]$log, [string[]]$argv, [int]$limit, [string]$exe = $Exe) {
   Write-Host "--- phase $name"
+  $script:phaseName = $name
+  # Answers from an earlier phase must not be read as this one's.
+  Remove-Item (Join-Path $App 'driver') -Recurse -Force -ErrorAction SilentlyContinue
   $script:log = $log
   Remove-Item $log -ErrorAction SilentlyContinue
   $offset = 0
@@ -292,12 +309,14 @@ try {
   $h = 0
   for ($i = 0; $i -lt 150 -and -not $h; $i++) { Start-Sleep -Milliseconds 100; $h = [W]::Dialog([uint32]$p.Id) }
   $text = if ($h) { [W]::DialogText($h) } else { '' }
-  if ($h) { [W]::Press($h, 1) }
+  $seen = if ($h) { '' } else { (@([W]::Visible(@([uint32]$p.Id))) -join ' | ') }
+  if ($h) { [W]::Press($h, 2) }
+  if ($h -and -not $p.WaitForExit(3000)) { [W]::Press($h, 1); [void][W]::Post($h, 0x10, 0, 0) }
   if ($p.WaitForExit(10000)) {
     $said = [bool](Select-String -Path $log -Pattern 'app folder missing' -Quiet)
     $ok = $h -and $said -and $p.ExitCode -eq 1 -and $text -match 'app folder is missing'
     Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'check.start.no-app' "box $([bool]$h) text $($text -match 'app folder is missing') log $said exit $($p.ExitCode)"
-  } else { Result 'FAIL' 'check.start.no-app' 'still running'; $p.Kill() }
+  } else { Result 'FAIL' 'check.start.no-app' "still running: box $([bool]$h) text '$text' windows '$seen'"; $p.Kill() }
 
   # ---------- a core page that throws: one box within 35 s, the tray stays ----------
   $log = Join-Path $Out 'not-ready.log'
@@ -318,6 +337,39 @@ try {
   Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'check.start.not-ready' "box after $boxAt ms, names the log $($text -match 'log'), exe stayed $stayed with tray $tray, log $said, ended by --seconds $exited code $(if ($exited) { $p.ExitCode } else { '-' })"
   if (-not $exited) { $p.Kill() }
   [void](No-Strays 'not-ready')
+
+  # ---------- a measurement: WebRTC under other browser arguments ----------
+  # The pinned arguments may not stop WebRTC in WebView2. These runs try others through WebView2's
+  # own environment variable, so no other exe is needed to measure them. Each run gets its own data
+  # folder, since one folder's browser keeps the arguments it started with. The proxy here is the
+  # fixtures' HTTP listener, which logs a CONNECT and drops it.
+  $proxy = "--proxy-server=http://127.0.0.1:$($fx.tcp) --proxy-bypass-list=<-loopback>"
+  $base = '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required'
+  $variants = [ordered]@{
+    'pinned' = "$base $proxy --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable"
+    'policy-switch' = "$base $proxy --webrtc-ip-handling-policy=disable_non_proxied_udp --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable"
+    'permission-check' = "$base $proxy --force-webrtc-ip-handling-policy=disable_non_proxied_udp --enforce-webrtc-ip-permission-check --dns-prefetch-disable"
+    'no-proxy' = "$base --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable"
+  }
+  foreach ($name in $variants.Keys) {
+    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $variants[$name]
+    $from = Now-Ms
+    $log = Join-Path $Out "webrtc-$name.log"
+    $folder = Join-Path $tmp "rtc-$name"
+    $script:folder = $folder
+    $p = Run-Phase "webrtc-$name" $log @('--app-dir', $App, '--data-dir', $folder, '--log', $log, '--seconds', '45', '--phase', 'webrtc', '--variant', $name) 70
+    Remove-Item Env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+    $to = Now-Ms
+    $hits = @(Get-Content (Join-Path $Out 'hits.jsonl') | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.at -ge $from -and $_.at -le $to })
+    $udp = @($hits | Where-Object { $_.kind -eq 'udp' -and $_.listener -like 'probe-*' }).Count
+    $tcp = @($hits | Where-Object { $_.kind -eq 'tcp' -and $_.listener -like 'probe-*' }).Count
+    $connect = @($hits | Where-Object { $_.kind -eq 'connect' }).Count
+    $m = Select-String -Path $log -Pattern 'INFO webrtc \S+ (.*)$' | Select-Object -First 1
+    $saw = if ($m) { $m.Matches[0].Groups[1].Value } else { 'nothing' }
+    $sink = 0; foreach ($l in Get-Content $log) { if ($l -match 'sink refused (\d+) ') { $sink = [int]$Matches[1] } }
+    Result 'PASS' "check.webrtc.$name" "udp to the listeners $udp, tcp $tcp, CONNECTs at the fixtures' proxy $connect, exe sink $sink, page saw $saw, WebView2 was told: $($told["webrtc-$name"])"
+    [void](No-Strays "webrtc-$name")
+  }
 
   # ---------- the positive controls ----------
   Write-Host '--- controls'

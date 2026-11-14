@@ -21,6 +21,11 @@
     "start.not-ready",
     "smoke.ready",
     "smoke.chat",
-    "smoke.quit"
+    "smoke.quit",
+    "webview.args",
+    "webrtc.pinned",
+    "webrtc.policy-switch",
+    "webrtc.permission-check",
+    "webrtc.no-proxy"
   ]
 }

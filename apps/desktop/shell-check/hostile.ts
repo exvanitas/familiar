@@ -7,10 +7,11 @@
    Each route gets its own label, `<run><ctx><nn>`, in every path and name it uses, and its own LAN
    port, so the driver can tell which route got out, from which page. */
 
-/* `driver` is the driver's own sends, the other half of the positive control. */
-export type Ctx = 'core' | 'view' | 'bare' | 'edge' | 'driver';
-export const CTX_CODE: Record<Ctx, string> = { core: 'c', view: 'v', bare: 'b', edge: 'e', driver: 'd' };
-const CTX_INDEX: Record<Ctx, number> = { core: 0, view: 1, bare: 2, edge: 3, driver: 4 };
+/* `driver` is the driver's own sends, the other half of the positive control. `probe` is the
+   WebRTC measurement runs, judged apart from the egress checks. */
+export type Ctx = 'core' | 'view' | 'bare' | 'edge' | 'driver' | 'probe';
+export const CTX_CODE: Record<Ctx, string> = { core: 'c', view: 'v', bare: 'b', edge: 'e', driver: 'd', probe: 'p' };
+const CTX_INDEX: Record<Ctx, number> = { core: 0, view: 1, bare: 2, edge: 3, driver: 4, probe: 5 };
 export const NAME_SUFFIX = 'familiar-check.test';
 
 export interface HostileFixtures {
@@ -189,14 +190,15 @@ export const ROUTES: Route[] = [
 ];
 
 /* Runs every route once, all at the same time except the navigations, and says what the page saw. */
-export async function hostile(ctx: Ctx, fx: HostileFixtures, opts: { nav: boolean }): Promise<Record<string, Out>> {
+export async function hostile(ctx: Ctx, fx: HostileFixtures, opts: { nav: boolean; only?: string[] }): Promise<Record<string, Out>> {
   const out: Record<string, Out> = {};
+  const skip = (r: Route) => opts.only !== undefined && !opts.only.includes(r.id);
   const run = async (r: Route, i: number) => {
     try { out[r.id] = await r.go(where(fx, ctx, i), ctx, fx); } catch (e) { out[r.id] = { loop: 'threw:' + name(e) }; }
   };
-  await Promise.all(ROUTES.map((r, i) => (r.nav ? null : run(r, i))));
+  await Promise.all(ROUTES.map((r, i) => (r.nav || skip(r) ? null : run(r, i))));
   if (opts.nav) {
-    for (const [i, r] of ROUTES.entries()) if (r.nav) await run(r, i);
+    for (const [i, r] of ROUTES.entries()) if (r.nav && !skip(r)) await run(r, i);
   }
   return out;
 }

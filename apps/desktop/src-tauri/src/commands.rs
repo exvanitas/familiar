@@ -126,7 +126,8 @@ fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>)
         // Destroy, not close: a page listening for close requests can't hold its window open.
         CtlOp::Close => w.destroy().map_err(err)?,
         CtlOp::GetBounds => {
-            let (p, s) = (w.outer_position().map_err(err)?, w.outer_size().map_err(err)?);
+            // Where the window is, and how big its content is: what set-bounds takes.
+            let (p, s) = (w.outer_position().map_err(err)?, w.inner_size().map_err(err)?);
             return Ok(Some(Bounds { x: p.x, y: p.y, width: s.width, height: s.height }));
         }
         CtlOp::SetBounds => {

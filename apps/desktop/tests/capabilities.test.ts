@@ -5,7 +5,8 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const at = (p: string) => new URL(`../${p}`, import.meta.url);
-const read = (p: string) => readFileSync(at(p), 'utf8');
+// A Windows checkout may have CRLF line ends.
+const read = (p: string) => readFileSync(at(p), 'utf8').replace(/\r\n/g, '\n');
 
 interface Capability { identifier: string; description?: string; windows: string[]; webviews?: string[]; permissions: (string | { identifier: string })[]; remote?: unknown; platforms?: unknown }
 const capFiles = readdirSync(at('src-tauri/capabilities')).filter(f => f.endsWith('.json'));
@@ -22,7 +23,7 @@ const conf = JSON.parse(read('src-tauri/tauri.conf.json'));
 const webRs = read('shell-core/src/web.rs');
 const constOf = (name: string) => /"(.*)";/.exec(webRs.slice(webRs.indexOf(`pub const ${name}: &str = `)))?.[1] ?? '';
 const rustSources = readdirSync(at('src-tauri/src')).filter(f => f.endsWith('.rs')).map(f => [f, read(`src-tauri/src/${f}`)] as const);
-const design = readFileSync(new URL('../../../docs/shell-design.md', import.meta.url), 'utf8');
+const design = readFileSync(new URL('../../../docs/shell-design.md', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 
 /* The design's code block that follows a heading or phrase, joined into one line. */
 function designBlock(after: string): string {

@@ -38,7 +38,9 @@ const brief = (o: unknown) => JSON.stringify(o).replace(/"/g, '').slice(0, 900);
 async function persist(when: string) {
   await check(`check.persist.${when}`, async () => {
     const before = await navigator.storage.persisted();
+    await say('INFO persist asking');
     const granted = before || await navigator.storage.persist();
+    await say('INFO persist answered');
     const { quota, usage } = await navigator.storage.estimate();
     return `persisted=${before} granted=${granted} quota=${quota} usage=${usage}`;
   });
@@ -149,7 +151,8 @@ async function main(info: Info) {
     ok(emit === 'acl', 'core could emit');
     const big = 'x'.repeat(10000);
     const second = await step<{ exit: number; ms: number }>('second-launch', { args: ['--hello', 'small'] });
-    const second2 = await step<{ exit: number; ms: number }>('second-launch', { args: ['--hello', big] });
+    // A page line is cut at 4 KiB, so the driver makes the long argument itself.
+    const second2 = await step<{ exit: number; ms: number }>('second-launch', { args: ['--hello'], long: big.length });
     const tray = await step<{ done: boolean; how: string }>('tray-click', {});
     await sleep(1500);
     const got = messages.filter(m => m.t === 'second-launch') as { args: string[] }[];
@@ -238,8 +241,7 @@ async function main(info: Info) {
     await ask('chat', 'clip-ready', text);
     const click = await step<{ clicked: boolean; why?: string }>('click', { title: 'Familiar check chat' });
     if (!click.clicked) skip('the driver could not click here: ' + (click.why ?? ''));
-    await sleep(800);
-    const result = await ask<string>('chat', 'clip-result');
+    const result = await until(async () => { const r = await ask<string>('chat', 'clip-result'); return r === 'no click' ? null : r; }, 5000, 'the write').catch(() => 'no click');
     const back = await step<{ text: string }>('clipboard-get');
     ok(result === 'written' && back.text === text, `page said ${result}, clipboard ${back.text === text ? 'matches' : 'differs'}`);
     return 'navigator.clipboard.writeText after a real click works in a view';
@@ -298,8 +300,9 @@ async function main(info: Info) {
     ok(urls.length === 0, 'a refusal line carries a URL');
     const s = await ask<{ path: string }>('settings', 'where');
     ok(s.path === '/settings.html', 'settings moved');
+    // WebRTC isn't navigation and is judged in the egress checks: only http requests count here.
     const hits = await step<{ hits: number }>('hits', { prefix: fx.run });
-    ok(hits.hits === 0, `the listener saw ${hits.hits} requests from Familiar`);
+    ok(hits.hits === 0, `the listener saw ${hits.hits} http requests from Familiar`);
     return `${lines.count} refusals logged by scheme only, every page stayed, the listener saw nothing`;
   });
 
@@ -391,7 +394,15 @@ async function pinRead(info: Info, value: string, id: string) {
     else if (phase === 'pin-write') await pinWrite(info, value);
     else if (phase === 'pin-read') await pinRead(info, value, 'security.pin.restart');
     else if (phase === 'pin-moved') await pinRead(info, value, 'security.pin.moved-install');
-    else if (phase === 'hung-quit') {
+    else if (phase === 'webrtc') {
+      // A measurement: only the WebRTC routes, under whatever browser arguments the driver chose.
+      await step('mark', { name: 'webrtc-' + arg(info, '--variant') });
+      const out = await hostile('probe', await fixtures(), { nav: false, only: ['webrtc-stun', 'webrtc-turn'] });
+      await say(`INFO webrtc ${arg(info, '--variant')} ${JSON.stringify(out)}`);
+      onQuitting = () => { shell.quitReady().catch(() => {}); };
+      await say('DONE');
+      await shell.quit();
+    } else if (phase === 'hung-quit') {
       onQuitting = () => { void say('INFO hung core ignores quitting'); };
       await say('DONE');
     } else await say(`CHECK FAIL check.phase unknown phase ${phase}`);

@@ -18,7 +18,7 @@ import { randomBytes } from 'node:crypto';
 const [out, appDir, ...more] = process.argv.slice(2);
 if (!out || !appDir) throw new Error('usage: node fixtures.mjs <out dir> <check app dir> [<dirs>...]');
 const hitsFile = join(out, 'hits.jsonl');
-const CONTEXTS = ['core', 'view', 'bare', 'edge', 'driver'];
+const CONTEXTS = ['core', 'view', 'bare', 'edge', 'driver', 'probe'];
 const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
 const run = Array.from(randomBytes(8), b => alphabet[b % 36]).join('');
 // Never in use on the runner's network, so a packet to it can only be seen on the wire.
