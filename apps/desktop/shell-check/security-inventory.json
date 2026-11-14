@@ -59,6 +59,7 @@
     "server.stopped-asks",
     "server.kill",
     "link.confirm",
+    "files.modal",
     "files.save-refused"
   ]
 }

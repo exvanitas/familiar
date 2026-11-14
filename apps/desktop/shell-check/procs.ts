@@ -383,24 +383,51 @@ async function filesAndLinks(info: Info) {
       ok(!d.shown, `a dialog for ${url.slice(0, 40)}`);
       ok(await r === 'invalid', `${url.slice(0, 40)}: ${await r}`);
     }
-    // The current user's https handler is a recorder for this check, so what the browser would
-    // get is read back exactly.
+    // What the default browser was handed, read from the command line of the browser process
+    // open_url started, so the URL is checked exactly.
     const rec = await step<{ on: boolean; how: string }>('url-recorder-on');
-    ok(rec.on, 'the https recorder could not be set: ' + rec.how);
+    ok(rec.on, 'the browser watch could not start: ' + rec.how);
     const url = `https://familiar-check.test/p/${rand(8)}?q=a&r=b`;
     const no = shell.openUrl(url).then(() => 'opened', e => errKind(e));
     const d1 = await dialog('refuse', OPEN);
     ok(d1.shown && await no === 'declined', `Don't open: dialog ${d1.shown}, ${await no}`);
     ok(d1.text.includes('familiar-check.test'), 'the dialog does not show the host');
     const none = await step<{ urls: string[] }>('url-recorded', { ms: 4000 });
-    ok(none.urls.length === 0, `the handler got ${none.urls.length} URLs after Don't open`);
+    ok(none.urls.length === 0, `the browser got ${none.urls.length} URLs after Don't open`);
     const yes = shell.openUrl(url).then(() => 'opened', e => errKind(e));
     const d2 = await dialog('approve', OPEN);
     ok(d2.shown && await yes === 'opened', `Open: dialog ${d2.shown}, ${await yes}`);
     const seen = await step<{ urls: string[] }>('url-recorded', { ms: 20000, until: 1 });
     await step('url-recorder-off');
-    ok(seen.urls.length === 1 && seen.urls[0] === url, `the handler got: ${JSON.stringify(seen.urls)}, not exactly ${url}`);
-    return `http, javascript, file and too long refused with no dialog; Don't open: the handler got nothing; Open: it got exactly the approved URL (${rec.how})`;
+    ok(seen.urls.length === 1 && seen.urls[0] === url, `the browser got: ${JSON.stringify(seen.urls)}, not exactly ${url}`);
+    return `http, javascript, file and too long refused with no dialog; Don't open: no browser was started; Open: the browser was handed exactly the approved URL (${rec.how})`;
+  });
+
+  await check('security.files.modal', async () => {
+    // An always-on-top view, then a save dialog: while it's open nothing opens or moves, and
+    // every window is frozen as for a confirm; after it, all is as it was.
+    const title = 'Familiar check on top';
+    await shell.viewOpen({ label: 'view-ontop', page: 'chat.html', title, width: 360, height: 240, alwaysOnTop: true });
+    type State = Record<string, { found: boolean; topmost: boolean; enabled: boolean }>;
+    const before = (await step<State>('winstate', { titles: [title] }))[title];
+    ok(before.found && before.topmost && before.enabled, 'the view before: ' + JSON.stringify(before));
+    const saved = shell.saveAs({ name: `familiar-check-${rand(6)}.txt` }, new Uint8Array([1])).then(v => (v ? 'saved' : 'cancelled'), e => errKind(e));
+    const open = await step<{ found: boolean }>('save-dialog-wait');
+    ok(open.found, 'no save dialog');
+    const during = (await step<State>('winstate', { titles: [title] }))[title];
+    const viewOpen = await shell.viewOpen({ label: 'view-late', page: 'chat.html', title: 'Familiar check late' }).then(() => 'opened', e => errKind(e));
+    const moved = await shell.windowCtl('view-ontop', 'set-bounds', { x: 10, y: 10, width: 400, height: 300 }).then(() => 'moved', e => errKind(e));
+    const asked = await shell.openUrl('https://familiar-check.test/during').then(() => 'opened', e => errKind(e));
+    await step('save-dialog-cancel');
+    const outcome = await saved;
+    await sleep(500);
+    const after = (await step<State>('winstate', { titles: [title] }))[title];
+    await shell.windowCtl('view-ontop', 'close').catch(() => {});
+    ok(viewOpen === 'busy' && moved === 'busy' && asked === 'busy', `during the dialog: view_open ${viewOpen}, set-bounds ${moved}, open_url ${asked}`);
+    ok(!during.topmost && !during.enabled, 'the view during the dialog: ' + JSON.stringify(during));
+    ok(outcome === 'cancelled', 'the save: ' + outcome);
+    ok(after.topmost && after.enabled, 'the view after: ' + JSON.stringify(after));
+    return 'while a save dialog was open, view_open, window_ctl and open_url were busy and the always-on-top view was frozen; after it, the view was on top and enabled again';
   });
 
   await check('security.files.save-refused', async () => {

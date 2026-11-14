@@ -149,46 +149,42 @@ $procSteps = @{
     param($a)
     @{ alive = @($a.pids | Where-Object { Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue }) }
   }
+  'save-dialog-wait' = {
+    param($a)
+    @{ found = [bool](Find-Dialog 15000) }
+  }
+  'save-dialog-cancel' = {
+    param($a)
+    $h = Find-Dialog 2000
+    if ($h) { [W]::Press($h, 2) }
+    @{ done = [bool]$h }
+  }
   'url-recorder-on' = {
     param($a)
-    # The current user's https handler, made a recorder that writes the URL it's given to a file.
-    # What was there is kept and put back by url-recorder-off.
-    $script:urlFile = Join-Path $tmp 'urls.txt'
-    Remove-Item $script:urlFile -ErrorAction SilentlyContinue
-    $rec = Join-Path $tmp 'record-url.ps1'
-    Set-Content $rec "param([string]`$u)`n[IO.File]::AppendAllText('$($script:urlFile)', `$u + [char]10)"
-    $pwsh = (Get-Process -Id $PID).Path
-    $key = 'HKCU:\Software\Classes\https'
-    $script:httpsBackup = Test-Path $key
-    if ($script:httpsBackup) { $script:httpsExport = Join-Path $tmp 'https-backup.reg'; & reg.exe export 'HKCU\Software\Classes\https' $script:httpsExport /y | Out-Null }
-    New-Item -Force "$key\shell\open\command" | Out-Null
-    Set-ItemProperty $key -Name '(default)' -Value 'URL:https recorder for the check'
-    Set-ItemProperty $key -Name 'URL Protocol' -Value ''
-    Set-ItemProperty "$key\shell\open\command" -Name '(default)' -Value "`"$pwsh`" -NoProfile -NonInteractive -WindowStyle Hidden -File `"$rec`" `"%1`""
-    # A user choice for https would win over the class: it must go for the check.
-    $uc = 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice'
-    $how = 'HKCU\Software\Classes\https set to a recorder'
-    if (Test-Path $uc) {
-      $script:userChoice = (Get-ItemProperty $uc).ProgId
-      try { Remove-Item $uc -Force -ErrorAction Stop; $how += "; the user choice ($($script:userChoice)) removed" }
-      catch { return @{ on = $false; how = "the https user choice ($($script:userChoice)) can't be removed: $_" } }
-    }
-    @{ on = $true; how = $how }
+    # Not a recorder after all (run 43609051244: the runner's https association doesn't go
+    # through the user's class): from now on, every browser process that starts is read for the
+    # URL it was handed. Browsers already running are ended first, so a new one starts.
+    Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    $script:browserFrom = Get-Date
+    $prog = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice' -ErrorAction SilentlyContinue).ProgId
+    return @{ on = $true; how = "the browser's own command line read back (https user choice: $(if ($prog) { $prog } else { 'none' }))" }
   }
   'url-recorded' = {
     param($a)
+    # What each new browser process was handed: the argument after --single-argument, which
+    # Windows uses for a URL opened through the shell.
     $t = [Diagnostics.Stopwatch]::StartNew()
     do {
-      $urls = @(if (Test-Path $script:urlFile) { (Get-Content $script:urlFile -Raw).Split([char]10) | Where-Object { $_ } })
+      $urls = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CreationDate -ge $script:browserFrom -and $_.CommandLine -match '--single-argument (.+)$' } | ForEach-Object { if ($_.CommandLine -match '--single-argument (.+)$') { $Matches[1].Trim() } } | Sort-Object -Unique)
       if ($a.until -and $urls.Count -ge [int]$a.until) { break }
       Start-Sleep -Milliseconds 200
     } while ($t.ElapsedMilliseconds -lt [int]$a.ms)
-    @{ urls = $urls }
+    @{ urls = @($urls) }
   }
   'url-recorder-off' = {
     param($a)
-    Remove-Item 'HKCU:\Software\Classes\https' -Recurse -Force -ErrorAction SilentlyContinue
-    if ($script:httpsBackup -and $script:httpsExport) { & reg.exe import $script:httpsExport | Out-Null }
+    Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     @{}
   }
   'save-watch-start' = {
