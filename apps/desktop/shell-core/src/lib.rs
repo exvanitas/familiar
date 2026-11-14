@@ -9,3 +9,5 @@ pub mod setup;
 pub mod secret;
 pub mod fetch;
 pub mod server_path;
+pub mod link;
+pub mod confirm;
