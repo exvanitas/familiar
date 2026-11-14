@@ -66,7 +66,8 @@ struct Request {
 pub struct Net {
     open: Mutex<HashMap<String, Arc<Request>>>,
     used: Mutex<HashSet<String>>,
-    clients: OnceLock<[Client; 3]>,
+    /// Lan and loopback, which never use a proxy, so they can be kept.
+    local: OnceLock<[Client; 2]>,
 }
 
 /// A resolver that keeps only answers of the address's reach, so a name that later resolves
@@ -114,13 +115,15 @@ fn client(reach: Reach) -> Client {
 }
 
 impl Net {
-    fn client(&self, reach: Reach) -> &Client {
-        let all = self.clients.get_or_init(|| [client(Reach::Public), client(Reach::Lan), client(Reach::Loopback)]);
-        &all[match reach {
-            Reach::Public => 0,
-            Reach::Lan => 1,
-            Reach::Loopback => 2,
-        }]
+    /// A public address gets a client made for this request, so it uses the system proxy as it is
+    /// now, not as it was when Familiar started.
+    fn client(&self, reach: Reach) -> Client {
+        let local = self.local.get_or_init(|| [client(Reach::Lan), client(Reach::Loopback)]);
+        match reach {
+            Reach::Public => client(Reach::Public),
+            Reach::Lan => local[0].clone(),
+            Reach::Loopback => local[1].clone(),
+        }
     }
 
     fn take(&self, id: &str) -> Option<Arc<Request>> {
@@ -258,7 +261,7 @@ async fn run(app: &AppHandle, spec: Spec, body: Vec<u8>) -> Result<Head, FetchEr
         }
         open.insert(spec.id.clone(), req.clone());
     }
-    let result = send(net.client(reach), &mut stopped, method, &mut url, &swapped.headers, body, &norm, &secrets, &limits).await;
+    let result = send(&net.client(reach), &mut stopped, method, &mut url, &swapped.headers, body, &norm, &secrets, &limits).await;
     let (response, redirected) = match result {
         Ok(r) => r,
         Err(e) => {
