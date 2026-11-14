@@ -112,7 +112,10 @@ fn is_tchar(b: u8) -> bool {
 
 /// Request headers a page may not set. Each is dropped, with no error.
 fn dropped(name: &str) -> bool {
-    matches!(name, "host" | "content-length" | "transfer-encoding" | "connection" | "cookie") || name.starts_with("proxy-")
+    matches!(
+        name,
+        "host" | "content-length" | "transfer-encoding" | "connection" | "cookie" | "te" | "upgrade" | "keep-alive" | "trailer" | "expect"
+    ) || name.starts_with("proxy-")
 }
 
 /// The page's request headers, names lower-cased, with the ones it may not set dropped. A name
@@ -247,6 +250,11 @@ mod tests {
             ("Cookie", "a=b"),
             ("Proxy-Authorization", "Basic x"),
             ("proxy-connection", "keep-alive"),
+            ("TE", "trailers"),
+            ("Upgrade", "websocket"),
+            ("Keep-Alive", "timeout=5"),
+            ("Trailer", "x-a"),
+            ("Expect", "100-continue"),
             ("Authorization", "Bearer x"),
             ("x-tab", "a\tb"),
         ]))
