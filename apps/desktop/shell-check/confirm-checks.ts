@@ -23,7 +23,9 @@ type WinState = Record<string, { found: boolean; topmost: boolean; enabled: bool
 const APPROVE = 'Allow', REFUSE = "Don't allow";
 const add = (port: number, path: string, label: string, owner?: string) =>
   shell.addressAdd({ kind: 'server', url: `http://127.0.0.1:${port}/${path}`, label, owner });
-const outcome = (p: Promise<Address>) => p.then(a => 'saved:' + a.url, e => 'refused:' + reason(e));
+/* An ask's outcome, or 'no answer' if the dialog was never answered: the check fails, but goes on. */
+const outcome = (p: Promise<Address>) =>
+  Promise.race([p.then(a => 'saved:' + a.url, e => 'refused:' + reason(e)), new Promise<string>(r => setTimeout(() => r('no answer'), 45000))]);
 const dialog = (act: string, extra: object = {}) => step<Dialog>('dialog', { act, approve: APPROVE, refuse: REFUSE, ...extra }, 60000);
 const TITLES = ['Familiar check top', 'Familiar check settings', 'Familiar check chat'];
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);

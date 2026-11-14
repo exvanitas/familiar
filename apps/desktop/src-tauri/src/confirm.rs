@@ -105,7 +105,7 @@ impl Ticket {
         let owner_hwnd = owner.and_then(|l| app.get_webview_window(l)).filter(|w| w.is_visible().unwrap_or(false)).map(|w| platform::hwnd(&w));
         let result = {
             let _frozen = Freeze::new(&app);
-            platform::show(owner_hwnd.flatten(), &ask)
+            platform::show(owner_hwnd.flatten(), &ask, log.clone())
         };
         let approved = matches!(result, Ok(true));
         lock(&app.state::<Confirms>().throttle).end(approved);
@@ -182,8 +182,11 @@ impl Drop for Freeze {
 
 #[cfg(windows)]
 mod platform {
-    use shell_core::confirm::Ask;
-    use std::sync::mpsc;
+    use shell_core::{confirm::Ask, log::Log};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
     use windows::{
         core::{HRESULT, HSTRING, PCWSTR},
         Win32::{
@@ -194,7 +197,7 @@ mod platform {
                     TDF_CALLBACK_TIMER, TDM_ENABLE_BUTTON, TDN_CREATED, TDN_TIMER,
                 },
                 Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled},
-                WindowsAndMessaging::{SendMessageW, SetWindowPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE},
+                WindowsAndMessaging::{SendMessageW, SetWindowPos, HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE},
             },
         },
     };
@@ -204,8 +207,13 @@ mod platform {
     /// The approving button stays disabled this long, so a click meant for another window can't
     /// land on it.
     const APPROVE_AFTER_MS: usize = 1000;
-    /// Set in `lpCallbackData` when the dialog has no owner: it goes top-most.
-    const NO_OWNER: isize = 1;
+    /// What the dialog's callback knows, through `lpCallbackData`. It lives on the dialog's
+    /// thread for as long as the dialog does.
+    struct State {
+        no_owner: bool,
+        log: Arc<Log>,
+        enabled: AtomicBool,
+    }
 
     pub fn hwnd(w: &tauri::WebviewWindow) -> Option<isize> {
         w.hwnd().ok().map(|h| h.0 as isize)
@@ -222,21 +230,24 @@ mod platform {
     }
 
     unsafe extern "system" fn callback(hwnd: HWND, msg: TASKDIALOG_NOTIFICATIONS, wparam: WPARAM, _: LPARAM, data: isize) -> HRESULT {
+        let state = unsafe { &*(data as *const State) };
         if msg == TDN_CREATED {
             unsafe {
                 SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(APPROVE as usize)), Some(LPARAM(0)));
-                if data == NO_OWNER {
-                    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                if state.no_owner {
+                    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
                 }
             }
-        } else if msg == TDN_TIMER && wparam.0 >= APPROVE_AFTER_MS {
+            state.log.line("confirm: dialog shown");
+        } else if msg == TDN_TIMER && wparam.0 >= APPROVE_AFTER_MS && !state.enabled.swap(true, Ordering::SeqCst) {
             unsafe { SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(APPROVE as usize)), Some(LPARAM(1))) };
+            state.log.line("confirm: approve enabled");
         }
         S_OK
     }
 
     /// Shows the dialog on a thread of its own, which runs its message loop, and waits for it.
-    pub fn show(owner: Option<isize>, ask: &Ask) -> Result<bool, String> {
+    pub fn show(owner: Option<isize>, ask: &Ask, log: Arc<Log>) -> Result<bool, String> {
         let ask = ask.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -250,6 +261,7 @@ mod platform {
                 TASKDIALOG_BUTTON { nButtonID: APPROVE, pszButtonText: PCWSTR(approve.as_ptr()) },
                 TASKDIALOG_BUTTON { nButtonID: REFUSE, pszButtonText: PCWSTR(refuse.as_ptr()) },
             ];
+            let state = State { no_owner: owner.is_none(), log, enabled: AtomicBool::new(false) };
             let config = TASKDIALOGCONFIG {
                 cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
                 hwndParent: HWND(owner.unwrap_or(0) as _),
@@ -265,7 +277,7 @@ mod platform {
                 pszExpandedControlText: PCWSTR(when_open.as_ptr()),
                 pszCollapsedControlText: PCWSTR(when_closed.as_ptr()),
                 pfCallback: Some(callback),
-                lpCallbackData: if owner.is_none() { NO_OWNER } else { 0 },
+                lpCallbackData: &state as *const State as isize,
                 ..Default::default()
             };
             let mut pressed = 0i32;
@@ -287,7 +299,7 @@ mod platform {
         true
     }
     pub fn enable(_: isize, _: bool) {}
-    pub fn show(_: Option<isize>, _: &Ask) -> Result<bool, String> {
+    pub fn show(_: Option<isize>, _: &Ask, _: std::sync::Arc<shell_core::log::Log>) -> Result<bool, String> {
         Err("not on this system".into())
     }
 }

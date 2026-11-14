@@ -31,10 +31,27 @@ public static class WN {
   public static bool Topmost(long h) { return (GetLong(new IntPtr(h), -20).ToInt64() & 0x8) != 0; }
   public static bool Enabled(long h) { return IsWindowEnabled(new IntPtr(h)); }
   public static string TitleOf(long h) { return Text(new IntPtr(h)); }
+  [DllImport("user32")] static extern IntPtr SendMessageTimeoutW(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint ms, out IntPtr r);
+  /* whether the window's thread answers within 2 s */
+  public static bool Responds(long h) { IntPtr r; return SendMessageTimeoutW(new IntPtr(h), 0, IntPtr.Zero, IntPtr.Zero, 2, 2000, out r) != IntPtr.Zero; }
 }
 "@
 
 $UIA = [System.Windows.Automation.AutomationElement]
+Add-Type -AssemblyName System.Drawing
+$script:shotN = 0
+
+# The whole screen, to the results, for a dialog that went wrong.
+function Screen-Shot([string]$name) {
+  try {
+    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+    $bmp.Save((Join-Path $Out "$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    $g.Dispose(); $bmp.Dispose()
+  } catch { Write-Host "screenshot: $_" }
+}
 
 function Uia-All($el, $type) {
   $cond = New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, $type)
@@ -74,6 +91,13 @@ function Do-NetStep($action, $a) {
       $h = Wait-Dialog $wait
       if (-not $h) { return $out }
       $out.found = $true
+      $script:shotN++
+      Write-Host "dialog $($a.act): found $h"
+      if (-not [WN]::Responds($h)) {
+        Screen-Shot "dialog-$($script:shotN)-hung"
+        $out.answered = 'the dialog does not respond'
+        return $out
+      }
       $el = $UIA::FromHandle([IntPtr]$h)
       $approve = Dialog-Button $el $a.approve
       $out.approveAtStart = [bool]($approve -and $approve.Current.IsEnabled)
@@ -97,6 +121,7 @@ function Do-NetStep($action, $a) {
           $out.details = (@($after | Where-Object { $out.texts -notcontains $_ }) -join "`n")
         }
       }
+      if ($script:shotN -le 3) { Screen-Shot "dialog-$($script:shotN)" }
       switch ($a.act) {
         'approve' { $out.answered = [string](Invoke-El (Dialog-Button $el $a.approve)) }
         'refuse' { $out.answered = [string](Invoke-El (Dialog-Button $el $a.refuse)) }
