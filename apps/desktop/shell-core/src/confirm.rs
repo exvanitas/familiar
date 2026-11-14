@@ -12,16 +12,39 @@ pub const MAX_LABEL_CHARS: usize = 64;
 /// Refusals, across every kind of ask, after which asking stops until the person re-enables it.
 pub const STOP_AFTER: u32 = 3;
 
-/// Bidirectional formatting characters, shown escaped so text can't be reordered on screen.
-pub fn is_bidi(c: char) -> bool {
-    matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+/// Characters that show as nothing, or reorder or hide what's next to them: soft hyphens,
+/// joiners, fillers, variation selectors, bidirectional formatting, line and paragraph
+/// separators, tag characters and the rest. Each is shown as a visible `\u{...}` escape, as is
+/// every control character.
+pub const INVISIBLE: [(char, char); 16] = [
+    ('\u{00AD}', '\u{00AD}'),
+    ('\u{034F}', '\u{034F}'),
+    ('\u{061C}', '\u{061C}'),
+    ('\u{115F}', '\u{1160}'),
+    ('\u{17B4}', '\u{17B5}'),
+    ('\u{180B}', '\u{180F}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{2028}', '\u{202E}'),
+    ('\u{2060}', '\u{206F}'),
+    ('\u{3164}', '\u{3164}'),
+    ('\u{FE00}', '\u{FE0F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFA0}', '\u{FFA0}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0000}', '\u{E0FFF}'),
+];
+
+/// A character the confirms never show as it is: a control character or one in `INVISIBLE`.
+pub fn hidden(c: char) -> bool {
+    c.is_control() || INVISIBLE.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
 }
 
-/// Control and bidirectional formatting characters replaced with visible `\u{...}` escapes.
+/// Hidden characters replaced with visible `\u{...}` escapes.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() || is_bidi(c) {
+        if hidden(c) {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         } else {
             out.push(c);
@@ -219,8 +242,18 @@ mod tests {
             assert_eq!(escape(&format!("x{c}y")), format!("x\\u{{{:x}}}y", c as u32), "{:x}", c as u32);
         }
         assert_eq!(escape("evil\u{202E}exe.txt"), "evil\\u{202e}exe.txt");
-        for c in ['\u{2029}', '\u{2065}', '\u{206A}', '\u{2010}'] {
+        for c in ['\u{2010}', '\u{2027}', '\u{2070}', '\u{1D172}', '\u{1D17B}', '\u{E1000}', '\u{FFFC}', 'é'] {
             assert_eq!(escape(&c.to_string()), c.to_string(), "{:x} isn't on the list", c as u32);
+        }
+        // Every range, at both ends, and the review's zero-width space in a program path.
+        for &(lo, hi) in INVISIBLE.iter() {
+            for c in [lo, hi] {
+                assert_eq!(escape(&format!("a{c}b")), format!("a\\u{{{:x}}}b", c as u32));
+            }
+        }
+        assert_eq!(escape("C:\\tools\\safe\u{200B}.exe"), "C:\\tools\\safe\\u{200b}.exe");
+        for c in ['\u{00AD}', '\u{034F}', '\u{115F}', '\u{1160}', '\u{17B4}', '\u{180E}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{206F}', '\u{3164}', '\u{FE0F}', '\u{FEFF}', '\u{FFA0}', '\u{FFFA}', '\u{1D175}', '\u{E0001}', '\u{E007F}'] {
+            assert!(hidden(c), "{:x}", c as u32);
         }
     }
 
