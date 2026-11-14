@@ -192,7 +192,7 @@ mod tests {
             Ok(SecretRef::Server { setup: "fake-1".into(), name: "API_KEY".into() })
         );
         assert_eq!(SecretRef::parse("server:fake-1:api_key").unwrap().user(), "server:fake-1:API_KEY");
-        assert_eq!(SecretRef::parse("server:s:A:B").unwrap().user(), "server:s:A:B", "a name may hold a colon");
+        assert_eq!(SecretRef::parse("server:s:a.b-c").unwrap().user(), "server:s:A.B-C");
         assert_eq!(SecretRef::parse("addr:a1").unwrap().bound_to(), "a1");
         assert_eq!(SecretRef::parse("server:s:N").unwrap().bound_to(), "s");
         for bad in [
@@ -210,6 +210,9 @@ mod tests {
             "server:s:A=B",
             "server:s:A\0",
             "server:s:A\nB",
+            "server:s:A:B",
+            "server:s:\u{1f80}",
+            "server:s:1A",
             "key:a1",
             " addr:a1",
         ] {

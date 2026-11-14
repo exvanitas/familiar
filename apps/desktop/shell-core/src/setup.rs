@@ -122,23 +122,24 @@ pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_ID && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// A setting name as Windows compares them: each character upper-cased on its own, as
-/// Windows' simple case mapping does, so `node_options` and `NODE_OPTIONS` are one name.
+/// The longest setting or secret name.
+pub const MAX_NAME: usize = 128;
+
+/// A setting name as Windows compares them, upper-cased. Names are ASCII only (`valid_name`),
+/// so this is exact: `node_options` and `NODE_OPTIONS` are one name, and nothing else is.
 pub fn fold(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(u), None) => u,
-                _ => c, // a character that upper-cases to more than one keeps itself
-            }
-        })
-        .collect()
+    name.to_ascii_uppercase()
 }
 
-/// A setting name: not empty, no `=`, no NUL, and no other control character.
+/// A setting or secret name: ASCII letters, digits, `_`, `-` and `.`, not starting with a
+/// digit, up to 128. Keeping to ASCII makes the case-insensitive comparison exact, for the
+/// checks, the credential names and the environment alike.
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 256 && !name.contains('=') && !name.chars().any(char::is_control)
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= MAX_NAME
+        && !b[0].is_ascii_digit()
+        && b.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
 }
 
 /// Whether a name may not be a secret.
@@ -427,15 +428,29 @@ mod tests {
         let mut s = setup();
         s.secrets = vec!["Token".into(), "TOKEN".into()];
         assert_eq!(check(&s), Err(SetupError::DuplicateSetting));
+        assert_eq!(fold("node_Options-1.x"), "NODE_OPTIONS-1.X");
+    }
+
+    #[test]
+    fn good_names() {
+        for name in ["A", "a", "_JAVA_OPTIONS", "npm_config_registry", "X-Y.Z", "A1", &"N".repeat(MAX_NAME)] {
+            assert!(valid_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn unicode_names_that_fold_alike_are_refused() {
         let mut s = setup();
-        s.env = vec![("ÄPFEL".into(), "a".into()), ("äpfel".into(), "b".into())];
-        assert_eq!(check(&s), Err(SetupError::DuplicateSetting), "beyond ASCII too");
-        assert_eq!(fold("straße"), "STRAßE", "a character that upper-cases to two keeps itself");
+        s.env = vec![("\u{1f80}".into(), "a".into()), ("\u{1f88}".into(), "b".into())];
+        assert_eq!(check(&s), Err(SetupError::Invalid));
     }
 
     #[test]
     fn bad_names_and_values() {
-        for name in ["", "A=B", "=C:", "A\0", "A\nB", "A\tB"] {
+        // Beyond ASCII, case folding isn't one rule (U+1F80 and U+1F88 upper-case differently
+        // by simple and full mapping), so such names are refused rather than compared.
+        let long = "N".repeat(MAX_NAME + 1);
+        for name in ["", "A=B", "=C:", "A\0", "A\nB", "A\tB", "A B", "A:B", "1ABC", "9", "\u{1f80}", "\u{1f88}", "ÄPFEL", "straße", "A(x86)", &long] {
             let mut s = setup();
             s.env = vec![(name.into(), "v".into())];
             assert_eq!(check(&s), Err(SetupError::Invalid), "setting {name:?}");
