@@ -131,22 +131,27 @@ $script:dnsServer = $null
 $script:dnsAdapter = $null
 $script:dnsOriginal = $null
 function Start-DnsServer {
-  $ad = Get-NetAdapter | Where-Object Status -eq 'Up' | Sort-Object ifIndex | Select-Object -First 1
-  $script:dnsAdapter = $ad.ifIndex
-  $script:dnsOriginal = @((Get-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4).ServerAddresses)
+  # The interface of the default route, and the resolver it had.
+  $if = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1).InterfaceIndex
+  $script:dnsOriginal = @((Get-DnsClientServerAddress -InterfaceIndex $if -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
+  if (-not $script:dnsOriginal.Count) { throw "interface $if has no IPv4 resolver" }
+  $script:dnsAdapter = $if
   $upstream = $script:dnsOriginal[0]
   '{}' | Set-Content (Join-Path $Out 'dns-plan.json')
   $script:dnsServer = Start-Process node -ArgumentList "`"$(Join-Path $here 'dns-server.mjs')`"", "`"$Out`"", $upstream -PassThru -NoNewWindow `
     -RedirectStandardOutput (Join-Path $Out 'dns-server.out') -RedirectStandardError (Join-Path $Out 'dns-server.err')
   for ($i = 0; $i -lt 50 -and -not (Select-String -Path (Join-Path $Out 'dns-server.out') -Pattern 'dns server up' -Quiet -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 100 }
-  Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ServerAddresses '127.0.0.1'
+  Set-DnsClientServerAddress -InterfaceIndex $if -ServerAddresses '127.0.0.1'
   Clear-DnsClientCache
-  $script:lanIp = (Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 | Select-Object -First 1).IPAddress
+  $script:lanIp = (Get-NetIPAddress -InterfaceIndex $if -AddressFamily IPv4 | Select-Object -First 1).IPAddress
   Write-Host "dns server on 127.0.0.1, forwarding to $upstream; the runner's lan address $($script:lanIp)"
 }
 
 function Stop-DnsServer {
-  if ($script:dnsAdapter) { Set-DnsClientServerAddress -InterfaceIndex $script:dnsAdapter -ServerAddresses $script:dnsOriginal; Clear-DnsClientCache }
+  try {
+    if ($script:dnsAdapter) { Set-DnsClientServerAddress -InterfaceIndex $script:dnsAdapter -ServerAddresses $script:dnsOriginal; Clear-DnsClientCache }
+  } catch { Write-Host "dns: the resolver couldn't be put back: $_" }
+  $script:dnsAdapter = $null
   if ($script:dnsServer -and -not $script:dnsServer.HasExited) { $script:dnsServer.Kill() }
 }
 
