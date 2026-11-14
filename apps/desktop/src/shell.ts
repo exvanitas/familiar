@@ -22,7 +22,23 @@ export type CoreMessage =
   | { t: 'tray'; id: string }
   | { t: 'tray-click' }
   | { t: 'second-launch'; args: string[] }
-  | { t: 'quitting' };
+  | { t: 'quitting' }
+  /* The user state changed, or the PC resumed from sleep. */
+  | { t: 'system'; userState: UserState; idleMs: number; resumed?: true }
+  /* The deadline `wakeAt` set has come. */
+  | { t: 'wake'; at: number; now: number };
+
+export type UserState = 'normal' | 'fullscreen' | 'presentation' | 'busy' | 'quiet' | 'away';
+export interface SystemState { userState: UserState; idleMs: number }
+
+/* A local MCP server's setup. `env` holds plain settings, `secrets` the names of settings kept in
+   Credential Manager as `server:<id>:<NAME>`. */
+export interface Setup { id: string; label: string; program: string; args: string[]; cwd: string; env: [string, string][]; secrets: string[] }
+export type ServerEvent = { t: 'out'; line: string } | { t: 'err'; line: string } | { t: 'exit'; code: number | null };
+
+export interface FileFilter { name: string; extensions: string[] }
+export interface SaveSpec { name: string; filters?: FileFilter[]; owner?: string }
+export interface PickSpec { kind: 'file' | 'folder'; filters?: FileFilter[]; owner?: string }
 
 export interface MenuItem { id?: string; label?: string; checked?: boolean; enabled?: boolean; separator?: boolean; items?: MenuItem[] }
 /* `icon` is a .png of the app folder. The exe appends Quit, and ids starting `shell:` are its own. */
@@ -56,7 +72,8 @@ export interface ProxyStatus { inUse: boolean; kind: 'none' | 'manual' | 'auto-d
 /* What a command rejects with. A refusal by the command gate is a plain string instead:
    "Command <name> not allowed by ACL". */
 export interface ShellError {
-  kind: 'invalid' | 'refused' | 'missing' | 'failed' | 'busy' | 'asks-stopped' | 'declined' | 'insecure' | 'blocked-address' | 'not-saved';
+  kind: 'invalid' | 'refused' | 'missing' | 'failed' | 'busy' | 'asks-stopped' | 'declined' | 'insecure' | 'blocked-address' | 'not-saved'
+    | 'too-large' | 'unsafe-path' | 'not-found' | 'unsafe-argument' | 'duplicate-setting' | 'unsafe-secret' | 'start-failed' | 'no-key';
   message: string;
 }
 
@@ -101,6 +118,27 @@ export interface Shell {
   secretSet(ref: string, value: string): Promise<void>;
   secretStatus(ref: string): Promise<SecretStatus>;
   secretDelete(ref: string): Promise<void>;
+  /* Core: the user state and the time since the last input. */
+  system(): Promise<SystemState>;
+  /* Core: one deadline, in Unix ms. Each call replaces it. `wake` arrives on the core channel. */
+  wakeAt(at: number): Promise<void>;
+  /* Core: reads, or sets then reads, the Run entry. */
+  autostart(on?: boolean): Promise<boolean>;
+  /* Core: starts an approved setup, asking natively if it's new or changed. */
+  serverStart(setup: Setup, onEvent: (e: ServerEvent) => void, owner?: string): Promise<{ run: string }>;
+  /* Core: bytes to the server's stdin, at most 4 MiB a call. */
+  serverWrite(run: string, body: Uint8Array): Promise<void>;
+  serverStop(run: string): Promise<void>;
+  /* Core: stops the setup's runs and removes its approval. */
+  serverForget(setupId: string): Promise<void>;
+  /* Core: the native open dialog. A full path, or null. */
+  pickPath(spec: PickSpec): Promise<string | null>;
+  /* Core: the native save dialog, then the bytes there. Whether it saved. */
+  saveAs(spec: SaveSpec, bytes: Uint8Array): Promise<boolean>;
+  /* Core: the native confirm, then the default browser. https only. */
+  openUrl(url: string, owner?: string): Promise<void>;
+  /* Core: Explorer at one of Familiar's two folders. */
+  openFolder(which: 'backups' | 'logs'): Promise<void>;
 }
 
 /* A channel's messages come numbered and can arrive out of order. This hands them on in order, as
@@ -128,7 +166,9 @@ export function channel<T>(internals: Internals, onMessage: (m: T) => void): { t
 }
 
 export function createShell(internals: Internals = window.__TAURI_INTERNALS__): Shell {
-  const call = <T = void>(cmd: string, args?: object) => internals.invoke(cmd, args) as Promise<T>;
+  const call = <T = void>(cmd: string, args?: unknown, options?: { headers: Record<string, string> }) => internals.invoke(cmd, args, options) as Promise<T>;
+  /* Bytes go as the raw body, with the other arguments in a percent-encoded x-spec header. */
+  const spec = (o: object) => ({ headers: { 'x-spec': encodeURIComponent(JSON.stringify(o)) } });
   return {
     info: () => call<Info>('shell_info'),
     ready: onMessage => call('shell_ready', { channel: channel<CoreMessage>(internals, onMessage) }),
@@ -149,7 +189,18 @@ export function createShell(internals: Internals = window.__TAURI_INTERNALS__): 
     netProxy: () => call<ProxyStatus>('net_proxy'),
     secretSet: (ref, value) => call('secret_set', { id: ref, value }),
     secretStatus: ref => call<SecretStatus>('secret_status', { id: ref }),
-    secretDelete: ref => call('secret_delete', { id: ref })
+    secretDelete: ref => call('secret_delete', { id: ref }),
+    system: () => call<SystemState>('system'),
+    wakeAt: at => call('wake_at', { at }),
+    autostart: on => call<boolean>('autostart', { on }),
+    serverStart: (setup, onEvent, owner) => call<{ run: string }>('server_start', { setup, owner, channel: channel<ServerEvent>(internals, onEvent) }),
+    serverWrite: (run, body) => call('server_write', body, spec({ run })),
+    serverStop: run => call('server_stop', { run }),
+    serverForget: setupId => call('server_forget', { setupId }),
+    pickPath: s => call<string | null>('pick_path', { spec: s }),
+    saveAs: (s, bytes) => call<boolean>('save_as', bytes, spec(s)),
+    openUrl: (url, owner) => call('open_url', { url, owner }),
+    openFolder: which => call('open_folder', { which })
   };
 }
 

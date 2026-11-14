@@ -41,6 +41,19 @@
     "fetch.rebinding",
     "fetch.literal",
     "fetch.proxy",
-    "fetch.revoke"
+    "fetch.revoke",
+    "server.approve",
+    "server.reask",
+    "server.paths",
+    "server.remote-drive",
+    "server.links",
+    "server.settings",
+    "server.env",
+    "server.blank",
+    "server.start-failed",
+    "server.store-recovery",
+    "server.kill",
+    "link.confirm",
+    "files.save-refused"
   ]
 }

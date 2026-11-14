@@ -24,6 +24,17 @@ const COMMANDS: &[&str] = &[
     "secret_set",
     "secret_status",
     "secret_delete",
+    "server_start",
+    "server_write",
+    "server_stop",
+    "server_forget",
+    "system",
+    "wake_at",
+    "autostart",
+    "pick_path",
+    "save_as",
+    "open_url",
+    "open_folder",
 ];
 
 fn main() {

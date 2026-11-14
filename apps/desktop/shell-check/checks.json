@@ -33,6 +33,11 @@
     "fetch.proxy-start",
     "address.remove-retry",
     "key.remove-race",
-    "confirm.race"
+    "confirm.race",
+    "system.idle",
+    "wake.hidden",
+    "toast.app-id",
+    "persist.notified",
+    "autostart"
   ]
 }
