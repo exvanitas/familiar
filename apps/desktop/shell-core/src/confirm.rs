@@ -40,11 +40,16 @@ pub fn hidden(c: char) -> bool {
     c.is_control() || INVISIBLE.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
 }
 
-/// Hidden characters replaced with visible `\u{...}` escapes.
+/// Free text as shown: arguments, setting values, labels, hosts and URLs. A literal backslash is
+/// doubled, then each hidden character becomes a `\u{...}` escape, so the shown text reads back
+/// one way only. Paths and names never need it: server paths refuse hidden characters, and
+/// setting names are plain ASCII, so they show as they are.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if hidden(c) {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if hidden(c) {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         } else {
             out.push(c);
@@ -72,15 +77,19 @@ pub struct Ask {
     pub refuse: &'static str,
 }
 
+/// An argument in quotes. After `escape` every literal backslash is doubled, so `\"` can only
+/// be a quote from the argument.
 fn quoted(arg: &str) -> String {
-    format!("\"{}\"", escape(&arg.replace('\\', "\\\\").replace('"', "\\\"")))
+    format!("\"{}\"", escape(arg).replace('"', "\\\""))
 }
 
 /// "Start a program?": the resolved program first, then the server's label, the arguments, the
 /// folder, each plain setting and each secret's name. The details hold the canonical form, one
 /// argument per line.
 pub fn start_program(server_label: &str, form: &Canonical) -> Ask {
-    let mut s = vec![escape(&form.program)];
+    // The program and the folder passed the path checks, which refuse every hidden character,
+    // and names are plain ASCII: all of them show as they are.
+    let mut s = vec![form.program.clone()];
     if !server_label.is_empty() {
         s.push(format!("For: {}", label(server_label)));
     }
@@ -89,20 +98,20 @@ pub fn start_program(server_label: &str, form: &Canonical) -> Ask {
     } else {
         s.push(format!("Arguments: {}", form.args.iter().map(|a| quoted(a)).collect::<Vec<_>>().join(" ")));
     }
-    s.push(format!("In: {}", escape(&form.cwd)));
+    s.push(format!("In: {}", form.cwd));
     for (n, v) in &form.env {
-        s.push(escape(&format!("{n}={v}")));
+        s.push(format!("{n}={}", escape(v)));
     }
     for n in &form.secrets {
-        s.push(format!("{} (kept in Credential Manager)", escape(n)));
+        s.push(format!("{n} (kept in Credential Manager)"));
     }
     s.push("It runs as you, with your files. Only start programs you trust.".into());
 
-    let mut d = vec![format!("program: {}", escape(&form.program))];
+    let mut d = vec![format!("program: {}", form.program)];
     d.extend(form.args.iter().map(|a| format!("argument: {}", quoted(a))));
-    d.push(format!("folder: {}", escape(&form.cwd)));
-    d.extend(form.env.iter().map(|(n, v)| format!("setting: {}", escape(&format!("{n}={v}")))));
-    d.extend(form.secrets.iter().map(|n| format!("secret: {}", escape(n))));
+    d.push(format!("folder: {}", form.cwd));
+    d.extend(form.env.iter().map(|(n, v)| format!("setting: {n}={}", escape(v))));
+    d.extend(form.secrets.iter().map(|n| format!("secret: {n}")));
     Ask { title: "Start a program?", summary: s.join("\n"), details: d.join("\n"), approve: "Start it", refuse: "Don't start" }
 }
 
@@ -251,9 +260,91 @@ mod tests {
                 assert_eq!(escape(&format!("a{c}b")), format!("a\\u{{{:x}}}b", c as u32));
             }
         }
-        assert_eq!(escape("C:\\tools\\safe\u{200B}.exe"), "C:\\tools\\safe\\u{200b}.exe");
+        assert_eq!(escape("safe\u{200B}.exe"), "safe\\u{200b}.exe");
         for c in ['\u{00AD}', '\u{034F}', '\u{115F}', '\u{1160}', '\u{17B4}', '\u{180E}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{206F}', '\u{3164}', '\u{FE0F}', '\u{FEFF}', '\u{FFA0}', '\u{FFFA}', '\u{1D175}', '\u{E0001}', '\u{E007F}'] {
             assert!(hidden(c), "{:x}", c as u32);
+        }
+    }
+
+    #[test]
+    fn backslashes_are_doubled_so_escapes_read_back_one_way() {
+        assert_eq!(escape("x\ny"), "x\\u{a}y");
+        assert_eq!(escape("x\\u{a}y"), "x\\\\u{a}y", "a typed escape isn't an escape");
+        assert_ne!(escape("x\ny"), escape("x\\u{a}y"));
+        assert_eq!(escape("C:\\x"), "C:\\\\x");
+        assert_eq!(quoted("a\\\"b"), "\"a\\\\\\\"b\"");
+    }
+
+    /// The details, read back: every literal backslash doubled, quotes in arguments as `\"`,
+    /// and every hidden character as `\u{...}`. If this gives back the operation, no two
+    /// operations can show the same details.
+    fn read_back(details: &str) -> Canonical {
+        fn unescape(t: &str) -> String {
+            let mut out = String::new();
+            let mut it = t.chars().peekable();
+            while let Some(c) = it.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match it.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('"') => out.push('"'),
+                    Some('u') => {
+                        assert_eq!(it.next(), Some('{'));
+                        let hex: String = it.by_ref().take_while(|&c| c != '}').collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                    }
+                    other => panic!("a lone backslash before {other:?} in {t:?}"),
+                }
+            }
+            out
+        }
+        let mut f = Canonical { program: String::new(), args: vec![], cwd: String::new(), env: vec![], secrets: vec![] };
+        for line in details.split('\n') {
+            let (k, v) = line.split_once(": ").unwrap();
+            match k {
+                "program" => f.program = v.to_string(),
+                "folder" => f.cwd = v.to_string(),
+                "argument" => f.args.push(unescape(&v[1..v.len() - 1])),
+                "setting" => {
+                    let (n, val) = v.split_once('=').unwrap();
+                    f.env.push((n.to_string(), unescape(val)));
+                }
+                "secret" => f.secrets.push(v.to_string()),
+                _ => panic!("{line}"),
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn no_two_operations_show_the_same_details() {
+        fn next(x: &mut u64, n: u64) -> u64 {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            *x % n
+        }
+        let alphabet = ['a', '\\', '"', 'u', '{', '}', '\n', '=', ' ', ':', '\u{200b}', '0', '\u{202e}'];
+        let text = |x: &mut u64| -> String {
+            let n = next(x, 5);
+            (0..n).map(|_| alphabet[next(x, alphabet.len() as u64) as usize]).collect()
+        };
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut seen = std::collections::HashMap::new();
+        for _ in 0..20_000 {
+            let program = ["C:\\a\\x.exe", "C:\\b\\x.exe"][next(&mut x, 2) as usize].to_string();
+            let args = (0..next(&mut x, 3)).map(|_| text(&mut x)).collect();
+            let cwd = ["C:\\w", "C:\\w\\v"][next(&mut x, 2) as usize].to_string();
+            let env = (0..next(&mut x, 3)).map(|i| (["A", "B", "A_B"][i as usize].to_string(), text(&mut x))).collect();
+            let secrets = (0..next(&mut x, 2)).map(|_| "S".to_string()).collect();
+            let f = Canonical { program, args, cwd, env, secrets };
+            let details = start_program("", &f).details;
+            assert_eq!(read_back(&details), f, "{details}");
+            if let Some(other) = seen.insert(details.clone(), f.clone()) {
+                assert_eq!(other, f, "two operations show {details:?}");
+            }
         }
     }
 

@@ -129,7 +129,8 @@ pub fn parse(input: &str) -> Result<LocalPath, PathError> {
 }
 
 fn names(rest: &str) -> Result<Vec<String>, PathError> {
-    if rest.contains('/') {
+    // No control or invisible character, so a path always shows as it is in a confirm.
+    if rest.contains('/') || rest.chars().any(crate::confirm::hidden) {
         return Err(PathError::UnsafePath);
     }
     if rest.is_empty() {
@@ -151,7 +152,12 @@ fn is_volume_guid(s: &str) -> bool {
 /// anything else is `unsafe-path`, without touching it.
 pub fn link_target(target: &str, relative: bool, holder: &LocalPath) -> Result<LocalPath, PathError> {
     if relative {
-        if target.is_empty() || target.starts_with('\\') || target.contains('/') || target.contains(':') {
+        if target.is_empty()
+            || target.starts_with('\\')
+            || target.contains('/')
+            || target.contains(':')
+            || target.chars().any(crate::confirm::hidden)
+        {
             return Err(PathError::UnsafePath);
         }
         let mut out = holder.names.clone();
@@ -425,6 +431,12 @@ mod tests {
             "C:\\x\\a<b",
             "C:\\x\\a\0b",
             "C:\\x\\a\nb",
+            "C:\\tools\\safe\u{200B}.exe",
+            "C:\\a\u{202E}exe.txt",
+            "C:\\a\u{AD}b",
+            "C:\\a\u{FEFF}",
+            "C:\\a\u{E0041}",
+            "C:\\a\u{3164}",
             "",
         ] {
             assert_eq!(parse(bad), Err(PathError::UnsafePath), "{bad:?}");
@@ -658,6 +670,8 @@ mod tests {
             (&format!("{VOL}\\x"), false),
             ("\\Device\\Mup\\s", false),
             ("\\??\\D:x", false),
+            ("\\??\\C:\\a\u{200B}", false),
+            ("a\u{2066}", true),
             ("x", false),
         ] {
             assert_eq!(link_target(t, r, &holder), Err(PathError::UnsafePath), "{t}");
