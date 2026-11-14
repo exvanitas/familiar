@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -56,11 +57,17 @@ describe('the fake MCP server over stdio', () => {
 
   it('spawn_tree starts a child and a grandchild that live on, and says their ids', async () => {
     const { client } = await startStdio();
-    const ids = JSON.parse(textOf(await client.callTool({ name: 'spawn_tree', arguments: {} }))) as Record<string, number>;
+    const ids = JSON.parse(textOf(await client.callTool({ name: 'spawn_tree', arguments: { token: 'tok12345' } }))) as Record<string, number>;
     const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
     try {
       for (const k of ['server', 'child', 'grandchild']) expect(alive(ids[k]), k).toBe(true);
       expect(new Set([ids.server, ids.child, ids.grandchild]).size).toBe(3);
+      // The token rides on each command line: the grandchild got it as its last argument.
+      if (process.platform === 'linux') {
+        const argv = readFileSync(`/proc/${ids.grandchild}/cmdline`, 'utf8').split('\0').filter(Boolean);
+        expect(argv.at(-1)).toBe('tok12345');
+      }
+      expect(textOf(await client.callTool({ name: 'spawn_tree', arguments: { token: 'BAD token' } }))).toMatch(/token must be/);
     } finally {
       for (const k of ['grandchild', 'child']) { try { process.kill(ids[k]); } catch { /* gone */ } }
     }

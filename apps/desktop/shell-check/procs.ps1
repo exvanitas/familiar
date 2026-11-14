@@ -319,9 +319,13 @@ $procSteps = @{
     Stop-Process -Id $script:proc.Id -Force
     Start-Sleep -Seconds 2
     $left = @($all | Where-Object { -not $_.HasExited })
-    $ok = $named.Count -eq 3 -and $aliveBefore -eq 3 -and $left.Count -eq 0
-    Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.server.kill' "familiar.exe killed hard with a slow call in flight: the server, its child and its grandchild alive before ($aliveBefore of $($named.Count) of 3 found), $($all.Count) processes in all ($names), $($left.Count) left 2 s later"
+    # Any process of the tree, the ones started after the listing above included, carries the
+    # token on its command line.
+    $tokened = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains([string]$a.token) })
+    $ok = $named.Count -eq 3 -and $aliveBefore -eq 3 -and $left.Count -eq 0 -and $tokened.Count -eq 0 -and $a.token
+    Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.server.kill' "familiar.exe killed hard with a slow call in flight: the server, its child and its grandchild alive before ($aliveBefore of $($named.Count) of 3 found), $($all.Count) processes listed ($names), $($left.Count) left 2 s later, $($tokened.Count) processes anywhere carrying the tree's token"
     foreach ($l in $left) { Stop-Process -Id $l.Id -Force -ErrorAction SilentlyContinue }
+    foreach ($t in $tokened) { Stop-Process -Id $t.ProcessId -Force -ErrorAction SilentlyContinue }
     @{}
   }
 }
@@ -343,19 +347,26 @@ function Search-Keys([string[]]$dirs, [string]$log, [string[]]$keys) {
   return @{ listed = $files.Count; read = $read; unread = @($unread) + @($errs | ForEach-Object { "listing: $($_.Exception.Message)" }); found = @($found | Sort-Object -Unique) }
 }
 
-function Check-BlankSearch([string]$data, [string]$log) {
-  if ($script:keys.Count -eq 0) { Result 'FAIL' 'security.server.blank' 'no key was typed, so nothing was searched'; return }
+function Check-BlankSearch([string]$data, [string]$log, [string[]]$typed) {
+  # This phase must have run to its end, with the page's own check of the output passed, and
+  # typed exactly the one key searched for here.
+  $done = [bool](Select-String -Path $log -Pattern '\[core\] DONE$' -Quiet)
+  $output = @($results | Where-Object { $_ -like 'PASS security.server.blank-output *' }).Count -eq 1
+  if (-not $done -or -not $output -or $typed.Count -ne 1) {
+    Result 'FAIL' 'security.server.blank-search' "the phase completed: $done; the output check passed: $output; keys typed in the phase: $($typed.Count), not 1"
+    return
+  }
   # The control: a key planted in one file of the data folder, in UTF-16, must be found.
   $plant = 'fk' + (Rand 24)
   $planted = Join-Path $data 'shell\planted-control.bin'
   [IO.File]::WriteAllBytes($planted, [Text.Encoding]::Unicode.GetBytes("x $plant x"))
   $control = Search-Keys @($data) $log @($plant)
   Remove-Item $planted -Force
-  $real = Search-Keys @($data) $log @($script:keys)
+  $real = Search-Keys @($data) $log @($typed)
   $ok = ($control.found -contains 'planted-control.bin') -and $control.unread.Count -eq 0 -and $real.unread.Count -eq 0 -and $real.found.Count -eq 0 -and $real.read -gt 10
-  $detail = "after the run: $($real.read) of $($real.listed) files read under the data folder (WebView2's inside it) and the log, $($script:keys.Count) keys in UTF-8 and UTF-16: $(if ($real.found.Count) { 'found in ' + ($real.found -join ' ') } else { 'none found' }); the planted control was $(if ($control.found -contains 'planted-control.bin') { 'found' } else { 'missed' })"
+  $detail = "after the run: $($real.read) of $($real.listed) files read under the data folder (WebView2's inside it) and the log, for the one key typed in the phase, in UTF-8 and UTF-16: $(if ($real.found.Count) { 'found in ' + ($real.found -join ' ') } else { 'none found' }); the planted control was $(if ($control.found -contains 'planted-control.bin') { 'found' } else { 'missed' })"
   if ($real.unread.Count -or $control.unread.Count) { $detail += "; unread: " + (@($real.unread + $control.unread) | Select-Object -First 5) -join ' | ' }
-  Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.server.blank' $detail
+  Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.server.blank-search' $detail
 }
 
 function Run-ProcChecks {
@@ -365,9 +376,10 @@ function Run-ProcChecks {
   try {
     $data = Join-Path $tmp 'proc-data'
     $log = Join-Path $Out 'proc-main.log'
+    $keysBefore = $script:keys.Count
     [void](Run-Phase 'proc-main' $log @('--app-dir', $App, '--data-dir', $data, '--log', $log, '--seconds', '900', '--phase', 'proc-main') 960)
     [void](No-Strays 'proc-main')
-    Check-BlankSearch $data $log
+    Check-BlankSearch $data $log @($script:keys | Select-Object -Skip $keysBefore)
 
     # An unreadable approval store: every setup asks again.
     Set-Content (Join-Path $data 'shell\servers.json') 'not a store {'
@@ -378,6 +390,10 @@ function Run-ProcChecks {
     $log = Join-Path $Out 'proc-recover.log'
     [void](Run-Phase 'proc-recover' $log @('--app-dir', $App, '--data-dir', $data, '--log', $log, '--seconds', '120', '--phase', 'proc-recover') 150)
     [void](No-Strays 'proc-recover')
+
+    $log = Join-Path $Out 'proc-race.log'
+    [void](Run-Phase 'proc-race' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-race-data'), '--log', $log, '--seconds', '400', '--phase', 'proc-race') 430)
+    [void](No-Strays 'proc-race')
 
     $log = Join-Path $Out 'proc-stopped.log'
     [void](Run-Phase 'proc-stopped' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-stopped-data'), '--log', $log, '--seconds', '240', '--phase', 'proc-stopped') 270)

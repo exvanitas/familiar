@@ -8,6 +8,23 @@ const read = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), 'u
 const system = read('src-tauri/src/system.rs');
 const files = read('src-tauri/src/files.rs');
 const servers = read('src-tauri/src/servers.rs');
+const notify = read('src-tauri/src/notify.rs');
+
+/* Each command of a file: its whole text from the attribute to the end of its body. */
+function commands(src: string): { name: string; attr: string; text: string }[] {
+  const out: { name: string; attr: string; text: string }[] = [];
+  const re = /#\[tauri::command(\([^)]*\))?\]\s*pub (async )?fn (\w+)/g;
+  for (let m = re.exec(src); m; m = re.exec(src)) {
+    const open = src.indexOf('{', m.index + m[0].length);
+    let depth = 0, i = open;
+    for (; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}' && --depth === 0) break;
+    }
+    out.push({ name: m[3], attr: m[0], text: src.slice(m.index, i + 1) });
+  }
+  return out;
+}
 
 describe('resume after sleep', () => {
   it('registers for power notifications directly, and checks and logs the result', () => {
@@ -32,8 +49,9 @@ describe('the file dialogs and the save', () => {
     const pick = files.slice(files.indexOf('pub fn pick('), files.indexOf('pub struct OsSwap'));
     expect(save).toContain('FOS_NOTESTFILECREATE');
     expect(pick).toContain('FOS_NOTESTFILECREATE');
-    expect(files).toMatch(/ReplaceFileW\(&HSTRING::from\(target\), &HSTRING::from\(temp\), PCWSTR::null\(\),/);
-    expect(files).toMatch(/MoveFileExW\(&HSTRING::from\(temp\), &HSTRING::from\(target\), MOVEFILE_WRITE_THROUGH\)/);
+    // One rename, replacing and written through, for new and existing targets alike.
+    expect(files).not.toContain('ReplaceFileW');
+    expect(files).toMatch(/MoveFileExW\(&HSTRING::from\(temp\), &HSTRING::from\(target\), MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH\)/);
   });
 
   it('both dialogs run inside confirm::modal, and nothing checks busy and then opens outside the gate', () => {
@@ -50,14 +68,53 @@ describe('the file dialogs and the save', () => {
   });
 });
 
-describe('server starts', () => {
-  it('stop never waits on a write, and the slot and the last check are under the runs lock', () => {
-    const stop = servers.slice(servers.indexOf('fn stop('), servers.indexOf('pub fn server_stop('));
-    expect(stop).toMatch(/let until = Instant::now\(\) \+ Duration::from_millis\(500\);\n\s+lock\(&running\.input\)\.take\(\);/);
-    expect(servers).not.toMatch(/stdin: Mutex</);
-    expect(servers).toMatch(/lock\(&servers\.state\)\.reserve\(&setup\.id\)/);
-    expect(servers).toMatch(/slot\.commit\(&run, running\)/);
-    // The exe ends a hard kill's leftovers at each start.
+describe('server starts: one actor per setup', () => {
+  it('the commands only send a message and await the reply', () => {
+    for (const c of commands(servers)) {
+      expect(c.attr, c.name).toMatch(/pub async fn/);
+      expect(c.text, c.name).toMatch(/answer\.await/);
+      expect(c.text, c.name).toMatch(/\.send\(&app, &/);
+    }
+    expect(commands(servers).map(c => c.name).sort()).toEqual(['server_forget', 'server_start', 'server_stop', 'server_write']);
+  });
+
+  it('each actor follows the shell-core state machine, with a bounded queue and bounded writes', () => {
+    expect(servers).toMatch(/use shell_core::\{\s*actor::\{Effect, Machine, Msg, State\}/);
+    expect(servers).toMatch(/mpsc::sync_channel::<Cmd>\(QUEUE\)/);
+    expect(servers).toMatch(/const QUEUE: usize = 32;/);
+    expect(servers).toMatch(/const MAX_WRITES: usize = 8;/);
+    expect(servers).toMatch(/const MAX_WRITE_BYTES: usize = 16 \* 1024 \* 1024;/);
+    expect(servers).toMatch(/TrySendError::Full\(_\) => fail\("busy"/);
+    // servers.json has one writer.
+    expect(servers.match(/temp::write_atomic\(&path, &store\.to_bytes\(\)\)/g)?.length).toBe(1);
+    expect(servers).toMatch(/fn spawn_store\(/);
+    // A failed record aborts the start; the sweep removes a record only once its process is
+    // ended or gone.
+    expect(servers).toMatch(/fn write\(&self, pid: u32\) -> std::io::Result<\(\)>/);
+    const sweep = servers.slice(servers.indexOf('pub fn sweep('), servers.indexOf('/* ---------- the OS side'));
+    expect(sweep).toMatch(/os::Swept::Failed => \{\s*kept \+= 1;\s*continue;/);
     expect(read('src-tauri/src/main.rs')).toContain('servers::sweep(&app.state::<Shell>());');
   });
+});
+
+describe('no command blocks an async worker', () => {
+  const mine = { 'servers.rs': servers, 'files.rs': files, 'system.rs': system, 'notify.rs': notify };
+  // What waits: channel receives, joins, condition waits, sleeps, and the blocking helpers.
+  const waits = [/\.recv\(/, /recv_timeout\(/, /blocking_recv\(/, /\.join\(\)/, /\.wait\(/, /wait_timeout\(/, /thread::sleep\(/];
+  const blocking = [/dialogs::/, /confirm::reserve\(/, /confirm::modal\(/, /ticket\.ask\(/, /temp::save\(/, /std::fs::/];
+  for (const [file, src] of Object.entries(mine)) {
+    it(`${file}: every command is a plain async fn that waits on nothing but its awaits`, () => {
+      expect(src, file).not.toMatch(/#\[tauri::command\(async\)\]/);
+      for (const c of commands(src)) {
+        expect(c.attr, `${file} ${c.name}`).toMatch(/pub async fn/);
+        for (const w of waits) expect(c.text, `${file} ${c.name}: ${w}`).not.toMatch(w);
+        // Blocking work only inside the closure handed to on_thread.
+        const handed = c.text.indexOf('on_thread(');
+        for (const b of blocking) {
+          const at = c.text.search(b);
+          if (at >= 0) expect(handed >= 0 && handed < at, `${file} ${c.name}: ${b} outside on_thread`).toBe(true);
+        }
+      }
+    });
+  }
 });

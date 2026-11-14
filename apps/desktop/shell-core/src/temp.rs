@@ -55,13 +55,9 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// How a finished temp file takes its place. The OS's own on Windows.
 pub trait Swap {
-    /// Puts `temp` in place of `target`, which is there, keeping what the target is: its
-    /// permissions, encryption and attributes. No backup name: then a failure leaves the target
-    /// as it was, or holding the new file, and never neither (`ReplaceFileW`'s 1177 state needs a
-    /// backup name to arise).
-    fn replace(&self, target: &Path, temp: &Path) -> io::Result<()>;
-    /// Moves `temp` to `target`, which isn't there. Fails rather than overwrite.
-    fn place(&self, temp: &Path, target: &Path) -> io::Result<()>;
+    /// Moves `temp` over `target`, whether or not the target is there: one rename on one volume,
+    /// written through. On a failure the target is untouched.
+    fn move_in(&self, temp: &Path, target: &Path) -> io::Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,19 +77,14 @@ pub fn target(path: &Path) -> Result<Target, String> {
     }
 }
 
-/// A file the person chose: a temp file beside it, then the OS's replace with no backup, or a
-/// move if there was nothing there. Whatever fails, the chosen name holds the old file or the new
-/// one, and the temp file goes.
+/// A file the person chose: a temp file in the same folder, then one rename over the name. On a
+/// failure the name still holds what it held, and only then is the temp file deleted. A replaced
+/// file's own ACL and alternate streams aren't kept: the new file has its folder's.
 pub fn save(path: &Path, bytes: &[u8], swap: &dyn Swap) -> Result<(), String> {
-    let was = target(path)?;
+    target(path)?;
     let dir = path.parent().ok_or("no folder")?;
     let temp = write_temp(dir, bytes).map_err(|e| e.to_string())?;
-    let moved = match was {
-        Target::New => swap.place(&temp, path),
-        Target::File => swap.replace(path, &temp),
-    };
-    moved.map_err(|e| {
-        // Only this save's temp file, if it's still there.
+    swap.move_in(&temp, path).map_err(|e| {
         let _ = fs::remove_file(&temp);
         e.to_string()
     })
@@ -116,32 +107,19 @@ mod tests {
         v
     }
 
-    /// Plain renames, with a replace that fails before or after the new file went in, and a
-    /// log of what was asked.
+    /// A plain rename, which can fail on demand, and a log of what was asked.
     #[derive(Default)]
     struct Fake {
         calls: RefCell<Vec<&'static str>>,
-        /// Some(false): fails with nothing moved. Some(true): fails after the new file went in.
-        fail: Option<bool>,
+        fail: bool,
     }
     impl Swap for Fake {
-        fn replace(&self, target: &Path, temp: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push("replace");
-            match self.fail {
-                Some(false) => Err(io::Error::other("replace failed")),
-                Some(true) => {
-                    fs::rename(temp, target)?;
-                    Err(io::Error::other("an error after"))
-                }
-                None => fs::rename(temp, target),
+        fn move_in(&self, temp: &Path, target: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push("move");
+            if self.fail {
+                return Err(io::Error::other("move failed"));
             }
-        }
-        fn place(&self, from: &Path, to: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push("place");
-            if to.exists() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-            }
-            fs::rename(from, to)
+            fs::rename(temp, target)
         }
     }
 
@@ -202,63 +180,42 @@ mod tests {
     }
 
     #[test]
-    fn a_save_over_a_file_replaces_it_and_a_new_one_is_placed() {
+    fn a_save_over_a_file_replaces_it_and_a_new_one_is_moved_in() {
         let d = temp("save");
         let f = Fake::default();
         save(&d.join("a.txt"), b"one", &f).unwrap();
         save(&d.join("a.txt"), b"two", &f).unwrap();
-        assert_eq!(*f.calls.borrow(), ["place", "replace"]);
+        assert_eq!(*f.calls.borrow(), ["move", "move"], "one rename, new name or not");
         assert_eq!(fs::read(d.join("a.txt")).unwrap(), b"two");
         assert_eq!(names(&d), ["a.txt"], "nothing else is left");
         fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
-    fn whatever_fails_the_name_holds_the_old_file_or_the_new_one() {
-        for (fail, want) in [(false, &b"old"[..]), (true, &b"new"[..])] {
-            let d = temp(&format!("fail-{fail}"));
-            fs::write(d.join("a.txt"), "old").unwrap();
-            let r = save(&d.join("a.txt"), b"new", &Fake { fail: Some(fail), ..Fake::default() });
-            assert!(r.is_err());
-            assert_eq!(fs::read(d.join("a.txt")).unwrap(), want, "after a failure {fail}");
-            assert_eq!(names(&d), ["a.txt"], "no temp file left, and no backup ever made");
-            fs::remove_dir_all(d).unwrap();
-        }
-    }
-
-    #[test]
-    fn a_failed_place_leaves_nothing() {
-        let d = temp("place-fail");
-        struct AllFail;
-        impl Swap for AllFail {
-            fn replace(&self, _: &Path, _: &Path) -> io::Result<()> {
-                Err(io::Error::other("no"))
-            }
-            fn place(&self, _: &Path, _: &Path) -> io::Result<()> {
-                Err(io::Error::other("no"))
-            }
-        }
-        assert!(save(&d.join("a.txt"), b"new", &AllFail).is_err());
-        assert!(names(&d).is_empty());
+    fn a_failed_move_leaves_the_target_untouched_and_removes_the_temp() {
+        let d = temp("fail");
+        fs::write(d.join("a.txt"), "old").unwrap();
+        assert!(save(&d.join("a.txt"), b"new", &Fake { fail: true, ..Fake::default() }).is_err());
+        assert_eq!(fs::read(d.join("a.txt")).unwrap(), b"old");
+        assert_eq!(names(&d), ["a.txt"], "the temp file went, after the failure");
+        assert!(save(&d.join("b.txt"), b"new", &Fake { fail: true, ..Fake::default() }).is_err());
+        assert_eq!(names(&d), ["a.txt"], "a new name stays absent");
         fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
-    fn a_new_name_taken_meanwhile_is_never_overwritten() {
-        let d = temp("place-taken");
-        struct Race;
-        impl Swap for Race {
-            fn replace(&self, _: &Path, _: &Path) -> io::Result<()> {
-                unreachable!()
-            }
-            fn place(&self, from: &Path, to: &Path) -> io::Result<()> {
-                fs::write(to, "appeared")?;
-                Fake::default().place(from, to)
+    fn the_temp_file_is_made_in_the_targets_own_folder() {
+        let d = temp("same-folder");
+        struct Where(RefCell<Option<PathBuf>>);
+        impl Swap for Where {
+            fn move_in(&self, temp: &Path, target: &Path) -> io::Result<()> {
+                *self.0.borrow_mut() = Some(temp.to_path_buf());
+                fs::rename(temp, target)
             }
         }
-        assert!(save(&d.join("a.txt"), b"new", &Race).is_err());
-        assert_eq!(fs::read(d.join("a.txt")).unwrap(), b"appeared");
-        assert_eq!(names(&d), ["a.txt"]);
+        let w = Where(RefCell::new(None));
+        save(&d.join("a.txt"), b"x", &w).unwrap();
+        assert_eq!(w.0.borrow().as_ref().and_then(|p| p.parent().map(Path::to_path_buf)), Some(d.clone()), "one rename on one volume");
         fs::remove_dir_all(d).unwrap();
     }
 

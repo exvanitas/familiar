@@ -5,7 +5,7 @@
 use crate::shell::Shell;
 use serde::Serialize;
 use shell_core::identity::IDENTIFIER;
-use tauri::State;
+use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Serialize)]
 pub struct Fail {
@@ -37,8 +37,9 @@ pub fn register_app_id(shell: &Shell) {
 }
 
 /// Reads, or sets then reads, whether Familiar starts at sign-in.
-#[tauri::command(async)]
-pub fn autostart(on: Option<bool>, shell: State<Shell>) -> Result<bool, Fail> {
+#[tauri::command]
+pub async fn autostart(app: AppHandle, on: Option<bool>) -> Result<bool, Fail> {
+    let shell = app.state::<Shell>();
     let err = |e: String| Fail { kind: "failed", message: e };
     let key = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     match on {
