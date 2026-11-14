@@ -91,6 +91,14 @@ const handlers: Record<string, (args: never) => unknown> = {
   'service-workers': () => serviceWorkers(),
   'paste-ready': () => { const i = document.getElementById('paste') as HTMLInputElement; i.value = ''; i.focus(); return document.hasFocus(); },
   'paste-value': () => (document.getElementById('paste') as HTMLInputElement).value,
+  /* Settings saves what the driver typed into its password field, then clears it. The page never
+     returns the value. */
+  'save-key': async (ref: string) => {
+    const i = document.getElementById('paste') as HTMLInputElement;
+    const value = i.value;
+    i.value = '';
+    return shell.secretSet(ref, value).then(() => 'ok', e => 'failed:' + JSON.stringify(e));
+  },
   'clip-ready': (text: string) => { clip = text; return 'ready'; },
   'clip-result': () => (document.getElementById('clip') as HTMLElement).dataset.result ?? 'no click',
   violations: () => [...violations],

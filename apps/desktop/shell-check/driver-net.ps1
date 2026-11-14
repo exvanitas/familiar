@@ -83,8 +83,123 @@ function Wait-Dialog([int]$ms) {
   return 0
 }
 
+# ---------- the fake server, keys typed, hosts and the proxy ----------
+$script:keys = [System.Collections.Generic.List[string]]::new()
+$script:netServer = $null
+$script:certThumb = $null
+$script:hostsBackup = $null
+$script:proxyBackup = $null
+$script:proxyFrom = 0
+$hostsFile = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+$inet = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+
+function Random-Text([int]$n) { -join ((1..$n) | ForEach-Object { 'abcdefghijkmnopqrstuvwxyz23456789'[(Get-Random -Maximum 33)] }) }
+
+# The fake server, with a self-signed certificate the system doesn't trust, made for this run.
+function Start-NetServer {
+  $cert = New-SelfSignedCertificate -DnsName 'localhost', '127.0.0.1' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
+  $script:certThumb = $cert.Thumbprint
+  $word = Random-Text 24
+  $pfx = Join-Path $tmp 'net.pfx'
+  Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString -String $word -Force -AsPlainText) | Out-Null
+  $script:netServer = Start-Process node -ArgumentList "`"$(Join-Path $here 'net-server.mjs')`"", "`"$Out`"", "`"$App`"", "`"$pfx`"", $word -PassThru -NoNewWindow `
+    -RedirectStandardOutput (Join-Path $Out 'net-server.out') -RedirectStandardError (Join-Path $Out 'net-server.err')
+  for ($i = 0; $i -lt 100 -and -not (Test-Path (Join-Path $App 'net.json')); $i++) { Start-Sleep -Milliseconds 100 }
+  $script:net = Get-Content (Join-Path $App 'net.json') -Raw | ConvertFrom-Json
+}
+
+# Everything put back: hosts, the proxy, the certificate, the server.
+function Stop-NetServer {
+  if ($null -ne $script:hostsBackup) { Set-Content $hostsFile $script:hostsBackup; Clear-DnsClientCache }
+  if ($null -ne $script:proxyBackup) { Restore-Proxy }
+  if ($script:certThumb) { Remove-Item "Cert:\CurrentUser\My\$($script:certThumb)" -ErrorAction SilentlyContinue }
+  if ($script:netServer -and -not $script:netServer.HasExited) { $script:netServer.Kill() }
+}
+
+function Restore-Proxy {
+  foreach ($k in 'ProxyEnable', 'ProxyServer', 'ProxyOverride') {
+    $v = $script:proxyBackup[$k]
+    if ($null -eq $v) { Remove-ItemProperty $inet -Name $k -ErrorAction SilentlyContinue } else { Set-ItemProperty $inet -Name $k -Value $v }
+  }
+  $script:proxyBackup = $null
+}
+
+function Net-Log { @(Get-Content (Join-Path $Out 'net-log.jsonl') | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }) }
+
+# After the main run: no copy of any typed key in the data folder, the WebView2 folder or the log,
+# in UTF-8 or UTF-16.
+function Net-AfterMain([string]$data, [string]$log) {
+  if ($script:keys.Count -eq 0) { Result 'FAIL' 'security.key.no-copy' 'no key was typed, so nothing was searched'; return }
+  $files = @(Get-ChildItem $data -Recurse -File -Force -ErrorAction SilentlyContinue) + @(Get-Item $log)
+  $found = @()
+  $bytes = 0
+  foreach ($f in $files) {
+    try { $b = [IO.File]::ReadAllBytes($f.FullName) } catch { continue }
+    $bytes += $b.Length
+    $t8 = [Text.Encoding]::UTF8.GetString($b)
+    $t16 = [Text.Encoding]::Unicode.GetString($b)
+    $t16b = if ($b.Length -gt 1) { [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { '' }
+    foreach ($k in $script:keys) { if ($t8.Contains($k) -or $t16.Contains($k) -or $t16b.Contains($k)) { $found += $f.Name } }
+  }
+  Result $(if ($found.Count -eq 0 -and $files.Count -gt 10) { 'PASS' } else { 'FAIL' }) 'security.key.no-copy' "$($script:keys.Count) keys searched for in $($files.Count) files ($bytes bytes) under the data folder, WebView2's folder and the log, UTF-8 and UTF-16: $(if ($found.Count) { 'found in ' + ($found -join ' ') } else { 'none found' })"
+}
+
+# After the capture: no lookup before Allow.
+function Net-Lookups {
+  $l = & node (Join-Path $here 'net-analyze.mjs') $Out
+  $code = $LASTEXITCODE
+  if ($code -eq 0 -and $l) { $results.Add([string]$l) } else { Result 'FAIL' 'security.fetch.no-lookup-before-allow' "the analysis failed: node exit $code" }
+}
+
 function Do-NetStep($action, $a) {
   switch ($action) {
+    'type-key' {
+      # A fake key, made here and never shown to a page, typed into Settings by real key presses.
+      $key = 'fk' + (Random-Text $(if ($a.long) { 38 } else { 10 }))
+      $script:keys.Add($key)
+      $h = Bring-Front $a.title
+      if (-not $h) { throw 'could not bring Settings to the front' }
+      [System.Windows.Forms.SendKeys]::SendWait($key)
+      Start-Sleep -Milliseconds 300
+      $sha = ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes("Bearer $key")))).ToLower()
+      return @{ sha = $sha; head = $key.Substring(0, 10); tail = $key.Substring($key.Length - 10); length = $key.Length; last4 = $key.Substring($key.Length - 4) }
+    }
+    'cmdkey' {
+      $list = (& cmdkey /list) -join "`n"
+      return @{ found = $list.Contains($a.target) }
+    }
+    'hosts' {
+      if ($null -eq $script:hostsBackup) { $script:hostsBackup = @(Get-Content $hostsFile) }
+      $lines = @(Get-Content $hostsFile | Where-Object { $_ -notmatch "\s$([regex]::Escape($a.name))\s*$" })
+      if ($a.ip) { $lines += "$($a.ip) $($a.name)" }
+      Set-Content $hostsFile $lines
+      Clear-DnsClientCache
+      return @{}
+    }
+    'proxy' {
+      if ($a.on) {
+        $cur = Get-ItemProperty $inet
+        $script:proxyBackup = @{ ProxyEnable = $cur.ProxyEnable; ProxyServer = $cur.ProxyServer; ProxyOverride = $cur.ProxyOverride }
+        $script:proxyFrom = (Net-Log).Count
+        Set-ItemProperty $inet -Name ProxyEnable -Value 1 -Type DWord
+        Set-ItemProperty $inet -Name ProxyServer -Value "127.0.0.1:$($script:net.proxy)"
+        Set-ItemProperty $inet -Name ProxyOverride -Value ''
+        return @{}
+      }
+      Restore-Proxy
+      $targets = @(Net-Log | Select-Object -Skip $script:proxyFrom | Where-Object { $_.proxy } | ForEach-Object { $_.target })
+      return @{ targets = $targets }
+    }
+    'net-requests' {
+      $since = if ($a.since) { [long]$a.since } else { 0 }
+      return @{ count = @(Net-Log | Where-Object { $_.path -and $_.path.StartsWith($a.path) -and $_.at -ge $since }).Count }
+    }
+    'net-open' {
+      $c = [Net.Sockets.TcpClient]::new('127.0.0.1', [int]$script:net.control)
+      $r = [IO.StreamReader]::new($c.GetStream()).ReadToEnd()
+      $c.Close()
+      return ($r | ConvertFrom-Json)
+    }
     'dialog' {
       $out = [ordered]@{ found = $false; title = ''; texts = @(); details = ''; buttons = @(); approveAtStart = $false; approveLater = $false; invokedEarly = ''; owner = ''; topmost = $false; answered = '' }
       $wait = if ($a.act -eq 'none') { 2500 } else { 15000 }

@@ -8,6 +8,7 @@ import { hostile } from './hostile.ts';
 import { CORE_EVENT_NAMES, CORE_ONLY, EVENTS, NOT_YET, PLUGINS } from './lists.ts';
 import { allowed, trySinks } from './tt.ts';
 import { confirmChecks } from './confirm-checks.ts';
+import { netChecks } from './net-checks.ts';
 
 const messages: CoreMessage[] = [];
 let onQuitting: () => void = () => {};
@@ -311,6 +312,7 @@ async function main(info: Info) {
   });
 
   await confirmChecks({ ask, up });
+  await netChecks({ ask, up });
 
   // Egress: core, a view, and a view without Trusted Types, one after another.
   const fx = await fixtures();
