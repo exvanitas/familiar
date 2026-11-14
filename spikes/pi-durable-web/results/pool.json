@@ -1,0 +1,55 @@
+{
+  "bare": [
+    {
+      "connections": 2,
+      "begin": "BEGIN IMMEDIATE",
+      "rowsAfterRollback": 0,
+      "error": "database is locked"
+    },
+    {
+      "connections": 2,
+      "begin": "BEGIN",
+      "rowsAfterRollback": 1,
+      "error": "callback failed"
+    },
+    {
+      "connections": 1,
+      "begin": "BEGIN IMMEDIATE",
+      "rowsAfterRollback": 0,
+      "error": "callback failed"
+    }
+  ],
+  "conformance": [
+    {
+      "connections": 2,
+      "begin": "BEGIN IMMEDIATE",
+      "passed": 0,
+      "total": 32,
+      "failures": [
+        "reserves ID 1 for the immutable root conversation: database is locked",
+        "receives a durable commit once before resolving, and never a refused one: database is locked",
+        "commits mixed table writes atomically and rolls all of them back on failure: database is locked",
+        "detaches retained writes and every returned record: database is locked"
+      ]
+    },
+    {
+      "connections": 2,
+      "begin": "BEGIN",
+      "passed": 0,
+      "total": 32,
+      "failures": [
+        "reserves ID 1 for the immutable root conversation: SQLite schema metadata is missing",
+        "receives a durable commit once before resolving, and never a refused one: SQLite schema metadata is missing",
+        "commits mixed table writes atomically and rolls all of them back on failure: SQLite schema metadata is missing",
+        "detaches retained writes and every returned record: SQLite schema metadata is missing"
+      ]
+    },
+    {
+      "connections": 1,
+      "begin": "BEGIN IMMEDIATE",
+      "passed": 32,
+      "total": 32,
+      "failures": []
+    }
+  ]
+}

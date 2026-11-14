@@ -1,0 +1,685 @@
+{
+  "chromium": "chromium-1248/chrome-linux64/chrome",
+  "buildWarnings": [],
+  "pageErrors": [],
+  "results": {
+    "conformance/idb": {
+      "ms": 973,
+      "scenario": "conformance",
+      "store": "idb",
+      "conformance": {
+        "total": 32,
+        "passed": 32,
+        "failed": []
+      },
+      "log": [
+        "life 1 +64ms scenario=conformance store=idb run=conformance-idb-1794641442308",
+        "life 1 +917ms conformance 32/32"
+      ]
+    },
+    "inflight-unsafe/idb": {
+      "ms": 419,
+      "scenario": "inflight-unsafe",
+      "store": "idb",
+      "life": 2,
+      "counters": {
+        "toolStarts": 1,
+        "consentAsks": 1,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "working",
+        "waiting",
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Saving that. toolCall(save_note {\"text\":\"buy milk\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "<harness>\n[error] Tool save_note was interrupted and may have partially run\n</harness>",
+          "isError": true,
+          "diagnostics": [
+            {
+              "severity": "error",
+              "code": "interrupted",
+              "message": "Tool save_note was interrupted and may have partially run"
+            }
+          ]
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Done. (<harness>\n[error] Tool save_note was interrupted and may have partially run\n</harness>)",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 2 +36ms scenario=inflight-unsafe store=idb run=inflight-unsafe-idb-1794641443420",
+        "life 2 +54ms engine open",
+        "life 2 +63ms resumed",
+        "life 2 +97ms settled done"
+      ]
+    },
+    "inflight-safe/idb": {
+      "ms": 382,
+      "scenario": "inflight-safe",
+      "store": "idb",
+      "life": 2,
+      "counters": {
+        "toolStarts": 2,
+        "consentAsks": 1,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "working",
+        "waiting",
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Saving that. toolCall(save_note {\"text\":\"buy milk\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "saved: buy milk",
+          "isError": false,
+          "diagnostics": []
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Done. (saved: buy milk)",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 2 +40ms scenario=inflight-safe store=idb run=inflight-safe-idb-1794641443985",
+        "life 2 +60ms engine open",
+        "life 2 +71ms resumed",
+        "life 2 +76ms tool save_note started (start #2)",
+        "life 2 +107ms settled done"
+      ]
+    },
+    "conformance/sqljs": {
+      "ms": 467,
+      "scenario": "conformance",
+      "store": "sqljs",
+      "conformance": {
+        "total": 32,
+        "passed": 32,
+        "failed": []
+      },
+      "log": [
+        "life 1 +49ms scenario=conformance store=sqljs run=conformance-sqljs-1794641444489",
+        "life 1 +447ms conformance 32/32"
+      ]
+    },
+    "inflight-unsafe/sqljs": {
+      "ms": 341,
+      "scenario": "inflight-unsafe",
+      "store": "sqljs",
+      "life": 2,
+      "counters": {
+        "toolStarts": 1,
+        "consentAsks": 1,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "working",
+        "waiting",
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Saving that. toolCall(save_note {\"text\":\"buy milk\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "<harness>\n[error] Tool save_note was interrupted and may have partially run\n</harness>",
+          "isError": true,
+          "diagnostics": [
+            {
+              "severity": "error",
+              "code": "interrupted",
+              "message": "Tool save_note was interrupted and may have partially run"
+            }
+          ]
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Done. (<harness>\n[error] Tool save_note was interrupted and may have partially run\n</harness>)",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "sqlCalls": 128,
+      "sqlTransactions": 14,
+      "sql": {
+        "calls": 128,
+        "outsideTransactions": 30,
+        "transactions": 14,
+        "rollbacks": 0,
+        "statementsPerTransaction": [
+          3,
+          5,
+          3,
+          3,
+          3,
+          3,
+          3,
+          5,
+          9,
+          5,
+          8,
+          5,
+          5,
+          10
+        ],
+        "readsInTransactions": 35,
+        "writesInTransactions": 35,
+        "maxHeldMs": 1.1,
+        "readThenWrite": 8,
+        "largest": [
+          "begin BEGIN IMMEDIATE",
+          "get SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1",
+          "all SELECT id, record_type FROM record_ids WHERE id IN (SELECT value FROM json_each(?))",
+          "all SELECT record FROM documents WHERE id IN (SELECT value FROM json_each(?))",
+          "run INSERT INTO record_ids (id, record_type) SELECT json_extract(item.value, '$[0]'), json_ext",
+          "run INSERT INTO entries (id, conversation_id, head, commit_seq, record) SELECT json_extract(it",
+          "run INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record)",
+          "run INSERT INTO submissions (id, conversation_id, request_id, status, record) SELECT json_extr",
+          "run DELETE FROM document_revisions WHERE document_id IN (SELECT value FROM json_each(?))",
+          "run INSERT INTO document_revisions (document_id, seq, kind, version, content) SELECT json_extr",
+          "run UPDATE durable_metadata SET next_id = ?, next_seq = ? WHERE singleton = 1",
+          "commit COMMIT"
+        ]
+      },
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 2 +37ms scenario=inflight-unsafe store=sqljs run=inflight-unsafe-sqljs-1794641445071",
+        "life 2 +65ms engine open",
+        "life 2 +76ms resumed",
+        "life 2 +103ms settled done"
+      ]
+    },
+    "inflight-safe/sqljs": {
+      "ms": 374,
+      "scenario": "inflight-safe",
+      "store": "sqljs",
+      "life": 2,
+      "counters": {
+        "toolStarts": 2,
+        "consentAsks": 1,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "working",
+        "waiting",
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Saving that. toolCall(save_note {\"text\":\"buy milk\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "saved: buy milk",
+          "isError": false,
+          "diagnostics": []
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Done. (saved: buy milk)",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "sqlCalls": 135,
+      "sqlTransactions": 15,
+      "sql": {
+        "calls": 135,
+        "outsideTransactions": 30,
+        "transactions": 15,
+        "rollbacks": 0,
+        "statementsPerTransaction": [
+          3,
+          5,
+          3,
+          3,
+          3,
+          3,
+          3,
+          5,
+          5,
+          9,
+          5,
+          8,
+          5,
+          5,
+          10
+        ],
+        "readsInTransactions": 38,
+        "writesInTransactions": 37,
+        "maxHeldMs": 1,
+        "readThenWrite": 9,
+        "largest": [
+          "begin BEGIN IMMEDIATE",
+          "get SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1",
+          "all SELECT id, record_type FROM record_ids WHERE id IN (SELECT value FROM json_each(?))",
+          "all SELECT record FROM documents WHERE id IN (SELECT value FROM json_each(?))",
+          "run INSERT INTO record_ids (id, record_type) SELECT json_extract(item.value, '$[0]'), json_ext",
+          "run INSERT INTO entries (id, conversation_id, head, commit_seq, record) SELECT json_extract(it",
+          "run INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record)",
+          "run INSERT INTO submissions (id, conversation_id, request_id, status, record) SELECT json_extr",
+          "run DELETE FROM document_revisions WHERE document_id IN (SELECT value FROM json_each(?))",
+          "run INSERT INTO document_revisions (document_id, seq, kind, version, content) SELECT json_extr",
+          "run UPDATE durable_metadata SET next_id = ?, next_seq = ? WHERE singleton = 1",
+          "commit COMMIT"
+        ]
+      },
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 2 +34ms scenario=inflight-safe store=sqljs run=inflight-safe-sqljs-1794641445527",
+        "life 2 +63ms engine open",
+        "life 2 +73ms resumed",
+        "life 2 +79ms tool save_note started (start #2)",
+        "life 2 +102ms settled done"
+      ]
+    },
+    "consent/idb": {
+      "ms": 365,
+      "scenario": "consent",
+      "store": "idb",
+      "life": 2,
+      "counters": {
+        "toolStarts": 1,
+        "consentAsks": 2,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "working",
+        "waiting",
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Saving that. toolCall(save_note {\"text\":\"buy milk\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "saved: buy milk",
+          "isError": false,
+          "diagnostics": []
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Done. (saved: buy milk)",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 2 +35ms scenario=consent store=idb run=consent-idb-1794641445997",
+        "life 2 +59ms engine open",
+        "life 2 +69ms resumed",
+        "life 2 +75ms consent asked for save_note (ask #2)",
+        "life 2 +79ms tool save_note started (start #1)",
+        "life 2 +114ms settled done"
+      ]
+    },
+    "consent-deny/idb": {
+      "ms": 189,
+      "scenario": "consent-deny",
+      "store": "idb",
+      "life": 1,
+      "counters": {
+        "toolStarts": 0,
+        "consentAsks": 1,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "idle",
+        "waiting",
+        "thinking",
+        "working",
+        "waiting",
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Saving that. toolCall(save_note {\"text\":\"buy milk\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "<harness>\n[error] Tool call blocked: The user said no.\n</harness>",
+          "isError": true,
+          "diagnostics": [
+            {
+              "severity": "error",
+              "code": "blocked",
+              "message": "Tool call blocked: The user said no."
+            }
+          ]
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Done. (<harness>\n[error] Tool call blocked: The user said no.\n</harness>)",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 1 +46ms scenario=consent-deny store=idb run=consent-deny-idb-1794641446459",
+        "life 1 +105ms engine open",
+        "life 1 +117ms submitted 8",
+        "life 1 +142ms consent asked for save_note (ask #1)"
+      ]
+    },
+    "midstream/idb": {
+      "ms": 3751,
+      "scenario": "midstream",
+      "store": "idb",
+      "life": 2,
+      "counters": {
+        "toolStarts": 0,
+        "consentAsks": 0,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "thinking",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Let me think abo",
+          "stopReason": "aborted"
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "Here is the whole answer after the restart.",
+          "stopReason": "stop"
+        }
+      ],
+      "reports": [],
+      "settled": {
+        "status": "done"
+      },
+      "log": [
+        "life 2 +29ms scenario=midstream store=idb run=midstream-idb-1794641446751",
+        "life 2 +45ms engine open",
+        "life 2 +54ms resumed",
+        "life 2 +2074ms settled done"
+      ]
+    },
+    "reminder/idb": {
+      "ms": 1709,
+      "scenario": "reminder",
+      "store": "idb",
+      "life": 2,
+      "counters": {
+        "toolStarts": 0,
+        "consentAsks": 0,
+        "modelRequests": 0,
+        "remindersFired": 1
+      },
+      "states": [
+        "idle"
+      ],
+      "entries": [],
+      "reports": [],
+      "firedAfterOpenMs": 1457,
+      "lateMs": 4,
+      "inspection": 0,
+      "log": [
+        "life 2 +31ms scenario=reminder store=idb run=reminder-idb-1794641450594",
+        "life 2 +46ms engine open",
+        "life 2 +55ms resumed",
+        "life 2 +1482ms reminder fired: stretch (4ms after due)"
+      ]
+    },
+    "reminder-missed/idb": {
+      "ms": 2902,
+      "scenario": "reminder-missed",
+      "store": "idb",
+      "life": 2,
+      "counters": {
+        "toolStarts": 0,
+        "consentAsks": 0,
+        "modelRequests": 0,
+        "remindersFired": 1
+      },
+      "states": [
+        "idle"
+      ],
+      "entries": [],
+      "reports": [],
+      "firedAfterOpenMs": 52,
+      "lateMs": 1672,
+      "inspection": 0,
+      "log": [
+        "life 2 +87ms scenario=reminder-missed store=idb run=reminder-missed-idb-1794641452402",
+        "life 2 +113ms engine open",
+        "life 2 +137ms resumed",
+        "life 2 +140ms reminder fired: stretch (1672ms after due)"
+      ]
+    },
+    "turn-cap/idb": {
+      "ms": 244,
+      "scenario": "turn-cap",
+      "store": "idb",
+      "life": 1,
+      "counters": {
+        "toolStarts": 2,
+        "consentAsks": 2,
+        "modelRequests": 2,
+        "remindersFired": 0
+      },
+      "states": [
+        "idle",
+        "waiting",
+        "thinking",
+        "working",
+        "waiting",
+        "thinking",
+        "working",
+        "waiting",
+        "idle"
+      ],
+      "entries": [
+        {
+          "kind": "pi.user",
+          "role": "user",
+          "text": "Remember to buy milk."
+        },
+        {
+          "kind": "pi.system",
+          "role": "system",
+          "text": ""
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "toolCall(save_note {\"text\":\"again\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "saved: again",
+          "isError": false,
+          "diagnostics": []
+        },
+        {
+          "kind": "pi.assistant",
+          "role": "assistant",
+          "text": "toolCall(save_note {\"text\":\"again\"})",
+          "stopReason": "toolUse"
+        },
+        {
+          "kind": "pi.tool-result",
+          "role": "toolResult",
+          "text": "saved: again",
+          "isError": false,
+          "diagnostics": []
+        }
+      ],
+      "runFailure": {
+        "taskId": 14,
+        "inputs": [
+          8
+        ],
+        "reason": "turn_limit",
+        "detail": "2 turns",
+        "first": 7
+      },
+      "reports": [],
+      "settled": {
+        "status": "unanswered",
+        "reason": "turn_limit"
+      },
+      "log": [
+        "life 1 +50ms scenario=turn-cap store=idb run=turn-cap-idb-1794641455439",
+        "life 1 +111ms engine open",
+        "life 1 +124ms submitted 8",
+        "life 1 +157ms consent asked for save_note (ask #1)",
+        "life 1 +160ms tool save_note started (start #1)",
+        "life 1 +184ms consent asked for save_note (ask #2)",
+        "life 1 +186ms tool save_note started (start #2)"
+      ]
+    }
+  }
+}
