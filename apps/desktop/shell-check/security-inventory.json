@@ -21,6 +21,10 @@
     "quit.clean",
     "download.refused",
     "assets.inside",
-    "harden.before-page"
+    "harden.before-page",
+    "confirm.defaults",
+    "confirm.throttle",
+    "confirm.escaping",
+    "confirm.frozen"
   ]
 }

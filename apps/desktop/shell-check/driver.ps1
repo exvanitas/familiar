@@ -19,6 +19,7 @@ $Broken = (Resolve-Path $Broken).Path
 New-Item -ItemType Directory -Force $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
 . (Join-Path $here 'win32.ps1')
+. (Join-Path $here 'driver-net.ps1')
 Add-Type -AssemblyName System.Windows.Forms
 
 # What this driver writes. None may be left from an earlier run, so a verdict here is this run's.
@@ -188,7 +189,11 @@ function Do-Step($action, $a) {
       }
       return @{ hits = $n }
     }
-    default { throw "unknown step $action" }
+    default {
+      $r = Do-NetStep $action $a
+      if ($null -ne $r) { return $r }
+      throw "unknown step $action"
+    }
   }
 }
 

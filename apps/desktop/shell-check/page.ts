@@ -85,7 +85,7 @@ const handlers: Record<string, (args: never) => unknown> = {
   listen: (names: string[]) => listen(names),
   heard: () => ({ ...heard }),
   'close-self': () => { setTimeout(() => shell.windowSelf('close').catch(() => {}), 100); return 'closing'; },
-  'self-op': (op: 'minimize') => shell.windowSelf(op).then(() => 'ok', e => 'failed:' + String(e)),
+  'self-op': (op: 'minimize') => shell.windowSelf(op).then(() => 'ok', e => 'failed:' + JSON.stringify(e)),
   navigate: (to: string) => { setTimeout(() => { location.href = to; }, 100); return 'navigating'; },
   permissions: () => permissions(),
   'service-workers': () => serviceWorkers(),
