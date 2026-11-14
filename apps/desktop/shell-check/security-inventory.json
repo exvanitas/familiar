@@ -1,0 +1,23 @@
+{
+  "description": "Every security id that must PASS on the Windows runner, prefixed security. in the results. Only the ids with checks so far: later rounds append theirs (see section 7 of docs/shell-design.md). The release gate requires the whole list in the design.",
+  "ids": [
+    "caps.static",
+    "caps.view-refused",
+    "caps.core-reaches",
+    "caps.cross-window",
+    "caps.forged-event",
+    "caps.page-binding",
+    "csp.trusted-types",
+    "csp.no-service-worker",
+    "perm.denied",
+    "egress.core",
+    "egress.view",
+    "egress.controls",
+    "nav.refused",
+    "pin.origin",
+    "pin.folder",
+    "pin.restart",
+    "pin.moved-install",
+    "quit.clean"
+  ]
+}
