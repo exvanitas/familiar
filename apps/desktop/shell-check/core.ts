@@ -274,6 +274,41 @@ async function main(info: Info) {
     return `settings and chat stayed on their pages, ${tries.length} bad view_open calls refused`;
   });
 
+  await check('security.download.refused', async () => {
+    await shell.viewOpen({ label: 'view-download', page: 'download.html', title: 'Familiar check download', width: 360, height: 240 });
+    await up('download');
+    const before = await step<{ names: string[] }>('downloads');
+    const said: string[] = [];
+    for (const kind of ['same', 'blob'] as const) {
+      said.push(await ask<string>('download', 'dl-ready', kind));
+      const click = await step<{ clicked: boolean; why?: string }>('click', { title: 'Familiar check download' });
+      if (!click.clicked) fail('the driver could not click: ' + (click.why ?? ''));
+      await sleep(2000);
+    }
+    const after = await step<{ names: string[] }>('downloads');
+    const fresh = after.names.filter(n => !before.names.includes(n));
+    const refused = await step<{ count: number }>('log-grep', { pattern: 'download refused in view-download' });
+    ok(fresh.length === 0, 'files appeared in Downloads: ' + fresh.join(' '));
+    ok(refused.count >= 2, `the exe refused ${refused.count} downloads, of 2 clicked`);
+    await shell.windowCtl('view-download', 'close');
+    return `a same-origin and a blob: download after a real click were both cancelled (${said.join(', ')}), nothing in Downloads`;
+  });
+
+  await check('security.assets.inside', async () => {
+    const inside = await fetch('tray.png', { cache: 'no-store' }).then(r => r.status, () => 0);
+    const through = await fetch('outside/secret.txt', { cache: 'no-store' }).then(async r => (r.ok ? `${r.status} ${(await r.text()).length} bytes` : String(r.status)), () => 'failed');
+    ok(inside === 200, `the app folder's own file gave ${inside}`);
+    ok(!/^2/.test(through), `a file through a junction out of the app folder was served: ${through}`);
+    return `the app folder's file 200, a junction's target ${through}`;
+  });
+
+  await check('check.sink.slow-clients', async () => {
+    const r = await step<{ answered: string; owner: boolean; ms: number }>('sink-slow');
+    ok(r.owner, 'the sink port is not held by familiar.exe');
+    ok(r.answered.startsWith('HTTP/1.1 403'), `a request after 70 slow clients got: ${r.answered || 'nothing'}`);
+    return `70 clients trickling a byte a second; a new request got 403 in ${r.ms} ms; the port is familiar.exe's`;
+  });
+
   // Egress: core, a view, and a view without Trusted Types, one after another.
   const fx = await fixtures();
   await step('mark', { name: 'egress-start' });
@@ -383,6 +418,19 @@ async function pinRead(info: Info, value: string, id: string) {
 
 (async () => {
   const info = await shell.info();
+  if (arg(info, '--phase') === 'early') {
+    // A second launch before core is ready must still reach core once it is.
+    const r = await step<{ exit: number }>('second-launch', { args: ['--early'] });
+    await shell.ready(m => { messages.push(m); if (m.t === 'quitting') shell.quitReady().catch(() => {}); });
+    await check('check.queue.early', async () => {
+      const got = await until(() => messages.find(m => m.t === 'second-launch' && m.args.includes('--early')), 5000, 'the early launch').catch(() => null);
+      ok(got, 'core never heard the second launch made before it was ready');
+      return `a second launch before shell_ready (exit ${r.exit}) reached core after it`;
+    });
+    await say('DONE');
+    await shell.quit();
+    return;
+  }
   await shell.ready(m => {
     messages.push(m);
     if (m.t === 'quitting') onQuitting();

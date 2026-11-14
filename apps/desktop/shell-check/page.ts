@@ -8,7 +8,7 @@ import { trySinks } from './tt.ts';
 
 const role = location.pathname.replace(/^\//, '').replace(/\.html$/, '');
 const token = rand(8);
-stepBase({ chat: 10000, bare: 30000, settings: 20000 }[role] ?? 40000);
+stepBase({ chat: 10000, bare: 30000, settings: 20000, download: 50000 }[role] ?? 40000);
 const heard: Record<string, number> = {};
 let clip = '';
 
@@ -93,7 +93,14 @@ const handlers: Record<string, (args: never) => unknown> = {
   'paste-value': () => (document.getElementById('paste') as HTMLInputElement).value,
   'clip-ready': (text: string) => { clip = text; return 'ready'; },
   'clip-result': () => (document.getElementById('clip') as HTMLElement).dataset.result ?? 'no click',
-  violations: () => [...violations]
+  violations: () => [...violations],
+  /* A link the driver clicks for real: the same origin's file, or a blob, each with download set. */
+  'dl-ready': (kind: 'same' | 'blob') => {
+    const a = document.getElementById('dl') as HTMLAnchorElement;
+    a.href = kind === 'same' ? 'tray.png' : URL.createObjectURL(new Blob(['not to be saved'], { type: 'text/plain' }));
+    a.download = kind === 'same' ? 'familiar-check-same.png' : 'familiar-check-blob.txt';
+    return a.href.slice(0, 5);
+  }
 };
 
 document.getElementById('clip')?.addEventListener('click', e => {

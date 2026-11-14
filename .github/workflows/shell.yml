@@ -11,6 +11,10 @@ on:
         description: Skip the build, and use the exe from the latest build on this branch
         type: boolean
         default: false
+      variants:
+        description: Also build and check the WebRTC measurement variants
+        type: boolean
+        default: false
   push:
     paths:
       - apps/desktop/**
@@ -26,13 +30,13 @@ concurrency:
 
 jobs:
   windows:
-    # `both` is the exe as it ships. The others are measurement builds of the same source with one
-    # WebRTC closure taken out, or other switches tried, so each closure is measured on its own. They
-    # never ship, and their gate is information only.
+    # `both` is the exe as it ships. By hand, with `variants`, the others are measurement builds of
+    # the same source with one WebRTC closure taken out, or other switches tried, so each closure is
+    # measured on its own. They never ship, and their gate is information only.
     strategy:
       fail-fast: false
       matrix:
-        variant: [both, csp-only, script-only, switches]
+        variant: ${{ fromJSON(inputs.variants && '["both", "csp-only", "script-only", "switches"]' || '["both"]') }}
     name: windows (${{ matrix.variant }})
     continue-on-error: ${{ matrix.variant != 'both' }}
     runs-on: windows-latest

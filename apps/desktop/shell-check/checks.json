@@ -24,6 +24,9 @@
     "smoke.chat",
     "smoke.quit",
     "webview.args",
-    "webrtc.env-override"
+    "webrtc.env-override",
+    "sink.slow-clients",
+    "queue.early",
+    "start.overlap"
   ]
 }

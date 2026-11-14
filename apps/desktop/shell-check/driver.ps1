@@ -21,6 +21,11 @@ $Out = (Resolve-Path $Out).Path
 . (Join-Path $here 'win32.ps1')
 Add-Type -AssemblyName System.Windows.Forms
 
+# What this driver writes. None may be left from an earlier run, so a verdict here is this run's.
+foreach ($f in 'contract.txt', 'egress.txt', 'egress.md', 'hits.jsonl', 'capture.pcapng', 'marks.json', 'edge-result.json', 'dns-log.txt', 'fixtures.json') {
+  Remove-Item (Join-Path $Out $f) -Force -ErrorAction SilentlyContinue
+}
+Remove-Item (Join-Path $App 'fixtures.json') -Force -ErrorAction SilentlyContinue
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('familiar-check-' + [guid]::NewGuid().ToString('n').Substring(0, 8))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $results = [System.Collections.Generic.List[string]]::new()
@@ -143,6 +148,35 @@ function Do-Step($action, $a) {
       $marks[$a.name] = $m
       return $m
     }
+    'downloads' {
+      $dir = Join-Path $env:USERPROFILE 'Downloads'
+      return @{ names = @(Get-ChildItem $dir -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
+    }
+    'sink-slow' {
+      # 70 clients, more than the sink's 64 workers, each trickling a byte a second and never a
+      # newline. A request after them must still get its 403.
+      if ($told.main -notmatch '--proxy-server=http://127\.0\.0\.1:(\d+)') { throw 'no sink port in the browser arguments' }
+      $port = [int]$Matches[1]
+      $owner = @(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -eq $script:proc.Id }).Count -gt 0
+      $slow = @(1..70 | ForEach-Object { try { [Net.Sockets.TcpClient]::new('127.0.0.1', $port) } catch { $null } } | Where-Object { $_ })
+      for ($s = 0; $s -lt 3; $s++) {
+        foreach ($c in $slow) { try { $c.GetStream().WriteByte(65) } catch { } }
+        Start-Sleep -Seconds 1
+      }
+      $t = [Diagnostics.Stopwatch]::StartNew()
+      $answered = ''
+      try {
+        $c = [Net.Sockets.TcpClient]::new('127.0.0.1', $port)
+        $st = $c.GetStream(); $st.ReadTimeout = 4000
+        $req = [Text.Encoding]::ASCII.GetBytes("GET http://familiar-check.test/ HTTP/1.1`r`n`r`n")
+        $st.Write($req, 0, $req.Length)
+        $buf = [byte[]]::new(64); $n = $st.Read($buf, 0, 64)
+        $answered = [Text.Encoding]::ASCII.GetString($buf, 0, $n).Split("`r")[0]
+        $c.Close()
+      } catch { $answered = "error: $($_.Exception.Message)" }
+      foreach ($c in $slow) { try { $c.Close() } catch { } }
+      return @{ answered = $answered; owner = $owner; ms = $t.ElapsedMilliseconds; slow = $slow.Count }
+    }
     'hits' {
       $n = 0
       foreach ($l in Get-Content (Join-Path $Out 'hits.jsonl')) {
@@ -253,6 +287,12 @@ try {
   Write-Host "pktmon capturing: $capturing"
 
   # ---------- the main run ----------
+  # A junction inside the app folder to a folder outside it: nothing through it may be served.
+  $outside = Join-Path $tmp 'outside'
+  New-Item -ItemType Directory -Force $outside | Out-Null
+  'outside the app folder' | Set-Content (Join-Path $outside 'secret.txt')
+  $junction = Join-Path $App 'outside'
+  New-Item -ItemType Junction -Path $junction -Target $outside | Out-Null
   $data = Join-Path $tmp 'data'
   $main = Join-Path $Out 'check.log'
   $p = Run-Phase 'main' $main @('--app-dir', $App, '--data-dir', $data, '--log', $main, '--seconds', '600', '--phase', 'main') 660
@@ -261,6 +301,18 @@ try {
   $quitParts.main = ($p.ExitCode -eq 0 -and $mainMs -ge 0 -and $mainMs -lt 3000 -and $mainWrite)
   Write-Host "main: exit $($p.ExitCode), quit after $mainMs ms, write while quitting $mainWrite"
   $quitParts.strays = No-Strays 'the main run'
+  (Get-Item $junction).Delete()
+
+  # Every window was hardened before its page logged anything.
+  $lines = @(Get-Content $main)
+  $labels = @($lines | ForEach-Object { if ($_ -match '^\s*[\d.]+ \[([a-z0-9-]+)\] ') { $Matches[1] } } | Sort-Object -Unique)
+  $late = @()
+  foreach ($l in $labels) {
+    $first = [array]::FindIndex([string[]]$lines, [Predicate[string]] { param($x) $x -match "^\s*[\d.]+ \[$l\] " })
+    $hard = [array]::FindIndex([string[]]$lines, [Predicate[string]] { param($x) $x -match "^\s*[\d.]+ hardened $l$" })
+    if ($hard -lt 0 -or $hard -gt $first) { $late += $l }
+  }
+  Result $(if ($labels.Count -ge 4 -and $late.Count -eq 0) { 'PASS' } else { 'FAIL' }) 'security.harden.before-page' "$($labels.Count) windows logged, each after its hardening$(if ($late.Count) { "; not: $($late -join ' ')" })"
   $urls = @(Select-String -Path $main -Pattern '(navigation|new window) refused' | Where-Object { $_.Line -match '://' })
   if ($urls.Count) { Result 'FAIL' 'security.nav.refused' "$($urls.Count) refusal lines carry a URL" }
 
@@ -307,6 +359,29 @@ try {
   $landed = [bool]($results | Where-Object { $_ -like 'PASS check.quit.write-landed*' })
   $ok = $quitParts.main -and $quitParts.pinWrite -and $quitParts.hung -and $quitParts.strays -and $landed
   Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.quit.clean' "main exit 0 and done in $mainMs ms with its quitting write: $($quitParts.main); pin-write $writeMs ms: $($quitParts.pinWrite); that write read back: $landed; silent core ended in $hungMs ms: $($quitParts.hung); no strays: $($quitParts.strays)"
+
+  # ---------- a second launch before core is ready ----------
+  $log = Join-Path $Out 'early.log'
+  $p = Run-Phase 'early' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'early-data'), '--log', $log, '--seconds', '60', '--phase', 'early') 90
+  [void](No-Strays 'early')
+
+  # ---------- an app folder that holds the data folder: a box, and out with 1 ----------
+  $ov = Join-Path $tmp 'overlap'
+  Copy-Item $App $ov -Recurse
+  $log = Join-Path $Out 'overlap.log'
+  $script:log = $log
+  $p = Launch $Exe @('--app-dir', $ov, '--data-dir', (Join-Path $ov 'data'), '--log', $log)
+  $h = 0
+  for ($i = 0; $i -lt 150 -and -not $h; $i++) { Start-Sleep -Milliseconds 100; $h = [W]::Dialog([uint32]$p.Id) }
+  $text = if ($h) { [W]::DialogText($h) } else { '' }
+  if ($h) { [W]::Press($h, 2) }
+  if ($h -and -not $p.WaitForExit(3000)) { [W]::Press($h, 1); [void][W]::Post($h, 0x10, 0, 0) }
+  if ($p.WaitForExit(10000)) {
+    $said = [bool](Select-String -Path $log -Pattern 'app folder overlaps the data folder' -Quiet)
+    $ok = $h -and $said -and $p.ExitCode -eq 1 -and $text -match 'overlap'
+    Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'check.start.overlap' "box $([bool]$h) text $($text -match 'overlap') log $said exit $($p.ExitCode)"
+  } else { Result 'FAIL' 'check.start.overlap' 'still running'; $p.Kill() }
+  [void](No-Strays 'overlap')
 
   # ---------- a missing app folder: a box, and out with 1 ----------
   $log = Join-Path $Out 'no-app.log'
@@ -372,6 +447,13 @@ try {
 
   # ---------- the positive controls ----------
   Write-Host '--- controls'
+  $marks['driver-start'] = @{ at = (Now-Ms); sink = 0 }
+  # A bare TCP connection that sends nothing, and UDP to every TCP listener's port.
+  try { $c = [Net.Sockets.TcpClient]::new('127.0.0.1', [int]$fx.tcp); Start-Sleep -Milliseconds 200; $c.Close() } catch { Write-Host "control bare tcp: $_" }
+  $q = [Net.Sockets.UdpClient]::new()
+  [void]$q.Send([byte[]](0xC0, 1, 2, 3), 4, '127.0.0.1', [int]$fx.tcp)
+  foreach ($prop in $fx.turnTcp.PSObject.Properties) { [void]$q.Send([byte[]](0xC0, 1, 2, 3), 4, '127.0.0.1', [int]$prop.Value) }
+  $q.Close()
   $dl = "$($fx.run)d00"; $dn = "$($fx.run)d01"
   try { Invoke-WebRequest "http://127.0.0.1:$($fx.tcp)/h/$dl/loop" -UseBasicParsing -TimeoutSec 5 | Out-Null } catch { Write-Host "control http: $_" }
   $u = [Net.Sockets.UdpClient]::new()
@@ -385,6 +467,8 @@ try {
   try { $c = [Net.Sockets.TcpClient]::new('127.0.0.1', [int]$fx.turnTcp.driver); $c.Close() } catch { Write-Host "control tcp: $_" }
   Resolve-DnsName "$dn.familiar-check.test" -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null
   Clear-DnsClientCache
+  Start-Sleep -Milliseconds 500
+  $marks['driver-end'] = @{ at = (Now-Ms); sink = 0 }
 
   $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
   if ($edge) {
@@ -415,8 +499,15 @@ finally {
 
 # ---------- the egress verdicts ----------
 & node (Join-Path $here 'analyze.mjs') $Out | Out-Host
-if (Test-Path (Join-Path $Out 'egress.txt')) { foreach ($l in Get-Content (Join-Path $Out 'egress.txt')) { if ($l) { $results.Add($l) } } }
-else { Result 'FAIL' 'security.egress.controls' 'the analysis did not run' }
+$analysed = $LASTEXITCODE
+$run = if ($fx) { $fx.run } else { '' }
+$verdicts = if ((Test-Path (Join-Path $Out 'egress.txt')) -and $analysed -eq 0) { @(Get-Content (Join-Path $Out 'egress.txt') | Where-Object { $_ }) } else { @() }
+$fresh = @($verdicts | Where-Object { $run -and $_.EndsWith(" run=$run") })
+if ($analysed -ne 0 -or $fresh.Count -ne $verdicts.Count -or $fresh.Count -eq 0) {
+  foreach ($id in 'controls', 'core', 'view') { Result 'FAIL' "security.egress.$id" "no analysis from this run: node exit $analysed, $($fresh.Count) of $($verdicts.Count) verdicts stamped run=$run" }
+} else { foreach ($l in $fresh) { $results.Add($l) } }
+# The gate checks each egress verdict against this line.
+if ($run) { $results.Insert(0, "RUN $run") }
 if ($env:GITHUB_STEP_SUMMARY -and (Test-Path (Join-Path $Out 'egress.md'))) { Get-Content (Join-Path $Out 'egress.md') | Add-Content $env:GITHUB_STEP_SUMMARY }
 
 $results | Set-Content (Join-Path $Out 'contract.txt')

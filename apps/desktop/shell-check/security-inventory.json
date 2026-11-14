@@ -18,6 +18,9 @@
     "pin.folder",
     "pin.restart",
     "pin.moved-install",
-    "quit.clean"
+    "quit.clean",
+    "download.refused",
+    "assets.inside",
+    "harden.before-page"
   ]
 }
