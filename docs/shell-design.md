@@ -235,12 +235,12 @@ CSP governs fetch, WebSocket, images, styles and forms. It doesn't govern WebRTC
 ```
 
 - **A sink proxy the exe owns.** Before any window opens, the exe binds its own listener on `127.0.0.1` at a random free port, with `SO_EXCLUSIVEADDRUSE` so nothing else can take it, and passes that port as `<sink>`. The listener answers every connection with `HTTP/1.1 403`, reads nothing past the first line, and closes. Every request the webview's own network stack makes goes there, so it fails, whatever started it: a beacon, a prefetch, a form, a link's `ping`, a notification icon, anything CSP missed. `<-loopback>` removes Chromium's implicit loopback bypass, so local services are closed too. Familiar's own pages and IPC don't use that stack: `http://tauri.localhost` and `http://ipc.localhost` are answered by WebView2's request interception before any network. The guarded fetch is native and never sees this setting. Step 3 confirms both on the runner.
-- **WebRTC** may then only use UDP through a proxy, which Chromium can't do over an HTTP proxy, and TCP through the sink. So it can't reach anything.
+- **WebRTC** may then only use UDP through a proxy, which Chromium can't do over an HTTP proxy, and TCP through the sink. So it can't reach anything. **Measured on the runner, this is wrong** (runs 43590029085 and 43590687737 of `shell.yml`): WebView2's browser process is given `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` (its command line shows it) and ignores it. From core, a view and a view without Trusted Types, an `RTCPeerConnection` gathers host and server-reflexive candidates: STUN binding requests reach a STUN responder on `127.0.0.1`, UDP goes to a LAN address, and the STUN and TURN host names are looked up on the wire and in the DNS Client log. WebRTC is the one route open; promise 2 is not declared.
 - **DNS prefetch** is off, and with a fixed proxy Chromium leaves name resolution to the proxy anyway.
 - **SmartScreen** in the webview is off, because pages are only ever local and it would send URLs to Microsoft.
 - **Autoplay** is on so a reminder can play a sound, which could not be added later without an exe.
 - The sink counts what it refused, never logging content, so the runner check can see the webview really used it.
-- If the runner shows any route still open, promise 2 isn't declared. An initialization script for every frame that deletes `RTCPeerConnection` and its relatives is a stopgap only (an `about:blank` frame might keep its own copy), not a way to declare it.
+- If the runner shows any route still open, promise 2 isn't declared. An initialization script for every frame that deletes `RTCPeerConnection` and its relatives is a stopgap only (an `about:blank` frame might keep its own copy), not a way to declare it. Measured: under `frame-src 'none'` a page can still make an `about:blank` frame, and that frame's own `RTCPeerConnection` gathers and sends just as the page's does, so deleting the page's copy closes nothing unless the script also reaches every such frame. Measured too: setting `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` in the environment does not replace the exe's arguments, so the proxy can't be dropped that way.
 
 **Tests** (all in the security inventory, [7](#7-checks-on-the-windows-runner)):
 
@@ -276,7 +276,7 @@ The install folder (`%LOCALAPPDATA%\Programs\Familiar\`) and the data folder are
 
 At every start, core calls `navigator.storage.persisted()`, and if it's false, `navigator.storage.persist()`. It records `{ at, persisted, granted, quota, usage }` (the last two from `navigator.storage.estimate()`) in its settings and logs `persist granted=<bool>`. Settings shows the answer. If it's false, step 10's rolling backup turns on.
 
-Whether WebView2 grants it is open. Chromium decides `persist()` by heuristics (engagement, an installed app, notification permission), and WebView2 has no permission kind for it that the exe could answer. **Step 3 measures it**: the check app logs both answers and the estimate on a fresh data folder, on a second start, and after core has shown a notification. These are recorded as INFO, not pass or fail, and the result goes into this file. Nothing native depends on the answer, since the backup commands are in the exe either way.
+Whether WebView2 grants it is open. Chromium decides `persist()` by heuristics (engagement, an installed app, notification permission), and WebView2 has no permission kind for it that the exe could answer. **Measured on the runner, the last part is wrong**: each `persist()` call raises a WebView2 `PermissionRequested` of kind 13, which the SDK in `webview2-com 0.39` doesn't name, in the same millisecond. The exe's deny-everything handler answers it, and `persist()` returns false: on a fresh data folder, on a second start, and from a moved install, with `quota` 10737418240 and `usage` 0 each time. So the exe can answer it, and today answers no. Whether WebView2 would grant it if the exe allowed kind 13 is not measured. **Step 3 measures it**: the check app logs both answers and the estimate on a fresh data folder, on a second start, and after core has shown a notification. These are recorded as INFO, not pass or fail, and the result goes into this file. Nothing native depends on the answer, since the backup commands are in the exe either way.
 
 ---
 
@@ -674,15 +674,15 @@ Decided in this note, after review: untrusted content is never HTML, with Truste
 
 ## Open, for step 3 to measure
 
-- Whether WebView2 grants `navigator.storage.persist()` ([3](#3-origin-and-data-folder-pinned)).
-- Whether the sink proxy, the WebRTC policy and DNS prefetch off close every egress route, with Familiar's pages and IPC still working ([2](#egress-outside-fetch)). Promise 2 waits on it.
-- Whether Tauri's injected scripts run under the app's `trusted-types 'none'`. If not, the fix is in the app ([2](#the-web-surface-what-the-exe-pins)).
-- Whether `navigator.clipboard.writeText` works in a view, which decides the clipboard plugin ([4](#4-plugins)).
+- Whether WebView2 grants `navigator.storage.persist()` ([3](#3-origin-and-data-folder-pinned)). Measured: it asks the exe (permission kind 13), the exe denies, and the answer is false. Whether it would grant it if allowed is still open.
+- Whether the sink proxy, the WebRTC policy and DNS prefetch off close every egress route, with Familiar's pages and IPC still working ([2](#egress-outside-fetch)). Promise 2 waits on it. Measured: every route but WebRTC is closed, from core, a view and a view without Trusted Types, with pages and IPC working under the sink (IPC went over `http://ipc.localhost` every time); WebRTC is open.
+- Whether Tauri's injected scripts run under the app's `trusted-types 'none'`. If not, the fix is in the app ([2](#the-web-surface-what-the-exe-pins)). Measured: they do, with no violation from them; invoke, and channel messages both small (by script) and large (by Tauri's fetch command), all work.
+- Whether `navigator.clipboard.writeText` works in a view, which decides the clipboard plugin ([4](#4-plugins)). Measured: it works after a real click, so no clipboard plugin.
 - Whether the registry app id is enough for toasts on an unpackaged exe ([4](#4-plugins)).
 - That `wake_at` reaches a core hidden for 10 minutes, and, before release on a real PC, that a reminder due during sleep shows after resume ([6](#6-tray-hotkey-autostart-single-instance-notifications-system-state)).
 - That the reparse walk reads links without following them on the runner's file system ([5b](#5b-starting-a-local-mcp-server)).
 - That rustls with the platform verifier trusts what Windows trusts ([5c](#5c-the-guarded-fetch)).
-- That the permission handler's deny is the last word, with no prompt shown, and that paste still works in Settings ([2](#web-permissions)).
+- That the permission handler's deny is the last word, with no prompt shown, and that paste still works in Settings ([2](#web-permissions)). Measured: clipboard read, geolocation, notifications and MIDI reached the exe's handler and were denied within 5 ms, no new window appeared, and Ctrl+V into Settings worked. Camera and microphone were refused before asking, since the runner has no devices.
 
 ---
 
