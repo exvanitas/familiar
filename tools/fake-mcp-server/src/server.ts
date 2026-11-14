@@ -28,6 +28,8 @@ export interface FakeServerOptions {
   readonly crash?: () => void;
   /** Notes kept across connections. */
   readonly notes?: string[];
+  /** What spawn_tree does. The program starts a child that starts a grandchild, and says their ids. */
+  readonly spawnTree?: () => Promise<{ server: number; child: number; grandchild: number }>;
 }
 
 export const SERVER_NAME = 'familiar-fake';
@@ -100,6 +102,12 @@ export function fakeTools(variant: Variant = 'a'): Tool[] {
       annotations: { readOnlyHint: true }
     },
     {
+      name: 'spawn_tree',
+      description: 'Starts a long-lived child process, which starts a grandchild, and returns the three process ids.',
+      inputSchema: noInput,
+      annotations: { readOnlyHint: false, destructiveHint: false }
+    },
+    {
       name: 'read_page',
       description: 'Returns a fixed web page, the way outside content arrives.',
       inputSchema: noInput,
@@ -159,6 +167,10 @@ export function createFakeServer(options: FakeServerOptions = {}): Server {
         );
       case 'read_page':
         return text(OUTSIDE_CONTENT);
+      case 'spawn_tree': {
+        if (!options.spawnTree) return toolError('This server can not start processes.');
+        return text(JSON.stringify(await options.spawnTree()));
+      }
       default:
         throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${request.params.name}`);
     }

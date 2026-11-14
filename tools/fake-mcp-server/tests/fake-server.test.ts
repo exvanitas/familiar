@@ -48,9 +48,22 @@ describe('the fake MCP server over stdio', () => {
       ['crash', false],
       ['print_secret', true],
       ['list_env', true],
+      ['spawn_tree', false],
       ['read_page', true]
     ]);
     expect(tools).toEqual(fakeTools('a'));
+  });
+
+  it('spawn_tree starts a child and a grandchild that live on, and says their ids', async () => {
+    const { client } = await startStdio();
+    const ids = JSON.parse(textOf(await client.callTool({ name: 'spawn_tree', arguments: {} }))) as Record<string, number>;
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      for (const k of ['server', 'child', 'grandchild']) expect(alive(ids[k]), k).toBe(true);
+      expect(new Set([ids.server, ids.child, ids.grandchild]).size).toBe(3);
+    } finally {
+      for (const k of ['grandchild', 'child']) { try { process.kill(ids[k]); } catch { /* gone */ } }
+    }
   });
 
   it('echoes, and variant b changes the description and the answer', async () => {

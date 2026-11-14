@@ -5,6 +5,7 @@
 //   --variant b                      echo's description and behaviour change
 // Its log goes to stderr. The crash tool exits with code 3.
 
+import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { startHttp } from './http.ts';
@@ -26,7 +27,22 @@ const options = {
   variant: values.variant as Variant,
   env: process.env,
   log: (line: string) => process.stderr.write(`${line}\n`),
-  crash: () => process.exit(3)
+  crash: () => process.exit(3),
+  // A child that starts a grandchild and prints its id, both waiting for ever. Neither reads the
+  // server's stdin or writes to its stdout.
+  spawnTree: () =>
+    new Promise<{ server: number; child: number; grandchild: number }>((done, fail) => {
+      const grandchild = 'setInterval(() => {}, 1000)';
+      const child = `const g = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' }); process.stdout.write(g.pid + '\\n'); setInterval(() => {}, 1000)`;
+      const c = spawn(process.execPath, ['-e', child], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      c.stdout.on('data', (b: Buffer) => {
+        out += b.toString();
+        const line = out.split('\n')[0].trim();
+        if (out.includes('\n') && line) done({ server: process.pid, child: c.pid ?? 0, grandchild: Number(line) });
+      });
+      c.on('error', fail);
+    })
 };
 
 if (values.http !== undefined) {
