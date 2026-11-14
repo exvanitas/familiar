@@ -20,6 +20,17 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
 
+  # The shell's plain rules, on every push. rustup reads apps/desktop/rust-toolchain.toml.
+  shell-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/desktop/shell-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo test --locked
+
   # Local MCP servers will run on Windows, so the tests run there too. Main only: Windows minutes count double.
   windows:
     if: github.ref == 'refs/heads/main'

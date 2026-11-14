@@ -1,0 +1,10 @@
+[package]
+name = "shell-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "What Familiar's native shell decides, with no Tauri and no OS calls, so its tests run anywhere."
+
+[dependencies]
