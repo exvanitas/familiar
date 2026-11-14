@@ -13,6 +13,8 @@ pub mod views;
 pub mod web;
 pub mod queue;
 pub mod folders;
+pub mod gate;
+pub mod reach;
 pub mod address;
 pub mod redact;
 pub mod setup;

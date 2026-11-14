@@ -4,6 +4,6 @@
   "windows": ["settings"],
   "permissions": [
     "allow-window-self", "allow-log-line",
-    "allow-address-list", "allow-secret-set", "allow-secret-status"
+    "allow-address-list", "allow-secret-set", "allow-secret-status", "allow-net-proxy"
   ]
 }

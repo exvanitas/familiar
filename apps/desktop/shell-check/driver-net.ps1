@@ -125,13 +125,46 @@ $inet = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 function Random-Text([int]$n) { -join ((1..$n) | ForEach-Object { 'abcdefghijkmnopqrstuvwxyz23456789'[(Get-Random -Maximum 33)] }) }
 
 # The fake server, with a self-signed certificate the system doesn't trust, made for this run.
+# The runner's own resolver is swapped for dns-server.mjs, which answers planned names and forwards
+# the rest to the resolver the runner had. Put back by Stop-NetServer.
+$script:dnsServer = $null
+$script:dnsAdapter = $null
+$script:dnsOriginal = $null
+function Start-DnsServer {
+  # The interface of the default route, and the resolver it had.
+  $if = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1).InterfaceIndex
+  $script:dnsOriginal = @((Get-DnsClientServerAddress -InterfaceIndex $if -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
+  if (-not $script:dnsOriginal.Count) { throw "interface $if has no IPv4 resolver" }
+  $script:dnsAdapter = $if
+  $upstream = $script:dnsOriginal[0]
+  '{}' | Set-Content (Join-Path $Out 'dns-plan.json')
+  $script:dnsServer = Start-Process node -ArgumentList "`"$(Join-Path $here 'dns-server.mjs')`"", "`"$Out`"", $upstream -PassThru -NoNewWindow `
+    -RedirectStandardOutput (Join-Path $Out 'dns-server.out') -RedirectStandardError (Join-Path $Out 'dns-server.err')
+  for ($i = 0; $i -lt 50 -and -not (Select-String -Path (Join-Path $Out 'dns-server.out') -Pattern 'dns server up' -Quiet -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 100 }
+  Set-DnsClientServerAddress -InterfaceIndex $if -ServerAddresses '127.0.0.1'
+  Clear-DnsClientCache
+  $script:lanIp = (Get-NetIPAddress -InterfaceIndex $if -AddressFamily IPv4 | Select-Object -First 1).IPAddress
+  Write-Host "dns server on 127.0.0.1, forwarding to $upstream; the runner's lan address $($script:lanIp)"
+}
+
+function Stop-DnsServer {
+  try {
+    if ($script:dnsAdapter) { Set-DnsClientServerAddress -InterfaceIndex $script:dnsAdapter -ServerAddresses $script:dnsOriginal; Clear-DnsClientCache }
+  } catch { Write-Host "dns: the resolver couldn't be put back: $_" }
+  $script:dnsAdapter = $null
+  if ($script:dnsServer -and -not $script:dnsServer.HasExited) { $script:dnsServer.Kill() }
+}
+
+function Dns-Log { @(Get-Content (Join-Path $Out 'dns-log.jsonl') | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }) }
+
 function Start-NetServer {
+  Start-DnsServer
   $cert = New-SelfSignedCertificate -DnsName 'localhost', '127.0.0.1' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
   $script:certThumb = $cert.Thumbprint
   $word = Random-Text 24
   $pfx = Join-Path $tmp 'net.pfx'
   Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString -String $word -Force -AsPlainText) | Out-Null
-  $script:netServer = Start-Process node -ArgumentList "`"$(Join-Path $here 'net-server.mjs')`"", "`"$Out`"", "`"$App`"", "`"$pfx`"", $word -PassThru -NoNewWindow `
+  $script:netServer = Start-Process node -ArgumentList "`"$(Join-Path $here 'net-server.mjs')`"", "`"$Out`"", "`"$App`"", "`"$pfx`"", $word, $script:lanIp -PassThru -NoNewWindow `
     -RedirectStandardOutput (Join-Path $Out 'net-server.out') -RedirectStandardError (Join-Path $Out 'net-server.err')
   for ($i = 0; $i -lt 100 -and -not (Test-Path (Join-Path $App 'net.json')); $i++) { Start-Sleep -Milliseconds 100 }
   $script:net = Get-Content (Join-Path $App 'net.json') -Raw | ConvertFrom-Json
@@ -143,6 +176,8 @@ function Stop-NetServer {
   if ($null -ne $script:proxyBackup) { Restore-Proxy }
   if ($script:certThumb) { Remove-Item "Cert:\CurrentUser\My\$($script:certThumb)" -ErrorAction SilentlyContinue }
   if ($script:netServer -and -not $script:netServer.HasExited) { $script:netServer.Kill() }
+  Stop-DnsServer
+  if ($script:shellLocked) { & icacls $script:shellLocked /remove:d "$env:USERNAME" | Out-Null }
 }
 
 function Restore-Proxy {
@@ -153,24 +188,57 @@ function Restore-Proxy {
   $script:proxyBackup = $null
 }
 
+# The system proxy setting as the registry has it: pac, manual, auto-detect or none.
+function Proxy-Kind {
+  $s = Get-ItemProperty $inet
+  if ($s.AutoConfigURL) { return 'pac' }
+  if ($s.ProxyEnable -eq 1 -and $s.ProxyServer) { return 'manual' }
+  $b = (Get-ItemProperty "$inet\Connections" -ErrorAction SilentlyContinue).DefaultConnectionSettings
+  if ($b -and $b.Length -gt 8 -and ($b[8] -band 0x08)) { return 'auto-detect' }
+  return 'none'
+}
+
 function Net-Log { @(Get-Content (Join-Path $Out 'net-log.jsonl') | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }) }
 
 # After the main run: no copy of any typed key in the data folder, the WebView2 folder or the log,
 # in UTF-8 or UTF-16.
 function Net-AfterMain([string]$data, [string]$log) {
   if ($script:keys.Count -eq 0) { Result 'FAIL' 'security.key.no-copy' 'no key was typed, so nothing was searched'; return }
-  $files = @(Get-ChildItem $data -Recurse -File -Force -ErrorAction SilentlyContinue) + @(Get-Item $log)
-  $found = @()
-  $bytes = 0
+  # A control key planted in each place searched, which the search must find: in the data folder,
+  # deep in WebView2's folder, and in the log, as UTF-16 and as UTF-8.
+  $control = 'fk' + (Random-Text 30)
+  $webview = Join-Path $data 'webview'
+  $deep = Get-ChildItem $webview -Recurse -Directory -Force -ErrorAction SilentlyContinue | Select-Object -Last 1
+  $plants = [ordered]@{
+    data = Join-Path $data 'control.bin'
+    webview = Join-Path $(if ($deep) { $deep.FullName } else { $webview }) 'control.bin'
+  }
+  [IO.File]::WriteAllBytes($plants.data, [Text.Encoding]::Unicode.GetBytes("x $control x"))
+  [IO.File]::WriteAllBytes($plants.webview, [Text.Encoding]::UTF8.GetBytes("x $control x"))
+  Add-Content $log "control $control"
+  $problems = @()
+  try { $files = @(Get-ChildItem $data -Recurse -File -Force -ErrorAction Stop) + @(Get-Item $log -ErrorAction Stop) }
+  catch { $problems += "a folder couldn't be listed: $($_.Exception.Message)"; $files = @() }
+  $found = @(); $controls = @{}; $bytes = 0; $scanned = 0
   foreach ($f in $files) {
-    try { $b = [IO.File]::ReadAllBytes($f.FullName) } catch { continue }
+    try { $b = [IO.File]::ReadAllBytes($f.FullName) }
+    catch { $problems += "unreadable: $($f.Name)"; continue }
+    $scanned++
     $bytes += $b.Length
     $t8 = [Text.Encoding]::UTF8.GetString($b)
     $t16 = [Text.Encoding]::Unicode.GetString($b)
     $t16b = if ($b.Length -gt 1) { [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { '' }
-    foreach ($k in $script:keys) { if ($t8.Contains($k) -or $t16.Contains($k) -or $t16b.Contains($k)) { $found += $f.Name } }
+    $has = { param($k) $t8.Contains($k) -or $t16.Contains($k) -or $t16b.Contains($k) }
+    foreach ($k in $script:keys) { if (& $has $k) { $found += $f.Name } }
+    if (& $has $control) {
+      $where = if ($f.FullName -eq (Get-Item $log).FullName) { 'log' } elseif ($f.FullName.StartsWith($webview)) { 'webview' } else { 'data' }
+      $controls[$where] = $true
+    }
   }
-  Result $(if ($found.Count -eq 0 -and $files.Count -gt 10) { 'PASS' } else { 'FAIL' }) 'security.key.no-copy' "$($script:keys.Count) keys searched for in $($files.Count) files ($bytes bytes) under the data folder, WebView2's folder and the log, UTF-8 and UTF-16: $(if ($found.Count) { 'found in ' + ($found -join ' ') } else { 'none found' })"
+  foreach ($p in $plants.Values) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+  $missed = @('data', 'webview', 'log' | Where-Object { -not $controls[$_] })
+  $ok = $problems.Count -eq 0 -and $missed.Count -eq 0 -and $found.Count -eq 0 -and $scanned -eq $files.Count -and $scanned -gt 10
+  Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.key.no-copy' "$($script:keys.Count) keys searched for in $scanned of $($files.Count) files ($bytes bytes), UTF-8 and UTF-16; the planted control was found in $((@('data', 'webview', 'log' | Where-Object { $controls[$_] })) -join ', ')$(if ($missed.Count) { ', missed in ' + ($missed -join ', ') }); $(if ($found.Count) { 'a key was found in ' + ($found -join ' ') } else { 'no key found' })$(if ($problems.Count) { '; ' + ($problems -join '; ') })"
 }
 
 # After the capture: no lookup before Allow.
@@ -232,9 +300,43 @@ function Do-NetStep($action, $a) {
       $targets = @(Net-Log | Select-Object -Skip $script:proxyFrom | Where-Object { $_.proxy } | ForEach-Object { $_.target })
       return @{ targets = $targets }
     }
+    'proxy-kind' { return @{ kind = (Proxy-Kind) } }
     'net-requests' {
       $since = if ($a.since) { [long]$a.since } else { 0 }
       return @{ count = @(Net-Log | Where-Object { $_.path -and $_.path.StartsWith($a.path) -and $_.at -ge $since }).Count }
+    }
+    'dns-plan' {
+      $f = Join-Path $Out 'dns-plan.json'
+      $plan = Get-Content $f -Raw | ConvertFrom-Json -AsHashtable
+      $plan[$a.name] = @{ answers = @($a.answers | ForEach-Object { , @($_) }); delay = @($a.delay) }
+      $plan | ConvertTo-Json -Depth 6 | Set-Content $f
+      Clear-DnsClientCache
+      return @{ lanIp = $script:lanIp }
+    }
+    'dns-queries' {
+      $q = @(Dns-Log | Where-Object { $_.name -eq $a.name -and $_.type -eq 1 })
+      return @{ count = $q.Count; queries = @($q | ForEach-Object { @{ at = $_.at; n = $_.n; answered = ($_.answered -join ',') } }) }
+    }
+    'dns-canary' {
+      $name = "$($a.label).familiar-check.test"
+      Clear-DnsClientCache
+      Resolve-DnsName $name -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null
+      return @{ at = (Now-Ms) }
+    }
+    'conns' {
+      $since = if ($a.since) { [long]$a.since } else { 0 }
+      return @{ count = @(Net-Log | Where-Object { $_.conn -eq $a.kind -and $_.at -ge $since }).Count }
+    }
+    'shell-lock' {
+      $dir = Join-Path $a.data 'shell'
+      if ($a.on) {
+        & icacls $dir /deny "$($env:USERNAME):(W,AD,WD,DC)" | Out-Null
+        $script:shellLocked = $dir
+      } else {
+        & icacls $dir /remove:d "$env:USERNAME" | Out-Null
+        $script:shellLocked = $null
+      }
+      return @{ code = $LASTEXITCODE }
     }
     'net-open' {
       $c = [Net.Sockets.TcpClient]::new('127.0.0.1', [int]$script:net.control)
@@ -256,22 +358,57 @@ function Do-NetStep($action, $a) {
         return $res
       }
       $el = $UIA::FromHandle([IntPtr]$h)
-      # What UI Automation sees of the dialog, for the results.
-      $res.tree = @($el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Select-Object -First 60 | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''):$($_.Current.Name):$($_.Current.AutomationId)" })
-      if ($script:shotN -le 2) { Write-Host "dialog tree: $($res.tree -join ' | ')" }
       $approve = Dialog-Button $el $a.approve
       $res.approveAtStart = [bool]($approve -and $approve.Current.IsEnabled)
+      if ($a.act -eq 'enter') {
+        # The approve button sampled every 40 ms from the dialog's creation, which the exe logs
+        # with its wall-clock time, and one real click on it 300 ms in, which must do nothing.
+        $m = Select-String -Path $script:log -Pattern 'confirm: dialog shown at (\d+)' | Select-Object -Last 1
+        $created = if ($m) { [long]$m.Matches[0].Groups[1].Value } else { 0 }
+        $samples = [System.Collections.Generic.List[object]]::new()
+        # Where to click, read before sampling starts. The click (a cursor move and a press, with
+        # pauses) runs on a thread of its own so the sampling goes on through it.
+        $r = $approve.Current.BoundingRectangle
+        $clicked = $false
+        $clickJob = $null
+        while ($created -and (Now-Ms) - $created -lt 1600) {
+          $t = (Now-Ms) - $created
+          try { $samples.Add(@{ t = $t; on = [bool]$approve.Current.IsEnabled }) } catch { break }
+          if (-not $clicked -and $t -ge 300) {
+            $clicked = $true
+            if ($r.IsEmpty) { $res.invokedEarly = 'could not click' }
+            else { $clickJob = Start-ThreadJob -ScriptBlock { param($x, $y) [W]::Click($x, $y) } -ArgumentList ([int]($r.X + $r.Width / 2)), ([int]($r.Y + $r.Height / 2)) }
+            continue
+          }
+          Start-Sleep -Milliseconds 40
+        }
+        if ($clickJob) {
+          $went = [bool](Receive-Job $clickJob -Wait -AutoRemoveJob)
+          $res.invokedEarly = if ($went) { 'clicked' } else { 'could not click' }
+        }
+        # The dialog still showing after the early click means the click did nothing.
+        if ($res.invokedEarly -eq 'clicked') { $res.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' } }
+        $on = @($samples | Where-Object { $_.on })
+        $off = @($samples | Where-Object { -not $_.on })
+        $gaps = @(for ($i = 1; $i -lt $samples.Count; $i++) { $samples[$i].t - $samples[$i - 1].t })
+        $res.timing = [ordered]@{
+          created = $created
+          firstSample = $(if ($samples.Count) { $samples[0].t } else { -1 })
+          lastOff = $(if ($off.Count) { $off[-1].t } else { -1 })
+          firstOn = $(if ($on.Count) { $on[0].t } else { -1 })
+          samples = $samples.Count
+          maxGap = $(if ($gaps.Count) { ($gaps | Measure-Object -Maximum).Maximum } else { -1 })
+        }
+      } else {
+        Start-Sleep -Milliseconds 1300
+      }
+      # What UI Automation sees of the dialog, for the results.
       $res.owner = [WN]::OwnerTitle($h)
       $res.topmost = [WN]::Topmost($h)
-      if ($a.act -eq 'enter') {
-        # A click within the first second must do nothing.
-        # A real click on it within the first second must do nothing.
-        if (Click-El $approve) {
-          Start-Sleep -Milliseconds 300
-          $res.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' }
-        } else { $res.invokedEarly = 'could not click' }
+      if ($res.invokedEarly -ne 'closed it') {
+        $res.tree = @($el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Select-Object -First 60 | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''):$($_.Current.Name):$($_.Current.AutomationId)" })
+        if ($script:shotN -le 2) { Write-Host "dialog tree: $($res.tree -join ' | ')" }
       }
-      Start-Sleep -Milliseconds 1300
       if ($res.invokedEarly -ne 'closed it') {
         $approve = Dialog-Button $el $a.approve
         $res.approveLater = [bool]($approve -and $approve.Current.IsEnabled)
@@ -286,7 +423,7 @@ function Do-NetStep($action, $a) {
       }
       if ($script:shotN -le 3) { Screen-Shot "dialog-$($script:shotN)" }
       switch ($a.act) {
-        'approve' { $res.answered = Answer-Dialog $h $el $a.approve 100 }
+        'approve' { $res.answeredAt = Now-Ms; $res.answered = Answer-Dialog $h $el $a.approve 100 }
         'refuse' { $res.answered = Answer-Dialog $h $el $a.refuse 101 }
         'close' { [void][W]::Post($h, 0x10, 0, 0); $res.answered = 'closed' }
         'enter' {

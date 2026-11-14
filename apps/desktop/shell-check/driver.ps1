@@ -376,6 +376,13 @@ try {
   $p = Run-Phase 'early' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'early-data'), '--log', $log, '--seconds', '60', '--phase', 'early') 90
   [void](No-Strays 'early')
 
+  # ---------- the system proxy set before the exe starts ----------
+  [void](Do-NetStep 'proxy' @{ on = $true })
+  $log = Join-Path $Out 'proxy-start.log'
+  $p = Run-Phase 'proxy-start' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proxy-data'), '--log', $log, '--seconds', '120', '--phase', 'proxy-start') 150
+  if ($null -ne $script:proxyBackup) { Restore-Proxy }
+  [void](No-Strays 'proxy-start')
+
   # ---------- server starts, links, saving, system state, wake: procs.ps1 ----------
   Run-ProcChecks
 

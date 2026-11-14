@@ -66,6 +66,8 @@ export interface NetSpec {
 }
 export interface NetHead { status: number; statusText: string; headers: [string, string][]; url: string; redirected: boolean }
 export interface SecretStatus { present: boolean; boundTo: string | null; hint: string | null }
+/* The per-user system proxy. Only `manual` is used; a PAC script and auto-detect aren't supported. */
+export interface ProxyStatus { inUse: boolean; kind: 'none' | 'manual' | 'auto-detect' | 'pac' }
 
 /* What a command rejects with. A refusal by the command gate is a plain string instead:
    "Command <name> not allowed by ACL". */
@@ -108,6 +110,9 @@ export interface Shell {
   /* Up to 1 MiB of the body; empty only at the real end. */
   netRead(id: string): Promise<Uint8Array>;
   netCancel(id: string): Promise<void>;
+  /* Core and Settings: the system proxy setting's kind, and whether the guarded fetch uses it
+     (only for `manual`). */
+  netProxy(): Promise<ProxyStatus>;
   /* Settings, for `addr:<id>` and `server:<setup>:<NAME>`; core, for a peer's `addr:` only.
      Write-only: no command reads a key back. */
   secretSet(ref: string, value: string): Promise<void>;
@@ -181,6 +186,7 @@ export function createShell(internals: Internals = window.__TAURI_INTERNALS__): 
       internals.invoke('net_fetch', body, { headers: { 'x-spec': encodeURIComponent(JSON.stringify(spec)) } }) as Promise<NetHead>,
     netRead: id => call<ArrayBuffer>('net_read', { id }).then(b => new Uint8Array(b)),
     netCancel: id => call('net_cancel', { id }),
+    netProxy: () => call<ProxyStatus>('net_proxy'),
     secretSet: (ref, value) => call('secret_set', { id: ref, value }),
     secretStatus: ref => call<SecretStatus>('secret_status', { id: ref }),
     secretDelete: ref => call('secret_delete', { id: ref }),

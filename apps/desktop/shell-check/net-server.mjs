@@ -3,7 +3,7 @@
 // self-signed certificate the system doesn't trust, and a logging HTTP proxy. Every request is
 // written to net-log.jsonl: its path, and a SHA-256 of its authorization header, never the header.
 //
-//   node net-server.mjs <out dir> <check app dir> <pfx file> <pfx passphrase>
+//   node net-server.mjs <out dir> <check app dir> <pfx file> <pfx passphrase> [lan ip]
 //
 // Writes net.json (the ports) into both dirs, and runs until it's killed.
 import { createServer } from 'node:http';
@@ -14,7 +14,9 @@ import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import { join } from 'node:path';
 
-const [out, appDir, pfxFile, pfxWord] = process.argv.slice(2);
+const [out, appDir, pfxFile, pfxWord, lanIp] = process.argv.slice(2);
+/* The last key a request carried, so a later request without one can be answered with it. */
+let lastKey = '';
 const logFile = join(out, 'net-log.jsonl');
 const sha = s => createHash('sha256').update(s).digest('hex');
 const log = e => appendFileSync(logFile, JSON.stringify({ at: Date.now(), ...e }) + '\n');
@@ -29,11 +31,17 @@ async function handle(req, res) {
   const path = (req.url ?? '').split('?')[0];
   log({ path: path.slice(0, 300), method: req.method, auth: req.headers.authorization ? sha(req.headers.authorization) : null });
   const key = keyOf(req);
+  if (key) lastKey = key;
   const route = path.replace(/^\/[^/]+/, '');
   open++;
   res.on('close', () => { open--; });
   switch (route) {
     case '/ok': return res.end('ok');
+    // The address's key, though this request didn't carry it.
+    case '/echo/remembered': return res.end(`remembered ${lastKey}`);
+    // A redirect on a connection that then closes, so the next request connects, and resolves,
+    // again.
+    case '/redir-close': res.writeHead(302, { location: 'ok', connection: 'close' }); return res.end();
     case '/key-hash': return res.end(sha(req.headers.authorization ?? ''));
     case '/echo/header-value': res.setHeader('x-echo', `Bearer ${key}`); return res.end('header');
     case '/echo/header-name': res.setHeader(`x-k-${key.toLowerCase()}`, '1'); return res.end('name');
@@ -93,12 +101,21 @@ proxy.on('connect', (req, socket, head) => {
 // For the driver: how many requests are open right now.
 const control = createTcp(c => { c.end(JSON.stringify({ open })); });
 
-const listen = s => new Promise(done => s.listen(0, '127.0.0.1', () => done(s.address().port)));
+const listen = (s, host = '127.0.0.1', port = 0) => new Promise(done => s.listen(port, host, () => done(s.address().port)));
+// Every TCP connection to the servers, with where it came in, so a check can say nothing came.
+for (const [name, server] of [['http', http], ['tls', tls]]) server.on('connection', c => log({ conn: name, local: `${c.localAddress}:${c.localPort}` }));
 const httpPort = await listen(http);
 const tlsPort = await listen(tls);
 const proxyPort = await listen(proxy);
 const controlPort = await listen(control);
 writeFileSync(logFile, '');
-const config = { http: httpPort, tls: tlsPort, proxy: proxyPort, control: controlPort };
+// A lan fixture on the runner's own private address, and on the same port on 127.0.0.1 a
+// listener nothing may reach: a name that moves from one to the other must not get through.
+const lan = createServer((q, s) => { handle(q, s).catch(() => s.destroy()); });
+lan.on('connection', c => log({ conn: 'lan', local: `${c.localAddress}:${c.localPort}` }));
+const lanPort = lanIp ? await listen(lan, lanIp) : 0;
+const forbidden = createTcp(c => { log({ conn: 'forbidden', local: `${c.localAddress}:${c.localPort}` }); c.destroy(); });
+if (lanPort) await listen(forbidden, '127.0.0.1', lanPort);
+const config = { http: httpPort, tls: tlsPort, proxy: proxyPort, control: controlPort, lanIp: lanIp ?? '', lan: lanPort };
 for (const d of [out, appDir]) writeFileSync(join(d, 'net.json'), JSON.stringify(config));
 console.log(`net server up: ${JSON.stringify(config)}`);

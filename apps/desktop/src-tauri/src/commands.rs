@@ -94,10 +94,26 @@ fn tray_set(app: AppHandle, spec: TraySpec) -> Res<()> {
 
 #[tauri::command(async)]
 fn view_open(app: AppHandle, spec: ViewSpec) -> Res<()> {
-    if crate::confirm::busy(&app) {
-        return Err(fail("busy", "a confirm is open"));
+    // Built and hardened to the end inside the window gate, so a confirm can't freeze the windows
+    // part-way through.
+    window_op(&app, || pages::open(&app, spec).map_err(|e| fail("refused", e)))
+}
+
+/// A window operation through the confirm gate: `busy` while a confirm is reserved or open.
+fn window_op<T>(app: &AppHandle, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    crate::confirm::window_op(app, f).map_err(|e| fail(e.kind(), "a confirm is open"))?
+}
+
+/// Destroys a window and waits until it has gone.
+fn destroyed(w: &WebviewWindow) -> Res<()> {
+    w.destroy().map_err(|e| fail("failed", e.to_string()))?;
+    for _ in 0..100 {
+        if w.app_handle().get_webview_window(w.label()).is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    pages::open(&app, spec).map_err(|e| fail("refused", e))
+    Err(fail("failed", "the window didn't close"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,9 +128,10 @@ pub struct Bounds {
 /// Show, hide, focus, close, and get or set bounds, on Settings or a view. Never core.
 #[tauri::command(async)]
 fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>) -> Res<Option<Bounds>> {
-    if crate::confirm::busy(&app) {
-        return Err(fail("busy", "a confirm is open"));
-    }
+    window_op(&app, || window_ctl_now(&app, label, op, bounds))
+}
+
+fn window_ctl_now(app: &AppHandle, label: String, op: String, bounds: Option<Bounds>) -> Res<Option<Bounds>> {
     views::ctl_target(&label).map_err(|e| fail("refused", e))?;
     let op = CtlOp::parse(&op).ok_or_else(|| fail("invalid", "unknown op"))?;
     let w = app.get_webview_window(&label).ok_or_else(|| fail("missing", "no such window"))?;
@@ -130,7 +147,7 @@ fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>)
             w.set_focus().map_err(err)?;
         }
         // Destroy, not close: a page listening for close requests can't hold its window open.
-        CtlOp::Close => w.destroy().map_err(err)?,
+        CtlOp::Close => return destroyed(&w).map(|()| None),
         CtlOp::GetBounds => {
             // Where the window is, and how big its content is: what set-bounds takes.
             let (p, s) = (w.outer_position().map_err(err)?, w.inner_size().map_err(err)?);
@@ -145,6 +162,7 @@ fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>)
             w.set_size(PhysicalSize::new(b.width, b.height)).map_err(err)?;
         }
     }
+    crate::confirm::settle(&w);
     Ok(None)
 }
 
@@ -152,26 +170,30 @@ fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>)
 /// read from the request, never from what the page sent.
 #[tauri::command(async)]
 fn window_self(window: WebviewWindow, op: String) -> Res<()> {
-    if crate::confirm::busy(window.app_handle()) {
-        return Err(fail("busy", "a confirm is open"));
-    }
+    let app = window.app_handle().clone();
+    window_op(&app, || window_self_now(&window, op))
+}
+
+fn window_self_now(window: &WebviewWindow, op: String) -> Res<()> {
     if window.label() == views::CORE {
         return Err(fail("refused", "core has no window to act on"));
     }
     let op = SelfOp::parse(&op).ok_or_else(|| fail("invalid", "unknown op"))?;
     let err = |e: tauri::Error| fail("failed", e.to_string());
     match op {
-        SelfOp::Drag => window.start_dragging().map_err(err),
-        SelfOp::Minimize => window.minimize().map_err(err),
+        SelfOp::Drag => window.start_dragging().map_err(err)?,
+        SelfOp::Minimize => window.minimize().map_err(err)?,
         SelfOp::ToggleMaximize => {
             if window.is_maximized().map_err(err)? {
-                window.unmaximize().map_err(err)
+                window.unmaximize().map_err(err)?
             } else {
-                window.maximize().map_err(err)
+                window.maximize().map_err(err)?
             }
         }
-        SelfOp::Close => window.destroy().map_err(err),
+        SelfOp::Close => return destroyed(window),
     }
+    crate::confirm::settle(window);
+    Ok(())
 }
 
 pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
@@ -191,6 +213,7 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::net::net_fetch,
         crate::net::net_read,
         crate::net::net_cancel,
+        crate::net::net_proxy,
         crate::secrets::secret_set,
         crate::secrets::secret_status,
         crate::secrets::secret_delete,

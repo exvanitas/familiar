@@ -17,6 +17,8 @@ export interface Dialog {
   owner: string;
   topmost: boolean;
   answered: string;
+  /* For 'enter': the approve button sampled every 40 ms, in ms from the dialog's creation. */
+  timing?: { created: number; firstSample: number; lastOff: number; firstOn: number; samples: number; maxGap: number };
 }
 type WinState = Record<string, { found: boolean; topmost: boolean; enabled: boolean }>;
 
@@ -78,14 +80,49 @@ export async function confirmChecks(ctx: { ask: <T>(to: string, cmd: string, arg
     return `busy for view_open, window_ctl on the owner, a changed address_add and window_self; always-on-top dropped and windows disabled while open, all restored; the shown operation stored`;
   });
 
+  // A window opened at the moment an ask begins: either it's refused as busy, or it opened first
+  // and is frozen with the rest. It never shows enabled or on top behind the dialog.
+  await check('check.confirm.race', async () => {
+    const seen: string[] = [];
+    const bad: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const title = `Familiar check race ${i}`;
+      // Sent in both orders, so both outcomes come up.
+      const open = () => shell.viewOpen({ label: `view-race${i}`, page: 'download.html', title, width: 300, height: 200, alwaysOnTop: true }).then(() => 'opened', reason);
+      const v = i % 2 ? open() : null;
+      const p = outcome(add(47010 + i, 'race', 'race'));
+      const v2 = v ?? open();
+      const held = await dialog('hold');
+      const opened = await v2;
+      const during = await step<WinState>('winstate', { titles: [...TITLES, title] });
+      await dialog('approve');
+      const r = await p;
+      const after = await step<WinState>('winstate', { titles: [title] });
+      if (!held.found || !r.startsWith('saved:')) bad.push(`${i}: dialog ${held.found}, ${r}`);
+      for (const [t, w] of Object.entries(during)) if (w.found && (w.topmost || w.enabled)) bad.push(`${i}: ${t} not frozen`);
+      if (opened === 'opened') {
+        if (!during[title]?.found) bad.push(`${i}: opened but not there`);
+        if (!after[title]?.topmost || !after[title]?.enabled) bad.push(`${i}: not restored ${JSON.stringify(after[title])}`);
+      } else if (!opened.startsWith('busy')) bad.push(`${i}: view_open ${opened}`);
+      seen.push(opened === 'opened' ? 'opened first, then frozen' : 'busy');
+      await shell.windowCtl(`view-race${i}`, 'close').catch(() => {});
+    }
+    ok(bad.length === 0, bad.join('; '));
+    return `four view_open calls with always-on-top sent with an address_add, before and after it: ${seen.join(', ')}; none showed on top or enabled behind the dialog`;
+  });
+
   // Defaults, then three refusals of three kinds, then the stop and the tray item.
   let defaults = 'not reached';
+  let timingOk = false;
   await check('security.confirm.throttle', async () => {
     const before = await step<WinState>('winstate', { titles: TITLES });
     const p1 = outcome(add(47003, 'enter', 'reflex'));
     const d1 = await dialog('enter');
     const r1 = await p1;
-    defaults = `approve enabled at first ${d1.approveAtStart}, after a second ${d1.approveLater}, an early click ${d1.invokedEarly}, Enter gave ${r1}, top-most with no owner ${d1.topmost}`;
+    const t = d1.timing;
+    const timing = t ? `sampled ${t.samples} times from ${t.firstSample} ms, at most ${t.maxGap} ms apart: last disabled at ${t.lastOff} ms, first enabled at ${t.firstOn} ms` : 'not sampled';
+    timingOk = !!t && t.created > 0 && t.firstSample <= 400 && t.maxGap <= 150 && t.lastOff >= 900 && t.firstOn >= 1000 && t.firstOn <= 1400;
+    defaults = `approve enabled at first ${d1.approveAtStart}, after a second ${d1.approveLater}, an early click ${d1.invokedEarly}, Enter gave ${r1}, top-most with no owner ${d1.topmost}; ${timing}`;
     ok(r1 === 'refused:declined: the person didn\'t allow it', 'Enter: ' + r1);
     const p2 = outcome(add(47004, 'close', 'closed'));
     await dialog('close');
@@ -110,6 +147,7 @@ export async function confirmChecks(ctx: { ask: <T>(to: string, cmd: string, arg
   await check('security.confirm.defaults', async () => {
     ok(defaults !== 'not reached', 'the throttle check never got there');
     ok(/enabled at first false, after a second true, an early click no effect, Enter gave refused:declined/.test(defaults), defaults);
+    ok(timingOk, 'the first second: ' + defaults);
     return defaults;
   });
   await shell.windowCtl('view-top', 'close');

@@ -2,7 +2,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { judge } from '../shell-check/gate.mjs';
-import { dnsNames, judge as egress, parsePcapng } from '../shell-check/analyze.mjs';
+import { dnsNames, judge as egress, parsePcapng, reassembleDns } from '../shell-check/analyze.mjs';
+import { answer, question } from '../shell-check/dns-server.mjs';
 import { label, lanPort, ROUTES } from '../shell-check/hostile.ts';
 import { judgeLookups } from '../shell-check/net-analyze.mjs';
 
@@ -198,15 +199,65 @@ describe('the egress analysis', () => {
 });
 
 describe('no lookup before Allow', () => {
-  const log = 'x NETLOOKUP never aaa\n NETLOOKUP never bbb\n NETLOOKUP never ccc\n NETLOOKUP after ddd\n NETLOOKUP flow ok\n';
-  const q = (n: string) => ({ proto: 'udp', dst: '1.1.1.1', dport: 53, names: [`${n}.familiar-check.test`], at: 1 });
-  it('passes when only the allowed name was looked up', () => {
-    expect(judgeLookups({ log, packets: [q('ddd')], dnsLog: '', run: 'r' })).toMatch(/^PASS .* run=r$/);
+  // Canaries at 100 and 900, the window 200 to 800, ddd allowed at 500.
+  const log = [
+    'NETLOOKUP canary cfirst', 'NETLOOKUP never aaa', 'NETLOOKUP never bbb', 'NETLOOKUP never ccc',
+    'NETLOOKUP after ddd 500', 'NETLOOKUP window 200 800', 'NETLOOKUP canary clast', 'NETLOOKUP flow ok'
+  ].map(l => `x ${l}`).join('\n');
+  const q = (n: string, at: number) => ({ proto: 'udp', dst: '1.1.1.1', dport: 53, names: [`${n}.familiar-check.test`], at });
+  const sq = (n: string, at: number) => ({ name: `${n}.familiar-check.test`, type: 1, at });
+  const packets = [q('cfirst', 100), q('ddd', 520), q('clast', 900)];
+  const server = [sq('cfirst', 99), sq('ddd', 510), sq('clast', 899)];
+  const judged = (o: object) => judgeLookups({ log, packets, dnsLog: '', server, run: 'r', ...o });
+  it('passes when only the allowed name was looked up, after Allow, inside seen canaries', () => {
+    expect(judged({})).toMatch(/^PASS .*first queried 10 ms after Allow.* run=r$/);
   });
-  it('fails on a refused name on the wire or in the log, or an allowed one seen nowhere', () => {
-    expect(judgeLookups({ log, packets: [q('ddd'), q('bbb')], dnsLog: '', run: 'r' })).toMatch(/^FAIL .*looked up: bbb/);
-    expect(judgeLookups({ log, packets: [q('ddd')], dnsLog: 'QueryName aaa.familiar-check.test', run: 'r' })).toMatch(/^FAIL/);
-    expect(judgeLookups({ log, packets: [], dnsLog: '', run: 'r' })).toMatch(/^FAIL .*0 seen/);
-    expect(judgeLookups({ log: log.replace('NETLOOKUP flow ok', ''), packets: [q('ddd')], dnsLog: '', run: 'r' })).toMatch(/^FAIL .*never finished/);
+  it('fails on a refused name at the server, on the wire or in the client log', () => {
+    expect(judged({ packets: [...packets, q('bbb', 300)] })).toMatch(/^FAIL .*bbb looked up before any Allow \(wire\)/);
+    expect(judged({ server: [...server, sq('aaa', 300)] })).toMatch(/^FAIL .*aaa looked up before any Allow \(server\)/);
+    expect(judged({ dnsLog: 'QueryName ccc.familiar-check.test' })).toMatch(/^FAIL .*ccc .*client log/);
+  });
+  it('fails when the allowed name was looked up before Allow, or never', () => {
+    expect(judged({ server: [...server, sq('ddd', 450)] })).toMatch(/^FAIL .*50 ms before Allow/);
+    expect(judged({ packets: packets.filter(p => !p.names[0].startsWith('ddd')) })).toMatch(/^FAIL .*allowed ddd was not seen/);
+  });
+  it('fails when the witnesses did not cover the window', () => {
+    expect(judged({ packets: packets.filter(p => !p.names[0].startsWith('cfirst')) })).toMatch(/^FAIL .*opening canary was not seen/);
+    expect(judged({ server: server.filter(p => !p.name.startsWith('clast')) })).toMatch(/^FAIL .*closing canary was not seen/);
+    expect(judged({ packets: [q('cfirst', 300), q('ddd', 520), q('clast', 900)] })).toMatch(/^FAIL .*capture starts after the window/);
+    expect(judged({ log: log.replace(/NETLOOKUP window.*\n/, '') })).toMatch(/^FAIL .*no window/);
+    expect(judged({ log: log.replace('NETLOOKUP flow ok', '') })).toMatch(/^FAIL .*never finished/);
+  });
+});
+
+describe('DNS over TCP and the check\'s DNS server', () => {
+  const query = (name: string, type = 1) => {
+    const labels = name.split('.').map(l => Buffer.concat([Buffer.from([l.length]), Buffer.from(l)]));
+    const tail = Buffer.alloc(5);
+    tail.writeUInt16BE(type, 1);
+    tail.writeUInt16BE(1, 3);
+    return Buffer.concat([Buffer.from([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]), ...labels, tail]);
+  };
+  it('reads a query split across segments, out of order and resent', () => {
+    const m = query('split.familiar-check.test');
+    const stream = Buffer.concat([Buffer.from([m.length >> 8, m.length & 0xff]), m]);
+    const seg = (from: number, to: number, at: number) => ({ proto: 'tcp', src: 'a', dst: 'b', sport: 5000, dport: 53, names: [], seq: 1000 + from, payload: stream.subarray(from, to), at });
+    const got = reassembleDns([seg(10, stream.length, 2), seg(0, 10, 1), seg(0, 10, 3), seg(5, 15, 4)]);
+    expect(got).toHaveLength(1);
+    expect(got[0].names).toEqual(['split.familiar-check.test']);
+    expect(got[0].at).toBe(1);
+    // A hole leaves the name unread rather than misread.
+    expect(reassembleDns([seg(0, 10, 1), seg(20, stream.length, 2)])).toHaveLength(0);
+  });
+  it('answers with the planned addresses of the asked type, at TTL 0', () => {
+    const m = query('plan.familiar-check.test');
+    expect(question(m)).toMatchObject({ name: 'plan.familiar-check.test', type: 1 });
+    const r = answer(m, ['192.168.1.5', '127.0.0.1', '::1']);
+    expect(r.readUInt16BE(6)).toBe(2);
+    expect([...r.subarray(r.length - 4)]).toEqual([127, 0, 0, 1]);
+    expect(r.readUInt32BE(r.length - 4 - 2 - 4)).toBe(0);
+    const six = answer(query('plan.familiar-check.test', 28), ['192.168.1.5', '::1']);
+    expect(six.readUInt16BE(6)).toBe(1);
+    expect(six[six.length - 1]).toBe(1);
   });
 });

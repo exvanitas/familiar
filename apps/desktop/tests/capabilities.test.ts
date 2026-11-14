@@ -45,14 +45,14 @@ const DESIGN_CORE = [
   'global-shortcut:allow-register', 'global-shortcut:allow-unregister', 'global-shortcut:allow-is-registered',
   'allow-shell-info', 'allow-shell-ready', 'allow-log-line', 'allow-quit', 'allow-quit-ready', 'allow-tray-set',
   'allow-system', 'allow-wake-at', 'allow-view-open', 'allow-window-ctl',
-  'allow-address-list', 'allow-address-add', 'allow-address-remove', 'allow-net-fetch', 'allow-net-read', 'allow-net-cancel',
+  'allow-address-list', 'allow-address-add', 'allow-address-remove', 'allow-net-fetch', 'allow-net-read', 'allow-net-cancel', 'allow-net-proxy',
   'allow-secret-status', 'allow-secret-delete', 'allow-server-start', 'allow-server-write', 'allow-server-stop', 'allow-server-forget',
   'allow-pick-path', 'allow-save-as', 'allow-open-url', 'allow-open-folder',
   'allow-backup-write', 'allow-backup-list', 'allow-backup-read', 'allow-backup-delete', 'allow-autostart', 'allow-secret-set',
   'allow-ws-connect', 'allow-ws-send', 'allow-ws-close'
 ];
 const DESIGN_VIEWS = ['core:event:allow-listen', 'core:event:allow-unlisten', 'allow-window-self', 'allow-log-line'];
-const DESIGN_SETTINGS = ['allow-window-self', 'allow-log-line', 'allow-secret-set', 'allow-secret-status', 'allow-address-list'];
+const DESIGN_SETTINGS = ['allow-window-self', 'allow-log-line', 'allow-secret-set', 'allow-secret-status', 'allow-address-list', 'allow-net-proxy'];
 const toCommand = (perm: string) => perm.replace(/^allow-/, '').replace(/-/g, '_');
 
 describe('the capability files', () => {

@@ -85,6 +85,10 @@ pub fn delete(r: &SecretRef) -> Result<(), Fail> {
 #[tauri::command(async)]
 pub fn secret_set(app: AppHandle, window: WebviewWindow, id: String, value: String) -> Result<(), Fail> {
     let r = SecretRef::parse(&id)?;
+    // From the address check through the credential's commit, no removal can run: a key is never
+    // stored for an address that's gone.
+    let addresses = app.state::<Addresses>();
+    let _keys = addresses.keys();
     let (bound, kind) = binding(&app, &r);
     if !secret::may_set(Caller::from_label(window.label()), &r, kind) {
         return Err(SecretError::NotAllowed.into());

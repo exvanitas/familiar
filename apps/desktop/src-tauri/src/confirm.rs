@@ -22,17 +22,21 @@
 //! Three refusals or closes, across every kind of ask, stop asking until the person picks the
 //! exe's own tray item "Let Familiar ask again".
 
-use crate::shell::{lock, Shell};
-use shell_core::confirm::{Ask, Refused, Throttle};
-use std::sync::Mutex;
-use tauri::{AppHandle, Manager};
+use crate::shell::Shell;
+use shell_core::{
+    confirm::{Ask, Refused},
+    gate::{Freezable, Gate, Reservation},
+};
+use std::sync::Arc;
+use tauri::{AppHandle, Manager, WebviewWindow};
 
 /// What `ask` refuses with, before or instead of a dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AskFail {
     Busy,
     AsksStopped,
-    /// The dialog couldn't be shown. Counted as a refusal, as a close is.
+    /// The dialog couldn't be shown, or the windows couldn't be frozen. Counted as a refusal, as
+    /// a close is.
     Failed(String),
 }
 
@@ -55,43 +59,91 @@ impl From<Refused> for AskFail {
     }
 }
 
-/// The exe's confirm state, managed by Tauri.
+/// The exe's confirm state, managed by Tauri: `shell_core::gate`.
 #[derive(Default)]
 pub struct Confirms {
-    throttle: Mutex<Throttle>,
+    gate: Arc<Gate>,
+}
+
+fn gate(app: &AppHandle) -> Option<Arc<Gate>> {
+    app.try_state::<Confirms>().map(|c| c.gate.clone())
 }
 
 /// True while a dialog is open, or reserved and about to open.
+#[allow(dead_code)] // part of the interface other asks use
 pub fn busy(app: &AppHandle) -> bool {
-    app.try_state::<Confirms>().is_some_and(|c| lock(&c.throttle).is_open())
+    gate(app).is_some_and(|g| g.busy())
 }
 
 /// True when three refusals have stopped asking.
 pub fn stopped(app: &AppHandle) -> bool {
-    app.try_state::<Confirms>().is_some_and(|c| lock(&c.throttle).stopped())
+    gate(app).is_some_and(|g| g.stopped())
 }
 
 /// The tray item "Let Familiar ask again". Only the person can pick it.
 pub fn reenable(app: &AppHandle) {
-    if let Some(c) = app.try_state::<Confirms>() {
-        lock(&c.throttle).reenable();
+    if let Some(g) = gate(app) {
+        g.reenable();
     }
     app.state::<Shell>().log.line("confirm: asking again, at the person's word");
     crate::tray::refresh(app);
 }
 
-/// The right to show one dialog. While it's held every other ask is `busy`. Dropped without
-/// asking, it gives the right back without counting a refusal.
-pub struct Ticket {
-    app: AppHandle,
-    used: bool,
+/// Runs one operation that opens, closes, shows, moves or otherwise changes a window, to its
+/// real end, unless a confirm is reserved or open (`Err(AskFail::Busy)`). Every such command goes
+/// through here: reserving a confirm and freezing the windows wait for an operation in progress,
+/// so no window is made or changed behind an open dialog. `f` must not return until its change
+/// has happened; `settle` does that for Tauri's queued window calls.
+pub fn window_op<T>(app: &AppHandle, f: impl FnOnce() -> T) -> Result<T, AskFail> {
+    match gate(app) {
+        Some(g) => g.window_op(f).map_err(AskFail::from),
+        None => Ok(f()),
+    }
 }
 
-/// Checks the confirm state before anything else an ask would do, and holds it.
+/// Waits until a window's queued calls have been carried out: a read is answered only after
+/// them.
+pub fn settle(w: &WebviewWindow) {
+    let _ = w.is_visible();
+}
+
+/// The right to show one dialog. While it's held every other ask is `busy`. Dropped without
+/// asking, it gives the right back without counting a refusal. Whatever happens once it asks, a
+/// panic included, it ends, counting a refusal unless the person approved.
+pub struct Ticket {
+    app: AppHandle,
+    reservation: Reservation,
+}
+
+/// Checks the confirm state before anything else an ask would do, and holds it. Waits for a
+/// window operation in progress to finish.
 pub fn reserve(app: &AppHandle) -> Result<Ticket, AskFail> {
-    let c = app.state::<Confirms>();
-    lock(&c.throttle).begin()?;
-    Ok(Ticket { app: app.clone(), used: false })
+    let g = gate(app).ok_or_else(|| AskFail::Failed("no confirm state".into()))?;
+    Ok(Ticket { app: app.clone(), reservation: g.reserve()? })
+}
+
+/// One Familiar window, as the freeze sees it.
+struct Win {
+    w: WebviewWindow,
+    h: isize,
+}
+
+impl Freezable for Win {
+    fn read(&self) -> Result<(bool, bool), String> {
+        let on_top = self.w.is_always_on_top().map_err(|e| e.to_string())?;
+        Ok((platform::enabled(self.h), on_top))
+    }
+    fn set(&self, enabled: bool, on_top: bool) -> Result<(), String> {
+        // Always-on-top first: changing it rebuilds the window's styles on its own thread, which
+        // would undo an enable or disable made before it. `settle` waits for that.
+        self.w.set_always_on_top(on_top).map_err(|e| e.to_string())?;
+        settle(&self.w);
+        platform::enable(self.h, enabled);
+        Ok(())
+    }
+    fn alive(&self) -> bool {
+        self.w.app_handle().get_webview_window(self.w.label()).is_some_and(|w| platform::hwnd(&w) == Some(self.h))
+    }
 }
 
 impl Ticket {
@@ -99,16 +151,23 @@ impl Ticket {
     /// owner. True if the person approved. Blocks until they answer, so it's never called on the
     /// main thread: commands that ask are async.
     pub fn ask(mut self, owner: Option<&str>, ask: Ask) -> Result<bool, AskFail> {
-        self.used = true;
+        self.reservation.asking();
         let app = self.app.clone();
         let log = app.state::<Shell>().log.clone();
-        let owner_hwnd = owner.and_then(|l| app.get_webview_window(l)).filter(|w| w.is_visible().unwrap_or(false)).map(|w| platform::hwnd(&w));
-        let result = {
-            let _frozen = Freeze::new(&app);
-            platform::show(owner_hwnd.flatten(), &ask, log.clone())
+        let owner_hwnd = owner.and_then(|l| app.get_webview_window(l)).filter(|w| w.is_visible().unwrap_or(false)).and_then(|w| platform::hwnd(&w));
+        let windows: Vec<Win> = app.webview_windows().into_values().filter_map(|w| platform::hwnd(&w).map(|h| Win { w, h })).collect();
+        let result = match self.reservation.freeze(windows) {
+            // The dialog isn't shown on windows that couldn't all be frozen.
+            Err(e) => Err(format!("the windows couldn't be frozen: {e}")),
+            Ok(frozen) => {
+                let r = platform::show(owner_hwnd, &ask, log.clone());
+                drop(frozen);
+                r
+            }
         };
         let approved = matches!(result, Ok(true));
-        lock(&app.state::<Confirms>().throttle).end(approved);
+        let Ticket { reservation, .. } = self;
+        reservation.finish(approved);
         log.line(&format!(
             "confirm: {} {}",
             ask.title,
@@ -126,62 +185,10 @@ impl Ticket {
     }
 }
 
-impl Drop for Ticket {
-    fn drop(&mut self) {
-        if !self.used {
-            // Released, not refused.
-            lock(&self.app.state::<Confirms>().throttle).end(true);
-        }
-    }
-}
-
 /// The whole ask in one call: the confirm state, then the dialog. For server starts and links.
 #[allow(dead_code)] // the other kinds of ask call it
 pub fn ask(app: &AppHandle, owner: Option<&str>, ask: Ask) -> Result<bool, AskFail> {
     reserve(app)?.ask(owner, ask)
-}
-
-/// Every Familiar window's enabled and always-on-top state, recorded before the dialog and put
-/// back when this goes, whatever the dialog returned. A window that went meanwhile is skipped.
-struct Freeze {
-    app: AppHandle,
-    saved: Vec<(String, isize, bool, bool)>,
-}
-
-impl Freeze {
-    fn new(app: &AppHandle) -> Freeze {
-        let mut saved = vec![];
-        for (label, w) in app.webview_windows() {
-            let Some(h) = platform::hwnd(&w) else { continue };
-            let on_top = w.is_always_on_top().unwrap_or(false);
-            let enabled = platform::enabled(h);
-            saved.push((label, h, enabled, on_top));
-            if on_top {
-                let _ = w.set_always_on_top(false);
-                // The window's styles are rebuilt on its own thread when always-on-top changes,
-                // which would undo a disable made before it. A read waits for that thread.
-                let _ = w.is_always_on_top();
-            }
-            platform::enable(h, false);
-        }
-        Freeze { app: app.clone(), saved }
-    }
-}
-
-impl Drop for Freeze {
-    fn drop(&mut self) {
-        for (label, h, enabled, on_top) in &self.saved {
-            let Some(w) = self.app.get_webview_window(label) else { continue };
-            if platform::hwnd(&w) != Some(*h) {
-                continue;
-            }
-            if *on_top {
-                let _ = w.set_always_on_top(true);
-                let _ = w.is_always_on_top();
-            }
-            platform::enable(*h, *enabled);
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -242,7 +249,9 @@ mod platform {
                     let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
                 }
             }
-            state.log.line("confirm: dialog shown");
+            // With the wall-clock moment, so the driver can time the approve button's first second.
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            state.log.line(&format!("confirm: dialog shown at {at}"));
         } else if msg == TDN_TIMER && wparam.0 >= APPROVE_AFTER_MS && !state.enabled.swap(true, Ordering::SeqCst) {
             unsafe { SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(APPROVE as usize)), Some(LPARAM(1))) };
             state.log.line("confirm: approve enabled");
