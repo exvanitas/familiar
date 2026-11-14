@@ -8,3 +8,4 @@ pub mod redact;
 pub mod setup;
 pub mod secret;
 pub mod fetch;
+pub mod server_path;
