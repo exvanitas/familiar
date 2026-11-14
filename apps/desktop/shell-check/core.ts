@@ -8,7 +8,7 @@ import { hostile } from './hostile.ts';
 import { CORE_EVENT_NAMES, CORE_ONLY, EVENTS, NOT_YET, PLUGINS } from './lists.ts';
 import { allowed, trySinks } from './tt.ts';
 import { confirmChecks } from './confirm-checks.ts';
-import { netChecks } from './net-checks.ts';
+import { netChecks, proxyStartChecks } from './net-checks.ts';
 
 const messages: CoreMessage[] = [];
 let onQuitting: () => void = () => {};
@@ -453,6 +453,11 @@ async function pinRead(info: Info, value: string, id: string) {
       await step('mark', { name: 'webrtc-' + arg(info, '--variant') });
       const out = await hostile('probe', await fixtures(), { nav: false, only: ['webrtc-stun', 'webrtc-turn', 'webrtc-frame'] });
       await say(`INFO webrtc ${arg(info, '--variant')} ${JSON.stringify(out)}`);
+      onQuitting = () => { shell.quitReady().catch(() => {}); };
+      await say('DONE');
+      await shell.quit();
+    } else if (phase === 'proxy-start') {
+      await proxyStartChecks();
       onQuitting = () => { shell.quitReady().catch(() => {}); };
       await say('DONE');
       await shell.quit();

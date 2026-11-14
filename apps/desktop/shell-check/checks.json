@@ -29,6 +29,10 @@
     "queue.early",
     "start.overlap",
     "fetch.no-lookup-flow",
-    "tls.roots"
+    "tls.roots",
+    "fetch.proxy-start",
+    "address.remove-retry",
+    "key.remove-race",
+    "confirm.race"
   ]
 }

@@ -99,6 +99,8 @@ const handlers: Record<string, (args: never) => unknown> = {
     i.value = '';
     return shell.secretSet(ref, value).then(() => 'ok', e => 'failed:' + JSON.stringify(e));
   },
+  /* A key made here and written at once, for the removal checks; never returned. */
+  'make-key': (ref: string) => shell.secretSet(ref, 'fk' + rand(30)).then(() => 'ok', e => 'failed:' + JSON.stringify(e)),
   'clip-ready': (text: string) => { clip = text; return 'ready'; },
   'clip-result': () => (document.getElementById('clip') as HTMLElement).dataset.result ?? 'no click',
   violations: () => [...violations],
