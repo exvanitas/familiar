@@ -109,8 +109,7 @@ pub fn modal<T>(app: &AppHandle, owner: Option<&str>, f: impl FnOnce(Option<isiz
     let g = gate(app).ok_or_else(|| AskFail::Failed("no confirm state".into()))?;
     let hold = g.hold()?;
     let owner_hwnd = owner.and_then(|l| app.get_webview_window(l)).filter(|w| w.is_visible().unwrap_or(false)).and_then(|w| platform::hwnd(&w));
-    let windows: Vec<Win> = app.webview_windows().into_values().filter_map(|w| platform::hwnd(&w).map(|h| Win { w, h })).collect();
-    let frozen = hold.freeze(windows).map_err(|e| AskFail::Failed(format!("the windows couldn't be frozen: {e}")))?;
+    let frozen = hold.freeze(windows(app), report(app)).map_err(|e| AskFail::Failed(format!("the windows couldn't be frozen: {e}")))?;
     let r = f(owner_hwnd);
     drop(frozen);
     drop(hold);
@@ -138,27 +137,46 @@ pub fn reserve(app: &AppHandle) -> Result<Ticket, AskFail> {
     Ok(Ticket { app: app.clone(), reservation: g.reserve()? })
 }
 
-/// One Familiar window, as the freeze sees it.
+/// One Familiar window, as the freeze sees it. A window whose handle can't be read is still
+/// listed, so it fails the freeze rather than being left out of it.
 struct Win {
     w: WebviewWindow,
-    h: isize,
+    h: Option<isize>,
+}
+
+/// Every Familiar window.
+fn windows(app: &AppHandle) -> Vec<Win> {
+    app.webview_windows().into_values().map(|w| Win { h: platform::hwnd(&w), w }).collect()
+}
+
+/// A freeze's failures to put a window back, to the log.
+fn report(app: &AppHandle) -> shell_core::gate::Report {
+    let log = app.state::<Shell>().log.clone();
+    Box::new(move |m| log.line(&format!("confirm: {m}")))
 }
 
 impl Freezable for Win {
     fn read(&self) -> Result<(bool, bool), String> {
+        let h = self.h.ok_or("no window handle")?;
         let on_top = self.w.is_always_on_top().map_err(|e| e.to_string())?;
-        Ok((platform::enabled(self.h), on_top))
+        Ok((platform::enabled(h), on_top))
     }
-    fn set(&self, enabled: bool, on_top: bool) -> Result<(), String> {
-        // Always-on-top first: changing it rebuilds the window's styles on its own thread, which
-        // would undo an enable or disable made before it. `settle` waits for that.
-        self.w.set_always_on_top(on_top).map_err(|e| e.to_string())?;
+    fn set_on_top(&self, on: bool) -> Result<(), String> {
+        // Changing it rebuilds the window's styles on its own thread; `settle` waits for that, so
+        // an enable made after it isn't undone.
+        self.w.set_always_on_top(on).map_err(|e| e.to_string())?;
         settle(&self.w);
-        platform::enable(self.h, enabled);
+        Ok(())
+    }
+    fn set_enabled(&self, on: bool) -> Result<(), String> {
+        platform::enable(self.h.ok_or("no window handle")?, on);
         Ok(())
     }
     fn alive(&self) -> bool {
-        self.w.app_handle().get_webview_window(self.w.label()).is_some_and(|w| platform::hwnd(&w) == Some(self.h))
+        self.w.app_handle().get_webview_window(self.w.label()).is_some_and(|w| platform::hwnd(&w) == self.h)
+    }
+    fn name(&self) -> String {
+        self.w.label().to_string()
     }
 }
 
@@ -171,8 +189,7 @@ impl Ticket {
         let app = self.app.clone();
         let log = app.state::<Shell>().log.clone();
         let owner_hwnd = owner.and_then(|l| app.get_webview_window(l)).filter(|w| w.is_visible().unwrap_or(false)).and_then(|w| platform::hwnd(&w));
-        let windows: Vec<Win> = app.webview_windows().into_values().filter_map(|w| platform::hwnd(&w).map(|h| Win { w, h })).collect();
-        let result = match self.reservation.freeze(windows) {
+        let result = match self.reservation.freeze(windows(&app), report(&app)) {
             // The dialog isn't shown on windows that couldn't all be frozen.
             Err(e) => Err(format!("the windows couldn't be frozen: {e}")),
             Ok(frozen) => {
@@ -270,7 +287,8 @@ mod platform {
             state.log.line(&format!("confirm: dialog shown at {at}"));
         } else if msg == TDN_TIMER && wparam.0 >= APPROVE_AFTER_MS && !state.enabled.swap(true, Ordering::SeqCst) {
             unsafe { SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(APPROVE as usize)), Some(LPARAM(1))) };
-            state.log.line("confirm: approve enabled");
+            // The timer's own count, from the dialog's creation.
+            state.log.line(&format!("confirm: approve enabled {} ms after creation", wparam.0));
         }
         S_OK
     }
@@ -311,6 +329,10 @@ mod platform {
             };
             let mut pressed = 0i32;
             let r = unsafe { TaskDialogIndirect(&config, Some(&mut pressed), None, None) };
+            // When the dialog returned, with nothing of what it asked: the moment any lookup the
+            // answer allows may begin after.
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            state.log.line(&format!("confirm: dialog answered at {at}"));
             let _ = tx.send(r.map(|()| pressed == APPROVE).map_err(|e| e.to_string()));
         });
         rx.recv().map_err(|_| "the dialog's thread ended without an answer".to_string())?
