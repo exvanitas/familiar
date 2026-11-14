@@ -1,0 +1,21 @@
+[package]
+name = "mcp-start"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Spike: can a small Rust command start a local MCP server on Windows, talk to it over stdio, and make sure it dies with the app?"
+
+[dependencies]
+serde_json = "=1.0.154"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
