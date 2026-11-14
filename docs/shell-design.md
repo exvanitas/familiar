@@ -1,12 +1,12 @@
 # Familiar's native shell
 
-Build step 3. The design for `familiar.exe`, written before any of it is built. Revised twice after review, see [Changes after review 1](#changes-after-review-1) and [Changes after review 2](#changes-after-review-2).
+Build step 3. The design for `familiar.exe`, written before any of it is built. Revised twice after review, see [Changes after review 1](#changes-after-review-1) and [Changes after review 2](#changes-after-review-2), then for the maintainer's [decisions](#decisions) ([Changes after the decisions](#changes-after-the-decisions)).
 
 ## The rule
 
 **The exe holds general native building blocks and the gates that must not live in a webview. Everything else is the `app` folder beside it.**
 
-Familiar ships unsigned. Each new unsigned exe gets a fresh Smart App Control verdict on a person's PC, and a blocked exe has no "run anyway". App folder changes get no verdict. So the exe settles once and rarely changes after, as Desktop Buddies' did (`docs/native-shell-design.md` in that repo, which this follows wherever it can, and whose proven code it copies). This note assumes it settles before the first release (step 12), not at step 3: the owner's PC only ever sees release builds, and the runner has no Smart App Control, so exe changes during development cost nothing there. That's recommended to the lead, see [Decisions](#decisions-for-the-lead). Step 3 builds and proves the exe's core. A few pieces designed here are built later, still before release, see [9](#9-hours).
+Familiar ships unsigned. Each new unsigned exe gets a fresh Smart App Control verdict on a person's PC, and a blocked exe has no "run anyway". App folder changes get no verdict. So the exe settles once and rarely changes after, as Desktop Buddies' did (`docs/native-shell-design.md` in that repo, which this follows wherever it can, and whose proven code it copies). It settles just before the first release (step 12), not at step 3 (decided 2026-11-14, see [Decisions](#decisions)). The rule is: no exe reaches a person's PC until it's settled. The owner's PC only ever sees release builds, and the runner has no Smart App Control, so exe changes during development cost nothing there. Step 3 builds and proves the exe's core. A few pieces designed here are built later, still before release, see [9](#9-hours).
 
 A gate belongs in the exe when a page that went wrong could do lasting harm without it: carry a key away, send data somewhere the person never chose, or start a program. A page goes wrong by a bug in the app, or by script running where it shouldn't. Everything that is a choice, such as which hotkey, what the tray says, when to ask for consent to a tool call, lives in the app.
 
@@ -16,7 +16,7 @@ The exe asks the person itself, in a native Windows dialog, in three places: bef
 
 The promises, each with the checks that prove it in [section 7](#7-checks-on-the-windows-runner):
 
-1. **No page reads a key back.** A key goes from Credential Manager only into requests to its own saved address. Two documented exceptions: the Settings page sees a key while the person enters it, unless the lead picks native entry, and a peer's pairing token passes through core once as it arrives during pairing, with either entry option ([5a](#5a-credentials), [5d](#5d-the-rest)).
+1. **No page reads a key back.** A key is typed into the Settings window, goes straight to Credential Manager, and from there only into requests core makes to its own saved address. After saving, pages see only that a key is set and a masked hint. Two documented exceptions: the Settings window sees a key while the person types it, and a peer's pairing token passes through core once as it arrives during pairing ([5a](#5a-credentials), [5d](#5d-the-rest)). The Settings window is kept apart so that script in the chat view can't watch a key being typed ([2](#windows)).
 2. **Data leaves only to places the person approved natively**: saved addresses through the guarded fetch, saved loopback peers through the WebSocket, and links the person confirmed. This promise is declared only once the egress checks pass on the runner, positive controls included, and not before ([2](#2-windows-capabilities-and-the-web-surface)).
 3. **Only approved programs start.** Approval binds the launch: the resolved program, its arguments, its folder, its plain settings with their values, and the names of its secrets. Secret values can change without asking again. Approved programs stop with Familiar ([5b](#5b-starting-a-local-mcp-server)).
 4. **The origin and data folders never move**, so an update never starts an empty database ([3](#3-origin-and-data-folder-pinned)).
@@ -106,11 +106,19 @@ Desktop Buddies' pattern, copied:
 ### Windows
 
 - **`core`**: opened by the exe at start from `core.html`, hidden, no taskbar entry, `focused(false)` and `focusable(false)`, so it never takes the keyboard, at a sign-in start or ever (Desktop Buddies found a hidden window takes the foreground when it opens unless told not to). It runs the agent core for the whole run: the turn loop, pi-durable, reminders, the MCP client. It never draws model text, card text or tool results.
-- **Views**, labels `view-<name>`: chat, settings, and whatever the app adds later. A view draws what core publishes and sends requests back over a `BroadcastChannel`, as Desktop Buddies' Manager does. Closing a view loses nothing.
+- **Views**, labels `view-<name>`: chat, and whatever the app adds later. A view draws what core publishes and sends requests back over a `BroadcastChannel`, as Desktop Buddies' Manager does. Closing a view loses nothing.
+- **`settings`**: its own window, label `settings`, always bound to `settings.html`, and no `view-*` label may load that page. It's where keys are typed. It never draws model text, card text or tool results, and it never joins the channel core publishes conversations on: it talks to core over its own `BroadcastChannel`, which carries settings only. Its capability set is its own and holds nothing it doesn't need: no events at all, the key commands, and a read of the saved addresses, so the address shown beside a key box comes from the exe, not from a message another page could forge. Its page loads only its own small bundle, with no model, MCP or Markdown code in it (checked in step 11).
 
-One helper builds every window, because WebView2 windows sharing a data folder must share browser arguments. It always sets the pinned data folder, `use_https_scheme(false)`, `disable_drag_drop_handler()`, the navigation handler and the browser arguments below.
+**What keeps chat's script out of Settings.** All pages share one origin, so the gap would be script that reaches Settings through what they share. Each route is closed:
 
-**Each window is bound to its page.** The exe remembers the page each label was opened with (`core.html` for `core`, the `page` given to `view_open` for a view). Navigation to anything else, even another page of the app, is refused. So a label's permissions always go with the page they were meant for: `view-settings` can't be turned into the chat page, and core can't be navigated away.
+- No window can reach another's DOM: `window.open` is denied and no window holds a reference to another.
+- No service worker can sit in front of Settings' page: the exe's CSP has `worker-src blob:`, and a service worker can't be a `blob:` URL, so registering one always fails.
+- No page can read the clipboard, where a pasted key may still be: the exe answers every web permission request with deny ([below](#web-permissions)).
+- Storage and channels carry data only: Settings draws everything it reads as text, so nothing stored or sent can become script there, and it never takes an address from a message.
+
+One helper builds every window, because WebView2 windows sharing a data folder must share browser arguments. It always sets the pinned data folder, `use_https_scheme(false)`, `disable_drag_drop_handler()`, the navigation handler, the permission handler, autofill and password saving off, and the browser arguments below.
+
+**Each window is bound to its page.** The exe remembers the page each label was opened with (`core.html` for `core`, `settings.html` for `settings`, the `page` given to `view_open` for a view). Navigation to anything else, even another page of the app, is refused. So a label's permissions always go with the page they were meant for: `settings` can't be turned into the chat page, a view can't load `settings.html`, and core can't be navigated away.
 
 ### The command gate
 
@@ -118,8 +126,8 @@ Tauri 2 checks app commands against capabilities only when the app declares an a
 
 **A capability names the caller, not the target.** Tauri's window commands (`core:window:allow-close` and the rest) take a target label, so a view allowed to close "its" window could close core. So nobody gets any `core:window:*` or `core:webview:*` permission. Window operations go through two native wrappers:
 
-- `window_self(op)`: drag, minimize, toggle maximize, close, on the **calling** window, whose label the exe reads from the IPC request, not from the page's arguments. Views only.
-- `window_ctl(label, op)`: show, hide, focus (restoring a minimized one), close, and get or set bounds, on a `view-*` window only. Never `core`. Core only.
+- `window_self(op)`: drag, minimize, toggle maximize, close, on the **calling** window, whose label the exe reads from the IPC request, not from the page's arguments. Views and Settings.
+- `window_ctl(label, op)`: show, hide, focus (restoring a minimized one), close, and get or set bounds, on `settings` or a `view-*` window only. Never `core`. Core only.
 
 **Events carry nothing worth having.** In Tauri 2.12.5 a page listener registered for any target receives events emitted to other windows too (`match_any_or_filter` in `src/event/listener.rs` lets a listener with target `Any` through every filter). So the exe never emits a Tauri event with content. Everything it tells core, such as tray clicks, second launches, system state, wake-ups and quitting, goes over one `Channel` that core hands to `shell_ready`. Server output and WebSocket messages go over their own channels. A channel's messages reach only the page that created it. No page gets `emit` or `emit-to`, so no page can fake an event either.
 
@@ -161,7 +169,7 @@ Tauri 2 checks app commands against capabilities only when the app declares an a
 ```json
 {
   "identifier": "views",
-  "description": "Chat, settings and later views: their own window and the log. Nothing else.",
+  "description": "Chat and later views: their own window and the log. Nothing else.",
   "windows": ["view-*"],
   "permissions": [
     "core:event:allow-listen", "core:event:allow-unlisten",
@@ -170,22 +178,23 @@ Tauri 2 checks app commands against capabilities only when the app declares an a
 }
 ```
 
-`capabilities/settings-keys.json`, with page entry of keys (option B in [5a](#5a-credentials)):
+`capabilities/settings.json`:
 
 ```json
 {
-  "identifier": "settings-keys",
-  "description": "Key entry. Write-only: nothing can read a key back.",
-  "windows": ["view-settings"],
-  "permissions": ["allow-secret-set", "allow-secret-status"]
+  "identifier": "settings",
+  "description": "The Settings window: key entry, write-only, and a read of the saved addresses. No events.",
+  "windows": ["settings"],
+  "permissions": [
+    "allow-window-self", "allow-log-line",
+    "allow-secret-set", "allow-secret-status", "allow-address-list"
+  ]
 }
 ```
 
-With native entry (option A), this file grants `allow-secret-prompt` and `allow-secret-status` instead, and `secret_set` is left only for core's peer tokens ([5d](#5d-the-rest)).
+A view can't open or touch other windows, fetch, start servers, open links, use the WebSocket, notify, register hotkeys, read system state, write or check keys, or emit events. Settings can do none of that either, and can't listen to events.
 
-A view can't open or touch other windows, fetch, start servers, open links, use the WebSocket, notify, register hotkeys, read system state or emit events.
-
-**Why Settings may write keys directly** (a decision for the lead). The other way, sending a pasted key to core first, puts it on the shared `BroadcastChannel`, where every page hears it, the chat view included. Nothing anywhere can read a key back, core included.
+**Why Settings writes keys directly** (decided 2026-11-14). The other way, sending a typed key to core first, would put it on a `BroadcastChannel`, where every page of the origin can hear it, the chat view included. So Settings calls `secret_set` itself, and nothing anywhere can read a key back, core included.
 
 ### The web surface: what the exe pins
 
@@ -196,17 +205,22 @@ A view can't open or touch other windows, fetch, start servers, open links, use 
 ```
 default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';
 img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:;
-connect-src 'self' ipc: http://ipc.localhost; worker-src 'self' blob:;
+connect-src 'self' ipc: http://ipc.localhost; worker-src blob:;
 frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'
 ```
 
 - No inline script and no `eval`, so `javascript:` links and injected handlers don't run.
 - The exe's CSP holds the network and frame rules. A page's own `<meta>` CSP can only add limits, so the app adds Trusted Types and tightens the rest without an exe, but can never loosen these.
 - Styles are loose on purpose: with the network closed, CSS can't send anything anywhere.
+- `worker-src blob:` and nothing else, so no page can register a service worker, which would sit in front of every page of the origin, Settings included.
 
 **No sandboxed frame for untrusted rendering. Decided now, because the frame rules are in the exe.** A frame with an opaque origin (no IndexedDB, no channel to core) would contain script that got into rendered content. But with no HTML sinks and no inline script, there's no path left for content to become script. The frame would add a second rendering system and a message relay, and that relay would be a new place to forge consent. So `frame-src 'none'` stays. **Residual, honestly:** a bug in the app's own code (not in content), or a compromised dependency, runs as the page and owns the origin, as [above](#what-the-exe-promises-and-what-it-doesnt) says. The native gates still bound it.
 
 **Navigation stays local.** Navigation off a window's own page is refused and logged by scheme only. Unlike Desktop Buddies, nothing is sent on to the browser, because a page could otherwise send data out in a URL with no click. `window.open` is denied the same way. Links go through `open_url`, which asks the person ([5d](#5d-the-rest)).
+
+### Web permissions
+
+The one window helper adds a `PermissionRequested` handler to each WebView2 (through `with_webview`, registered after Tauri's own, so its answer is the last) that answers **deny** to every kind: clipboard read, camera, microphone, location, web notifications, MIDI, sensors, local fonts, window management, file system access and any kind added later. So no page can read the clipboard, where a key someone just copied may still be. Pasting with Ctrl+V needs no permission and still works. Familiar's toasts go through the notification plugin, not web notifications. Writing to the clipboard after a click is settled by measurement ([4](#4-plugins)).
 
 ### Egress outside fetch
 
@@ -230,9 +244,10 @@ CSP governs fetch, WebSocket, images, styles and forms. It doesn't govern WebRTC
 
 **Tests** (all in the security inventory, [7](#7-checks-on-the-windows-runner)):
 
-- **Static, on Linux CI every push** (`apps/desktop/tests/capabilities.test.ts`): parses `capabilities/*.json`, `build.rs` and `tauri.conf.json`. It fails if any capability grants a `core:window:*`, `core:webview:*` or event `emit` permission, if `views.json` or `settings-keys.json` grants anything outside its list, if any capability uses a remote URL, if a command in `COMMANDS` has no capability or the reverse, if the TypeScript client in `src/shell.ts` calls a command not in `COMMANDS`, or if the CSP or browser arguments (apart from the sink's port) differ from the pinned strings. An app-side test checks every page in the app folder carries the Trusted Types `<meta>`.
-- **The refusal, on the runner**: `view-chat` and `view-settings` call every core-only command and plugin command with valid arguments, and each must reject with `not allowed by ACL`. `view-chat` calls `secret_set` and is refused. Core makes the same calls and each reaches its command.
-- **Cross-window**: `view-chat` calls `window_self('close')` and only `view-chat` closes. Core calls `window_ctl('core', ...)` and is refused. A view calling Tauri's own `plugin:window|close` with `label: 'core'` is refused by ACL. A view calling `plugin:event|emit` is refused. A view listening for every event name core uses gets nothing while the driver clicks the tray and makes a second launch. `view-settings` navigating to `chat.html` is refused and stays on its page.
+- **Static, on Linux CI every push** (`apps/desktop/tests/capabilities.test.ts`): parses `capabilities/*.json`, `build.rs` and `tauri.conf.json`. It fails if any capability grants a `core:window:*`, `core:webview:*` or event `emit` permission, if `views.json` or `settings.json` grants anything outside its list, if any capability uses a remote URL, if a command in `COMMANDS` has no capability or the reverse, if the TypeScript client in `src/shell.ts` calls a command not in `COMMANDS`, or if the CSP or browser arguments (apart from the sink's port) differ from the pinned strings. An app-side test checks every page in the app folder carries the Trusted Types `<meta>`.
+- **The refusal, on the runner**: `view-chat` and `settings` call every core-only command and plugin command with valid arguments, and each must reject with `not allowed by ACL`. `view-chat` calls `secret_set`, `secret_status` and `address_list` and is refused. `settings` calls `plugin:event|listen` and is refused. Core makes the same calls and each reaches its command.
+- **Cross-window**: `view-chat` calls `window_self('close')` and only `view-chat` closes. Core calls `window_ctl('core', ...)` and is refused. A view calling Tauri's own `plugin:window|close` with `label: 'core'` is refused by ACL. A view calling `plugin:event|emit` is refused. A view listening for every event name core uses gets nothing while the driver clicks the tray and makes a second launch. `settings` navigating to `chat.html` is refused and stays on its page, and core's `view_open` of `view-x` with `settings.html` is refused.
+- **Settings kept apart**: a page calls `navigator.serviceWorker.register` with an app script, and it fails. The driver puts a value on the clipboard, a page calls `navigator.clipboard.readText()`, `getUserMedia` and `geolocation.getCurrentPosition`, and each is refused with no prompt shown, while a paste into a text box in Settings still works.
 - **Trusted Types**: core and a view each try `innerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and `trustedTypes.createPolicy('x', ...)`. Each must throw, and IPC must still work.
 - **Egress**: a hostile page in core and in a view tries every route it can: `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `sendBeacon`, an `<img>`, a CSS `url()`, a web font, `<link rel=prefetch|preconnect|dns-prefetch>`, an `<a ping>` click, a form POST, `window.open`, `location.assign`, a remote `import()`, a service worker registration, a notification with a remote icon, and an `RTCPeerConnection` with STUN and TURN servers. The targets are the driver's listeners on `127.0.0.1` (TCP and UDP, including a STUN responder), a LAN-looking address, and unique random host names. DNS is watched on the wire: `pktmon` captures UDP and TCP port 53, mDNS (5353) and LLMNR (5355) for the whole check, with the DNS Client operational event log on as well. Pass means no listener saw a packet, and none of the random names is in the capture or the log. **Positive controls** prove the fixtures can see: the driver looks up a random name of its own and sends to each listener itself, and the same hostile page runs once in a headless Edge with no sink proxy, where the listeners and the capture must see its traffic. A control that sees nothing fails the check, and so does a sink refusal count of zero.
 
@@ -305,25 +320,22 @@ Starting a server (5b), adding an address (5c) and opening a link (5d) share one
 - **One at a time, and a stop after three refusals**: a second ask while one is open gets `busy`. Refusals and closes are counted across every kind of ask. After the third since the run started, or since the person last re-enabled asking, the exe stops asking (`asks-stopped`) until the person picks "Let Familiar ask again" from an exe-owned tray item. That item is native, so only the person can re-enter. Changing an argument or an address each time doesn't get around it.
 - **Showing it honestly**: every shown string has control characters and bidirectional formatting characters (U+200E, U+200F, U+061C, U+202A to U+202E, U+2066 to U+2069) replaced with visible `\u{...}` escapes. Host names show in punycode. Labels are cut to 64 characters with an ellipsis and always appear after the fact they describe, never instead of it. The main text is a summary. The dialog's "Show details" area holds the complete canonical operation, so nothing that runs or sends is hidden.
 
-**Tests** (runner): the driver reads each dialog through UI Automation and checks the default button, the disabled first second, the escaped text and the details area. While a dialog is open, core calls `view_open`, `window_ctl('view-settings', 'close')` on the owner and another `address_add`, and a view calls `window_self`: each gets `busy`, no new window appears, and the owner stays. Core sends a changed operation meanwhile, and approving stores the one shown. After every way out, each window's enabled and always-on-top state is back as it was. It sends three refusals in a row and checks the fourth ask is refused without a dialog until it picks the tray item.
+**Tests** (runner): the driver reads each dialog through UI Automation and checks the default button, the disabled first second, the escaped text and the details area. While a dialog is open, core calls `view_open`, `window_ctl('settings', 'close')` on the owner and another `address_add`, and a view calls `window_self`: each gets `busy`, no new window appears, and the owner stays. Core sends a changed operation meanwhile, and approving stores the one shown. After every way out, each window's enabled and always-on-top state is back as it was. It sends three refusals in a row and checks the fourth ask is refused without a dialog until it picks the tray item.
 
 ### 5a. Credentials
 
-**Choice: keys go into Windows Credential Manager, go out only into requests to their own saved address, and never come back to any page.**
+**Choice: keys are typed into the Settings window, go into Windows Credential Manager, go out only into requests core makes to their own saved address, and never come back to any page.**
 
 ```ts
-// option B, page entry (as reviewed)
-secret_set(ref: string, value: string): void                   // view-settings only
-// option A, native entry
-secret_prompt(ref: string, owner?: string): { saved: boolean }  // view-settings only
-
-secret_status(ref: string): { present: boolean, boundTo: string | null }   // core, view-settings
-secret_delete(ref: string): void                                // core
+secret_set(ref: string, value: string): void        // settings; from core, peer tokens only (5d)
+secret_status(ref: string): { present: boolean, boundTo: string | null, hint: string | null }   // core, settings
+secret_delete(ref: string): void                    // core
 ```
 
 - `ref` is `addr:<addressId>` for a model endpoint or remote server, or `server:<setupId>:<NAME>` for a local server's setting. Anything else is refused (`invalid`).
 - One credential per ref: service `dev.exvanitas.familiar`, user the ref, through `keyring::Entry`. The stored secret is `{"v":1,"for":"<address or setup id>","value":"..."}` as UTF-8 bytes (`set_secret`), under Credential Manager's 2560-byte blob limit.
-- **Bound to the address.** For `addr:` refs the exe writes `for` from its own saved-address list, never from the page. A saved address can't be edited: changing it in Settings removes the old entry and adds a new one, which has a new id and no key. So the app asks for the key again, and an old key can never go to a new address. `address_remove` deletes its key.
+- **Bound to the address, so a changed address needs the key typed again.** For `addr:` refs the exe writes `for` from its own saved-address list, never from the page. A saved address can't be edited: changing a provider's base URL or a server's address in Settings removes the old entry and adds a new one, which has a new id and no key. So the person types the key again, in the Settings window, and an old key can never go to a new address. That's the failure seen elsewhere, where swapping a base URL sent the stored key to the new one. `address_remove` deletes its key.
+- **Write-only.** There is no read command. `secret_status` says whether a key is set, which address or setup it's bound to, and a masked hint: the last 4 characters, shown as `…abcd`, only when the value is at least 20 characters long, else null. The hint is computed in the exe at each call, never stored apart from the key.
 - **Limits**: a value of 8 to 1024 bytes with no control characters (CR or LF in a key would split a header). Eight is the floor so every secret can be blanked wherever it appears without blanking ordinary text. Refs up to 128 characters.
 - **Never written** to files, logs, IndexedDB, exports or errors. There is no read command.
 
@@ -348,23 +360,21 @@ How the swap works:
 
 **The streaming matcher.** A body is redacted as it streams by an incremental matcher (Aho-Corasick over every secret that request used) that holds back only the longest tail of the output so far that could still be the start of one of them, and nothing else. Ordinary text with no secret prefix at its end passes at once. So an MCP server that sends one complete SSE event and then waits for the next request gets that event straight away. A chunk that produces no output doesn't end the read: `net_read` waits for the next chunk, and returns empty only at the real end of the body, when the held tail, which can't be a whole secret, is released. Literal copies only: an endpoint that returns the key encoded some other way defeats it, so **the recipient of a key is trusted**, which it already is, since it's the service the key belongs to.
 
-**What the guarantee is, worded honestly.** A key reaches only its own saved address, and no page can read it back, except the Settings page while the person enters it (option B). A page running bad script can still *use* a key through Familiar, while Familiar runs, at its own address. It can't carry it away.
+**What the guarantee is, worded honestly.** A key reaches only its own saved address, and no page can read it back, except the Settings window while the person types it. A page running bad script can still *use* a key through Familiar, while Familiar runs, at its own address. It can't carry it away.
 
-**Entering a key: two ways, the lead decides.**
+**Entering a key: in the Settings window** (decided 2026-11-14, [Decisions](#decisions)). Settings has a password field and calls `secret_set` itself, then clears the field. The key never touches IndexedDB, a channel or core. Four safeguards come with it:
 
-| | Option A: native entry | Option B: page entry |
-| --- | --- | --- |
-| How | `secret_prompt` opens a small native dialog owned by Settings: the endpoint's label and address, a password box, Save and Cancel. Built as an in-memory dialog template on the `windows` crate. The key goes from the box to Credential Manager | Settings has a password field and calls `secret_set`, then clears the field. The key never touches IndexedDB or the channel |
-| Who sees the key | Only the exe | The Settings page, between paste and the call |
-| Exe surface | `secret_prompt` replaces `secret_set`. Server setting secrets use the same prompt | `secret_set` |
-| Runner test | The driver types into the dialog through UI Automation | The page calls the command |
-| Hours on top of B | About 2 (1 to build, 1 to test) | 0 |
+1. **A separate window.** Settings never draws model, card or tool text, has its own channel and capability set, and the routes by which chat's script could reach it are closed ([2](#windows)).
+2. **Write-only storage.** The key goes straight to Credential Manager, and pages see only "set" and the masked hint.
+3. **Core makes every request with the key**, through the placeholder swap, and only to the key's own address.
+4. **A changed address needs the key typed again**, in Settings, because a key is bound to one saved address.
 
-Recommendation: A, if the hours are acceptable. It removes the Settings exception from promise 1, and the dialog module it needs exists anyway. It doesn't remove the peer pairing token's pass through core ([5d](#5d-the-rest)), which stays a documented exception with either option. B is acceptable if they aren't: the gap needs script already running inside Settings at the moment of a paste.
+The field is `type=password` with `autocomplete=off` and `spellcheck=false`, and the window helper turns WebView2's form autofill and password saving off (`IsGeneralAutofillEnabled` and `IsPasswordAutosaveEnabled`, both false), so nothing the person types is kept in the WebView2 profile.
 
 **Tests.** shell-core: ref parsing, the value rules, the swap (only those headers, exact match, `no-key`), and the matcher: every split of every secret across two and three chunks, two secrets overlapping, a stream that is one long near-miss, and that output not followed by a secret prefix is released in the same read. On the runner:
 
-- Settings stores a random fake key for `addr:<id>`, and `secret_status` says present and bound. The driver finds the target name in `cmdkey /list`.
+- The driver types a random fake key into Settings' password field with real key presses (so autofill would have seen it) and Settings saves it for `addr:<id>`. `secret_status` says present and bound, with the right hint for a long key and none for a short one. The driver finds the target name in `cmdkey /list`.
+- **Rebinding**: Settings stores a key for address A, then core removes A and adds A' with another base URL. `secret_status` for A' is not present, a fetch under A' with the placeholder is `no-key`, A's fake server never sees a request after the removal, and A's credential is gone from `cmdkey`.
 - Core fetches the fake server with the placeholder, and the fake server answers with a SHA-256 of the header it got, which must match the fake key's.
 - **Echo routes**: the fake server sends the key back literally in a response header value, in a header name, in the status text, in a 200 body, in a 401 body, in a 300 KB body, split across two chunks, and as a redirect to `<saved path>/<key>`. The page must see `[key]` or a dropped header every time, the redirect must end as `redirect-refused`, and the fake server must see no request to the key's path.
 - **Live streams**: the fake server sends one SSE event, then keeps the connection open and quiet for 30 s. The event must reach the page within 100 ms, and the read must not end early.
@@ -503,16 +513,16 @@ Each of these is here because a page can't do it and a later need would otherwis
 | `tray_set({ tooltip, icon, items })` | Sets the menu, as Desktop Buddies' | `icon` a PNG from the app folder. The exe appends Quit, and "Let Familiar ask again" when the confirms are stopped. Menu ids starting `shell:` are the exe's |
 | `system()` | `{ userState, idleMs }` | `userState` from `SHQueryUserNotificationState`: `normal`, `fullscreen` (a D3D game or any full-screen app), `presentation`, `busy`, `quiet` (Windows' quiet time), `away`. `idleMs` from `GetLastInputInfo`, for the rules' "back after 20 minutes". Battery and session lock are left out until a feature uses them, and would be added before release if one does |
 | `wake_at(at)` | One native deadline: at `at` (Unix ms), the exe sends `wake` over the channel | One pending deadline, each call replaces it. Fired within 1 s, also late after a resume. Doesn't wake a sleeping PC |
-| `view_open(spec)` | Opens a view window, bound to its page | Label `view-[a-z0-9-]{1,32}`, page a plain `.html` name in the app folder, size, title, `decorations`, `transparent`, `alwaysOnTop`, `skipTaskbar`, `visible`, `focused`, `focusable`. `core` can't be made |
-| `window_ctl(label, op, bounds?)` | show, hide, focus (restoring a minimized one), close, get and set bounds | `view-*` labels only |
-| `window_self(op)` | drag, minimize, toggle maximize, close, on the calling window | Views only |
+| `view_open(spec)` | Opens a view window, or Settings, bound to its page | Label `view-[a-z0-9-]{1,32}` with a plain `.html` page in the app folder other than `settings.html`, or `settings`, which always gets `settings.html`. size, title, `decorations`, `transparent`, `alwaysOnTop`, `skipTaskbar`, `visible`, `focused`, `focusable`. `core` can't be made |
+| `window_ctl(label, op, bounds?)` | show, hide, focus (restoring a minimized one), close, get and set bounds | `settings` and `view-*` labels only |
+| `window_self(op)` | drag, minimize, toggle maximize, close, on the calling window | Views and Settings |
 | `autostart({ on? })` | Reads, or sets then reads, the Run entry | Current user. The entry runs the exe with `--autostart` |
 | `open_url(url, owner?)` | The confirm dialog, then the default browser | `https` only, 2048 characters. The dialog shows the host on its own line in punycode and the full URL in its details, with "Open" and "Don't open". Under the one throttle. No allowlist in the exe |
 | `open_folder(which)` | Explorer at `backups` or `logs` | Only those two |
 | `pick_path({ kind, filters?, owner? })` | Native open dialog, returns a full path or null | `kind` is `file` or `folder` |
 | `save_as({ name, filters, owner? }, bytes)` | Native save dialog, writes the bytes there | 256 MiB. Desktop Buddies' API 2 code: a new temp file beside the target, swapped in with `ReplaceFileW`, links refused. Refused inside the native data folder, the WebView2 folder, and the folder holding the exe and the app folder, compared on the final path of the target's folder |
 | `backup_write(name, bytes)`, `backup_list()`, `backup_read(name)`, `backup_delete(name)` | The rolling backup's files | Inside `backups\` only, plain names ending `.familiar-backup`, up to 16 files. One write at a time. **One budget**: 1 GiB for every file in the folder, temporary ones included, checked before a write starts. Temporary files have the exe's own exclusive `.~<16 hex>.tmp` names, and each start deletes those, and only those. Which to keep and when to delete is the app's. **Built in step 10**, before release |
-| `secret_set` from core | Stores a peer's pairing token | The handler reads the caller's label from the IPC request: from `core`, only `addr:<id>` refs whose address is a `peer` are accepted, so core still can't write model or server keys. With option A this is the only use of `secret_set` left. **Built in the pre-release native pass**, with the WebSocket |
+| `secret_set` from core | Stores a peer's pairing token | The handler reads the caller's label from the IPC request: from `core`, only `addr:<id>` refs whose address is a `peer` are accepted, so core still can't write model or server keys. **Built in the pre-release native pass**, with the WebSocket |
 | `ws_connect({ address, port, path }, channel)`, `ws_send(id, text)`, `ws_close(id)` | A WebSocket client, opened from `familiar.exe`'s own process | `address` a saved `peer` address and `port` inside its range. The exe builds the URL `ws://127.0.0.1:<port><path>` itself and checks it again. It sends `Host: 127.0.0.1:<port>` exactly and no `Origin` header, and the page sets no headers at all. Messages up to 1 MiB both ways, 4 sockets at once, messages to core over the channel. No redirects. In outgoing text, the placeholder is swapped for the address's stored token, and incoming text has literal copies redacted, as in [5a](#5a-credentials). **Built in the pre-release native pass**, against Desktop Buddies' settled protocol |
 
 **Agreed with Desktop Buddies on 2026-11-14** (with its own session): Familiar needs only Desktop Buddies' socket. There's no discovery or port file, and no earlier file-based phase. Desktop Buddies listens on a WebSocket on `127.0.0.1`, on one of a fixed range of five consecutive ports, which isn't chosen yet. Familiar finds it by trying the range and exchanging a hello: a product id plus a protocol version the app can refuse. The app asks once, through `address_add`, for "Desktop Buddies on this PC, ports a to e" with whatever range Desktop Buddies picks, so no numbers are compiled in. Desktop Buddies identifies its caller by the process that owns the connection, so the socket must be opened by `familiar.exe` itself, never by WebView2 or a helper process, which is how `ws_connect` works. The app does the hello, the pairing and the protocol. The pairing token goes into Credential Manager through the secret commands. It passes through core once, as it arrives over the socket during pairing, and after that core only ever sends the placeholder.
@@ -524,19 +534,20 @@ Each of these is here because a page can't do it and a later need would otherwis
 | Group | Command | Caller |
 | --- | --- | --- |
 | Shell | `shell_info`, `shell_ready`, `quit`, `quit_ready`, `tray_set`, `system`, `wake_at`, `autostart` | core |
-| | `log_line` | core, views |
+| | `log_line` | core, views, settings |
 | Windows | `view_open`, `window_ctl` | core |
-| | `window_self` | views |
-| Addresses and fetch | `address_list`, `address_add`, `address_remove`, `net_fetch`, `net_read`, `net_cancel` | core |
-| Keys | `secret_set` (B) or `secret_prompt` (A) | view-settings |
+| | `window_self` | views, settings |
+| Addresses and fetch | `address_list` | core, settings |
+| | `address_add`, `address_remove`, `net_fetch`, `net_read`, `net_cancel` | core |
+| Keys | `secret_set` | settings |
 | | `secret_set`, for `peer` addresses only | core |
-| | `secret_status` | core, view-settings |
+| | `secret_status` | core, settings |
 | | `secret_delete` | core |
 | Servers | `server_start`, `server_write`, `server_stop`, `server_forget` | core |
 | Files and links | `pick_path`, `save_as`, `open_url`, `open_folder`, `backup_write`, `backup_list`, `backup_read`, `backup_delete` | core |
 | Part 2 | `ws_connect`, `ws_send`, `ws_close` | core |
 
-36 commands with option B, 37 with option A (`secret_prompt` added, `secret_set` kept for peer tokens). `COMMANDS` in `build.rs`, the capability files, the Rust handler list and `src/shell.ts` are one inventory, and the static test fails if they disagree.
+36 commands. `COMMANDS` in `build.rs`, the capability files, the Rust handler list and `src/shell.ts` are one inventory, and the static test fails if they disagree.
 
 ---
 
@@ -566,10 +577,10 @@ Modelled on Desktop Buddies' `shell.yml`: `.github/workflows/shell.yml` on `wind
 
    The security inventory, each id prefixed `security.`:
    - `caps.static`, `caps.view-refused`, `caps.core-reaches`, `caps.cross-window`, `caps.forged-event`, `caps.page-binding`
-   - `csp.trusted-types`, `egress.core`, `egress.view`, `egress.controls`, `nav.refused`
+   - `csp.trusted-types`, `csp.no-service-worker`, `perm.denied`, `egress.core`, `egress.view`, `egress.controls`, `nav.refused`
    - `pin.origin`, `pin.folder`, `pin.restart`, `pin.moved-install`
    - `confirm.defaults`, `confirm.throttle`, `confirm.escaping`, `confirm.frozen`
-   - `key.roundtrip`, `key.echo`, `key.no-copy`, `key.bound`, and `key.prompt` with option A
+   - `key.roundtrip`, `key.echo`, `key.no-copy`, `key.bound`, `key.rebind`, `key.write-only`
    - `fetch.saved-only`, `fetch.no-lookup-before-allow`, `fetch.stream-stop`, `fetch.live-stream`, `fetch.limits`, `fetch.redirects`, `fetch.rebinding`, `fetch.literal`, `fetch.proxy`, `fetch.revoke`
    - `server.approve`, `server.reask`, `server.paths`, `server.remote-drive`, `server.links`, `server.settings`, `server.blank`, `server.env`, `server.start-failed`, `server.store-recovery`, `server.kill`
    - `link.confirm`, `files.save-refused`, `quit.clean`
@@ -613,7 +624,7 @@ Modelled on Desktop Buddies' `shell.yml`: `.github/workflows/shell.yml` on `wind
 
 ## 9. Hours
 
-The exe settles before the first release, not at step 3 (recommended, [Decisions](#decisions-for-the-lead)). So step 3 builds and proves the exe's core, and three designed pieces are built later, still before release: the backup commands in step 10, the recorded-provider run over the guarded fetch in step 4, and the peer WebSocket in a pre-release native pass. Review 2's fixes add work, and four cuts take some away: Trusted Types moved to the app, a simpler refusal stop, battery and session lock deferred, and no page-timer soak.
+The exe settles just before the first release, not at step 3 ([Decisions](#decisions)). So step 3 builds and proves the exe's core, and three designed pieces are built later, still before release: the backup commands in step 10, the recorded-provider run over the guarded fetch in step 4, and the peer WebSocket in a pre-release native pass. Review 2's fixes add work, and four cuts take some away: Trusted Types moved to the app, a simpler refusal stop, battery and session lock deferred, and no page-timer soak.
 
 **Step 3**
 
@@ -624,38 +635,40 @@ The exe settles before the first release, not at step 3 (recommended, [Decisions
 | The confirm module: dialog, defaults, delay, escaping, frozen state and restore, the refusal stop and tray re-entry | 1.5 | 1.25 | |
 | Saved addresses: approval before any lookup, identity by full scope | 1 | 0.25 | |
 | Guarded fetch: rules, literal IPs, resolver, proxy, redirects, limits, streaming, the swap, the streaming matcher, redaction of every field, revocation | 5 | 1.75 | |
-| Credentials (option B) | 0.5 | 0.5 | |
+| Credentials, typed in Settings | 0.5 | 0.5 | |
+| Settings kept apart: its own label, page and capability set, the permission handler, autofill and password saving off, the service-worker refusal, their checks | 0.75 | 0.5 | |
 | Server start: path, drive and link rules, setting rules, approval store, dialog, job, failure cleanup, blanking | 3.5 | 2.25 | |
 | `save_as`, `pick_path`, links, folders, autostart | 0.75 | 0.5 | |
 | `system()` (full screen, presentation, quiet time, idle) and resume, `wake_at`, notifications, hotkey, toast app id | 1 | 0.5 | |
 | Egress harness (listeners, STUN, `pktmon`, positive controls), the two-namespace gate, the workflow | | 3 | |
 | Runs on the runner until green, and what the measurements overturn (WebRTC, the sink proxy, clipboard, toasts) | | | 4 |
-| **Total** | **17** | **11.5** | **4** |
+| **Total** | **17.75** | **12** | **4** |
 
-**Step 3 is about 32.5 hours, 34.5 with native key entry.** That replaces its 8, it doesn't add to them.
+**Step 3 is about 33.75 hours.** That replaces its 8, it doesn't add to them. It was 32.5 when the owner accepted it. The 1.25 more is the safeguards that came with typing keys in Settings.
 
 **What moved where, and the part 1 total**, starting from the current 93:
 
 | Step | Was | Now | Why |
 | --- | --- | --- | --- |
-| 3, the shell | 8 | 32.5 | This note |
+| 3, the shell | 8 | 33.75 | This note |
 | 4, the model layer | 5 | 5.25 | Gains the recorded-provider contract run over `guardedFetch` in the real webview (0.75), saves on a fetch already proven (0.5) |
 | 7, the MCP client | 12 | 10.5 | The server start, its approval and blanking are built in step 3 |
 | 10, memory and export | 5 | 6 | Gains the native backup commands and their budget check |
 | 11, chat and settings | 10 | 10.25 | Gains the Trusted Types `<meta>` on every page and its test |
 | New: a pre-release native pass, before step 12 | 0 | 1.25 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks |
-| **Part 1** | **93** | **118.75** | 120.75 with native key entry |
+| **Part 1** | **93** | **120** | |
 
 This is still an estimate before anything is built. It should be redone once the riskiest pieces (the egress closure with the sink proxy, and the reparse walk) have run on the runner, which should be the first thing step 3 does.
 
 ---
 
-## Decisions for the lead
+## Decisions
 
-1. **Key entry: native (A) or page (B).** Both are designed in [5a](#5a-credentials) and change the exe (`secret_prompt` or `secret_set`). Recommended: A, at about 2 more hours.
-2. **With B, Settings calls `secret_set` directly**, write-only, so a key never crosses the shared channel. That goes against "only core touches keys". Recommended: allow it.
-3. **When the exe settles.** (a) At step 3, as `docs/design.md` says. (b) Before the first release (step 12). The owner's PC only sees release builds and the runner has no Smart App Control, so exe changes during development cost nothing there. This note is written for (b), and the hours depend on it: under (a) the three moved pieces come back into step 3. Recommended: (b). The rule then reads "no exe reaches a person's PC until it's settled".
-4. **The estimate**: step 3 at about 32.5 hours (34.5 with A) in place of 8, and part 1 at 118.75 (120.75 with A) in place of 93.
+Decided 2026-11-14 by the maintainer, in their words: "so we do option 1, the rest of your decisions make sense to me."
+
+1. **When the exe settles: just before the first release (step 12)**, not at step 3. The rule: no exe reaches a person's PC until it's settled. The three moved pieces (backups in step 10, the recorded-provider run in step 4, the peer WebSocket in a pre-release pass) are built before release.
+2. **Key entry: typed in Familiar's own Settings window** ("option 1"), not a native prompt. Settings calls `secret_set` itself, write-only, so a key never crosses a channel. It comes with four safeguards: a separate Settings window that never draws model or tool text and has its own narrow capability set, write-only storage with only "set" and a masked hint shown, core making every request with the key, and a changed address needing the key typed again ([5a](#5a-credentials)). The reason for those safeguards: in open-source chat apps the failure seen again and again is script in model output reaching a key, including one case where swapping a base URL sent the stored key to the new address.
+3. **The estimate: accepted**, step 3 at about 32.5 hours and part 1 at about 118.75, to be redone after the egress closure and Trusted Types have been measured on the runner. The safeguards in 2 then added 1.25, so this note now says 33.75 and 120 ([9](#9-hours)).
 
 Decided in this note, after review: untrusted content is never HTML, with Trusted Types in the app's own CSP and no sandboxed frame. Consent to MCP writes and sends stays in the app. Links ask natively with no allowlist. No OAuth in v1. No loopback fetch mode. With Desktop Buddies, on 2026-11-14: its socket only, no discovery file ([5d](#5d-the-rest)).
 
@@ -669,6 +682,7 @@ Decided in this note, after review: untrusted content is never HTML, with Truste
 - That `wake_at` reaches a core hidden for 10 minutes, and, before release on a real PC, that a reminder due during sleep shows after resume ([6](#6-tray-hotkey-autostart-single-instance-notifications-system-state)).
 - That the reparse walk reads links without following them on the runner's file system ([5b](#5b-starting-a-local-mcp-server)).
 - That rustls with the platform verifier trusts what Windows trusts ([5c](#5c-the-guarded-fetch)).
+- That the permission handler's deny is the last word, with no prompt shown, and that paste still works in Settings ([2](#web-permissions)).
 
 ---
 
@@ -713,3 +727,11 @@ Decided in this note, after review: untrusted content is never HTML, with Truste
 | Cut: soak | The page-timer soak is gone. A hidden `wake_at` delivery check stays in step 3, and a sleep and resume reminder check on a real PC before release |
 | Moved | Backups to step 10, the recorded-provider run to step 4, the peer WebSocket to a pre-release native pass. Their designs stay in this note |
 | Estimate | Step 3 at 32.5 hours (34.5 with native entry) in place of its 8, not on top of them. Part 1 from 93 to 118.75 (120.75), with each step's change listed in [9](#9-hours) |
+
+## Changes after the decisions
+
+| Decision | What changed |
+| --- | --- |
+| The exe settles before the first release | Written as decided, with the rule "no exe reaches a person's PC until it's settled" |
+| Keys typed in Settings | Option A and `secret_prompt` are gone. Promise 1 names the Settings window as its one entry exception. Settings is its own window, label `settings`, bound to `settings.html`, with its own channel and a capability set of its own and no events. `secret_status` gains a masked hint. A changed address needing the key again is named as a safeguard, with a `key.rebind` check. New closures so chat's script can't reach Settings: `worker-src blob:` in the exe's CSP (no service workers), every web permission denied (no clipboard read), and WebView2's autofill and password saving off. New security ids `csp.no-service-worker`, `perm.denied`, `key.rebind` and `key.write-only` |
+| Hours | Step 3 at 33.75, part 1 at 120: the accepted 32.5 and 118.75 plus 1.25 for the safeguards |
