@@ -6,15 +6,30 @@
 use shell_core::{log::Log, sink};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// A connection whose reads get the time left before one deadline for the whole first line.
+struct Conn<'a>(&'a TcpStream);
+
+impl Read for Conn<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&mut &*self.0).read(buf)
+    }
+}
+
+impl sink::Timed for Conn<'_> {
+    fn read_within(&mut self, left: Duration) -> bool {
+        self.0.set_read_timeout(Some(left)).is_ok()
+    }
+}
 
 /// Connections handled at once. Past that, a connection is closed at once, and still counted.
 const AT_ONCE: usize = 64;
@@ -38,9 +53,9 @@ fn exclusive(_: &Socket) -> std::io::Result<()> {
 }
 
 fn refuse(mut stream: TcpStream, counts: &sink::Counts) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let deadline = Instant::now() + sink::LINE_WITHIN;
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let kind = sink::first_line(&stream);
+    let kind = sink::first_line(&mut Conn(&stream), deadline, Instant::now);
     let _ = stream.write_all(sink::RESPONSE);
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Both);
