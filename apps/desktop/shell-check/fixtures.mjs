@@ -48,6 +48,8 @@ const http = createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
   res.end('seen');
 });
+// Every TCP connection, whether or not a request follows: a preconnect sends none.
+http.on('connection', () => hit({ kind: 'accept', listener: 'http' }));
 http.on('upgrade', (req, socket) => {
   hit({ kind: 'upgrade', path: (req.url ?? '').slice(0, 200), label: labelOf(req.url) });
   socket.destroy();
@@ -75,7 +77,7 @@ function stunAnswer(msg, rinfo) {
   return res;
 }
 
-function udp(name) {
+function udp(name, port = 0) {
   return new Promise(done => {
     const s = createSocket('udp4');
     s.on('message', (msg, rinfo) => {
@@ -84,7 +86,7 @@ function udp(name) {
       const a = stunAnswer(msg, rinfo);
       if (a) s.send(a, rinfo.port, rinfo.address);
     });
-    s.bind(0, '127.0.0.1', () => done(s.address().port));
+    s.bind(port, '127.0.0.1', () => done(s.address().port));
   });
 }
 
@@ -103,6 +105,9 @@ for (const ctx of CONTEXTS) {
   config.udp[`${ctx}-turn`] = await udp(`${ctx}-turn`);
   config.turnTcp[ctx] = await tcp(`${ctx}-turn-tcp`);
 }
+// UDP on every TCP port too, so QUIC (WebTransport, HTTP/3) to a TCP listener is seen.
+await udp('http-udp', config.tcp);
+for (const ctx of CONTEXTS) await udp(`${ctx}-turn-tcp-udp`, config.turnTcp[ctx]);
 writeFileSync(hitsFile, '');
 for (const dir of [out, appDir, ...more]) writeFileSync(join(dir, 'fixtures.json'), JSON.stringify(config));
 console.log(`fixtures up: run ${run}, http ${config.tcp}`);

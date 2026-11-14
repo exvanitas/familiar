@@ -32,12 +32,21 @@ describe('the gate', () => {
     expect(judge(['PASS security.a.one', 'PASS security.a.two', 'PASS bare.id'], inventory, checks).ok).toBe(false);
   });
 
+  it('an egress verdict must carry the run id of this run', () => {
+    const inv = ['egress.core'];
+    expect(judge(['RUN abc', 'PASS security.egress.core closed run=abc'], inv, []).ok).toBe(true);
+    expect(judge(['RUN abc', 'PASS security.egress.core closed run=old'], inv, []).problems).toEqual(["security.egress.core: not from this run's analysis"]);
+    expect(judge(['PASS security.egress.core closed run=abc'], inv, []).ok).toBe(false);
+    expect(judge(['RUN abc', 'RUN def', 'PASS security.egress.core closed run=abc'], inv, []).ok).toBe(false);
+    expect(judge(['RUN abc', 'PASS security.egress.core closed'], inv, []).ok).toBe(false);
+  });
+
   it('the real lists are well formed and apart', () => {
     const inv = JSON.parse(readFileSync(new URL('../shell-check/security-inventory.json', import.meta.url), 'utf8')).ids as string[];
     const chk = JSON.parse(readFileSync(new URL('../shell-check/checks.json', import.meta.url), 'utf8')).ids as string[];
     expect(new Set(inv).size).toBe(inv.length);
     expect(new Set(chk).size).toBe(chk.length);
-    expect(inv.length).toBe(18);
+    expect(inv.length).toBe(21);
     for (const id of [...inv, ...chk]) expect(id).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$|^[a-z0-9-]+$/);
   });
 });
@@ -78,7 +87,7 @@ function pcapng(frames: { at: number; data: Buffer }[]): Buffer {
 }
 
 describe('the egress analysis', () => {
-  const fx = { run: 'r1x2y3z4', tcp: 5000, lan: '192.168.250.250', udp: {}, turnTcp: {} };
+  const fx = { run: 'r1x2y3z4', tcp: 5000, lan: '192.168.250.250', udp: {}, turnTcp: { core: 1, view: 2, bare: 3, edge: 4, driver: 5, probe: 6 } };
 
   it('reads DNS names and ports out of a pcapng capture', () => {
     const buf = pcapng([
@@ -92,38 +101,97 @@ describe('the egress analysis', () => {
     expect(dnsNames(dnsQuery('a.b'))).toEqual(['a.b']);
   });
 
-  it('a route is open when the listener, the capture or the DNS log saw its label, and the controls must see', () => {
-    const coreFetch = label(fx, 'core', 0);
-    const hits = [
-      { kind: 'http', label: label(fx, 'driver', 0) }, { kind: 'udp', listener: 'driver-stun', stun: true }, { kind: 'udp', listener: 'driver-turn' },
-      { kind: 'tcp', listener: 'driver-turn-tcp' }, { kind: 'http', label: label(fx, 'edge', 0) }, { kind: 'udp', listener: 'edge-stun', stun: true }
+  /* A run where every page recorded every route and every control saw its traffic. */
+  function evidence() {
+    const T = { driver: [100, 200], core: [300, 400], view: [500, 600], bare: [700, 800] };
+    const marks: Record<string, { at: number; sink: number }> = {};
+    for (const [k, [a, b]] of Object.entries(T)) { marks[`${k}-start`] = { at: a, sink: 0 }; marks[`${k}-end`] = { at: b, sink: 4 }; }
+    marks['egress-start'] = { at: 300, sink: 0 };
+    marks['egress-end'] = { at: 800, sink: 4 };
+    const hits: Record<string, unknown>[] = [
+      { kind: 'http', label: label(fx, 'driver', 0), at: 150 }, { kind: 'udp', listener: 'driver-stun', stun: true, at: 150 },
+      { kind: 'udp', listener: 'driver-turn', at: 150 }, { kind: 'tcp', listener: 'driver-turn-tcp', at: 150 },
+      { kind: 'accept', listener: 'http', at: 150 }, { kind: 'udp', listener: 'http-udp', at: 150 },
+      ...Object.keys(fx.turnTcp).map(n => ({ kind: 'udp', listener: `${n}-turn-tcp-udp`, at: 150 })),
+      { kind: 'accept', listener: 'http', at: 5000 }, { kind: 'http', label: label(fx, 'edge', 0), at: 5000 }, { kind: 'udp', listener: 'edge-stun', stun: true, at: 5000 }
     ];
     const packets = [
-      { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${label(fx, 'driver', 1)}.familiar-check.test`], at: 1 },
-      { proto: 'udp', dst: fx.lan, dport: lanPort('driver', 99), names: [], at: 1 },
-      { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${label(fx, 'edge', 3)}.familiar-check.test`], at: 1 },
-      { proto: 'udp', dst: fx.lan, dport: lanPort('edge', 3), names: [], at: 1 }
+      { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${label(fx, 'driver', 1)}.familiar-check.test`], at: 150 },
+      { proto: 'udp', dst: fx.lan, dport: lanPort('driver', 99), names: [], at: 150 },
+      { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${label(fx, 'edge', 3)}.familiar-check.test`], at: 5000 },
+      { proto: 'udp', dst: fx.lan, dport: lanPort('edge', 3), names: [], at: 5000 }
     ];
-    const log = 'x sink refused 4 (connect 4, request 0, other 0)\n [core] EGRESS-DONE core\n [core] INFO egress view routes 42 ipc-after ok\n [core] INFO egress bare routes 42 ipc-after ok\n';
-    const base = { fx, hits, packets, dnsLog: `QueryName ${label(fx, 'driver', 1)}.familiar-check.test`, marks: {}, log, edge: {} };
-    const clean = egress(base);
-    expect(clean.lines.find((l: string) => l.includes('egress.controls'))).toMatch(/^PASS/);
-    expect(clean.lines.find((l: string) => l.includes('egress.core'))).toMatch(/^PASS/);
-    expect(clean.lines.find((l: string) => l.includes('egress.view'))).toMatch(/^PASS/);
+    const rec = JSON.stringify({ loop: 'rejected:TypeError', lan: 'rejected:TypeError', name: 'rejected:TypeError' });
+    const lines = ['x sink refused 4 (connect 4, request 0, other 0)'];
+    for (const ctx of ['core', 'view', 'bare']) for (const r of ROUTES) lines.push(`   1.00 [core] EGRESS ${ctx} ${r.id} ${rec}`);
+    lines.push(' [core] EGRESS-DONE core', ` [core] INFO egress view routes ${ROUTES.length} ipc-after ok`, ` [core] INFO egress bare routes ${ROUTES.length} ipc-after ok`);
+    const edge = Object.fromEntries(ROUTES.filter(r => !r.nav).map(r => [r.id, { loop: 'gathered:host', lan: 'error', name: 'error' }]));
+    return { fx, hits, packets, dnsLog: `QueryName ${label(fx, 'driver', 1)}.familiar-check.test`, marks, log: lines.join('\n') + '\n', edge };
+  }
+  const line = (r: { lines: string[] }, id: string) => r.lines.find(l => l.includes(`security.egress.${id} `)) ?? '';
 
-    const leaky = egress({ ...base, packets: [...packets, { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${coreFetch}.familiar-check.test`], at: 1 }] });
-    expect(leaky.lines.find((l: string) => l.includes('egress.core'))).toMatch(/^FAIL .*core:fetch\(dns 1\)/);
+  it('passes only with every record, every control, and this run stamped on it', () => {
+    const r = egress(evidence());
+    for (const id of ['controls', 'core', 'view']) expect(line(r, id)).toMatch(new RegExp(`^PASS .* run=${fx.run}$`));
+  });
 
-    const rtc = egress({ ...base, hits: [...hits, { kind: 'udp', listener: 'view-stun', stun: true }] });
-    expect(rtc.lines.find((l: string) => l.includes('egress.view'))).toMatch(/^FAIL .*view:webrtc-loopback\(1\)/);
-    expect(rtc.lines.find((l: string) => l.includes('egress.core'))).toMatch(/^PASS/);
+  it('a route is open when the listener, the capture or the DNS log saw its label', () => {
+    const base = evidence();
+    const leaky = egress({ ...base, packets: [...base.packets, { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${label(fx, 'core', 0)}.familiar-check.test`], at: 350 }] });
+    expect(line(leaky, 'core')).toMatch(/^FAIL .*core:fetch\(dns 1\)/);
+    const rtc = egress({ ...base, hits: [...base.hits, { kind: 'udp', listener: 'view-stun', stun: true, at: 550 }] });
+    expect(line(rtc, 'view')).toMatch(/^FAIL .*view:webrtc-loopback\(1\)/);
+    expect(line(rtc, 'core')).toMatch(/^PASS/);
+  });
 
-    const blind = egress({ ...base, hits: hits.slice(1) });
-    expect(blind.lines.find((l: string) => l.includes('egress.controls'))).toMatch(/^FAIL .*MISSING driver http/);
-    expect(blind.lines.find((l: string) => l.includes('egress.core'))).toMatch(/^FAIL .*proves nothing/);
+  it('a bare TCP connection or UDP to a TCP port while a page runs is open', () => {
+    const base = evidence();
+    const tcp = egress({ ...base, hits: [...base.hits, { kind: 'accept', listener: 'http', at: 320 }] });
+    expect(line(tcp, 'core')).toMatch(/^FAIL .*core:tcp-accept\(1\)/);
+    const quic = egress({ ...base, hits: [...base.hits, { kind: 'udp', listener: 'core-turn-tcp-udp', at: 720 }] });
+    expect(line(quic, 'view')).toMatch(/^FAIL .*bare:udp-to-tcp-ports\(1\)/);
+  });
 
-    const noSink = egress({ ...base, log: log.replace('sink refused 4', 'sink refused 0') });
-    expect(noSink.lines.find((l: string) => l.includes('egress.controls'))).toMatch(/^FAIL .*MISSING sink refusals/);
-    expect(ROUTES.length).toBeGreaterThan(30);
+  it('missing evidence fails, never counts as closed', () => {
+    const base = evidence();
+    // No records at all: the case that used to pass.
+    const bare = base.log.split('\n').filter(l => !/ EGRESS (core|view|bare) /.test(l)).join('\n');
+    const none = egress({ ...base, log: bare.replace(/routes \d+/g, 'routes 0') });
+    expect(line(none, 'core')).toMatch(/^FAIL .*no evidence: core:missing fetch/);
+    expect(line(none, 'view')).toMatch(/^FAIL .*no evidence/);
+    // One record missing, one broken, one skipped.
+    const one = egress({ ...base, log: base.log.replace(/.* EGRESS view img .*\n/, '') });
+    expect(line(one, 'view')).toMatch(/^FAIL .*view:missing img/);
+    const broken = egress({ ...base, log: base.log.replace(/( EGRESS core xhr ).*/, '$1{"loop":') });
+    expect(line(broken, 'core')).toMatch(/^FAIL .*core:broken xhr/);
+    const skipped = egress({ ...base, log: base.log.replace(/( EGRESS bare css-url ).*/, '$1{"loop":"skipped"}') });
+    expect(line(skipped, 'view')).toMatch(/^FAIL .*bare:broken css-url/);
+    const empty = egress({ ...base, log: base.log.replace(/( EGRESS core beacon ).*/, '$1{}') });
+    expect(line(empty, 'core')).toMatch(/^FAIL .*core:broken beacon/);
+    // A page that ran fewer routes than there are.
+    const short = egress({ ...base, log: base.log.replace(`view routes ${ROUTES.length}`, 'view routes 3') });
+    expect(line(short, 'view')).toMatch(/^FAIL .*IPC after the run missing in view/);
+    // No time window for a page: its bare TCP and UDP can't be judged.
+    const { 'core-start': _gone, ...rest } = base.marks;
+    expect(line(egress({ ...base, marks: rest }), 'core')).toMatch(/^FAIL .*core:no time window/);
+    // Edge with an empty or partial record proves nothing.
+    expect(line(egress({ ...base, edge: {} }), 'controls')).toMatch(/^FAIL .*MISSING Edge recorded every route: missing fetch/);
+    expect(line(egress({ ...base, edge: null }), 'core')).toMatch(/^FAIL .*proves nothing/);
+  });
+
+  it('a control that sees nothing fails every egress id', () => {
+    const base = evidence();
+    const blind = egress({ ...base, hits: base.hits.slice(1) });
+    expect(line(blind, 'controls')).toMatch(/^FAIL .*MISSING driver http/);
+    expect(line(blind, 'core')).toMatch(/^FAIL .*proves nothing/);
+    const noAccept = egress({ ...base, hits: base.hits.filter(h => !(h.kind === 'accept' && h.at === 150)) });
+    expect(line(noAccept, 'controls')).toMatch(/^FAIL .*MISSING driver bare TCP connection/);
+    const noQuic = egress({ ...base, hits: base.hits.filter(h => h.listener !== 'core-turn-tcp-udp') });
+    expect(line(noQuic, 'controls')).toMatch(/^FAIL .*MISSING driver UDP to core's TCP TURN port/);
+    const noEdgeRtc = egress({ ...base, hits: base.hits.filter(h => h.listener !== 'edge-stun') });
+    expect(line(noEdgeRtc, 'controls')).toMatch(/^FAIL .*MISSING Edge's WebRTC/);
+    const noSink = egress({ ...base, log: base.log.replace('sink refused 4', 'sink refused 0') });
+    expect(line(noSink, 'controls')).toMatch(/^FAIL .*MISSING sink refusals/);
+    expect(ROUTES.length).toBeGreaterThan(40);
   });
 });

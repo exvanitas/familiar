@@ -105,6 +105,10 @@ export function parsePcapng(buf) {
 
 const FAMILIAR = ['core', 'view', 'bare'];
 
+/* One route's record, as the page wrote it: an object of non-empty strings, one per target. */
+const structured = v => v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
+  Object.values(v).every(x => typeof x === 'string' && x.length > 0 && x !== 'skipped');
+
 export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
   const lines = [], table = [];
   const has = (s, l) => s.includes(l);
@@ -113,7 +117,29 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
   const lanTo = (ctx, i) => packets.filter(p => p.dst === fx.lan && p.dport === lanPort(ctx, i));
   const listenerFor = ctx => new Set([`${ctx}-stun`, `${ctx}-turn`, `${ctx}-turn-tcp`]);
   const egressLines = log.split('\n').filter(l => / EGRESS /.test(l));
-  const ipcAfter = ctx => (ctx === 'core' ? log.includes('EGRESS-DONE core') : new RegExp(`INFO egress ${ctx} routes \\d+ ipc-after ok`).test(log));
+  const ipcAfter = ctx => (ctx === 'core' ? log.includes('EGRESS-DONE core') : new RegExp(`INFO egress ${ctx} routes ${ROUTES.length} ipc-after ok`).test(log));
+  const recordOf = (ctx, id) => {
+    const line = egressLines.find(x => x.includes(` EGRESS ${ctx} ${id} `));
+    if (line === undefined) return undefined;
+    try { return JSON.parse(line.replace(/^.* EGRESS \S+ \S+ /, '')); } catch { return null; }
+  };
+  // Evidence: every route must have a record from every page, or nothing about it was proved.
+  // A missing or broken record is a failure, never "closed".
+  const evidence = ctx => {
+    const bad = [];
+    for (const r of ROUTES) {
+      if (ctx === 'edge' && r.nav) continue;
+      const rec = ctx === 'edge' ? (edge && typeof edge === 'object' ? edge[r.id] : undefined) : recordOf(ctx, r.id);
+      if (rec === undefined) bad.push(`missing ${r.id}`);
+      else if (!structured(rec)) bad.push(`broken ${r.id}`);
+    }
+    if (ctx !== 'edge' && !(marks[`${ctx}-start`]?.at && marks[`${ctx}-end`]?.at)) bad.push('no time window');
+    return bad;
+  };
+  const inWindow = (h, name, pad = 2000) => {
+    const a = marks[`${name}-start`]?.at, b = marks[`${name}-end`]?.at;
+    return a != null && b != null && h.at >= a && h.at <= b + pad;
+  };
 
   // Per context: which routes got out, and how.
   const open = {};
@@ -138,6 +164,15 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
     // The loopback STUN and TURN listeners are one set per page, shared by its WebRTC routes.
     if (udpTcp.length) open[ctx].push(`webrtc-loopback(${udpTcp.length})`);
     table.push(`| ${ctx} | webrtc-loopback | ${udpTcp.length ? 'OPEN ' + udpTcp.length + ' packets or connections' : 'closed'} | the page's STUN and TURN listeners on 127.0.0.1 |`);
+    if (ctx === 'edge') continue;
+    // A bare TCP connection that never sends a request, or UDP (QUIC) to a TCP port, carries no
+    // label, so it's counted by the time the page ran.
+    const accepts = hits.filter(h => h.kind === 'accept' && inWindow(h, ctx)).length;
+    const quic = hits.filter(h => h.kind === 'udp' && /-udp$/.test(h.listener ?? '') && inWindow(h, ctx)).length;
+    if (accepts) open[ctx].push(`tcp-accept(${accepts})`);
+    if (quic) open[ctx].push(`udp-to-tcp-ports(${quic})`);
+    table.push(`| ${ctx} | tcp-accept | ${accepts ? 'OPEN ' + accepts : 'closed'} | any TCP connection to the HTTP listener while the page ran |`);
+    table.push(`| ${ctx} | udp-to-tcp-ports | ${quic ? 'OPEN ' + quic : 'closed'} | UDP to a TCP listener's port while the page ran |`);
   }
 
   // The sink: the count must have moved, and the more so while the pages tried.
@@ -160,7 +195,14 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
   const edgeHttp = hits.filter(h => h.label?.startsWith(fx.run + 'e')).length;
   const edgeDns = packets.filter(p => p.names.some(n => n.startsWith(fx.run + 'e'))).length;
   const edgeLan = packets.filter(p => p.dst === fx.lan && p.dport >= lanPort('edge', 0) && p.dport < lanPort('edge', 100)).length;
-  ctl(edge != null, 'Edge ran the hostile page');
+  const edgeBad = evidence('edge');
+  ctl(edgeBad.length === 0, `Edge recorded every route${edgeBad.length ? ': ' + edgeBad.slice(0, 6).join(', ') : ''}`);
+  const inDriver = h => inWindow(h, 'driver', 0);
+  ctl(hits.some(h => h.kind === 'accept' && inDriver(h)), 'driver bare TCP connection to the HTTP listener');
+  ctl(hits.some(h => h.kind === 'udp' && h.listener === 'http-udp' && inDriver(h)), "driver UDP to the HTTP listener's port");
+  for (const name of Object.keys(fx.turnTcp ?? {})) {
+    ctl(hits.some(h => h.kind === 'udp' && h.listener === `${name}-turn-tcp-udp` && inDriver(h)), `driver UDP to ${name}'s TCP TURN port`);
+  }
   ctl(edgeHttp > 0, `Edge's requests at the listener (${edgeHttp})`);
   ctl(edgeDns > 0, `Edge's lookups in the capture (${edgeDns})`);
   ctl(edgeLan > 0, `Edge's packets to the LAN address in the capture (${edgeLan})`);
@@ -173,8 +215,10 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
   const verdict = (id, ctxs) => {
     const bad = ctxs.flatMap(x => open[x].map(r => `${x}:${r}`));
     const notDone = ctxs.filter(x => !ipcAfter(x));
-    const ok = controlsOk && bad.length === 0 && notDone.length === 0;
+    const noEvidence = ctxs.flatMap(x => evidence(x).map(e => `${x}:${e}`));
+    const ok = controlsOk && bad.length === 0 && notDone.length === 0 && noEvidence.length === 0;
     const why = [
+      noEvidence.length ? `no evidence: ${noEvidence.slice(0, 12).join(' ')}${noEvidence.length > 12 ? ` and ${noEvidence.length - 12} more` : ''}` : `every route recorded in ${ctxs.join('+')}`,
       bad.length ? `open: ${bad.join(' ')}` : `${ROUTES.length} routes closed in ${ctxs.join('+')}`,
       notDone.length ? `IPC after the run missing in ${notDone.join(',')}` : 'IPC worked after',
       controlsOk ? 'controls saw' : 'a control saw nothing, so this proves nothing',
@@ -195,6 +239,8 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
   });
   lines.push(`PASS check.egress.mdns-llmnr packets to 5353/5355 while pages ran: ${quiet.join(', ')}; whole capture ${packets.filter(p => p.dport === 5353 || p.dport === 5355).length}`);
   lines.push(`PASS check.egress.sink total ${sinkTotal}, during the pages' runs ${during ?? '?'}, marks ${JSON.stringify(Object.fromEntries(Object.entries(marks).map(([k, v]) => [k, v.sink])))}`);
+  // Each verdict carries this run's id, so one left from another run can't be read as this one's.
+  for (let i = 0; i < lines.length; i++) lines[i] += ` run=${fx.run}`;
   const md = ['| page | route | wire | what the page saw |', '| --- | --- | --- | --- |', ...table, '', '**Controls**: ' + c.join('; ')].join('\n');
   return { lines, md, open, controlsOk };
 }
