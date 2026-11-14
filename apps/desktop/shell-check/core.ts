@@ -7,6 +7,7 @@ import { bus, check, fail, fixtures, gate, ok, rand, raw, say, shell, skip, slee
 import { hostile } from './hostile.ts';
 import { CORE_EVENT_NAMES, CORE_ONLY, EVENTS, NOT_YET, PLUGINS } from './lists.ts';
 import { allowed, trySinks } from './tt.ts';
+import { procPhase } from './procs.ts';
 
 const messages: CoreMessage[] = [];
 let onQuitting: () => void = () => {};
@@ -448,6 +449,11 @@ async function pinRead(info: Info, value: string, id: string) {
       await step('mark', { name: 'webrtc-' + arg(info, '--variant') });
       const out = await hostile('probe', await fixtures(), { nav: false, only: ['webrtc-stun', 'webrtc-turn', 'webrtc-frame'] });
       await say(`INFO webrtc ${arg(info, '--variant')} ${JSON.stringify(out)}`);
+      onQuitting = () => { shell.quitReady().catch(() => {}); };
+      await say('DONE');
+      await shell.quit();
+    } else if (phase.startsWith('proc-')) {
+      await procPhase(phase, info, messages);
       onQuitting = () => { shell.quitReady().catch(() => {}); };
       await say('DONE');
       await shell.quit();

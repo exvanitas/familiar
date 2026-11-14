@@ -27,6 +27,11 @@
     "webrtc.env-override",
     "sink.slow-clients",
     "queue.early",
-    "start.overlap"
+    "start.overlap",
+    "system.idle",
+    "wake.hidden",
+    "toast.app-id",
+    "persist.notified",
+    "autostart"
   ]
 }

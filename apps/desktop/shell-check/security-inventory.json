@@ -21,6 +21,18 @@
     "quit.clean",
     "download.refused",
     "assets.inside",
-    "harden.before-page"
+    "harden.before-page",
+    "server.approve",
+    "server.reask",
+    "server.paths",
+    "server.remote-drive",
+    "server.links",
+    "server.settings",
+    "server.env",
+    "server.start-failed",
+    "server.store-recovery",
+    "server.kill",
+    "link.confirm",
+    "files.save-refused"
   ]
 }
