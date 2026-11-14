@@ -166,5 +166,26 @@ fn window_self(window: WebviewWindow, op: String) -> Res<()> {
 }
 
 pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![shell_info, shell_ready, log_line, quit, quit_ready, tray_set, view_open, window_ctl, window_self]
+    tauri::generate_handler![
+        shell_info,
+        shell_ready,
+        log_line,
+        quit,
+        quit_ready,
+        tray_set,
+        view_open,
+        window_ctl,
+        window_self,
+        crate::servers::server_start,
+        crate::servers::server_write,
+        crate::servers::server_stop,
+        crate::servers::server_forget,
+        crate::system::system,
+        crate::system::wake_at,
+        crate::notify::autostart,
+        crate::files::pick_path,
+        crate::files::save_as,
+        crate::files::open_url,
+        crate::files::open_folder,
+    ]
 }

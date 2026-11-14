@@ -4,12 +4,17 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ask;
 mod assets;
 mod commands;
+mod files;
+mod notify;
 mod pages;
 mod platform;
+mod servers;
 mod shell;
 mod sink;
+mod system;
 mod tray;
 
 use assets::FolderAssets;
@@ -80,6 +85,8 @@ fn start(app: &AppHandle, args: Args, app_dir: PathBuf, log: Arc<Log>) -> Result
 
     let seconds = args.seconds;
     app.manage(Shell::new(app_dir, data_dir, webview_dir, log_path, &args, log.clone(), sink_port, sink));
+    notify::register_app_id(&app.state::<Shell>());
+    system::start(app);
 
     // The tray first, so Quit works whatever the pages do.
     if let Err(e) = tray::create(app) {
@@ -139,6 +146,10 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(second_launch))
+        .manage(servers::Servers::default())
+        .manage(system::Clock::default())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(commands::handler())
         .on_window_event(|w, e| {
             if matches!(e, tauri::WindowEvent::Destroyed) {

@@ -14,6 +14,17 @@ const COMMANDS: &[&str] = &[
     "view_open",
     "window_ctl",
     "window_self",
+    "server_start",
+    "server_write",
+    "server_stop",
+    "server_forget",
+    "system",
+    "wake_at",
+    "autostart",
+    "pick_path",
+    "save_as",
+    "open_url",
+    "open_folder",
 ];
 
 fn main() {

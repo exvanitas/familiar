@@ -4,8 +4,17 @@
   "windows": ["core"],
   "permissions": [
     "core:event:allow-listen", "core:event:allow-unlisten",
+    "notification:allow-notify", "notification:allow-is-permission-granted",
+    "notification:allow-register-action-types",
+    "notification:allow-register-listener", "notification:allow-remove-listener",
+    "global-shortcut:allow-register", "global-shortcut:allow-unregister",
+    "global-shortcut:allow-is-registered",
     "allow-shell-info", "allow-shell-ready", "allow-log-line",
     "allow-quit", "allow-quit-ready", "allow-tray-set",
-    "allow-view-open", "allow-window-ctl"
+    "allow-system", "allow-wake-at",
+    "allow-view-open", "allow-window-ctl",
+    "allow-server-start", "allow-server-write", "allow-server-stop", "allow-server-forget",
+    "allow-pick-path", "allow-save-as", "allow-open-url", "allow-open-folder",
+    "allow-autostart"
   ]
 }
