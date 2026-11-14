@@ -6,7 +6,10 @@
 //! can't be read counts as an empty list.
 //!
 //! Whether an address may be used is the owner's (`crate::owner`): `Saved`, `Removing` from the
-//! moment its removal begins until the list without it is durably written, then `Removed`. Every
+//! moment its removal begins until the list without it is durably written, then `Removed`. A
+//! removal is durable before anything irreversible: the entry is written as `removing` first,
+//! then its key is deleted, then the list is written without it. An entry loaded as `removing`
+//! starts `Removing`, refusing everything, and the removal is finished at start. Every
 //! command here is async, and anything that blocks (the dialog, a lookup, a file or credential
 //! write) runs off the async workers.
 
@@ -33,6 +36,9 @@ pub struct Saved {
     pub reach: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ports: Option<(u16, u16)>,
+    /// Its removal has begun and isn't finished.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removing: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,8 +126,21 @@ impl Addresses {
                 }
             },
         };
-        let owner = Owner::new(list.iter().map(|a| a.id.clone()));
-        Addresses { path, list: Mutex::new(list), save: Mutex::new(()), log, owner }
+        let owner = Owner::new(list.iter().map(|a| (a.id.clone(), a.removing)));
+        let unfinished: Vec<String> = list.iter().filter(|a| a.removing).map(|a| a.id.clone()).collect();
+        let addresses = Addresses { path, list: Mutex::new(list), save: Mutex::new(()), log, owner };
+        // A removal a run before didn't finish: finished now, before any page runs. Until it is,
+        // the address refuses everything.
+        for id in unfinished {
+            match shell_core::owner::run_removal(&mut Durable(&addresses), &id) {
+                Ok(()) => {
+                    addresses.owner.removed(&id);
+                    addresses.log.line(&format!("address removed {id}, finishing a removal from before"));
+                }
+                Err(e) => addresses.log.line(&format!("address {id} is still being removed: {e}")),
+            }
+        }
+        addresses
     }
 
     fn sound(a: &Saved) -> bool {
@@ -146,6 +165,20 @@ impl Addresses {
         self.save(&next)?;
         *lock(&self.list) = next;
         Ok(saved)
+    }
+
+    /// Writes the list with the address marked as being removed. Blocking.
+    fn mark_removing_durably(&self, id: &str) -> Result<(), Fail> {
+        let _save = lock(&self.save);
+        let mut next = lock(&self.list).clone();
+        let a = next.iter_mut().find(|a| a.id == id).ok_or_else(|| fail("not-saved", "no such address"))?;
+        if a.removing {
+            return Ok(());
+        }
+        a.removing = true;
+        self.save(&next)?;
+        *lock(&self.list) = next;
+        Ok(())
     }
 
     /// Writes the list without the address, then drops it from memory. Blocking.
@@ -198,7 +231,8 @@ pub async fn address_add(app: AppHandle, kind: String, url: String, label: Strin
     let candidate = address::check_add(kind, &url, &label, ports)?;
     // 2. An identical address: returned, with no dialog.
     let identity = candidate.identity.clone();
-    let same = move |a: &Saved| a.kind == kind.as_str() && a.url == identity.url && a.ports == identity.ports;
+    // An address being removed isn't the same address: asking again saves a new one.
+    let same = move |a: &Saved| !a.removing && a.kind == kind.as_str() && a.url == identity.url && a.ports == identity.ports;
     if let Some(a) = app.state::<Addresses>().all().into_iter().find(|a| same(a)) {
         return Ok(a);
     }
@@ -229,6 +263,7 @@ pub async fn address_add(app: AppHandle, kind: String, url: String, label: Strin
         label,
         reach: reach.as_str().into(),
         ports: candidate.identity.ports,
+        removing: false,
     };
     let a = app.clone();
     let stored = blocking(move || a.state::<Addresses>().add_durably(saved, same)).await??;
@@ -238,24 +273,36 @@ pub async fn address_add(app: AppHandle, kind: String, url: String, label: Strin
     Ok(stored)
 }
 
+/// A removal's durable steps on the real list and Credential Manager. Blocking.
+struct Durable<'a>(&'a Addresses);
+
+impl shell_core::owner::RemovalStore for Durable<'_> {
+    fn mark_removing(&mut self, id: &str) -> Result<(), String> {
+        self.0.mark_removing_durably(id).map_err(|e| e.message)
+    }
+    fn delete_key(&mut self, id: &str) -> Result<(), String> {
+        crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id: id.to_string() }).map_err(|_| "the address's key couldn't be deleted".to_string())
+    }
+    fn write_without(&mut self, id: &str) -> Result<(), String> {
+        self.0.remove_durably(id).map_err(|e| e.message)
+    }
+}
+
 /// Removes an address. From the first moment it's `Removing`: its requests end `revoked`, and new
-/// requests and key writes are refused. Once no key write is running its key is deleted, then the
-/// list without it is written, and only then is it `Removed`. If either fails, it stays
-/// `Removing`, still refusing everything, and a retry continues from there.
+/// requests and key writes are refused. Once every one of its requests' transports has terminated
+/// and no key write is running, the removal is made durable (`run_removal`): the entry written as
+/// removing, its key deleted, the list written without it, and only then is it `Removed`. If any
+/// step fails it stays `Removing`, still refusing everything, across a restart too, and a retry,
+/// or the next start, continues from there.
 #[tauri::command]
 pub async fn address_remove(app: AppHandle, id: String) -> Result<(), Fail> {
     let addresses = app.state::<Addresses>();
-    addresses.owner.begin_remove(&id).map_err(|_| fail("not-saved", "no such address"))?;
-    addresses.owner.writes_over(&id).await;
+    addresses.owner.begin_remove(&id).await.map_err(|_| fail("not-saved", "no such address"))?;
     let (a, i) = (app.clone(), id.clone());
-    let done = blocking(move || {
-        crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id: i.clone() }).map_err(|_| fail("failed", "the address's key couldn't be deleted"))?;
-        a.state::<Addresses>().remove_durably(&i)
-    })
-    .await?;
+    let done = blocking(move || shell_core::owner::run_removal(&mut Durable(a.state::<Addresses>().inner()), &i)).await?;
     if let Err(e) = done {
         addresses.log.line(&format!("address {id} not removed yet: it stays refused until a retry completes"));
-        return Err(e);
+        return Err(fail("failed", e));
     }
     addresses.owner.removed(&id);
     addresses.log.line(&format!("address removed {id}"));

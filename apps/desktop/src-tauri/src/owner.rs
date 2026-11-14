@@ -1,8 +1,10 @@
 //! The one owner of every saved address's and every guarded request's state: shell-core's
 //! `owner::Ledger`, behind one lock that's never held across a wait, with each open request's
-//! connection beside it. See "5c. The guarded fetch" in docs/shell-design.md. Every transition is
-//! one call here, and whatever it ends is ended in the same critical section: its connection is
-//! dropped and its waits are woken.
+//! stop signal and read queue beside it. See "5c. The guarded fetch" in docs/shell-design.md.
+//!
+//! Every transition is one call here. A request's transport is one task (`net.rs`) that says when
+//! it has terminated; a cancel and a removal end their requests at once, then wait, without
+//! blocking a thread, until every one of those tasks has said so, before they return or go on.
 
 use crate::shell::lock;
 use shell_core::{
@@ -11,41 +13,46 @@ use shell_core::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
-use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
-/// Why a request was ended from outside, as its waits see it.
+/// What a request's transport task watches: running, or ended and why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stop {
     Running,
     Ended(FetchError),
 }
 
-/// One open request: how to stop its waits, and its body once the head has come.
-pub struct Live<B> {
-    pub stop: watch::Sender<Stop>,
-    pub body: AsyncMutex<Option<B>>,
+/// One open request, as the owner holds it: how to stop its task, and how to ask it for a read.
+struct Live<R> {
+    stop: watch::Sender<Stop>,
+    reads: mpsc::Sender<R>,
 }
 
-struct Book<B> {
+struct Book<R> {
     ledger: Ledger,
-    live: HashMap<String, Arc<Live<B>>>,
+    live: HashMap<String, Live<R>>,
 }
 
-pub struct Owner<B> {
-    book: Mutex<Book<B>>,
-    /// Woken whenever a key write ends, for a removal waiting to delete the key.
-    writes_done: Notify,
+pub struct Owner<R> {
+    book: Mutex<Book<R>>,
+    /// Woken whenever a transport terminates or a key write ends.
+    changed: Notify,
 }
 
-impl<B> Owner<B> {
-    pub fn new(saved: impl IntoIterator<Item = String>) -> Owner<B> {
+impl<R> Owner<R> {
+    /// The owner, from the list as loaded: each id, and whether it's marked as being removed.
+    pub fn new(loaded: impl IntoIterator<Item = (String, bool)>) -> Owner<R> {
         let mut ledger = Ledger::default();
-        for id in saved {
-            ledger.saved(&id);
+        for (id, removing) in loaded {
+            if removing {
+                ledger.loaded_removing(&id);
+            } else {
+                ledger.saved(&id);
+            }
         }
-        Owner { book: Mutex::new(Book { ledger, live: HashMap::new() }), writes_done: Notify::new() }
+        Owner { book: Mutex::new(Book { ledger, live: HashMap::new() }), changed: Notify::new() }
     }
 
     /// A new address, once durably written.
@@ -53,14 +60,15 @@ impl<B> Owner<B> {
         lock(&self.book).ledger.saved(id);
     }
 
-    /// Registers a request: the address checked and the request open, in one step.
-    pub fn register(&self, id: &str, address: &str, fetchable: bool) -> Result<(Arc<Live<B>>, watch::Receiver<Stop>), FetchError> {
+    /// Registers a request, its address checked, in one step. Returns what its transport task
+    /// watches and the queue its reads come in on.
+    pub fn register(&self, id: &str, address: &str, fetchable: bool) -> Result<(watch::Receiver<Stop>, mpsc::Receiver<R>), FetchError> {
         let mut book = lock(&self.book);
         book.ledger.register(id, address, fetchable, fetch::MAX_OPEN)?;
         let (stop, stopped) = watch::channel(Stop::Running);
-        let live = Arc::new(Live { stop, body: AsyncMutex::new(None) });
-        book.live.insert(id.to_string(), live.clone());
-        Ok((live, stopped))
+        let (reads, queue) = mpsc::channel(4);
+        book.live.insert(id.to_string(), Live { stop, reads });
+        Ok((stopped, queue))
     }
 
     pub fn advance(&self, id: &str, to: ReqState) -> Result<(), FetchError> {
@@ -71,19 +79,12 @@ impl<B> Owner<B> {
         lock(&self.book).ledger.check(id)
     }
 
-    pub fn live(&self, id: &str) -> Option<Arc<Live<B>>> {
-        lock(&self.book).live.get(id).cloned()
+    /// Where to ask an open request for a read.
+    pub fn reads(&self, id: &str) -> Option<mpsc::Sender<R>> {
+        lock(&self.book).live.get(id).map(|l| l.reads.clone())
     }
 
-    fn drop_live(book: &mut Book<B>, id: &str, why: Option<FetchError>) {
-        if let Some(l) = book.live.remove(id) {
-            if let Some(e) = why {
-                let _ = l.stop.send(Stop::Ended(e));
-            }
-        }
-    }
-
-    /// The request ended on its own, with an error or at the real end of its body.
+    /// The request ended by itself: with an error, or at the real end of its body.
     pub fn end(&self, id: &str, why: Option<FetchError>) {
         let mut book = lock(&self.book);
         match why {
@@ -92,40 +93,61 @@ impl<B> Owner<B> {
             }
             None => book.ledger.finish(id),
         }
-        Self::drop_live(&mut book, id, None);
     }
 
-    /// `net_cancel`: in one step, an open request ends and its connection goes, or an id not yet
-    /// registered is ended so its registration is refused.
-    pub fn cancel(&self, id: &str) {
-        let mut book = lock(&self.book);
-        if book.ledger.cancel(id, fetch::valid_id(id)) {
-            Self::drop_live(&mut book, id, Some(FetchError::Cancelled));
+    /// Its transport task has terminated: connection dropped, nothing more can be sent.
+    pub fn terminated(&self, id: &str) {
+        {
+            let mut book = lock(&self.book);
+            book.ledger.terminated(id);
+            book.live.remove(id);
+        }
+        self.changed.notify_waiters();
+    }
+
+    fn signal(book: &Book<R>, id: &str, why: FetchError) {
+        if let Some(l) = book.live.get(id) {
+            let _ = l.stop.send(Stop::Ended(why));
         }
     }
 
-    /// A removal begins or is retried: the address is `Removing`, and every request under it
-    /// ends `revoked` with its connection.
-    pub fn begin_remove(&self, address: &str) -> Result<(), FetchError> {
-        let mut book = lock(&self.book);
-        for id in book.ledger.begin_remove(address)? {
-            Self::drop_live(&mut book, &id, Some(FetchError::Revoked));
-        }
-        Ok(())
-    }
-
-    /// Waits, without blocking a thread, until no key write for the address is running. None can
-    /// start once its removal has begun.
-    pub async fn writes_over(&self, address: &str) {
+    /// Waits, without blocking a thread, until `done` holds.
+    async fn until(&self, done: impl Fn(&Ledger) -> bool) {
         loop {
-            let woken = self.writes_done.notified();
+            let woken = self.changed.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
-            if lock(&self.book).ledger.writes(address) == 0 {
+            if done(&lock(&self.book).ledger) {
                 return;
             }
             woken.await;
         }
+    }
+
+    /// `net_cancel`: the request ends now (or an id not yet registered is ended, so its
+    /// registration is refused), and this returns only once its transport has terminated.
+    pub async fn cancel(&self, id: &str) {
+        {
+            let mut book = lock(&self.book);
+            if book.ledger.cancel(id, fetch::valid_id(id)) {
+                Self::signal(&book, id, FetchError::Cancelled);
+            }
+        }
+        self.until(|l| !l.running(id)).await;
+    }
+
+    /// A removal begins or is retried: the address is `Removing`, and every request under it ends
+    /// `revoked`. Then waits until each of their transports has terminated and no key write for
+    /// the address is running.
+    pub async fn begin_remove(&self, address: &str) -> Result<(), FetchError> {
+        {
+            let mut book = lock(&self.book);
+            for id in book.ledger.begin_remove(address)? {
+                Self::signal(&book, &id, FetchError::Revoked);
+            }
+        }
+        self.until(|l| l.settled(address)).await;
+        Ok(())
     }
 
     /// The list without the address is durably written.
@@ -139,6 +161,6 @@ impl<B> Owner<B> {
 
     pub fn end_write(&self, address: &str) {
         lock(&self.book).ledger.end_write(address);
-        self.writes_done.notify_waiters();
+        self.changed.notify_waiters();
     }
 }

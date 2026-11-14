@@ -7,12 +7,15 @@
 //! A request is pull-based: `net_fetch` returns the head, then each `net_read` returns up to 1 MiB
 //! of the body after redaction, and an empty read only at the real end. Its state is the owner's
 //! (`crate::owner`): registered with its address checked, resolving under a deadline, sending,
-//! streaming, ended. `net_cancel` and removing its address are transitions there, and every wait
-//! here checks the state on entering and leaving.
+//! streaming, ended. Its transport, from the lookup to the last byte, is one task that owns the
+//! connection and tells the owner when it has terminated; `net_read` asks it for each read.
+//! `net_cancel` and removing the address end it in the owner and return only after it has
+//! terminated. Every wait checks the request's state first (a biased select), so nothing is sent
+//! once it has ended.
 
 use crate::{
     addresses::{Addresses, Saved},
-    owner::{Live, Stop},
+    owner::Stop,
     secrets,
 };
 use reqwest::{
@@ -35,7 +38,7 @@ use std::{
     time::Duration,
 };
 use tauri::{ipc::Response, AppHandle, Manager};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug, Serialize)]
 pub struct Fail {
@@ -57,7 +60,10 @@ pub struct Body {
     ended: bool,
 }
 
-pub type Owner = crate::owner::Owner<Body>;
+/// A read, asked of a request's transport task: where its answer goes.
+pub type Read = oneshot::Sender<Result<Vec<u8>, FetchError>>;
+
+pub type Owner = crate::owner::Owner<Read>;
 
 /// The kept clients. Every request's state is the owner's, in `Addresses`.
 #[derive(Default)]
@@ -167,13 +173,28 @@ fn kind_of(e: &reqwest::Error) -> FetchError {
     FetchError::Network
 }
 
+/// Resolves once the owner has ended the request, with why. Checked on the first poll, so in a
+/// biased select it wins over anything else that's ready.
+async fn stopped(stop: &mut watch::Receiver<Stop>) -> FetchError {
+    loop {
+        if let Stop::Ended(e) = *stop.borrow_and_update() {
+            return e;
+        }
+        if stop.changed().await.is_err() {
+            return FetchError::Cancelled;
+        }
+    }
+}
+
 /// One wait of a request: `f`, unless the owner ends the request first or `limit` passes. The
-/// request's state is checked on entering and on leaving, so an end that came in between wins.
+/// state is checked before `f` is first polled and on every wake, so an ended request never
+/// polls `f` again; the owner's state is checked again on leaving.
 async fn wait<T>(owner: &Owner, id: &str, stop: &mut watch::Receiver<Stop>, limit: Duration, f: impl Future<Output = Result<T, FetchError>>) -> Result<T, FetchError> {
     owner.check(id)?;
     let r = tokio::select! {
+        biased;
+        e = stopped(stop) => Err(e),
         r = tokio::time::timeout(limit, f) => r.unwrap_or(Err(FetchError::Timeout)),
-        _ = stop.changed() => Err(match *stop.borrow() { Stop::Ended(e) => e, Stop::Running => FetchError::Cancelled }),
     };
     owner.check(id)?;
     r
@@ -192,29 +213,83 @@ pub async fn net_fetch(app: AppHandle, request: tauri::ipc::Request<'_>) -> Resu
         tauri::ipc::InvokeBody::Raw(b) => b.clone(),
         tauri::ipc::InvokeBody::Json(_) => vec![],
     };
-    run(&app, spec, body).await.map_err(fail)
+    start(&app, spec, body).await.map_err(fail)
 }
 
-async fn run(app: &AppHandle, spec: Spec, body: Vec<u8>) -> Result<Head, FetchError> {
+/// Registers the request, its address checked, in one step of the owner, then starts its
+/// transport task and waits for the head.
+async fn start(app: &AppHandle, spec: Spec, body: Vec<u8>) -> Result<Head, FetchError> {
     if !fetch::valid_id(&spec.id) {
         return Err(FetchError::Invalid);
     }
     let addresses = app.state::<Addresses>();
-    let owner = &addresses.owner;
     let found = addresses.get(&spec.address);
     let fetchable = found.as_ref().is_some_and(|(a, _)| matches!(Kind::parse(&a.kind), Some(Kind::Model | Kind::Server)));
-    // Registered first, with its address checked, in one step of the owner: from here a cancel or
-    // a removal ends it, in whatever state it's in.
-    let (live, mut stop) = owner.register(&spec.id, &spec.address, fetchable)?;
-    let id = spec.id.clone();
-    let result = go(app, owner, &live, &mut stop, found.expect("registered, so it's saved"), spec, body).await;
-    if let Err(e) = result {
-        owner.end(&id, Some(e));
-    }
-    result
+    let (stop, reads) = addresses.owner.register(&spec.id, &spec.address, fetchable)?;
+    let found = found.expect("registered, so it's saved");
+    let (head, got) = oneshot::channel();
+    tauri::async_runtime::spawn(transport(app.clone(), spec, found, body, stop, reads, head));
+    got.await.unwrap_or(Err(FetchError::Network))
 }
 
-async fn go(app: &AppHandle, owner: &Owner, live: &Live<Body>, stop: &mut watch::Receiver<Stop>, (saved, norm): (Saved, Normalized), spec: Spec, body: Vec<u8>) -> Result<Head, FetchError> {
+/// Tells the owner the transport has terminated when it goes, on every way out, a panic
+/// included. Declared first in the task, so it goes last, after the connection.
+struct Terminated {
+    app: AppHandle,
+    id: String,
+}
+
+impl Drop for Terminated {
+    fn drop(&mut self) {
+        self.app.state::<Addresses>().owner.terminated(&self.id);
+    }
+}
+
+/// One request's transport, from its lookup to its last byte: it owns the connection, answers
+/// reads, and ends when the body does, on an error, or when the owner ends the request.
+async fn transport(app: AppHandle, spec: Spec, found: (Saved, Normalized), body: Vec<u8>, mut stop: watch::Receiver<Stop>, mut reads: mpsc::Receiver<Read>, head: oneshot::Sender<Result<Head, FetchError>>) {
+    let _terminated = Terminated { app: app.clone(), id: spec.id.clone() };
+    let id = spec.id.clone();
+    let addresses = app.state::<Addresses>();
+    let owner = &addresses.owner;
+    let mut b = match go(&app, owner, &mut stop, found, spec, body).await {
+        Ok((h, b)) => {
+            if head.send(Ok(h)).is_err() {
+                owner.end(&id, Some(FetchError::Cancelled));
+                return;
+            }
+            b
+        }
+        Err(e) => {
+            owner.end(&id, Some(e));
+            let _ = head.send(Err(e));
+            return;
+        }
+    };
+    loop {
+        let reply = tokio::select! {
+            biased;
+            _ = stopped(&mut stop) => return,
+            r = reads.recv() => match r {
+                Some(r) => r,
+                None => return,
+            },
+        };
+        let out = read_once(owner, &id, &mut stop, &mut b).await;
+        let over = !matches!(&out, Ok(v) if !v.is_empty());
+        match &out {
+            Err(e) => owner.end(&id, Some(*e)),
+            Ok(v) if v.is_empty() => owner.end(&id, None),
+            Ok(_) => {}
+        }
+        let _ = reply.send(out);
+        if over {
+            return;
+        }
+    }
+}
+
+async fn go(app: &AppHandle, owner: &Owner, stop: &mut watch::Receiver<Stop>, (saved, norm): (Saved, Normalized), spec: Spec, body: Vec<u8>) -> Result<(Head, Body), FetchError> {
     let id = spec.id.as_str();
     let reach = crate::addresses::reach(&saved).ok_or(FetchError::NotSaved)?;
     let mut url = address::under(&norm, spec.url.as_str())?;
@@ -258,9 +333,9 @@ async fn go(app: &AppHandle, owner: &Owner, live: &Live<Body>, stop: &mut watch:
         return Err(FetchError::TooLarge);
     }
     let status = response.status().as_u16();
-    *live.body.lock().await = Some(Body { response, redactor: Redactor::new(&secrets, KEY_MARK), out: vec![], total: 0, limits, ended: false });
+    let body = Body { response, redactor: Redactor::new(&secrets, KEY_MARK), out: vec![], total: 0, limits, ended: false };
     owner.advance(id, ReqState::Streaming)?;
-    Ok(Head { status, status_text: head.status_text, headers: head.headers, url: head.url, redirected })
+    Ok((Head { status, status_text: head.status_text, headers: head.headers, url: head.url, redirected }, body))
 }
 
 /// Sends, following redirects only under the same saved address.
@@ -289,7 +364,7 @@ async fn send(
                 rb = rb.body(b.clone());
             }
         }
-        let response = wait(owner, id, stop, limits.headers, async { rb.send().await.map_err(|e| kind_of(&e)) }).await?;
+        let response = wait(owner, id, stop, limits.headers, async move { rb.send().await.map_err(|e| kind_of(&e)) }).await?;
         let status = response.status();
         if !status.is_redirection() || status == StatusCode::NOT_MODIFIED {
             return Ok((response, hop > 0));
@@ -305,56 +380,58 @@ async fn send(
 }
 
 /// Up to 1 MiB of the body, after redaction. Waits for output; empty only at the real end.
-#[tauri::command]
-pub async fn net_read(app: AppHandle, id: String) -> Result<Response, Fail> {
-    let addresses = app.state::<Addresses>();
-    let owner = &addresses.owner;
-    let Some(live) = owner.live(&id) else {
-        return Err(fail(owner.check(&id).err().unwrap_or(FetchError::Invalid)));
-    };
-    if owner.check(&id).map_err(fail)? != ReqState::Streaming {
-        return Err(fail(FetchError::Invalid));
-    }
-    let mut stop = live.stop.subscribe();
-    let mut guard = live.body.lock().await;
-    let Some(b) = guard.as_mut() else { return Err(fail(FetchError::Invalid)) };
-    let outcome: Result<Vec<u8>, FetchError> = loop {
+async fn read_once(owner: &Owner, id: &str, stop: &mut watch::Receiver<Stop>, b: &mut Body) -> Result<Vec<u8>, FetchError> {
+    loop {
         if !b.out.is_empty() {
             let n = b.out.len().min(fetch::MAX_READ);
-            return Ok(Response::new(b.out.drain(..n).collect::<Vec<u8>>()));
+            return Ok(b.out.drain(..n).collect());
         }
         if b.ended {
-            break Ok(vec![]);
+            return Ok(vec![]);
         }
         let response = &mut b.response;
-        match wait(owner, &id, &mut stop, b.limits.idle, async { response.chunk().await.map_err(|e| kind_of(&e)) }).await {
-            Ok(Some(chunk)) => {
+        match wait(owner, id, stop, b.limits.idle, async { response.chunk().await.map_err(|e| kind_of(&e)) }).await? {
+            Some(chunk) => {
                 // Counted after decompression, so a small compressed body can't grow past it.
                 b.total += chunk.len() as u64;
                 if b.total > b.limits.max_bytes {
-                    break Err(FetchError::TooLarge);
+                    return Err(FetchError::TooLarge);
                 }
                 let out = b.redactor.feed(&chunk);
                 b.out.extend(out);
             }
-            Ok(None) => {
+            None => {
                 let out = b.redactor.finish();
                 b.out.extend(out);
                 b.ended = true;
             }
-            Err(e) => break Err(e),
         }
-    };
-    // The end, or an error: the request is over either way.
-    drop(guard);
-    owner.end(&id, outcome.as_ref().err().copied());
-    outcome.map(Response::new).map_err(fail)
+    }
 }
 
-/// Ends a request at any moment, before or after its head: one step of the owner.
+/// Asks the request's transport task for the next read.
+#[tauri::command]
+pub async fn net_read(app: AppHandle, id: String) -> Result<Response, Fail> {
+    let addresses = app.state::<Addresses>();
+    let owner = &addresses.owner;
+    let gone = || fail(owner.check(&id).err().unwrap_or(FetchError::Invalid));
+    if owner.check(&id).map_err(fail)? != ReqState::Streaming {
+        return Err(fail(FetchError::Invalid));
+    }
+    let Some(reads) = owner.reads(&id) else { return Err(gone()) };
+    let (reply, answer) = oneshot::channel();
+    reads.send(reply).await.map_err(|_| gone())?;
+    match answer.await {
+        Ok(r) => r.map(Response::new).map_err(fail),
+        Err(_) => Err(gone()),
+    }
+}
+
+/// Ends a request at any moment, before or after its head, and returns only once its transport
+/// has terminated: nothing of it is sent after this returns.
 #[tauri::command]
 pub async fn net_cancel(app: AppHandle, id: String) -> Result<(), Fail> {
-    app.state::<Addresses>().owner.cancel(&id);
+    app.state::<Addresses>().owner.cancel(&id).await;
     Ok(())
 }
 

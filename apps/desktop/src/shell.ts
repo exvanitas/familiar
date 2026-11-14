@@ -56,7 +56,8 @@ export type CtlOp = 'show' | 'hide' | 'focus' | 'close' | 'get-bounds' | 'set-bo
 export type SelfOp = 'drag' | 'minimize' | 'toggle-maximize' | 'close';
 
 /* A place data may go, approved by the person in the exe's own dialog. */
-export interface Address { id: string; kind: 'model' | 'server' | 'peer'; url: string; label: string; reach: 'public' | 'lan' | 'loopback'; ports?: [number, number] }
+/* `removing`: its removal began and hasn't finished; it refuses everything until it has. */
+export interface Address { id: string; kind: 'model' | 'server' | 'peer'; url: string; label: string; reach: 'public' | 'lan' | 'loopback'; ports?: [number, number]; removing?: boolean }
 export interface AddressSpec { kind: Address['kind']; url: string; label: string; owner?: string; ports?: [number, number] }
 
 /* The guarded fetch's request: `address` is a saved address id, `url` must be under it. */
