@@ -3,10 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// Names Windows keeps for devices, with or without an extension.
-const DEVICES: [&str; 22] = [
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2",
-    "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+/// Names Windows keeps for devices, with or without an extension: the classic ones, `COM0`
+/// and `LPT0`, the superscript digits Windows also reads as port numbers, and the console and
+/// clock devices.
+const DEVICES: [&str; 33] = [
+    "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt0",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com\u{b9}", "com\u{b2}", "com\u{b3}",
+    "lpt\u{b9}", "lpt\u{b2}", "lpt\u{b3}", "conin$", "conout$", "clock$",
 ];
 
 /// One plain file or folder name: nothing Windows would read as something else.
@@ -20,7 +23,8 @@ pub fn plain(name: &str) -> bool {
     if name.chars().any(|c| c.is_control() || "<>:\"|?*".contains(c)) {
         return false; // ':' also covers drive letters and alternate streams
     }
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    // Windows also drops spaces before the extension, so `NUL .txt` is the device too.
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ').to_ascii_lowercase();
     !DEVICES.contains(&stem.as_str())
 }
 
@@ -66,6 +70,13 @@ mod tests {
             assert_eq!(names(bad), None, "{bad:?}");
         }
         assert_eq!(names(&"x".repeat(256)), None);
+        for dev in ["COM0", "lpt0", "COM\u{b9}", "com\u{b2}.txt", "COM\u{b3}", "LPT\u{b9}", "lpt\u{b2}", "LPT\u{b3}.log", "CONIN$", "conout$", "Clock$", "CONIN$.x", "nul .txt"] {
+            assert_eq!(names(dev), None, "{dev:?}");
+            assert_eq!(names(&format!("a/{dev}")), None, "{dev:?}");
+        }
+        for ok in ["com10", "lpt10", "com", "comb", "conin", "clock", "com\u{b4}"] {
+            assert!(names(ok).is_some(), "{ok:?}");
+        }
     }
 
     #[test]
