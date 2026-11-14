@@ -100,10 +100,17 @@ async function main(info: Info) {
   await persist('main');
 
   await check('security.caps.core-reaches', async () => {
+    // The same commands the views are refused, with arguments the command itself turns away, so
+    // nothing opens or quits here. Reaching the command is what counts.
     const r: Record<string, string> = {};
-    for (const [cmd, args] of CORE_ONLY) if (cmd !== 'quit' && cmd !== 'shell_ready') r[cmd] = await gate(cmd, args);
+    r.shell_info = await gate('shell_info');
     r.shell_ready = await gate('shell_ready', { channel: '__CHANNEL__:1' });
+    r.quit_ready = await gate('quit_ready');
+    r.tray_set = await gate('tray_set', { spec: { tooltip: 'Familiar check' } });
+    r.view_open = await gate('view_open', { spec: { label: 'view-', page: 'chat.html' } });
+    r.window_ctl = await gate('window_ctl', { label: 'view-none', op: 'get-bounds' });
     r.log_line = await gate('log_line', { line: 'reaches' });
+    ok(Object.keys(r).length === CORE_ONLY.length, 'the list and CORE_ONLY differ');
     const notReached = aclOnly(r);
     ok(notReached.length === 0, 'refused by the gate: ' + notReached.join(' '));
     // A real tray menu, through the typed client.

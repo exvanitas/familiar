@@ -133,7 +133,7 @@ function Do-Step($action, $a) {
       foreach ($l in Get-Content (Join-Path $Out 'hits.jsonl')) {
         if (-not $l) { continue }
         $h = $l | ConvertFrom-Json
-        if ($h.label -and $h.label.StartsWith($a.prefix) -and 'c', 'v', 'b' -contains $h.label.Substring($a.prefix.Length, 1)) { $n++ }
+        if ($h.label -and $h.label.StartsWith($a.prefix) -and (@('c', 'v', 'b') -contains $h.label.Substring($a.prefix.Length, 1))) { $n++ }
         if (($h.kind -eq 'udp' -or $h.kind -eq 'tcp') -and $h.listener -match '^(core|view|bare)-') { $n++ }
       }
       return @{ hits = $n }
