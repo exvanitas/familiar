@@ -20,6 +20,8 @@ struct Sink {
     path: PathBuf,
     size: u64,
     cap: Option<u64>,
+    /// Lines dropped because the file was full and couldn't roll over.
+    dropped: u64,
 }
 
 pub struct Log {
@@ -34,6 +36,23 @@ fn open(path: &Path) -> Option<File> {
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
+impl Sink {
+    /// Moves the file to `<name>.old.log` and opens a fresh one. Its size only counts as reset when
+    /// both worked: a failed rename leaves the same file, as full as it was.
+    fn roll(&self) -> Option<(File, u64)> {
+        let old = self.path.with_extension("old.log");
+        if let Err(e) = fs::remove_file(&old) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return None;
+            }
+        }
+        fs::rename(&self.path, &old).ok()?;
+        let file = open(&self.path)?;
+        let size = file.metadata().ok()?.len();
+        Some((file, size))
+    }
+}
+
 impl Log {
     /// A log that writes nowhere yet.
     pub fn new(started: Instant) -> Log {
@@ -45,7 +64,7 @@ impl Log {
         let Some(file) = open(path) else { return };
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         if let Ok(mut g) = self.sink.lock() {
-            *g = Some(Sink { file, path: path.to_path_buf(), size, cap });
+            *g = Some(Sink { file, path: path.to_path_buf(), size, cap, dropped: 0 });
         }
     }
 
@@ -54,12 +73,23 @@ impl Log {
         let Some(sink) = g.as_mut() else { return };
         let text = format!("{:>8.2} {s}\n", self.started.elapsed().as_secs_f64());
         if sink.cap.is_some_and(|cap| sink.size + text.len() as u64 > cap) {
-            let old = sink.path.with_extension("old.log");
-            let _ = fs::remove_file(&old);
-            let _ = fs::rename(&sink.path, &old);
-            if let Some(f) = open(&sink.path) {
-                sink.file = f;
-                sink.size = 0;
+            match sink.roll() {
+                Some((file, size)) => {
+                    sink.file = file;
+                    sink.size = size;
+                    if sink.dropped > 0 {
+                        let note = format!("{:>8.2} dropped {} lines: the log was full and couldn't roll over\n", self.started.elapsed().as_secs_f64(), sink.dropped);
+                        if sink.file.write_all(note.as_bytes()).is_ok() {
+                            sink.size += note.len() as u64;
+                        }
+                        sink.dropped = 0;
+                    }
+                }
+                // The file stays as big as it is, so nothing past the cap is written.
+                None => {
+                    sink.dropped += 1;
+                    return;
+                }
             }
         }
         if sink.file.write_all(text.as_bytes()).is_ok() {
@@ -167,6 +197,28 @@ mod tests {
         l.attach(&p, Some(100));
         l.line("this one goes over");
         assert!(d.join("app.old.log").exists());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_rollover_that_fails_keeps_the_cap_and_counts_what_it_dropped() {
+        let d = temp("stuck");
+        let p = d.join("app.log");
+        fs::create_dir_all(d.join("app.old.log")).unwrap(); // a folder where the old file would go
+        fs::write(d.join("app.old.log").join("keep"), b"x").unwrap();
+        let l = Log::new(Instant::now());
+        l.attach(&p, Some(100));
+        for i in 0..40 {
+            l.line(&format!("line {i}"));
+        }
+        assert!(fs::metadata(&p).unwrap().len() <= 100, "the cap held");
+        let dropped = l.sink.lock().unwrap().as_ref().unwrap().dropped;
+        assert!(dropped > 30, "dropped {dropped}");
+        // Once it can roll over again, it says how many it lost.
+        fs::remove_dir_all(d.join("app.old.log")).unwrap();
+        l.line("after");
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains(&format!("dropped {dropped} lines")) && text.ends_with(" after\n"), "{text}");
         fs::remove_dir_all(d).unwrap();
     }
 
