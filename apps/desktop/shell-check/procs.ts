@@ -307,6 +307,34 @@ async function main(info: Info, ctx: Ctx) {
     return `two 4 MiB writes blocked on a server that never reads; stop ended it in ${ms} ms, and the writes ended ${outcomes.join(', ')}`;
   });
 
+  await check('security.server.write-flood', async () => {
+    // Far more writes than the bound to a server that never reads: past 8 in flight they're
+    // refused busy, the commands all answer, other commands still answer, and stop ends it in
+    // its deadline.
+    const s = fakeSetup(p, 'fake-flood', { args: ['-e', 'setInterval(() => {}, 1000)'] });
+    const m = new Mcp();
+    const r = await startWith(m, s, 'yes');
+    ok(r.started === 'started', 'the start: ' + r.started);
+    const chunk = new Uint8Array(1024 * 1024).fill(0x62);
+    const writes = Array.from({ length: 60 }, () => shell.serverWrite(m.run, chunk).then(() => 'written', e => errKind(e)));
+    await sleep(1000);
+    const t1 = Date.now();
+    const info = await Promise.race([shell.info().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
+    const sys = await Promise.race([shell.system().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
+    const others = Date.now() - t1;
+    const t0 = Date.now();
+    const stopped = await Promise.race([shell.serverStop(m.run).then(() => 'stopped', e => errKind(e)), sleep(10000).then(() => 'hung')]);
+    const ms = Date.now() - t0;
+    await m.exited(5000);
+    const outcomes = await Promise.race([Promise.all(writes), sleep(5000).then(() => ['hung'])]);
+    const count = (k: string) => outcomes.filter(o => o === k).length;
+    ok(info === 'answered' && sys === 'answered', `other commands during the flood: shell_info ${info}, system ${sys}`);
+    ok(stopped === 'stopped' && ms < 3000, `stop during the flood: ${stopped} after ${ms} ms`);
+    ok(!outcomes.includes('hung'), 'some writes never answered');
+    ok(count('busy') >= 40, `only ${count('busy')} of 60 writes were refused busy`);
+    return `60 writes of 1 MiB to a server that never reads: ${count('busy')} busy, ${count('failed')} failed when it stopped, ${count('written')} written; other commands answered in ${others} ms; stop took ${ms} ms`;
+  });
+
   await check('security.server.exit-drains', async () => {
     // The program exits, but a grandchild it started holds its stdout open. The exit must still
     // come, and the grandchild go with the job.
@@ -326,7 +354,7 @@ async function main(info: Info, ctx: Ctx) {
     return `the exit came ${ms} ms after the start's wait began, with grandchild ${pid} holding stdout; it was ended with the job`;
   });
 
-  await check('security.server.blank', async () => {
+  await check('security.server.blank-output', async () => {
     // A key typed into Settings by real key presses, stored as the setup's secret. The page never
     // learns it: the driver keeps it, and says only its first and last characters.
     await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
@@ -351,8 +379,9 @@ async function main(info: Info, ctx: Ctx) {
     ok(leaked.length === 0, `${leaked.length} lines carry the secret`);
     await shell.serverStop(m.run);
     await m.exited(5000);
-    // The driver searches every file for the key once this run has ended (procs.ps1).
-    return `a ${typed.length}-character secret from Credential Manager came back [hidden] on stdout and stderr; the file search follows the run`;
+    // The driver searches every file for this same key once this run has ended
+    // (security.server.blank-search, procs.ps1).
+    return `the ${typed.length}-character secret typed in this phase, from Credential Manager, came back [hidden] on stdout and stderr`;
   });
 
   await check('security.server.start-failed', async () => {
@@ -467,6 +496,42 @@ async function filesAndLinks(info: Info) {
 
 }
 
+/* Forget and start interleaved 20 times: half with the setup running, half with it approved and
+   idle. Whatever order the actor sees them in, nothing runs once the forget has returned and both
+   have answered, and the next start asks. */
+async function forgetRace() {
+  const p = await step<Paths>('proc-paths', {}, 120000);
+  await check('security.server.forget-race', async () => {
+    const s = fakeSetup(p, 'fake-race');
+    const seen: Record<string, number> = {};
+    for (let i = 0; i < 20; i++) {
+      const m = new Mcp();
+      const asked = await startWith(m, s, 'yes');
+      ok(asked.dialog.shown, `round ${i}: the start after a forget didn't ask`);
+      ok(asked.started === 'started', `round ${i}: the approved start: ${asked.started}`);
+      if (i % 2) {
+        await shell.serverStop(m.run);
+        await m.exited(5000);
+      }
+      const racer = new Mcp();
+      const forget = () => shell.serverForget(s.id).then(() => 'forgot', e => errKind(e));
+      const start = () => racer.start(s).then(() => 'started', e => errKind(e));
+      const [f, st] = i % 4 < 2 ? await Promise.all([forget(), start()]) : (([a, b]) => [b, a])(await Promise.all([start(), forget()]));
+      ok(f === 'forgot', `round ${i}: the forget: ${f}`);
+      seen[st] = (seen[st] ?? 0) + 1;
+      if (st === 'started') {
+        // It started before the forget reached the actor: the forget must have stopped it.
+        ok(racer.exit !== undefined || await racer.exited(5000).then(() => true, () => false), `round ${i}: a run that started first outlived the forget`);
+      } else {
+        ok(['busy', 'revoked'].includes(st), `round ${i}: the racing start: ${st}`);
+      }
+      const left = await step<{ count: number }>('node-children');
+      ok(left.count === 0, `round ${i}: ${left.count} node processes after the forget returned`);
+    }
+    return `20 rounds of forget and start interleaved: the racing start was ${JSON.stringify(seen)}; nothing ran after each forget, and each next start asked`;
+  });
+}
+
 /* In a run of its own, so the refusals are counted from none: after three, an approved setup
    still starts, and a changed one is asks-stopped with no dialog. */
 async function stoppedAsks() {
@@ -538,13 +603,14 @@ async function kill() {
     return;
   }
   await m.initialize();
-  const tree = JSON.parse(await m.tool('spawn_tree')) as { server: number; child: number; grandchild: number };
+  const token = rand(16);
+  const tree = JSON.parse(await m.tool('spawn_tree', { token })) as { server: number; child: number; grandchild: number };
   void m.tool('slow', { ms: 60000 }, 70000).catch(() => '');
   await sleep(500);
   // The driver checks the server, its child and its grandchild are alive, kills the exe hard, and
   // reports what's left 2 s later. Nothing here runs after.
   await say('INFO kill ready');
-  await step('kill-tree', { pids: [tree.server, tree.child, tree.grandchild] }, 120000);
+  await step('kill-tree', { pids: [tree.server, tree.child, tree.grandchild], token }, 120000);
 }
 
 async function wake(messages: CoreMessage[]) {
@@ -580,6 +646,7 @@ export async function procPhase(phase: string, info: Info, messages: CoreMessage
   else if (phase === 'proc-files') await filesAndLinks(info);
   else if (phase === 'proc-recover') await recover(info);
   else if (phase === 'proc-stopped') await stoppedAsks();
+  else if (phase === 'proc-race') await forgetRace();
   else if (phase === 'proc-kill') await kill();
   else if (phase === 'proc-wake') await wake(messages);
 }
