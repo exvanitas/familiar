@@ -1,4 +1,4 @@
-// The first decider: the owner's accepted reaction rules (2026-11-14), as plain code.
+// The first decider: Familiar's reaction rules, as plain code.
 // When in doubt, quiet.
 
 import type {

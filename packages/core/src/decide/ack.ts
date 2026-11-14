@@ -1,4 +1,4 @@
-// The owner's rule (2026-11-14): a bare acknowledgement, such as "thanks" or "ok", gets no message reply.
+// Familiar's rule: a bare acknowledgement, such as "thanks" or "ok", gets no message reply.
 // A reaction is fine. One exception: if her last message asked you something, "ok" is an answer, so it goes
 // to the model as usual. This check is local and costs no model call.
 

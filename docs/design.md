@@ -2,7 +2,7 @@
 
 Familiar is a small Windows app. A person brings a model and a character card, and gets a persona that chats, remembers, sets reminders and does things through tools. Part 1 is Familiar on its own. Part 2 links it to Desktop Buddies, once that app's API v2 has shipped, so the persona can live in a buddy.
 
-The owner approved this plan on 2026-11-14. This file carries its decisions into the repo.
+This file holds the plan's decisions and the build order.
 
 ## Rules that hold everywhere
 
@@ -42,7 +42,7 @@ A decision port answers that. **One event goes in. Out comes an act and a kind:*
 
 What the decider sees: the persona's short sketch and a chattiness setting (low, medium, high), whether do-not-disturb or fullscreen is on, the last 10 events with times, her last 3 reactions with times, how long since the last chat and whether the chat is in front, and the local time. Never window titles, paths or message text.
 
-**Rules first.** The first decider is plain rules, from the owner's accepted reaction rules:
+**Rules first.** The first decider is plain rules:
 
 - Fullscreen or do-not-disturb: quiet, always.
 - Sent home, hidden or paused by you: quiet until you call her out.
@@ -60,7 +60,7 @@ What the decider sees: the persona's short sketch and a chattiness setting (low,
 
 ## A bare "thanks" or "ok" gets no reply message
 
-The owner's rule (2026-11-14): when you send only an acknowledgement, such as "thanks", "ok", "got it" or a thumbs up, the persona doesn't answer with a message. A reaction is fine: a small mark on your message in part 1, a pose from her buddy in part 2.
+When you send only an acknowledgement, such as "thanks", "ok", "got it" or a thumbs up, the persona doesn't answer with a message. A reaction is fine: a small mark on your message in part 1, a pose from her buddy in part 2.
 
 - A local check spots a bare acknowledgement. It costs no model call.
 - **Except when it answers her.** If her last message asked you something, "ok" is an answer, and it goes to the model as usual. Consent never rides on chat text: consent cards have their own buttons.
@@ -83,17 +83,17 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 | 9 | Capability matrix: the list, the Settings tab, the docs page, the setup guide | Settings and docs agree, checked in CI | 5 |
 | 10 | Memory: notes, summaries, the Memory tab, deletion | Notes survive restart and delete cleanly | 4 |
 | 11 | Chat window, first-run setup, settings | Headless screenshots, light and dark | 10 |
-| 12 | Packaging: the zip, the per-user installer and the draft release. A winget manifest for the public flip | The installer runs on the owner's PC, and a local server runs there | 4 |
-| 13 | What screenshots can't show: upgrades, sleep and wake, notification buttons, local servers under Smart App Control | Checked on the runner and once on the owner's PC. That last check gates the release | 8 |
+| 12 | Packaging: the zip, the per-user installer and the draft release. A winget manifest for the public flip | The installer runs on a real PC with Smart App Control on, and a local server runs there | 4 |
+| 13 | What screenshots can't show: upgrades, sleep and wake, notification buttons, local servers under Smart App Control | Checked on the runner and once on a real PC. That last check gates the release | 8 |
 | 14 | Codex reviews and fixes, spread over the steps | No open P1 or P2 | 8 |
 | | **Part 2: the buddy link, after Desktop Buddies' API v2 ships** | | **25** |
 | 15 | Presence protocol and buddy driver, against a fake Desktop Buddies | Contract tests for snapshots, leases, budgets, fallbacks | 6 |
 | 16 | Wiring into Familiar: moments, the Buddy setup step and tab, the buddy tool, matrix rows | End to end on the runner with the fake model | 5 |
-| 17 | The owner's own agents as buddies (in their own repo) | A started turn shows on that agent's buddy | 11 |
+| 17 | Other agent apps as buddies, through the same driver (in their own repos) | A started turn shows on that agent's buddy | 11 |
 | 18 | A release, Codex reviews and fixes | No open P1 or P2 | 3 |
 
 ## Shipping
 
 GitHub releases (a per-user installer, or a zip of the exe and its app folder, with SHA-256 sums), and winget once the repo is public. No Microsoft Store. Unsigned until free signing for open-source projects (SignPath) after the public flip, so the README says what Windows will show.
 
-Each new unsigned exe gets a fresh Smart App Control verdict. So the exe holds only native parts, settled in step 3, and the app lives in a folder beside it. If a new exe is blocked on the owner's PC, the work stops and gets reported. Builds are never rerolled to get past it.
+Each new unsigned exe gets a fresh Smart App Control verdict. So the exe holds only native parts, settled in step 3, and the app lives in a folder beside it. If a new exe is blocked on the test PC, the work stops and gets reported. Builds are never rerolled to get past it.

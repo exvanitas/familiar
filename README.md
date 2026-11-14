@@ -4,7 +4,7 @@ A character persona that helps on your Windows PC. You bring a model (your own k
 
 Later, once Desktop Buddies' API v2 is out, the persona can take over a buddy as its body.
 
-**Status:** early work. Nothing to install yet.
+**Status:** early, unreleased work. There's nothing to install yet, and no support. Things will change without notice.
 
 ## Layout
 
@@ -28,6 +28,10 @@ pnpm fake-mcp --http 0     # over HTTP on 127.0.0.1, on a free port
 ```
 
 Dev and tests use a fake model and the fake MCP server: no keys and no paid services. Test and demo runs use a scratch HOME.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Please report problems privately, not in a public issue.
 
 ## Licence
 
