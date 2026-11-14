@@ -14,3 +14,19 @@ export type {
   ToolSpec,
   Usage
 } from './model/port.ts';
+
+export { endsWithQuestion, isBareAcknowledgement, needsReply } from './decide/ack.ts';
+export type { AckOptions } from './decide/ack.ts';
+export type {
+  Act,
+  AmbientEventName,
+  Chattiness,
+  Decision,
+  DecisionContext,
+  DecisionPort,
+  PastReaction,
+  PersonaEvent,
+  ReactionKind,
+  RuleEventName
+} from './decide/port.ts';
+export { BACK_AFTER_MINUTES, BUBBLE_GAP_MINUTES, SETTLE_MINUTES, decideByRules, isLateNight, rulesDecider } from './decide/rules.ts';
