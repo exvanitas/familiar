@@ -43,24 +43,45 @@ struct SaveSpec {
 }
 
 /// The folders no save may land in, as final paths: the native data folder, the WebView2
-/// folder, and the folder holding the exe and the app folder. A folder that doesn't exist yet
-/// can't hold the target, so it's left out.
-fn forbidden(shell: &Shell) -> Vec<PathBuf> {
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    [Some(shell.data_dir.clone()), Some(shell.webview_dir.clone()), exe_dir, Some(shell.app_dir.clone())]
-        .into_iter()
-        .flatten()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
-        .collect()
+/// folder, and the folders holding the exe and the app folder. If any can't be resolved, none is
+/// returned, and every save is refused: fail closed.
+fn forbidden(shell: &Shell) -> Option<Vec<PathBuf>> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    [shell.data_dir.clone(), shell.webview_dir.clone(), exe_dir, shell.app_dir.clone()].into_iter().map(|p| std::fs::canonicalize(p).ok()).collect()
 }
 
-/// Whether a save to this file is refused, judged on the final path of its folder.
+/// Whether a save to this file is refused: anywhere remote (a UNC path, or a drive that isn't
+/// fixed or removable, which a share alias of a protected folder could be), or inside a
+/// protected folder, judged on final paths.
 fn refused(shell: &Shell, target: &Path) -> Result<bool, Fail> {
     let dir = target.parent().ok_or_else(|| fail("invalid", "no folder"))?;
+    if files::remote(&target.display().to_string()) || !local_drive(dir) {
+        return Ok(true);
+    }
     let dir = std::fs::canonicalize(dir).map_err(|_| fail("failed", "the folder can't be read"))?;
-    let forbidden = forbidden(shell);
+    if files::remote(&dir.display().to_string()) {
+        return Ok(true);
+    }
+    let Some(forbidden) = forbidden(shell) else { return Ok(true) };
     let refs: Vec<&Path> = forbidden.iter().map(PathBuf::as_path).collect();
     Ok(files::save_refused(&dir, &refs))
+}
+
+/// Whether a path's drive is fixed or removable, from the drive table.
+#[cfg(windows)]
+fn local_drive(dir: &Path) -> bool {
+    use shell_core::server_path::{DriveType, Fs};
+    let s = dir.display().to_string();
+    let b = s.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return false;
+    }
+    matches!(shell_win::WinFs.drive_type(&format!("{}:\\", &s[..1])), DriveType::Fixed | DriveType::Removable)
+}
+
+#[cfg(not(windows))]
+fn local_drive(_: &Path) -> bool {
+    false
 }
 
 fn spec_header(request: &Request) -> Res<String> {
@@ -154,7 +175,10 @@ mod dialogs {
             Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACE_FILE_FLAGS},
             System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED},
             UI::{
-                Shell::{Common::COMDLG_FILTERSPEC, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, ShellExecuteW, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH},
+                Shell::{
+                Common::COMDLG_FILTERSPEC, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, ShellExecuteW, FOS_FORCEFILESYSTEM,
+                FOS_NOTESTFILECREATE, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+            },
                 WindowsAndMessaging::SW_SHOWNORMAL,
             },
         },
@@ -218,7 +242,9 @@ mod dialogs {
         on_own_thread(move || unsafe {
             let d: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
             d.SetFileName(&HSTRING::from(name))?;
-            d.SetOptions(d.GetOptions()? | FOS_FORCEFILESYSTEM)?;
+            // No test file: without this the dialog creates and deletes one at the chosen name
+            // inside Show, before the exe has judged the folder.
+            d.SetOptions(d.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOTESTFILECREATE)?;
             show(&d.cast()?, &filters, owner)
         })
     }
@@ -227,7 +253,7 @@ mod dialogs {
         let filters = filters.to_vec();
         on_own_thread(move || unsafe {
             let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-            let mut opts = d.GetOptions()? | FOS_FORCEFILESYSTEM;
+            let mut opts = d.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOTESTFILECREATE;
             if kind == Pick::Folder {
                 opts |= FOS_PICKFOLDERS;
             }
@@ -236,14 +262,14 @@ mod dialogs {
         })
     }
 
-    /// The OS's own replace keeps the old file's permissions, encryption and attributes, and with
-    /// a backup named the old file is never lost. A file that wasn't there is moved in, never over
-    /// one that appeared meanwhile.
+    /// The OS's own replace keeps the old file's permissions, encryption and attributes. A file
+    /// that wasn't there is moved in, written through, never over one that appeared meanwhile.
     pub struct OsSwap;
 
     impl Swap for OsSwap {
-        fn replace(&self, target: &Path, temp: &Path, backup: &Path) -> io::Result<()> {
-            unsafe { ReplaceFileW(&HSTRING::from(target), &HSTRING::from(temp), &HSTRING::from(backup), REPLACE_FILE_FLAGS(0), None, None) }.map_err(io::Error::from)
+        fn replace(&self, target: &Path, temp: &Path) -> io::Result<()> {
+            // No backup name: a failure then leaves the target as it was or holding the new file.
+            unsafe { ReplaceFileW(&HSTRING::from(target), &HSTRING::from(temp), PCWSTR::null(), REPLACE_FILE_FLAGS(0), None, None) }.map_err(io::Error::from)
         }
 
         fn place(&self, temp: &Path, target: &Path) -> io::Result<()> {
@@ -279,7 +305,7 @@ mod dialogs {
     }
     pub struct OsSwap;
     impl Swap for OsSwap {
-        fn replace(&self, _: &Path, _: &Path, _: &Path) -> io::Result<()> {
+        fn replace(&self, _: &Path, _: &Path) -> io::Result<()> {
             Err(io::Error::other("Windows only"))
         }
         fn place(&self, _: &Path, _: &Path) -> io::Result<()> {

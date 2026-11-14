@@ -53,6 +53,18 @@ pub fn save_refused(folder: &Path, forbidden: &[&Path]) -> bool {
     forbidden.iter().any(|f| within(folder, f))
 }
 
+/// Whether a path names somewhere remote by its form: a UNC path (`\\server\share`), a
+/// `\\?\UNC\` path, or any other `\\` form but a local `\\?\C:\`. Remote drives are told by the
+/// drive table, not by their form.
+pub fn remote(path: &str) -> bool {
+    let p = path.replace('/', "\\");
+    if let Some(rest) = p.strip_prefix("\\\\?\\").or_else(|| p.strip_prefix("\\\\.\\")) {
+        let b = rest.as_bytes();
+        return !(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+    }
+    p.starts_with("\\\\")
+}
+
 /// The two folders `open_folder` opens, by name, inside the data folder.
 pub fn named_folder(which: &str) -> Option<&'static str> {
     match which {
@@ -101,6 +113,16 @@ mod tests {
         }
         for good in [p(&["users", "me", "Documents"]), p(&["local"]), p(&["local", "Programs"]), p(&["local", "dev.exvanitas.familiar2"])] {
             assert!(!save_refused(&good, &forbidden), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn remote_by_form() {
+        for r in ["\\\\localhost\\share\\shell", "\\\\server\\C$", "//server/share", "\\\\?\\UNC\\server\\share\\x", "\\\\?\\Volume{x}\\a", "\\\\.\\pipe\\x"] {
+            assert!(remote(r), "{r}");
+        }
+        for l in ["C:\\data\\x", "\\\\?\\C:\\data\\x", "c:/x", "\\\\.\\C:\\x"] {
+            assert!(!remote(l), "{l}");
         }
     }
 
