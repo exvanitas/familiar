@@ -1,0 +1,20 @@
+[package]
+name = "shell-win"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "The Windows calls behind shell-core's file system trait: drive types and links read without following them."
+
+[dependencies]
+shell-core = { path = "../shell-core" }
+
+# The copy Tauri 2.12.5 resolves, so the shell builds one windows crate, not two.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }

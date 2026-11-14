@@ -1,0 +1,145 @@
+name: shell-win
+
+# The reparse walk on Windows: links read without following them, and paths that would reach a
+# share refused with no SMB traffic. See "5b. Starting a local MCP server" in docs/shell-design.md.
+on:
+  push:
+    paths:
+      - apps/desktop/shell-core/**
+      - apps/desktop/shell-win/**
+      - .github/workflows/shell-win.yml
+
+permissions:
+  contents: read
+
+jobs:
+  reparse:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: apps/desktop/shell-win
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rustup reads apps/desktop/rust-toolchain.toml. This builds everything the watched step runs.
+      - name: Build, and the tests that need no fixtures
+        run: cargo test --locked
+
+      - name: Make the fixtures
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fx = 'C:\familiar-reparse'
+          New-Item -ItemType Directory -Force "$fx\local\bin" | Out-Null
+          Set-Content "$fx\local\bin\tool.exe" 'a placeholder, never run'
+          # The share is C$ of this runner, so its root is C:\.
+          New-Item -ItemType Directory -Force 'C:\familiar-fx' | Out-Null
+          Set-Content 'C:\familiar-fx\tool.exe' 'a placeholder, never run'
+          $unc = '\\localhost\C$'
+          try {
+            New-SmbMapping -LocalPath 'Z:' -RemotePath $unc -ErrorAction Stop | Format-List LocalPath, RemotePath, Status
+          } catch {
+            Write-Host "Mapping $unc failed ($_). Using a share of our own."
+            New-Item -ItemType Directory -Force 'C:\familiar-share\familiar-fx' | Out-Null
+            Set-Content 'C:\familiar-share\familiar-fx\tool.exe' 'a placeholder, never run'
+            New-SmbShare -Name familiar-share -Path 'C:\familiar-share' -FullAccess Everyone | Out-Null
+            $unc = '\\localhost\familiar-share'
+            New-SmbMapping -LocalPath 'Z:' -RemotePath $unc -ErrorAction Stop | Format-List LocalPath, RemotePath, Status
+          }
+          # The share works, so a refusal later is the walk's doing, not a dead share.
+          Get-ChildItem 'Z:\familiar-fx' | Format-Table Name, Length
+          New-Item -ItemType Junction -Path "$fx\j-local" -Target "$fx\local" | Out-Null
+          New-Item -ItemType SymbolicLink -Path "$fx\s-share" -Target $unc | Out-Null
+          New-Item -ItemType SymbolicLink -Path "$fx\s-mapped" -Target 'Z:\' | Out-Null
+          "FAMILIAR_REPARSE_FIXTURES=$fx" >> $env:GITHUB_ENV
+          "FAMILIAR_REPARSE_UNC=$unc" >> $env:GITHUB_ENV
+          "FAMILIAR_REPARSE_MAPPED=Z" >> $env:GITHUB_ENV
+          $env:FAMILIAR_REPARSE_FIXTURES = $fx
+          $env:FAMILIAR_REPARSE_UNC = $unc
+          $env:FAMILIAR_REPARSE_MAPPED = 'Z'
+          # A junction to the share: New-Item and mklink won't write one, so the test crate does.
+          cargo test --locked --offline --test reparse -- --ignored make_the_junction_to_the_share --nocapture
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem $fx | Format-Table Name, LinkType, Target
+
+      - name: Before, then start the capture on port 445
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $c = @(Get-SmbConnection)
+          $c | Format-Table ServerName, ShareName, Dialect, NumOpens
+          ($c | ForEach-Object { "$($_.ServerName)|$($_.ShareName)" }) -join ',' | Set-Content "$env:RUNNER_TEMP\smb-before.txt"
+          "SMB_BEFORE=$($c.Count)" >> $env:GITHUB_ENV
+          try { $f = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f = 'n/a' }
+          "FILES_BEFORE=$f" >> $env:GITHUB_ENV
+          Write-Host "SMB connections: $($c.Count). Server files opened: $f"
+          pktmon filter remove | Out-Null
+          pktmon filter add smb -p 445
+          pktmon start --capture --pkt-size 0 --file-name "$env:RUNNER_TEMP\walk.etl"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: The reparse walk, watched
+        run: cargo test --locked --offline --test reparse -- --nocapture --test-threads 1
+
+      - name: After, and the verdict
+        if: always()
+        run: |
+          pktmon counters
+          pktmon stop
+          pktmon format "$env:RUNNER_TEMP\walk.etl" -o "$env:RUNNER_TEMP\walk.txt" | Out-Null
+          $packets = @(Get-Content "$env:RUNNER_TEMP\walk.txt" | Where-Object { $_ -match '\.445[ :>]' }).Count
+          $c = @(Get-SmbConnection)
+          $c | Format-Table ServerName, ShareName, Dialect, NumOpens
+          $before = (Get-Content "$env:RUNNER_TEMP\smb-before.txt") -split ',' | Where-Object { $_ }
+          $new = @($c | Where-Object { "$($_.ServerName)|$($_.ShareName)" -notin $before })
+          try { $f = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f = 'n/a' }
+          $lines = @(
+            "SMB connections before: $env:SMB_BEFORE, after: $($c.Count), new: $($new.Count)",
+            "Server files opened before: $env:FILES_BEFORE, after: $f",
+            "Packets on port 445 during the walk: $packets"
+          )
+          $lines | ForEach-Object { Write-Host $_ }
+          "WALK_PACKETS=$packets" >> $env:GITHUB_ENV
+          "## The reparse walk" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path "$env:FAMILIAR_REPARSE_FIXTURES\reparse-results.txt") { Get-Content "$env:FAMILIAR_REPARSE_FIXTURES\reparse-results.txt" >> $env:GITHUB_STEP_SUMMARY }
+          $lines >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          $failed = $new.Count -gt 0 -or $packets -gt 0
+          if ($env:FILES_BEFORE -ne 'n/a' -and $f -ne 'n/a' -and [double]$f -gt [double]$env:FILES_BEFORE) { $failed = $true }
+          if ($failed) { Write-Host 'The walk made SMB traffic.'; exit 1 }
+
+      # A positive control: the same capture and counters while this step really uses the share,
+      # through the mapping and through a new connection. If they see nothing here, they prove
+      # nothing above, and the summary says so.
+      - name: Control, the share really used
+        if: always()
+        run: |
+          $before = @(Get-SmbConnection).Count
+          try { $f0 = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f0 = 'n/a' }
+          pktmon start --capture --pkt-size 0 --file-name "$env:RUNNER_TEMP\control.etl" | Out-Null
+          Get-Content 'Z:\familiar-fx\tool.exe' | Out-Null
+          $other = $env:FAMILIAR_REPARSE_UNC -replace '^\\\\localhost', '\\127.0.0.1'
+          Get-ChildItem "$other\familiar-fx" | Out-Null
+          Start-Sleep -Seconds 1
+          pktmon stop | Out-Null
+          pktmon format "$env:RUNNER_TEMP\control.etl" -o "$env:RUNNER_TEMP\control.txt" | Out-Null
+          $packets = @(Get-Content "$env:RUNNER_TEMP\control.txt" | Where-Object { $_ -match '\.445[ :>]' }).Count
+          $after = @(Get-SmbConnection).Count
+          try { $f1 = (Get-Counter '\Server\Files Opened Total').CounterSamples[0].CookedValue } catch { $f1 = 'n/a' }
+          Write-Host 'First lines of the control capture:'
+          Get-Content "$env:RUNNER_TEMP\control.txt" -TotalCount 15
+          $lines = @(
+            "Control: SMB connections $before -> $after",
+            "Control: server files opened $f0 -> $f1",
+            "Control: packets on port 445 $packets"
+          )
+          $lines | ForEach-Object { Write-Host $_ }
+          "## Control" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          $lines >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Clean up the mapping
+        if: always()
+        run: Remove-SmbMapping -LocalPath 'Z:' -Force -ErrorAction SilentlyContinue
