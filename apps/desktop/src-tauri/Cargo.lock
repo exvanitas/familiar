@@ -3093,6 +3093,13 @@ dependencies = [
 [[package]]
 name = "shell-core"
 version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "url",
+]
 
 [[package]]
 name = "shlex"
