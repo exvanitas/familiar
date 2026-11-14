@@ -1,0 +1,173 @@
+name: shell
+
+# Builds familiar.exe on a Windows runner and proves it there: the contract check with its
+# security gate, and a smoke run of the real app folder. Builds here face no Smart App Control
+# verdict, so a failing one costs nothing but minutes. To check new app folders against the exe
+# from the latest build on a branch, run it by hand with `reuse`.
+on:
+  workflow_dispatch:
+    inputs:
+      reuse:
+        description: Skip the build, and use the exe from the latest build on this branch
+        type: boolean
+        default: false
+      variants:
+        description: Also build and check the WebRTC measurement variants
+        type: boolean
+        default: false
+  push:
+    paths:
+      - apps/desktop/**
+      - .github/workflows/shell.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: shell-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    # `both` is the exe as it ships. By hand, with `variants`, the others are measurement builds of
+    # the same source with one WebRTC closure taken out, or other switches tried, so each closure is
+    # measured on its own. They never ship, and their gate is information only.
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variants && '["both", "csp-only", "script-only", "switches"]' || '["both"]') }}
+    name: windows (${{ matrix.variant }})
+    continue-on-error: ${{ matrix.variant != 'both' }}
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      VARIANT: ${{ matrix.variant }}
+      REUSE: ${{ inputs.reuse || false }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Restored here and saved right after the build, so a run that fails later still keeps it.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.REUSE != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/src-tauri/target
+            apps/desktop/shell-core/target
+          key: shell-${{ runner.os }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock', 'apps/desktop/rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            shell-${{ runner.os }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock', 'apps/desktop/rust-toolchain.toml') }}-
+            shell-${{ runner.os }}-
+
+      # rustup reads apps/desktop/rust-toolchain.toml from both crates' folders.
+      - name: cargo test, shell-core
+        if: env.REUSE != 'true'
+        working-directory: apps/desktop/shell-core
+        run: |
+          rustc --version
+          cargo test --locked
+
+      - name: Measurement variant
+        if: env.REUSE != 'true' && env.VARIANT != 'both'
+        run: |
+          $pages = 'apps/desktop/src-tauri/src/pages.rs'
+          $conf = 'apps/desktop/src-tauri/tauri.conf.json'
+          $web = 'apps/desktop/shell-core/src/web.rs'
+          if ($env:VARIANT -eq 'csp-only' -or $env:VARIANT -eq 'switches') {
+            (Get-Content $pages) | Where-Object { $_ -notmatch 'initialization_script_for_all_frames' } | Set-Content $pages
+          }
+          if ($env:VARIANT -eq 'script-only' -or $env:VARIANT -eq 'switches') {
+            (Get-Content -Raw $conf).Replace("; webrtc 'block'", '') | Set-Content -NoNewline $conf
+          }
+          if ($env:VARIANT -eq 'switches') {
+            (Get-Content -Raw $web).Replace('--dns-prefetch-disable";', '--dns-prefetch-disable --enforce-webrtc-ip-permission-check --webrtc-ip-handling-policy=disable_non_proxied_udp";') | Set-Content -NoNewline $web
+          }
+          git diff --stat
+          git diff
+
+      - name: Release build
+        if: env.REUSE != 'true'
+        working-directory: apps/desktop/src-tauri
+        run: cargo build --release --locked
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.REUSE != 'true' && env.VARIANT == 'both'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/src-tauri/target
+            apps/desktop/shell-core/target
+          key: shell-${{ runner.os }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock', 'apps/desktop/rust-toolchain.toml') }}-${{ github.run_id }}
+
+      - name: Exe from this build
+        if: env.REUSE != 'true'
+        run: |
+          New-Item -ItemType Directory -Force exe | Out-Null
+          Copy-Item apps/desktop/src-tauri/target/release/familiar.exe exe/
+
+      - name: Exe from the latest build
+        if: env.REUSE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $run = gh run list --workflow shell.yml --branch $env:GITHUB_REF_NAME --status success --limit 20 --json databaseId,event --jq '[.[] | select(.event == "push")][0].databaseId'
+          if (-not $run) { throw 'no earlier build on this branch' }
+          "using the exe from run $run"
+          gh run download $run --name familiar-windows --dir exe
+
+      - name: About the exe
+        run: |
+          $f = Get-Item exe/familiar.exe
+          $line = "``$($f.Name)`` $($f.Length) bytes, sha256 ``$((Get-FileHash $f -Algorithm SHA256).Hash)``"
+          $line
+          "$env:VARIANT: $line`n" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.REUSE != 'true'
+        with:
+          name: ${{ matrix.variant == 'both' && 'familiar-windows' || format('familiar-windows-{0}', matrix.variant) }}
+          path: exe/familiar.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0, pnpm from packageManager
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @familiar/desktop build
+
+      - name: Static gate
+        run: |
+          New-Item -ItemType Directory -Force results | Out-Null
+          if ($env:VARIANT -ne 'both') { "SKIP security.caps.static a measurement build, changed on purpose" | Set-Content results/static.txt; exit 0 }
+          pnpm vitest run --project desktop
+          $state = if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }
+          "$state security.caps.static capabilities, COMMANDS, handlers, shell.ts, CSP, browser arguments and Trusted Types on every page" | Set-Content results/static.txt
+          exit 0
+
+      - name: Contract check
+        run: apps/desktop/shell-check/driver.ps1 -Exe exe/familiar.exe -App apps/desktop/dist/shell-check -Broken apps/desktop/dist/shell-check-broken -Out results
+
+      - name: Smoke run
+        if: success() || failure()
+        run: apps/desktop/shell-check/smoke.ps1 -Exe exe/familiar.exe -App apps/desktop/dist/app -Out results
+
+      - name: Security gate
+        if: success() || failure()
+        run: node apps/desktop/shell-check/gate.mjs results/static.txt results/contract.txt results/smoke.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ matrix.variant == 'both' && 'shell-results' || format('shell-results-{0}', matrix.variant) }}
+          path: results
+          retention-days: 14
+          if-no-files-found: warn

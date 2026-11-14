@@ -1,0 +1,9 @@
+{
+  "identifier": "views",
+  "description": "Chat and later views: their own window and the log. Nothing else.",
+  "windows": ["view-*"],
+  "permissions": [
+    "core:event:allow-listen", "core:event:allow-unlisten",
+    "allow-window-self", "allow-log-line"
+  ]
+}

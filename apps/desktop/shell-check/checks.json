@@ -1,0 +1,32 @@
+{
+  "description": "Every check id that may PASS or SKIP on the Windows runner, prefixed check. in the results. A FAIL fails the run, and so does any id in neither this list nor the security inventory. Measurements are recorded here as PASS with their numbers.",
+  "ids": [
+    "info",
+    "phase",
+    "core-page",
+    "persist.main",
+    "persist.fresh",
+    "persist.second",
+    "persist.moved",
+    "persist.kind13",
+    "perm.paste",
+    "clipboard.write",
+    "egress.pages-alive",
+    "egress.mdns-llmnr",
+    "egress.sink",
+    "pin.origin-default",
+    "quit.write-landed",
+    "quit.hung",
+    "exit.no-strays",
+    "start.no-app",
+    "start.not-ready",
+    "smoke.ready",
+    "smoke.chat",
+    "smoke.quit",
+    "webview.args",
+    "webrtc.env-override",
+    "sink.slow-clients",
+    "queue.early",
+    "start.overlap"
+  ]
+}
