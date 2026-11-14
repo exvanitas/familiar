@@ -23,9 +23,6 @@
     "smoke.chat",
     "smoke.quit",
     "webview.args",
-    "webrtc.pinned",
-    "webrtc.policy-switch",
-    "webrtc.permission-check",
-    "webrtc.no-proxy"
+    "webrtc.env-override"
   ]
 }

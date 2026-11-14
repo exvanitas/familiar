@@ -213,7 +213,7 @@ async function main(info: Info) {
     await sleep(1000);
     const after = await step<{ windows: string[] }>('windows');
     const fresh = after.windows.filter(w => !before.windows.includes(w));
-    const denied = await step<{ count: number; lines: string[] }>('log-grep', { pattern: 'permission denied in ' });
+    const denied = await step<{ count: number; lines: string[] }>('log-grep', { pattern: '^\\s*[\\d.]+ permission denied in ' });
     const bad: string[] = [];
     for (const [who, r] of [['settings', settings], ['chat', chat]] as const) {
       if (!r.clipboard.startsWith('rejected')) bad.push(`${who} clipboard ${r.clipboard}`);
@@ -397,7 +397,7 @@ async function pinRead(info: Info, value: string, id: string) {
     else if (phase === 'webrtc') {
       // A measurement: only the WebRTC routes, under whatever browser arguments the driver chose.
       await step('mark', { name: 'webrtc-' + arg(info, '--variant') });
-      const out = await hostile('probe', await fixtures(), { nav: false, only: ['webrtc-stun', 'webrtc-turn'] });
+      const out = await hostile('probe', await fixtures(), { nav: false, only: ['webrtc-stun', 'webrtc-turn', 'webrtc-frame'] });
       await say(`INFO webrtc ${arg(info, '--variant')} ${JSON.stringify(out)}`);
       onQuitting = () => { shell.quitReady().catch(() => {}); };
       await say('DONE');

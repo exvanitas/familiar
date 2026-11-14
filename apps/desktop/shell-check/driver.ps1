@@ -338,18 +338,11 @@ try {
   if (-not $exited) { $p.Kill() }
   [void](No-Strays 'not-ready')
 
-  # ---------- a measurement: WebRTC under other browser arguments ----------
-  # The pinned arguments may not stop WebRTC in WebView2. These runs try others through WebView2's
-  # own environment variable, so no other exe is needed to measure them. Each run gets its own data
-  # folder, since one folder's browser keeps the arguments it started with. The proxy here is the
-  # fixtures' HTTP listener, which logs a CONNECT and drops it.
-  $proxy = "--proxy-server=http://127.0.0.1:$($fx.tcp) --proxy-bypass-list=<-loopback>"
-  $base = '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required'
+  # ---------- a measurement: can the environment change the exe's browser arguments? ----------
+  # WebView2 reads WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS. This run sets it to arguments with no
+  # proxy and no WebRTC rule, and records what WebView2's browser process was really told.
   $variants = [ordered]@{
-    'pinned' = "$base $proxy --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable"
-    'policy-switch' = "$base $proxy --webrtc-ip-handling-policy=disable_non_proxied_udp --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable"
-    'permission-check' = "$base $proxy --force-webrtc-ip-handling-policy=disable_non_proxied_udp --enforce-webrtc-ip-permission-check --dns-prefetch-disable"
-    'no-proxy' = "$base --force-webrtc-ip-handling-policy=disable_non_proxied_udp --dns-prefetch-disable"
+    'env-override' = '--disable-features=msWebOOUI --autoplay-policy=no-user-gesture-required'
   }
   foreach ($name in $variants.Keys) {
     $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $variants[$name]

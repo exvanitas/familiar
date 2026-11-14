@@ -93,11 +93,11 @@ function style(css: (cls: string) => string): Promise<string> {
   return new Promise(r => setTimeout(() => r('added'), 1200));
 }
 
-function rtc(servers: RTCIceServer[]): Promise<string> {
+function rtc(servers: RTCIceServer[], PC: typeof RTCPeerConnection = RTCPeerConnection): Promise<string> {
   return new Promise<string>(done => {
     let pc: RTCPeerConnection;
     try {
-      pc = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: 'all' });
+      pc = new PC({ iceServers: servers, iceTransportPolicy: 'all' });
     } catch (e) { done('threw:' + name(e)); return; }
     const seen = new Set<string>();
     pc.onicecandidate = e => { if (e.candidate) seen.add(e.candidate.type ?? '?'); };
@@ -177,6 +177,17 @@ export const ROUTES: Route[] = [
       { urls: [`turn:${fx.lan}:${w.lanPort}?transport=udp`, `turn:${fx.lan}:${w.lanPort}?transport=tcp`], username: 'u', credential: 'p' },
       { urls: [`turn:${w.host}:${fx.turnTcp[ctx]}?transport=tcp`, `turn:${w.host}:${fx.udp[`${ctx}-turn`]}?transport=udp`], username: 'u', credential: 'p' }
     ]), 7000).then(r => ({ loop: r, lan: r, name: r }))
+  },
+  /* Whether a fresh about:blank frame hands out its own RTCPeerConnection: if it does, deleting
+     the page's own copy, from the app or from an exe script that misses such frames, closes
+     nothing. */
+  {
+    id: 'webrtc-frame', go: (w, ctx, fx) => attempt(() => {
+      const f = element('iframe', () => {});
+      const PC = (f.contentWindow as unknown as { RTCPeerConnection?: typeof RTCPeerConnection } | null)?.RTCPeerConnection;
+      if (!PC) return 'frame-has-none';
+      return rtc([{ urls: `stun:127.0.0.1:${fx.udp[`${ctx}-stun`]}` }, { urls: `stun:${fx.lan}:${w.lanPort}` }, { urls: `stun:${w.host}:${fx.udp[`${ctx}-stun`]}` }], PC).then(r => 'frame-' + r);
+    }, 7000).then(r => ({ loop: r, lan: r, name: r }))
   },
   { id: 'window-open', go: w => three(w, u => 'returned:' + (window.open(u) === null ? 'null' : 'window')) },
   { id: 'blank-link', go: w => three(w, u => { element('a', a => { a.href = u; a.target = '_blank'; a.rel = 'noopener'; }).click(); return 'clicked'; }) },
