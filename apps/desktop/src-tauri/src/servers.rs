@@ -14,10 +14,11 @@ use crate::{confirm, secrets, shell::Shell};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shell_core::{
-    actor::{Effect, Machine, Msg, State},
+    actor::{Effect, Gen, Machine, Msg, State, Token},
     approvals::{self, Load, Store},
+    records,
     server_path::{self, Launch, PathError},
-    setup::{self, Canonical, Event, Lines, Setup, Stream},
+    setup::{self, Canonical, Event, Lines, Plan, Setup, Stream},
     temp,
 };
 use std::{
@@ -72,8 +73,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct Servers {
     /// Setup id to its actor's queue. Short-held.
     actors: Mutex<HashMap<String, mpsc::SyncSender<Cmd>>>,
-    /// Run id to setup id, while a run exists.
-    runs: Mutex<HashMap<String, String>>,
+    /// Run id to its setup and generation, while the run exists. A run id names one generation
+    /// of one setup's actor, so a command for a run that's over can't reach the next one.
+    runs: Mutex<HashMap<String, (String, Gen)>>,
     /// Slots held: every setup whose actor isn't idle, at most 16.
     slots: Mutex<usize>,
     /// The one writer of `servers.json`.
@@ -188,15 +190,16 @@ fn spawn_store(app: AppHandle) -> mpsc::Sender<StoreReq> {
 
 enum Cmd {
     Start { setup: Box<Setup>, owner: Option<String>, channel: Channel<Value>, reply: Reply<Started> },
-    Stop { reply: Reply<()> },
+    Stop { gen: Gen, reply: Reply<()> },
     Forget { reply: Reply<()> },
-    Write { bytes: Vec<u8>, reply: Reply<()> },
-    /// What the actor's own threads report.
-    Report(Report),
+    Write { gen: Gen, bytes: Vec<u8>, reply: Reply<()> },
+    /// What the actor's own threads report, each for the generation it was made for.
+    Report(Gen, Report),
 }
 
 enum Report {
-    AskDone(Result<Option<Box<Canonical>>, &'static str>),
+    /// The approved canonical form, and whether it must be stored (approved just now).
+    AskDone(Result<(Box<Canonical>, bool), &'static str>),
     Spawned { job: Arc<os::Job>, go: mpsc::Sender<bool> },
     Resumed { input: Option<Writer> },
     SpawnFailed(&'static str),
@@ -211,23 +214,39 @@ struct Writer {
     bytes: Arc<AtomicUsize>,
 }
 
+/// A command waiting for the machine's answer, by its token.
+enum Pending {
+    Start(Reply<Started>),
+    Unit(Reply<()>),
+    Write(Vec<u8>, Reply<()>),
+}
+
+/// One start attempt and, once it runs, its run. Everything here belongs to one generation.
+struct Attempt {
+    gen: Gen,
+    setup: Box<Setup>,
+    owner: Option<String>,
+    channel: Channel<Value>,
+    /// The approved canonical form, held as a value from the ask: the one thing a spawn launches.
+    form: Option<Box<Canonical>>,
+    run: Option<String>,
+    job: Option<Arc<os::Job>>,
+    input: Option<Writer>,
+}
+
 /// What an actor holds besides its state.
 struct Actor {
     app: AppHandle,
     setup_id: String,
     tx: mpsc::SyncSender<Cmd>,
     machine: Machine,
-    setup: Option<Box<Setup>>,
-    owner: Option<String>,
-    channel: Option<Channel<Value>>,
-    form: Option<Box<Canonical>>,
-    run: Option<String>,
-    job: Option<Arc<os::Job>>,
-    go: Option<mpsc::Sender<bool>>,
-    input: Option<Writer>,
-    start_reply: Option<Reply<Started>>,
-    stop_replies: Vec<Reply<()>>,
-    forget_replies: Vec<Reply<()>>,
+    next_token: Token,
+    pending: HashMap<Token, Pending>,
+    /// A start's setup, between its command and the machine's `BeginAsk`.
+    incoming: Option<(Box<Setup>, Option<String>, Channel<Value>)>,
+    attempt: Option<Attempt>,
+    /// Children made and suspended, waiting for the actor's word, by generation.
+    waiting: HashMap<Gen, (Arc<os::Job>, mpsc::Sender<bool>)>,
 }
 
 fn spawn_actor(app: AppHandle, setup_id: String) -> mpsc::SyncSender<Cmd> {
@@ -237,17 +256,11 @@ fn spawn_actor(app: AppHandle, setup_id: String) -> mpsc::SyncSender<Cmd> {
         setup_id,
         tx: tx.clone(),
         machine: Machine::default(),
-        setup: None,
-        owner: None,
-        channel: None,
-        form: None,
-        run: None,
-        job: None,
-        go: None,
-        input: None,
-        start_reply: None,
-        stop_replies: Vec::new(),
-        forget_replies: Vec::new(),
+        next_token: 0,
+        pending: HashMap::new(),
+        incoming: None,
+        attempt: None,
+        waiting: HashMap::new(),
     };
     thread::spawn(move || {
         for cmd in rx {
@@ -266,147 +279,146 @@ impl Actor {
         self.app.state::<Servers>()
     }
 
-    /// Reports from a helper thread come back on the actor's own queue. Blocking here is fine:
-    /// it's the helper's thread.
-    fn reporter(&self) -> impl Fn(Report) + Send + Clone + 'static {
+    /// Reports from a helper thread come back on the actor's own queue, stamped with their
+    /// generation. Blocking here is fine: it's the helper's thread.
+    fn reporter(&self, gen: Gen) -> impl Fn(Report) + Send + Clone + 'static {
         let tx = self.tx.clone();
         move |r| {
-            let _ = tx.send(Cmd::Report(r));
+            let _ = tx.send(Cmd::Report(gen, r));
         }
+    }
+
+    fn token(&mut self, p: Pending) -> Token {
+        let t = self.next_token;
+        self.next_token += 1;
+        self.pending.insert(t, p);
+        t
+    }
+
+    /// The attempt, if it's this generation's.
+    fn of(&mut self, gen: Gen) -> Option<&mut Attempt> {
+        self.attempt.as_mut().filter(|a| a.gen == gen)
     }
 
     fn handle(&mut self, cmd: Cmd) {
         let held = self.machine.holds_slot();
-        let before = self.machine.state;
-        let fx = match cmd {
+        let before = self.machine.state();
+        let msg = match cmd {
             Cmd::Start { setup, owner, channel, reply } => {
-                if before != State::Idle {
-                    // A second start of the same setup, or one during a forget.
-                    let kind = self.machine.handle(Msg::Start).into_iter().find_map(|e| if let Effect::ReplyStart(Err(k)) = e { Some(k) } else { None }).unwrap_or("busy");
-                    let _ = reply.send(Err(fail(kind, "this server is starting, running or being forgotten")));
-                    return;
-                }
-                if !self.servers().take_slot() {
+                if before == State::Idle && !self.servers().take_slot() {
                     let _ = reply.send(Err(fail("busy", "16 servers are running or starting")));
                     return;
                 }
-                self.setup = Some(setup);
-                self.owner = owner;
-                self.channel = Some(channel);
-                self.start_reply = Some(reply);
-                self.machine.handle(Msg::Start)
+                self.incoming = Some((setup, owner, channel));
+                Msg::Start(self.token(Pending::Start(reply)))
             }
-            Cmd::Stop { reply } => {
-                self.stop_replies.push(reply);
-                self.machine.handle(Msg::Stop)
-            }
-            Cmd::Forget { reply } => {
-                self.forget_replies.push(reply);
-                let fx = self.machine.handle(Msg::Forget);
-                // A forget joining one under way answers with it.
-                if fx.is_empty() && self.machine.state == State::Forgetting {
-                    self.log("forget joined the one under way");
-                }
-                fx
-            }
-            Cmd::Write { bytes, reply } => {
-                self.write(bytes, reply);
-                return;
-            }
-            Cmd::Report(r) => match r {
+            Cmd::Stop { gen, reply } => Msg::Stop(self.token(Pending::Unit(reply)), gen),
+            Cmd::Forget { reply } => Msg::Forget(self.token(Pending::Unit(reply))),
+            Cmd::Write { gen, bytes, reply } => Msg::Write(self.token(Pending::Write(bytes, reply)), gen),
+            Cmd::Report(gen, r) => match r {
                 Report::AskDone(r) => {
-                    let msg = match r {
-                        Ok(Some(form)) => {
-                            self.form = Some(form);
-                            Msg::AskDone(Ok(true))
+                    let r = r.map(|(form, store)| {
+                        // Held as a value, on both paths: approved before, and approved just now.
+                        if let Some(a) = self.of(gen) {
+                            a.form = Some(form);
                         }
-                        Ok(None) => Msg::AskDone(Ok(false)),
-                        Err(kind) => Msg::AskDone(Err(kind)),
-                    };
-                    self.machine.handle(msg)
+                        store
+                    });
+                    Msg::AskDone(gen, r)
                 }
                 Report::Spawned { job, go } => {
-                    self.job = Some(job);
-                    self.go = Some(go);
-                    self.machine.handle(Msg::Spawned)
+                    self.waiting.insert(gen, (job, go));
+                    Msg::Spawned(gen)
                 }
                 Report::Resumed { input } => {
-                    self.input = input;
-                    if self.machine.state == State::Stopping {
-                        // Stopped before it resumed: its input closes at once.
-                        self.input = None;
+                    let running = self.machine.state() == State::Running && self.machine.run() == Some(gen);
+                    // Stopped before it resumed, or another run's: its input closes at once.
+                    if let (true, Some(a)) = (running, self.of(gen)) {
+                        a.input = input;
                     }
-                    self.machine.handle(Msg::Resumed)
+                    Msg::Resumed(gen)
                 }
-                Report::SpawnFailed(kind) => {
-                    self.job = None;
-                    self.machine.handle(Msg::SpawnFailed(kind))
-                }
-                Report::Exited => self.machine.handle(Msg::Exited),
-                Report::Deadline => self.machine.handle(Msg::Deadline),
+                Report::SpawnFailed(kind) => Msg::SpawnFailed(gen, kind),
+                Report::Exited => Msg::Exited(gen),
+                Report::Deadline => Msg::Deadline(gen),
             },
         };
+        let fx = self.machine.handle(msg);
         self.apply(fx);
-        let after = self.machine.state;
+        self.incoming = None;
+        let after = self.machine.state();
         if before != after {
             self.log(&format!("{before:?} -> {after:?}"));
         }
-        if !matches!(after, State::Running | State::Stopping) {
-            self.end_run();
+        if !self.machine.holds_slot() {
+            self.end_attempt();
         }
         if held && !self.machine.holds_slot() {
             self.servers().release_slot();
         }
     }
 
-    /// The run's bookkeeping, once there's no run.
-    fn end_run(&mut self) {
-        if let Some(run) = self.run.take() {
-            lock(&self.servers().runs).remove(&run);
+    /// The attempt's bookkeeping, once the machine holds none: its run id leaves the map.
+    fn end_attempt(&mut self) {
+        if let Some(a) = self.attempt.take() {
+            if let Some(run) = a.run {
+                lock(&self.servers().runs).remove(&run);
+            }
         }
-        self.job = None;
-        self.input = None;
-        self.go = None;
     }
 
     fn apply(&mut self, fx: Vec<Effect>) {
         for e in fx {
             match e {
-                Effect::BeginAsk => self.begin_ask(),
-                Effect::StoreApproval => {
-                    let form = self.form.take().expect("an approved form");
+                Effect::BeginAsk(gen) => {
+                    let (setup, owner, channel) = self.incoming.take().expect("a start's setup");
+                    self.attempt = Some(Attempt { gen, setup, owner, channel, form: None, run: None, job: None, input: None });
+                    self.begin_ask(gen);
+                }
+                Effect::StoreApproval(gen) => {
+                    // The held form stays held: the store gets a copy.
+                    let form = self.of(gen).and_then(|a| a.form.clone());
                     let id = self.setup_id.clone();
-                    let ok = self.servers().store_call(&self.app, |reply| StoreReq::Approve { id, form, reply }).unwrap_or(false);
+                    let ok = match form {
+                        Some(form) => self.servers().store_call(&self.app, |reply| StoreReq::Approve { id, form, reply }).unwrap_or(false),
+                        None => false,
+                    };
                     self.log(if ok { "approval stored" } else { "the approval couldn't be stored" });
-                    let more = self.machine.handle(Msg::Stored(ok));
+                    let more = self.machine.handle(Msg::Stored(gen, ok));
                     self.apply(more);
                 }
-                Effect::BeginSpawn => self.begin_spawn(),
-                Effect::Go | Effect::Abort => {
-                    let go = matches!(e, Effect::Go);
-                    if go {
-                        let run = run_id();
-                        lock(&self.servers().runs).insert(run.clone(), self.setup_id.clone());
-                        self.run = Some(run);
+                Effect::BeginSpawn(gen) => self.begin_spawn(gen),
+                Effect::Go(gen) => {
+                    let Some((job, go)) = self.waiting.remove(&gen) else { continue };
+                    let run = format!("{}-{gen}", run_id());
+                    lock(&self.servers().runs).insert(run.clone(), (self.setup_id.clone(), gen));
+                    if let Some(a) = self.of(gen) {
+                        a.job = Some(job);
+                        a.run = Some(run);
                     }
-                    if let Some(tx) = self.go.take() {
-                        let _ = tx.send(go);
+                    let _ = go.send(true);
+                }
+                Effect::Abort(gen) => {
+                    if let Some((_, go)) = self.waiting.remove(&gen) {
+                        let _ = go.send(false);
                     }
                 }
-                Effect::CloseInput => {
+                Effect::CloseInput(gen) => {
                     // Dropping the queue closes stdin once a write in flight ends; ending the job
                     // breaks that write.
-                    self.input = None;
+                    if let Some(a) = self.of(gen) {
+                        a.input = None;
+                    }
                 }
-                Effect::ArmDeadline => {
-                    let report = self.reporter();
+                Effect::ArmDeadline(gen) => {
+                    let report = self.reporter(gen);
                     thread::spawn(move || {
                         thread::sleep(STOP_AFTER);
                         report(Report::Deadline);
                     });
                 }
-                Effect::Terminate => {
-                    if let Some(j) = &self.job {
+                Effect::Terminate(gen) => {
+                    if let Some(j) = self.of(gen).and_then(|a| a.job.clone()) {
                         j.terminate();
                     }
                 }
@@ -417,32 +429,39 @@ impl Actor {
                     let more = self.machine.handle(Msg::Removed(ok));
                     self.apply(more);
                 }
-                Effect::ReplyStart(r) => {
-                    if let Some(reply) = self.start_reply.take() {
-                        let r = match r {
-                            Ok(()) => Ok(Started { run: self.run.clone().unwrap_or_default() }),
-                            Err(kind) => Err(fail(kind, "not started")),
-                        };
-                        let _ = reply.send(r);
-                    }
-                }
-                Effect::ReplyStop(r) => {
-                    for reply in self.stop_replies.drain(..) {
-                        let _ = reply.send(r.map_err(|k| fail(k, "no such run")));
-                    }
-                }
-                Effect::ReplyForget(r) => {
-                    for reply in self.forget_replies.drain(..) {
-                        let _ = reply.send(r.map_err(|k| fail(k, "the approval couldn't be removed")));
-                    }
-                }
+                Effect::Forward(t) => match self.pending.remove(&t) {
+                    Some(Pending::Write(bytes, reply)) => self.write(bytes, reply),
+                    _ => self.log("a forward with no write waiting"),
+                },
+                Effect::Reply(t, r) => self.reply(t, r),
             }
+        }
+    }
+
+    /// Each token is answered once: its reply leaves the map as it's sent.
+    fn reply(&mut self, t: Token, r: Result<Option<Gen>, &'static str>) {
+        match self.pending.remove(&t) {
+            Some(Pending::Start(reply)) => {
+                let r = match r {
+                    Ok(Some(gen)) => match self.of(gen).and_then(|a| a.run.clone()) {
+                        Some(run) => Ok(Started { run }),
+                        None => Err(fail("failed", "the run has no id")),
+                    },
+                    Ok(None) => Err(fail("failed", "the run has no id")),
+                    Err(kind) => Err(fail(kind, "not started")),
+                };
+                let _ = reply.send(r);
+            }
+            Some(Pending::Unit(reply)) | Some(Pending::Write(_, reply)) => {
+                let _ = reply.send(r.map(|_| ()).map_err(|k| fail(k, "not done")));
+            }
+            None => self.log("a reply with no command waiting"),
         }
     }
 
     /// Writes are bounded, so a server that stops reading can't fill memory or the queue.
     fn write(&mut self, bytes: Vec<u8>, reply: Reply<()>) {
-        let Some(w) = &self.input else {
+        let Some(w) = self.attempt.as_ref().and_then(|a| a.input.as_ref()) else {
             let _ = reply.send(Err(fail("missing", "its input is closed")));
             return;
         };
@@ -461,26 +480,29 @@ impl Actor {
     }
 
     /// The walk, the approval check and, if new or changed, the dialog, on a thread of its own.
-    fn begin_ask(&mut self) {
-        let setup = self.setup.clone().expect("a setup");
-        let owner = self.owner.clone();
+    fn begin_ask(&mut self, gen: Gen) {
+        let report = self.reporter(gen);
+        let Some(a) = self.of(gen) else { return };
+        let (setup, owner) = (a.setup.clone(), a.owner.clone());
         let app = self.app.clone();
-        let report = self.reporter();
         thread::spawn(move || {
             let r = ask(&app, &setup, owner.as_deref());
             report(Report::AskDone(r));
         });
     }
 
-    /// The spawn, on a thread of its own: recheck, secrets, environment, then shell-win's start,
-    /// whose last step waits for the actor's word.
-    fn begin_spawn(&mut self) {
-        let setup = self.setup.clone().expect("a setup");
-        let channel = self.channel.clone().expect("a channel");
-        let app = self.app.clone();
-        let report = self.reporter();
+    /// The spawn, on a thread of its own, from the held form and nothing else.
+    fn begin_spawn(&mut self, gen: Gen) {
+        let report = self.reporter(gen);
+        let Some((form, channel)) = self.of(gen).and_then(|a| Some((a.form.clone()?, a.channel.clone()))) else {
+            // Never: `BeginSpawn` follows an approval, which held the form. Answered, not assumed.
+            let more = self.machine.handle(Msg::SpawnFailed(gen, "failed"));
+            self.apply(more);
+            return;
+        };
+        let (app, id) = (self.app.clone(), self.setup_id.clone());
         thread::spawn(move || {
-            if let Err(kind) = spawn(&app, &setup, channel, report.clone()) {
+            if let Err(kind) = spawn(&app, &id, &form, channel, report.clone()) {
                 report(Report::SpawnFailed(kind));
             }
         });
@@ -488,17 +510,17 @@ impl Actor {
 }
 
 /// The ask: the walk (local only), the form, and the dialog only if the form isn't the one
-/// approved. Some(form) when it must be stored, None when it was approved before.
-fn ask(app: &AppHandle, setup: &Setup, owner: Option<&str>) -> Result<Option<Box<Canonical>>, &'static str> {
+/// approved. The form either way, and whether it must be stored.
+fn ask(app: &AppHandle, setup: &Setup, owner: Option<&str>) -> Result<(Box<Canonical>, bool), &'static str> {
     let shell = app.state::<Shell>();
     let launch = walk(&setup.program, &setup.cwd).map_err(|e| e.kind)?;
-    let form = Canonical::new(setup, &launch);
+    let form = Box::new(Canonical::new(setup, &launch));
     let servers = app.state::<Servers>();
     let id = setup.id.clone();
-    let f2 = Box::new(form.clone());
+    let f2 = form.clone();
     if servers.store_call(app, |reply| StoreReq::Approved { id, form: f2, reply }).unwrap_or(false) {
         shell.log.line(&format!("server {}: approved before, no dialog", setup.id));
-        return Ok(None);
+        return Ok((form, false));
     }
     // Only a new or changed form involves the confirm state; `busy` or `asks-stopped` ends it.
     let ticket = confirm::reserve(app).map_err(|e| e.kind())?;
@@ -506,32 +528,40 @@ fn ask(app: &AppHandle, setup: &Setup, owner: Option<&str>) -> Result<Option<Box
     if !ticket.ask(owner, a).map_err(|e| e.kind())? {
         return Err("declined");
     }
-    Ok(Some(Box::new(form)))
+    Ok((form, true))
 }
 
-/// Makes the child and lets it run, or reports why not. On the spawn's own thread.
-fn spawn(app: &AppHandle, setup: &Setup, channel: Channel<Value>, report: impl Fn(Report) + Send + Clone + 'static) -> Result<(), &'static str> {
+/// Makes the child from the approved form and lets it run, or reports why not. On the spawn's own
+/// thread. Everything launched comes from `Plan::of(form)`: never the setup a page sent, nor a
+/// walk made after the approval. The walk again, before the spawn and once more after it (the
+/// image mapped, nothing of it run yet), must find exactly the approved targets.
+fn spawn(app: &AppHandle, setup_id: &str, form: &Canonical, channel: Channel<Value>, report: impl Fn(Report) + Send + Clone + 'static) -> Result<(), &'static str> {
     let shell = app.state::<Shell>();
-    // Just before starting: the walk again, and the same targets as approved.
-    let launch = walk(&setup.program, &setup.cwd).map_err(|e| e.kind)?;
-    let form = Canonical::new(setup, &launch);
-    server_path::recheck(&fs(), &form.launch()).map_err(|e| e.kind())?;
+    let approved = form.launch();
+    server_path::recheck(&fs(), &approved).map_err(|e| e.kind())?;
+    let plan = Plan::of(form);
     let mut secrets = Vec::new();
-    for name in &setup.secrets {
-        secrets.push((name.clone(), secrets::server_secret(&setup.id, name).ok_or("no-key")?));
+    for name in &plan.secrets {
+        secrets.push((name.clone(), secrets::server_secret(setup_id, name).ok_or("no-key")?));
     }
     let parent: Vec<(String, String)> = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
-    let env = setup::environment(parent.iter().map(|(k, v)| (k.as_str(), v.as_str())), setup, &secrets);
+    let env = plan.environment(parent.iter().map(|(k, v)| (k.as_str(), v.as_str())), &secrets);
     let values: Vec<String> = secrets.into_iter().map(|(_, v)| v).collect();
-    let mut cmd = Command::new(&form.program);
-    cmd.args(&setup.args).current_dir(&form.cwd).env_clear().envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = Command::new(&plan.program);
+    cmd.args(&plan.args).current_dir(&plan.cwd).env_clear().envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let record = Record::new(&shell);
     let go_report = report.clone();
+    let log = shell.log.clone();
+    let id = setup_id.to_string();
     let started = os::start(
         cmd,
         |pid| record.write(pid),
         move |job| {
+            if let Err(e) = server_path::recheck(&fs(), &approved) {
+                log.line(&format!("server {id}: the walk before resume no longer finds the approved targets"));
+                return Err(e.kind());
+            }
             // The actor's word: go, or abort (a forget came meanwhile).
             let (go_tx, go_rx) = mpsc::channel();
             go_report(Report::Spawned { job: job.clone(), go: go_tx });
@@ -543,7 +573,7 @@ fn spawn(app: &AppHandle, setup: &Setup, channel: Channel<Value>, report: impl F
         },
     );
     record.remove();
-    let (mut child, job) = started.inspect_err(|kind| shell.log.line(&format!("server {}: start failed ({kind})", setup.id)))?;
+    let (mut child, job) = started.inspect_err(|kind| shell.log.line(&format!("server {setup_id}: start failed ({kind})")))?;
 
     // stdin through a writer thread of its own; nothing else ever waits on a write.
     let input = child.stdin.take().map(|mut stdin| {
@@ -573,7 +603,7 @@ fn spawn(app: &AppHandle, setup: &Setup, channel: Channel<Value>, report: impl F
     // keep the output open; then the output drains, for a bounded time; then core hears the exit
     // and the actor that the run is gone.
     let log = shell.log.clone();
-    let id = setup.id.clone();
+    let id = setup_id.to_string();
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
         job.terminate();
@@ -688,18 +718,18 @@ pub async fn server_write(app: AppHandle, request: Request<'_>) -> Res<()> {
     let spec = percent_encoding::percent_decode_str(header).decode_utf8().map_err(|_| fail("invalid", "bad spec"))?;
     let spec: WriteSpec = serde_json::from_str(&spec).map_err(|_| fail("invalid", "bad spec"))?;
     let servers = app.state::<Servers>();
-    let setup = lock(&servers.runs).get(&spec.run).cloned().ok_or_else(|| fail("missing", "no such run"))?;
+    let (setup, gen) = lock(&servers.runs).get(&spec.run).cloned().ok_or_else(|| fail("missing", "no such run"))?;
     let (reply, answer) = oneshot::channel();
-    servers.send(&app, &setup, Cmd::Write { bytes: bytes.clone(), reply })?;
+    servers.send(&app, &setup, Cmd::Write { gen, bytes: bytes.clone(), reply })?;
     answer.await.map_err(|_| fail("failed", "the server's actor has gone"))?
 }
 
 #[tauri::command]
 pub async fn server_stop(app: AppHandle, run: String) -> Res<()> {
     let servers = app.state::<Servers>();
-    let setup = lock(&servers.runs).get(&run).cloned().ok_or_else(|| fail("missing", "no such run"))?;
+    let (setup, gen) = lock(&servers.runs).get(&run).cloned().ok_or_else(|| fail("missing", "no such run"))?;
     let (reply, answer) = oneshot::channel();
-    servers.send(&app, &setup, Cmd::Stop { reply })?;
+    servers.send(&app, &setup, Cmd::Stop { gen, reply })?;
     answer.await.map_err(|_| fail("failed", "the server's actor has gone"))?
 }
 
@@ -734,7 +764,7 @@ impl Record {
         let created = os::creation_time(pid).ok_or_else(|| std::io::Error::other("no creation time"))?;
         let path = self.dir.join(format!("{pid}.json"));
         std::fs::create_dir_all(&self.dir)?;
-        temp::write_atomic(&path, json!({ "pid": pid, "created": created }).to_string().as_bytes())?;
+        temp::write_atomic(&path, &records::bytes(pid, created))?;
         *lock(&self.path) = Some(path);
         Ok(())
     }
@@ -747,31 +777,29 @@ impl Record {
 }
 
 /// At each start, in the manager, before any actor exists: each record's process is ended or
-/// found gone, and only then is that record removed. One that can't be ended stays for the next
-/// start.
+/// proven gone, and only then is that record deleted. One that can't be read, or whose process
+/// can't be ended or proven gone, stays for the next start; one that can't be parsed is renamed
+/// aside. Every record kept or set aside is logged. The rule is `shell_core::records::sweep`.
 pub fn sweep(shell: &Shell) {
     let dir = shell.data_dir.join("shell").join("starting");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
-    let (mut ended, mut gone, mut kept) = (0, 0, 0);
-    for e in entries.flatten() {
-        let v: Option<Value> = std::fs::read(e.path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        let Some((pid, created)) = v.and_then(|v| Some((v.get("pid")?.as_u64()? as u32, v.get("created")?.as_u64()?))) else {
-            // Not a record: nothing it names can be ended.
-            let _ = std::fs::remove_file(e.path());
-            continue;
-        };
-        match os::sweep_one(pid, created) {
-            os::Swept::Ended => ended += 1,
-            os::Swept::Gone => gone += 1,
-            os::Swept::Failed => {
+    let out = records::sweep(&dir, os::sweep_one);
+    let (mut ended, mut gone, mut kept, mut aside) = (0, 0, 0, 0);
+    for (name, o) in &out {
+        match o {
+            records::Outcome::Ended => ended += 1,
+            records::Outcome::Gone => gone += 1,
+            records::Outcome::Kept(why) => {
                 kept += 1;
-                continue;
+                shell.log.line(&format!("servers: start record {name} kept for the next start: {why}"));
+            }
+            records::Outcome::Aside { moved } => {
+                aside += 1;
+                shell.log.line(&format!("servers: start record {name} unreadable: renamed aside {moved}"));
             }
         }
-        let _ = std::fs::remove_file(e.path());
     }
-    if ended + gone + kept > 0 {
-        shell.log.line(&format!("servers: start records left by a hard kill: {ended} children ended, {gone} gone, {kept} kept for the next start"));
+    if !out.is_empty() {
+        shell.log.line(&format!("servers: start records left by a hard kill: {ended} children ended, {gone} gone, {kept} kept for the next start, {aside} set aside"));
     }
 }
 
@@ -785,7 +813,8 @@ mod os {
         sync::Arc,
     };
 
-    pub use shell_win::start::{Job, Swept};
+    pub use shell_win::start::Job;
+    use shell_core::records::Swept;
 
     pub fn start(cmd: Command, spawned: impl FnOnce(u32) -> std::io::Result<()>, before_resume: impl FnOnce(&Arc<Job>) -> Result<(), &'static str>) -> Result<(Child, Arc<Job>), &'static str> {
         match start::start(&RealOs, cmd, |c| spawned(c.id()), before_resume) {
@@ -801,7 +830,11 @@ mod os {
     }
 
     pub fn sweep_one(pid: u32, created: u64) -> Swept {
-        start::sweep_one(pid, created)
+        match start::sweep_one(pid, created) {
+            start::Swept::Ended => Swept::Ended,
+            start::Swept::Gone => Swept::Gone,
+            start::Swept::Failed => Swept::Failed,
+        }
     }
 }
 
@@ -818,11 +851,7 @@ mod os {
         pub fn terminate(&self) {}
     }
 
-    pub enum Swept {
-        Ended,
-        Gone,
-        Failed,
-    }
+    use shell_core::records::Swept;
 
     pub fn start(_: Command, _: impl FnOnce(u32) -> std::io::Result<()>, _: impl FnOnce(&Arc<Job>) -> Result<(), &'static str>) -> Result<(Child, Arc<Job>), &'static str> {
         Err("start-failed")
@@ -833,6 +862,6 @@ mod os {
     }
 
     pub fn sweep_one(_: u32, _: u64) -> Swept {
-        Swept::Gone
+        Swept::Failed
     }
 }
