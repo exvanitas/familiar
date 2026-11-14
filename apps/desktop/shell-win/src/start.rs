@@ -20,7 +20,7 @@ use std::{
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, FILETIME, HANDLE},
+        Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0},
         System::{
             Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32},
             JobObjects::{
@@ -28,8 +28,8 @@ use windows::{
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
             Threading::{
-                GetProcessTimes, OpenProcess, OpenThread, ResumeThread, TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+                GetProcessTimes, OpenProcess, OpenThread, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
             },
         },
     },
@@ -126,19 +126,22 @@ fn end(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Spawns `cmd` suspended with no console window, tells `spawned` (so the caller can record it
-/// for `sweep`), makes a job, assigns the child, runs `before_resume` with the job (the caller's
-/// last check, under its own lock), then resumes. On any failure after the spawn the child is
-/// ended and waited for, so nothing is left half-started.
+/// Spawns `cmd` suspended with no console window, has `spawned` record it for `sweep` (a failure
+/// to record aborts the start), makes a job, assigns the child, runs `before_resume` with the job
+/// (the caller's last word), then resumes. On any failure after the spawn the child is ended and
+/// waited for, so nothing is left half-started.
 pub fn start<E>(
     os: &dyn StartOs,
     mut cmd: Command,
-    spawned: impl FnOnce(&Child),
+    spawned: impl FnOnce(&Child) -> io::Result<()>,
     before_resume: impl FnOnce(&Arc<Job>) -> Result<(), E>,
 ) -> Result<(Child, Arc<Job>), StartError<E>> {
     cmd.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
     let mut child = cmd.spawn().map_err(|e| if e.kind() == io::ErrorKind::InvalidInput { StartError::InvalidInput } else { StartError::Spawn(e) })?;
-    spawned(&child);
+    if let Err(e) = spawned(&child) {
+        end(&mut child);
+        return Err(StartError::Stage("record", e));
+    }
     let job = match os.new_job() {
         Ok(j) => Arc::new(j),
         Err(e) => {
@@ -180,16 +183,39 @@ pub fn creation_time(pid: u32) -> Option<u64> {
     t
 }
 
-/// Ends each recorded child that is still the same process: the same id and creation time, read
-/// from the one handle that ends it, so an id reused meanwhile is never touched. How many it ended.
-pub fn sweep(records: &[(u32, u64)]) -> usize {
-    let mut ended = 0;
-    for &(pid, created) in records {
-        let Ok(h) = (unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { continue };
-        if times(h) == Some(created) && unsafe { TerminateProcess(h, 1) }.is_ok() {
-            ended += 1;
+/// What one record's process came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swept {
+    /// It was still the recorded child, and it's ended.
+    Ended,
+    /// It's gone, or its id now belongs to another process, which is left alone.
+    Gone,
+    /// It's there and couldn't be ended: keep the record and try again at the next start.
+    Failed,
+}
+
+/// Ends a recorded child if it's still the same process: the same id and creation time, read from
+/// the one handle that ends it, so an id reused meanwhile is never touched.
+pub fn sweep_one(pid: u32, created: u64) -> Swept {
+    let h = match unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(h) => h,
+        // No such process. (Access denied would mean another user's, so not our child either.)
+        Err(_) => return Swept::Gone,
+    };
+    let r = match times(h) {
+        Some(t) if t == created => {
+            if unsafe { TerminateProcess(h, 1) }.is_ok() {
+                Swept::Ended
+            } else if unsafe { WaitForSingleObject(h, 0) } == WAIT_OBJECT_0 {
+                // It had already ended: only a handle still held it.
+                Swept::Gone
+            } else {
+                Swept::Failed
+            }
         }
-        let _ = unsafe { CloseHandle(h) };
-    }
-    ended
+        Some(_) => Swept::Gone,
+        None => Swept::Failed,
+    };
+    let _ = unsafe { CloseHandle(h) };
+    r
 }

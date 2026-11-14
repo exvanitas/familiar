@@ -5,7 +5,7 @@
 
 use std::{cell::Cell, io, os::windows::process::CommandExt, process::Command, sync::Arc};
 
-use shell_win::start::{creation_time, start, sweep, Job, RealOs, StartError, StartOs};
+use shell_win::start::{creation_time, start, sweep_one, Job, RealOs, StartError, StartOs, Swept};
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
     System::Threading::{OpenProcess, WaitForSingleObject, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE},
@@ -68,7 +68,7 @@ impl StartOs for FailAt {
 fn every_failed_stage_leaves_no_child() {
     for stage in [Stage::Job, Stage::Assign, Stage::Resume] {
         let watch = Cell::new(None);
-        let r = start(&FailAt(stage), whoami(), |c| watch.set(Some(Watch::of(c.id()))), |_| Ok::<(), ()>(()));
+        let r = start(&FailAt(stage), whoami(), |c| { watch.set(Some(Watch::of(c.id()))); Ok(()) }, |_| Ok::<(), ()>(()));
         let label = format!("{stage:?}");
         match r {
             Err(StartError::Stage(s, _)) => println!("STAGE {label} failed as {s}"),
@@ -83,7 +83,7 @@ fn every_failed_stage_leaves_no_child() {
 fn a_refusal_before_resume_leaves_no_child() {
     let watch = Cell::new(None);
     let saw_job = Cell::new(false);
-    let r = start(&RealOs, whoami(), |c| watch.set(Some(Watch::of(c.id()))), |job: &Arc<Job>| {
+    let r = start(&RealOs, whoami(), |c| { watch.set(Some(Watch::of(c.id()))); Ok(()) }, |job: &Arc<Job>| {
         saw_job.set(Arc::strong_count(job) >= 1);
         Err("forgotten meanwhile")
     });
@@ -96,7 +96,7 @@ fn a_refusal_before_resume_leaves_no_child() {
 fn a_good_start_runs_in_its_job() {
     let mut cmd = whoami();
     cmd.stdout(std::process::Stdio::null());
-    let (mut child, job) = start(&RealOs, cmd, |_| {}, |_| Ok::<(), ()>(())).expect("start");
+    let (mut child, job) = start(&RealOs, cmd, |_| Ok(()), |_| Ok::<(), ()>(())).expect("start");
     assert!(child.wait().unwrap().success());
     drop(job);
 }
@@ -106,6 +106,22 @@ fn invalid_arguments_make_no_process() {
     let mut cmd = whoami();
     cmd.arg("a\0b");
     assert!(matches!(start(&RealOs, cmd, |_| panic!("no child for bad arguments"), |_| Ok::<(), ()>(())), Err(StartError::InvalidInput)));
+}
+
+#[test]
+fn a_record_that_fails_aborts_the_start_and_leaves_no_child() {
+    let watch = Cell::new(None);
+    let r = start(
+        &RealOs,
+        whoami(),
+        |c| {
+            watch.set(Some(Watch::of(c.id())));
+            Err(io::Error::other("no record, on purpose"))
+        },
+        |_| -> Result<(), ()> { panic!("no job step after a failed record") },
+    );
+    assert!(matches!(r, Err(StartError::Stage("record", _))));
+    assert!(watch.take().unwrap().gone_within(2000), "the unrecorded child is still there");
 }
 
 #[test]
@@ -119,9 +135,10 @@ fn the_sweep_ends_a_child_left_outside_a_job_and_nothing_else() {
     let watch = Watch::of(pid);
     let created = creation_time(pid).expect("its creation time");
     drop(child);
-    assert_eq!(sweep(&[(pid, created + 1)]), 0, "another creation time is another process");
-    assert!(!watch.gone_within(200));
-    assert_eq!(sweep(&[(pid, created)]), 1);
+    assert_eq!(sweep_one(pid, created + 1), Swept::Gone, "another creation time is another process");
+    assert!(!watch.gone_within(200), "and it's left alone");
+    assert_eq!(sweep_one(pid, created), Swept::Ended);
     assert!(watch.gone_within(2000), "the swept child is still there");
-    assert_eq!(sweep(&[(pid, created)]), 0, "once");
+    drop(watch);
+    assert_eq!(sweep_one(pid, created), Swept::Gone, "once ended, gone");
 }
