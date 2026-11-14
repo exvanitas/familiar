@@ -7,6 +7,8 @@
     "allow-shell-info", "allow-shell-ready", "allow-log-line",
     "allow-quit", "allow-quit-ready", "allow-tray-set",
     "allow-view-open", "allow-window-ctl",
-    "allow-address-list", "allow-address-add", "allow-address-remove"
+    "allow-address-list", "allow-address-add", "allow-address-remove",
+    "allow-net-fetch", "allow-net-read", "allow-net-cancel",
+    "allow-secret-set", "allow-secret-status", "allow-secret-delete"
   ]
 }

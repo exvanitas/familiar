@@ -18,7 +18,7 @@ const buildRs = read('src-tauri/build.rs');
 const COMMANDS = [...(/const COMMANDS: &\[&str\] = &\[([^\]]*)\]/.exec(buildRs)?.[1] ?? '').matchAll(/"([a-z_]+)"/g)].map(m => m[1]);
 const handlers = (/generate_handler!\[([^\]]*)\]/.exec(read('src-tauri/src/commands.rs'))?.[1] ?? '').split(',').map(s => s.trim().split('::').pop()).filter(Boolean);
 const shellTs = read('src/shell.ts');
-const clientCalls = [...shellTs.matchAll(/call(?:<[^>]*>)?\('([a-z_:|]+)'/g)].map(m => m[1]);
+const clientCalls = [...shellTs.matchAll(/(?:call(?:<[^>]*>)?|internals\.invoke)\('([a-z_:|]+)'/g)].map(m => m[1]);
 const conf = JSON.parse(read('src-tauri/tauri.conf.json'));
 const webRs = read('shell-core/src/web.rs');
 const constOf = (name: string) => /"(.*)";/.exec(webRs.slice(webRs.indexOf(`pub const ${name}: &str = `)))?.[1] ?? '';

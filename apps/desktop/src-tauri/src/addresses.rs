@@ -120,7 +120,6 @@ impl Addresses {
     }
 
     /// A saved address by id, with its URL parsed for the fetch.
-    #[allow(dead_code)] // the guarded fetch's
     pub fn get(&self, id: &str) -> Option<(Saved, Normalized)> {
         let a = lock(&self.list).iter().find(|a| a.id == id).cloned()?;
         let n = address::normalize(&a.url).ok()?;
@@ -129,7 +128,6 @@ impl Addresses {
 }
 
 /// The reach of a saved address, as the fetch uses it.
-#[allow(dead_code)] // the guarded fetch's
 pub fn reach(a: &Saved) -> Option<Reach> {
     reach_of(&a.reach)
 }
@@ -199,5 +197,8 @@ pub fn address_remove(app: AppHandle, id: String) -> Result<(), Fail> {
         addresses.save(&list)?;
     }
     addresses.log.line(&format!("address removed {id}"));
+    // Its open requests end with `revoked`, and its key goes.
+    crate::net::revoke(&app, &id);
+    crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id }).map_err(|_| fail("failed", "the address went, but its key couldn't be deleted"))?;
     Ok(())
 }

@@ -188,5 +188,11 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::addresses::address_list,
         crate::addresses::address_add,
         crate::addresses::address_remove,
+        crate::net::net_fetch,
+        crate::net::net_read,
+        crate::net::net_cancel,
+        crate::secrets::secret_set,
+        crate::secrets::secret_status,
+        crate::secrets::secret_delete,
     ]
 }

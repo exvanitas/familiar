@@ -1,9 +1,9 @@
 {
   "identifier": "settings",
-  "description": "The Settings window: its own window, the log and a read of the saved addresses. The key commands join when they exist. No events.",
+  "description": "The Settings window: key entry, write-only, its own window, the log and a read of the saved addresses. No events.",
   "windows": ["settings"],
   "permissions": [
     "allow-window-self", "allow-log-line",
-    "allow-address-list"
+    "allow-address-list", "allow-secret-set", "allow-secret-status"
   ]
 }
