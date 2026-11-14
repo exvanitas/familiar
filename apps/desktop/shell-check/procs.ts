@@ -115,6 +115,9 @@ export interface Ctx {
 async function main(info: Info, ctx: Ctx) {
   const p = await step<Paths>('proc-paths', {}, 120000);
   const bad = (problems: (string | null)[]) => problems.filter(Boolean) as string[];
+  // Every attempt that could reach a share, the direct UNC ones in server.paths included, falls
+  // between this sample and the next.
+  await step('smb-save', { name: 'servers-before' });
 
   await check('security.server.settings', async () => {
     const s = (extra: Partial<Setup>) => fakeSetup(p, 'set-' + rand(4), extra);
@@ -149,8 +152,7 @@ async function main(info: Info, ctx: Ctx) {
     return 'UNC program and folder, \\\\?\\, \\\\.\\, drive-relative, a stream, .., an invisible character and a device name refused before any dialog';
   });
 
-  // Paths that would reach the share, between two samples of the SMB counts and their control.
-  await step('smb-save', { name: 'servers-before' });
+  // More paths that would reach the share, still inside the samples begun above.
   const viaDrive = bad([
     await refusedBefore(fakeSetup(p, 'z-prog', { program: `${p.smb.mapped}:\\familiar-fx\\tool.exe`, args: [] }), 'unsafe-path'),
     await refusedBefore(fakeSetup(p, 'z-dir', { cwd: `${p.smb.mapped}:\\familiar-fx` }), 'unsafe-path')
@@ -164,7 +166,12 @@ async function main(info: Info, ctx: Ctx) {
   const control = await step<{ opens: number; new: string[] }>('smb-control', {});
   const quiet = smb.opens === 0 && smb.new.length === 0;
   const moved = control.opens > 0 && control.new.length > 0;
-  const counts = `SMB during the starts: ${smb.opens} server opens, ${smb.new.length} new connections; control: ${control.opens} opens, ${control.new.length} new (${p.smb.how})`;
+  const counts = `SMB from the first UNC attempt to the last link: ${smb.opens} server opens, ${smb.new.length} new connections; control: ${control.opens} opens, ${control.new.length} new (${p.smb.how})`;
+  await check('security.server.unc-measured', async () => {
+    ok(quiet, counts);
+    ok(moved, 'the control moved nothing, so the counts prove nothing: ' + counts);
+    return 'the direct UNC program and folder of server.paths were inside the SMB samples: ' + counts;
+  });
   await check('security.server.remote-drive', async () => {
     ok(viaDrive.length === 0, viaDrive.join('; '));
     ok(quiet, counts);
@@ -281,6 +288,44 @@ async function main(info: Info, ctx: Ctx) {
   });
 
   // Last in this phase, since the driver's job stops the exe making any process after it.
+  await check('security.server.stop-blocked-write', async () => {
+    // A server that never reads its stdin: writes fill the pipe and block. Stop must still end it.
+    const s = fakeSetup(p, 'fake-deaf', { args: ['-e', 'setInterval(() => {}, 1000)'] });
+    const m = new Mcp();
+    const r = await startWith(m, s, 'yes');
+    ok(r.started === 'started', 'the start: ' + r.started);
+    const big = new Uint8Array(4 * 1024 * 1024).fill(0x61);
+    const writes = [1, 2].map(() => shell.serverWrite(m.run, big).then(() => 'written', e => errKind(e)));
+    await sleep(1000);
+    const t0 = Date.now();
+    const stopped = await Promise.race([shell.serverStop(m.run).then(() => 'stopped', e => errKind(e)), sleep(10000).then(() => 'hung')]);
+    const ms = Date.now() - t0;
+    ok(stopped === 'stopped' && ms < 3000, `stop with writes blocked: ${stopped} after ${ms} ms`);
+    await m.exited(5000);
+    const outcomes = await Promise.race([Promise.all(writes), sleep(5000).then(() => ['hung'])]);
+    ok(!outcomes.includes('hung') && !outcomes.every(o => o === 'written'), 'the blocked writes: ' + outcomes.join(' '));
+    return `two 4 MiB writes blocked on a server that never reads; stop ended it in ${ms} ms, and the writes ended ${outcomes.join(', ')}`;
+  });
+
+  await check('security.server.exit-drains', async () => {
+    // The program exits, but a grandchild it started holds its stdout open. The exit must still
+    // come, and the grandchild go with the job.
+    const grand = "console.log('GRANDCHILD ' + process.pid); setInterval(() => {}, 1000)";
+    const main = `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grand)}], { stdio: 'inherit' }); setTimeout(() => process.exit(0), 1500)`;
+    const m = new Mcp();
+    const r = await startWith(m, fakeSetup(p, 'fake-heir', { args: ['-e', main] }), 'yes');
+    ok(r.started === 'started', 'the start: ' + r.started);
+    const t0 = Date.now();
+    const exited = await m.exited(8000).then(() => true, () => false);
+    const ms = Date.now() - t0;
+    const pid = Number((m.out.find(l => l.startsWith('GRANDCHILD ')) ?? '').split(' ')[1]);
+    ok(exited, 'no exit event while a grandchild held the output open');
+    ok(pid > 0, 'the grandchild never said its id');
+    const alive = await step<{ alive: number[] }>('pids-alive', { pids: [pid] });
+    ok(alive.alive.length === 0, `the grandchild ${pid} outlived the job`);
+    return `the exit came ${ms} ms after the start's wait began, with grandchild ${pid} holding stdout; it was ended with the job`;
+  });
+
   await check('security.server.blank', async () => {
     // A key typed into Settings by real key presses, stored as the setup's secret. The page never
     // learns it: the driver keeps it, and says only its first and last characters.
@@ -306,9 +351,8 @@ async function main(info: Info, ctx: Ctx) {
     ok(leaked.length === 0, `${leaked.length} lines carry the secret`);
     await shell.serverStop(m.run);
     await m.exited(5000);
-    const search = await step<{ files: number; found: string[] }>('secret-search', { dirs: [info.dataDir, info.webviewDir] });
-    ok(search.found.length === 0, 'the secret is in ' + search.found.join(' '));
-    return `a ${typed.length}-character secret from Credential Manager came back [hidden] on stdout and stderr; no copy in ${search.files} files of the data folder, WebView2's folder and the log`;
+    // The driver searches every file for the key once this run has ended (procs.ps1).
+    return `a ${typed.length}-character secret from Credential Manager came back [hidden] on stdout and stderr; the file search follows the run`;
   });
 
   await check('security.server.start-failed', async () => {
@@ -339,44 +383,59 @@ async function filesAndLinks(info: Info) {
       ok(!d.shown, `a dialog for ${url.slice(0, 40)}`);
       ok(await r === 'invalid', `${url.slice(0, 40)}: ${await r}`);
     }
-    const { port } = await step<{ port: number }>('listen-start');
-    const url = `https://127.0.0.1:${port}/familiar-check-${rand(6)}`;
+    // The current user's https handler is a recorder for this check, so what the browser would
+    // get is read back exactly.
+    const rec = await step<{ on: boolean; how: string }>('url-recorder-on');
+    ok(rec.on, 'the https recorder could not be set: ' + rec.how);
+    const url = `https://familiar-check.test/p/${rand(8)}?q=a&r=b`;
     const no = shell.openUrl(url).then(() => 'opened', e => errKind(e));
     const d1 = await dialog('refuse', OPEN);
     ok(d1.shown && await no === 'declined', `Don't open: dialog ${d1.shown}, ${await no}`);
-    ok(d1.text.includes('127.0.0.1'), 'the dialog does not show the host');
-    const none = await step<{ count: number }>('listen-count', { ms: 4000 });
-    ok(none.count === 0, `the listener saw ${none.count} connections after Don't open`);
+    ok(d1.text.includes('familiar-check.test'), 'the dialog does not show the host');
+    const none = await step<{ urls: string[] }>('url-recorded', { ms: 4000 });
+    ok(none.urls.length === 0, `the handler got ${none.urls.length} URLs after Don't open`);
     const yes = shell.openUrl(url).then(() => 'opened', e => errKind(e));
     const d2 = await dialog('approve', OPEN);
     ok(d2.shown && await yes === 'opened', `Open: dialog ${d2.shown}, ${await yes}`);
-    const seen = await step<{ count: number }>('listen-count', { ms: 30000, until: 1 });
-    await step('listen-stop');
-    ok(seen.count > 0, 'the listener saw no connection after Open');
-    return `http, javascript, file and too long refused with no dialog; Don't open: no connection; Open: ${seen.count} connections`;
+    const seen = await step<{ urls: string[] }>('url-recorded', { ms: 20000, until: 1 });
+    await step('url-recorder-off');
+    ok(seen.urls.length === 1 && seen.urls[0] === url, `the handler got: ${JSON.stringify(seen.urls)}, not exactly ${url}`);
+    return `http, javascript, file and too long refused with no dialog; Don't open: the handler got nothing; Open: it got exactly the approved URL (${rec.how})`;
   });
 
   await check('security.files.save-refused', async () => {
     const bytes = new TextEncoder().encode('familiar check ' + rand(8));
-    const save = async (dir: string) => {
+    // `watch` is the folder as this PC sees it, watched for any change to the chosen name while
+    // the dialog is open and until the save returns: a test file made before the exe judged the
+    // folder would show there.
+    const save = async (dir: string, watch = dir) => {
       const name = `familiar-check-${rand(6)}.txt`;
+      await step('save-watch-start', { dir: watch, name });
       const r = shell.saveAs({ name, filters: [{ name: 'Text', extensions: ['txt'] }] }, bytes).then(v => (v ? 'saved' : 'cancelled'), e => errKind(e));
       const d = await step<{ shown: boolean; why?: string; typed?: string }>('save-dialog', { path: `${dir}\\${name}` });
       ok(d.shown, `no save dialog: ${d.why ?? ''}`);
       const outcome = await r;
-      const there = await step<{ length: number; found: string[] }>('file-length', { path: `${dir}\\${name}`, find: name });
+      const events = await step<{ events: string[] }>('save-watch-stop');
+      const there = await step<{ length: number; found: string[] }>('file-length', { path: `${watch}\\${name}`, find: name });
       if (outcome === 'saved' && there.length < 0) fail(`saved, but not at ${dir}: found at ${there.found.join(' | ') || 'nowhere looked'}; the box read ${d.typed}`);
-      return { outcome, length: there.length };
+      return { outcome, length: there.length, events: events.events };
     };
     const normal = await save(p.tmp);
     ok(normal.outcome === 'saved' && normal.length === bytes.length, `a normal folder: ${normal.outcome}, ${normal.length} bytes`);
-    const data = await save(info.dataDir);
-    ok(data.outcome === 'refused' && data.length < 0, `the data folder: ${data.outcome}, ${data.length}`);
-    const webview = await save(info.webviewDir);
-    ok(webview.outcome === 'refused' && webview.length < 0, `the WebView2 folder: ${webview.outcome}, ${webview.length}`);
-    const exe = await save(p.exeDir);
-    ok(exe.outcome === 'refused' && exe.length < 0, `beside the exe: ${exe.outcome}, ${exe.length}`);
-    return 'a normal folder saved whole; the data folder, the WebView2 folder and the exe\'s folder refused, nothing written';
+    ok(normal.events.length > 0, 'the watch saw nothing of a real save, so it proves nothing');
+    const refusedAt: [string, string, string?][] = [
+      ['the data folder', info.dataDir],
+      ['the WebView2 folder', info.webviewDir],
+      ["the exe's folder", p.exeDir],
+      ['the mapped drive', `${p.smb.mapped}:\\familiar-fx`, 'C:\\familiar-fx'],
+      ['a UNC path', `${p.smb.unc}\\familiar-fx`, 'C:\\familiar-fx']
+    ];
+    for (const [what, dir, local] of refusedAt) {
+      const r = await save(dir, local ?? dir);
+      ok(r.outcome === 'refused' && r.length < 0, `${what}: ${r.outcome}, ${r.length}`);
+      ok(r.events.length === 0, `${what}: the folder changed during the dialog: ${r.events.join(' ')}`);
+    }
+    return `a normal folder saved whole (the watch saw ${normal.events.length} changes); the data, WebView2 and exe folders, a mapped drive and a UNC path refused, with no change at the chosen name in any of them`;
   });
 
 }
@@ -411,6 +470,24 @@ async function stoppedAsks() {
 
 async function recover(info: Info) {
   const p = await step<Paths>('proc-paths', {}, 120000);
+  await check('security.server.forget-pending', async () => {
+    // A forget while the start is under way, here while its dialog is open: approving after it
+    // must not start anything, nor store the approval.
+    const s = fakeSetup(p, 'fake-fp');
+    const m = new Mcp();
+    const started = m.start(s).then(() => 'started', e => errKind(e));
+    const held = await step<{ found: boolean }>('dialog', { act: 'hold', approve: START[0], refuse: START[1] }, 60000);
+    ok(held.found, 'no dialog to hold');
+    await shell.serverForget(s.id);
+    const approved = await step<{ answered: string }>('dialog', { act: 'approve', approve: START[0], refuse: START[1] }, 60000);
+    const outcome = await started;
+    ok(outcome === 'revoked', `approved after the forget (${approved.answered}): ${outcome}`);
+    const left = await step<{ count: number }>('node-children');
+    ok(left.count === 0, 'a node process started');
+    const again = await startWith(new Mcp(), s, 'no');
+    ok(again.dialog.shown && again.started === 'declined', `the next start: dialog ${again.dialog.shown}, ${again.started}: the approval was stored`);
+    return 'forgotten while its dialog was open: approving gave revoked, nothing ran, and the next start asked again';
+  });
   await check('security.server.store-recovery', async () => {
     const s = fakeSetup(p, 'fake-c');
     const m = new Mcp();
@@ -434,11 +511,13 @@ async function kill() {
     return;
   }
   await m.initialize();
+  const tree = JSON.parse(await m.tool('spawn_tree')) as { server: number; child: number; grandchild: number };
   void m.tool('slow', { ms: 60000 }, 70000).catch(() => '');
   await sleep(500);
-  // The driver kills the exe hard and reports what's left 2 s later. Nothing here runs after.
+  // The driver checks the server, its child and its grandchild are alive, kills the exe hard, and
+  // reports what's left 2 s later. Nothing here runs after.
   await say('INFO kill ready');
-  await step('kill-tree', {}, 120000);
+  await step('kill-tree', { pids: [tree.server, tree.child, tree.grandchild] }, 120000);
 }
 
 async function wake(messages: CoreMessage[]) {

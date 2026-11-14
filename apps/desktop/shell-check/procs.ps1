@@ -87,7 +87,6 @@ public static class P {
 "@
 
 $script:smb = $null
-$script:listener = $null
 
 # The share, a mapped drive and links to them, made before any count is taken, so their own SMB
 # traffic is in the baseline. The share is this runner's C$, so its root is C:\.
@@ -146,19 +145,77 @@ $procSteps = @{
     $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
     @{ repo = $repo; mainTs = (Join-Path $repo 'tools\fake-mcp-server\src\main.ts'); node = (Get-Command node -CommandType Application | Select-Object -First 1).Source; tmp = $tmp; exeDir = (Split-Path $Exe); smb = $script:smb }
   }
-  'secret-search' = {
+  'pids-alive' = {
     param($a)
-    # Every key the driver typed (driver-net.ps1 keeps them), in UTF-8 and UTF-16.
-    $files = @(foreach ($d in $a.dirs) { Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue }) + @(Get-Item $script:log -ErrorAction SilentlyContinue)
-    $found = @()
-    foreach ($f in $files) {
-      try { $b = [IO.File]::ReadAllBytes($f.FullName) } catch { continue }
-      $t8 = [Text.Encoding]::UTF8.GetString($b); $t16 = [Text.Encoding]::Unicode.GetString($b)
-      $t16b = if ($b.Length -gt 1) { [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { '' }
-      foreach ($k in $script:keys) { if ($t8.Contains($k) -or $t16.Contains($k) -or $t16b.Contains($k)) { $found += $f.Name } }
+    @{ alive = @($a.pids | Where-Object { Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue }) }
+  }
+  'url-recorder-on' = {
+    param($a)
+    # The current user's https handler, made a recorder that writes the URL it's given to a file.
+    # What was there is kept and put back by url-recorder-off.
+    $script:urlFile = Join-Path $tmp 'urls.txt'
+    Remove-Item $script:urlFile -ErrorAction SilentlyContinue
+    $rec = Join-Path $tmp 'record-url.ps1'
+    Set-Content $rec "param([string]`$u)`n[IO.File]::AppendAllText('$($script:urlFile)', `$u + [char]10)"
+    $pwsh = (Get-Process -Id $PID).Path
+    $key = 'HKCU:\Software\Classes\https'
+    $script:httpsBackup = Test-Path $key
+    if ($script:httpsBackup) { $script:httpsExport = Join-Path $tmp 'https-backup.reg'; & reg.exe export 'HKCU\Software\Classes\https' $script:httpsExport /y | Out-Null }
+    New-Item -Force "$key\shell\open\command" | Out-Null
+    Set-ItemProperty $key -Name '(default)' -Value 'URL:https recorder for the check'
+    Set-ItemProperty $key -Name 'URL Protocol' -Value ''
+    Set-ItemProperty "$key\shell\open\command" -Name '(default)' -Value "`"$pwsh`" -NoProfile -NonInteractive -WindowStyle Hidden -File `"$rec`" `"%1`""
+    # A user choice for https would win over the class: it must go for the check.
+    $uc = 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice'
+    $how = 'HKCU\Software\Classes\https set to a recorder'
+    if (Test-Path $uc) {
+      $script:userChoice = (Get-ItemProperty $uc).ProgId
+      try { Remove-Item $uc -Force -ErrorAction Stop; $how += "; the user choice ($($script:userChoice)) removed" }
+      catch { return @{ on = $false; how = "the https user choice ($($script:userChoice)) can't be removed: $_" } }
     }
-    if ($script:keys.Count -eq 0) { $found += 'no key was typed' }
-    @{ files = $files.Count; found = @($found) }
+    @{ on = $true; how = $how }
+  }
+  'url-recorded' = {
+    param($a)
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    do {
+      $urls = @(if (Test-Path $script:urlFile) { (Get-Content $script:urlFile -Raw).Split([char]10) | Where-Object { $_ } })
+      if ($a.until -and $urls.Count -ge [int]$a.until) { break }
+      Start-Sleep -Milliseconds 200
+    } while ($t.ElapsedMilliseconds -lt [int]$a.ms)
+    @{ urls = $urls }
+  }
+  'url-recorder-off' = {
+    param($a)
+    Remove-Item 'HKCU:\Software\Classes\https' -Recurse -Force -ErrorAction SilentlyContinue
+    if ($script:httpsBackup -and $script:httpsExport) { & reg.exe import $script:httpsExport | Out-Null }
+    @{}
+  }
+  'save-watch-start' = {
+    param($a)
+    # Any change at the chosen name in the folder, from now until save-watch-stop.
+    $script:saveEvents = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $w = [IO.FileSystemWatcher]::new($a.dir, '*')
+    $w.IncludeSubdirectories = $false
+    $w.NotifyFilter = [IO.NotifyFilters]'FileName, LastWrite, Size, CreationTime'
+    $q = $script:saveEvents; $name = [string]$a.name
+    $script:saveSubs = @(foreach ($e in 'Created', 'Changed', 'Deleted', 'Renamed') {
+      Register-ObjectEvent -InputObject $w -EventName $e -MessageData @{ q = $q; name = $name } -Action {
+        $n = $Event.SourceEventArgs.Name
+        if ($n -and $n.Contains($Event.MessageData.name)) { $Event.MessageData.q.Enqueue("$($Event.SourceEventArgs.ChangeType) $n") }
+      }
+    })
+    $w.EnableRaisingEvents = $true
+    $script:saveWatcher = $w
+    @{}
+  }
+  'save-watch-stop' = {
+    param($a)
+    Start-Sleep -Milliseconds 500
+    $script:saveWatcher.EnableRaisingEvents = $false
+    foreach ($sub in $script:saveSubs) { Unregister-Event -SourceIdentifier $sub.Name -ErrorAction SilentlyContinue }
+    $script:saveWatcher.Dispose()
+    @{ events = @($script:saveEvents.ToArray()) }
   }
   'smb-save' = { param($a); $c = Save-SmbCounts $a.name; @{ opens = $c.opens } }
   'smb-compare' = {
@@ -184,29 +241,6 @@ $procSteps = @{
       if ($threads.Count -and -not @($threads | Where-Object { $_.ThreadWaitReason -ne 5 }).Count) { $suspended++ }
     }
     @{ count = $kids.Count; suspended = $suspended }
-  }
-  'listen-start' = {
-    param($a)
-    $script:listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
-    $script:listener.Start()
-    @{ port = $script:listener.LocalEndpoint.Port }
-  }
-  'listen-count' = {
-    param($a)
-    $n = 0; $t = [Diagnostics.Stopwatch]::StartNew()
-    while ($t.ElapsedMilliseconds -lt [int]$a.ms) {
-      while ($script:listener.Pending()) { $script:listener.AcceptTcpClient().Close(); $n++ }
-      if ($a.until -and $n -ge [int]$a.until) { break }
-      Start-Sleep -Milliseconds 100
-    }
-    @{ count = $n }
-  }
-  'listen-stop' = {
-    param($a)
-    if ($script:listener) { $script:listener.Stop() }
-    # The browser open_url started, with the runner's default profile.
-    Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    @{}
   }
   'save-dialog' = {
     param($a)
@@ -277,16 +311,55 @@ $procSteps = @{
   }
   'kill-tree' = {
     param($a)
+    # The server, its child and its grandchild, each alive now, held by handle, and everything
+    # below them too.
+    $named = @($a.pids | ForEach-Object { Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue })
     $tree = @(Tree-Below $script:proc.Id | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue } | Where-Object { $_ })
-    foreach ($t in $tree) { [void]$t.Handle }
-    $names = ($tree | ForEach-Object { $_.ProcessName } | Sort-Object -Unique) -join ' '
+    $below = @(foreach ($n in $named) { Tree-Below $n.Id | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue } | Where-Object { $_ } })
+    $all = @($named + $tree + $below | Sort-Object Id -Unique)
+    foreach ($t in $all) { [void]$t.Handle }
+    $aliveBefore = @($named | Where-Object { -not $_.HasExited }).Count
+    $names = ($all | ForEach-Object { $_.ProcessName } | Sort-Object -Unique) -join ' '
     Stop-Process -Id $script:proc.Id -Force
     Start-Sleep -Seconds 2
-    $left = @($tree | Where-Object { -not $_.HasExited })
-    Result $(if ($tree.Count -ge 1 -and $left.Count -eq 0) { 'PASS' } else { 'FAIL' }) 'security.server.kill' "familiar.exe killed hard with a slow call in flight: $($tree.Count) processes below it ($names), $($left.Count) left 2 s later"
+    $left = @($all | Where-Object { -not $_.HasExited })
+    $ok = $named.Count -eq 3 -and $aliveBefore -eq 3 -and $left.Count -eq 0
+    Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.server.kill' "familiar.exe killed hard with a slow call in flight: the server, its child and its grandchild alive before ($aliveBefore of $($named.Count) of 3 found), $($all.Count) processes in all ($names), $($left.Count) left 2 s later"
     foreach ($l in $left) { Stop-Process -Id $l.Id -Force -ErrorAction SilentlyContinue }
     @{}
   }
+}
+
+# Every file under the folders, and the log, searched for each typed key in UTF-8 and UTF-16, once
+# the exe has stopped writing. Any file that can't be listed or read fails the search, and a planted
+# key must be found first, or the search proves nothing.
+function Search-Keys([string[]]$dirs, [string]$log, [string[]]$keys) {
+  $errs = @()
+  $files = @(foreach ($d in $dirs) { Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable +errs }) + @(Get-Item $log)
+  $found = @(); $unread = @(); $read = 0
+  foreach ($f in $files) {
+    try { $b = [IO.File]::ReadAllBytes($f.FullName) } catch { $unread += "$($f.Name): $($_.Exception.Message)"; continue }
+    $read++
+    $t8 = [Text.Encoding]::UTF8.GetString($b); $t16 = [Text.Encoding]::Unicode.GetString($b)
+    $t16b = if ($b.Length -gt 1) { [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { '' }
+    foreach ($k in $keys) { if ($t8.Contains($k) -or $t16.Contains($k) -or $t16b.Contains($k)) { $found += $f.Name } }
+  }
+  return @{ listed = $files.Count; read = $read; unread = @($unread) + @($errs | ForEach-Object { "listing: $($_.Exception.Message)" }); found = @($found | Sort-Object -Unique) }
+}
+
+function Check-BlankSearch([string]$data, [string]$log) {
+  if ($script:keys.Count -eq 0) { Result 'FAIL' 'security.server.blank' 'no key was typed, so nothing was searched'; return }
+  # The control: a key planted in one file of the data folder, in UTF-16, must be found.
+  $plant = 'fk' + (Rand 24)
+  $planted = Join-Path $data 'shell\planted-control.bin'
+  [IO.File]::WriteAllBytes($planted, [Text.Encoding]::Unicode.GetBytes("x $plant x"))
+  $control = Search-Keys @($data) $log @($plant)
+  Remove-Item $planted -Force
+  $real = Search-Keys @($data) $log @($script:keys)
+  $ok = ($control.found -contains 'planted-control.bin') -and $control.unread.Count -eq 0 -and $real.unread.Count -eq 0 -and $real.found.Count -eq 0 -and $real.read -gt 10
+  $detail = "after the run: $($real.read) of $($real.listed) files read under the data folder (WebView2's inside it) and the log, $($script:keys.Count) keys in UTF-8 and UTF-16: $(if ($real.found.Count) { 'found in ' + ($real.found -join ' ') } else { 'none found' }); the planted control was $(if ($control.found -contains 'planted-control.bin') { 'found' } else { 'missed' })"
+  if ($real.unread.Count -or $control.unread.Count) { $detail += "; unread: " + (@($real.unread + $control.unread) | Select-Object -First 5) -join ' | ' }
+  Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.server.blank' $detail
 }
 
 function Run-ProcChecks {
@@ -298,6 +371,7 @@ function Run-ProcChecks {
     $log = Join-Path $Out 'proc-main.log'
     [void](Run-Phase 'proc-main' $log @('--app-dir', $App, '--data-dir', $data, '--log', $log, '--seconds', '900', '--phase', 'proc-main') 960)
     [void](No-Strays 'proc-main')
+    Check-BlankSearch $data $log
 
     # An unreadable approval store: every setup asks again.
     Set-Content (Join-Path $data 'shell\servers.json') 'not a store {'
