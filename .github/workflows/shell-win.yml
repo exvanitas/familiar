@@ -134,11 +134,17 @@ jobs:
             "Control: server files opened $f0 -> $f1",
             "Control: packets on port 445 $packets"
           )
+          # The share is this runner's own, so SMB goes over loopback, which never reaches the
+          # network stack pktmon watches. Then a capture of 0 proves nothing, and the server's
+          # open count is the measure that must have moved here.
+          if ($packets -eq 0) { $lines += 'pktmon saw none of the control either: it is blind to loopback SMB, so its 0 above proves nothing' }
           $lines | ForEach-Object { Write-Host $_ }
           "## Control" >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
           $lines >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
+          if ($f0 -eq 'n/a' -or $f1 -eq 'n/a' -or [double]$f1 -le [double]$f0) { Write-Host 'The server open count did not move when the share was used, so it proves nothing.'; exit 1 }
+          if ($after -le $before) { Write-Host 'No new SMB connection showed when one was made, so that count proves nothing.'; exit 1 }
 
       - name: Clean up the mapping
         if: always()
