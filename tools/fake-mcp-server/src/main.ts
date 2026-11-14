@@ -28,13 +28,15 @@ const options = {
   env: process.env,
   log: (line: string) => process.stderr.write(`${line}\n`),
   crash: () => process.exit(3),
-  // A child that starts a grandchild and prints its id, both waiting for ever. Neither reads the
-  // server's stdin or writes to its stdout.
-  spawnTree: () =>
+  // A child that starts a grandchild and prints its id; the grandchild starts one more after 2 s,
+  // after anyone listing the tree has listed it. All wait for ever, each with the token as its
+  // last argument. None reads the server's stdin or writes to its stdout.
+  spawnTree: (token: string) =>
     new Promise<{ server: number; child: number; grandchild: number }>((done, fail) => {
-      const grandchild = 'setInterval(() => {}, 1000)';
-      const child = `const g = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' }); process.stdout.write(g.pid + '\\n'); setInterval(() => {}, 1000)`;
-      const c = spawn(process.execPath, ['-e', child], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const later = 'setInterval(() => {}, 1000)';
+      const grandchild = `setTimeout(() => require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(later)}, process.argv[1]], { stdio: 'ignore' }), 2000); setInterval(() => {}, 1000)`;
+      const child = `const g = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}, process.argv[1]], { stdio: 'ignore' }); process.stdout.write(g.pid + '\\n'); setInterval(() => {}, 1000)`;
+      const c = spawn(process.execPath, ['-e', child, token], { stdio: ['ignore', 'pipe', 'ignore'] });
       let out = '';
       c.stdout.on('data', (b: Buffer) => {
         out += b.toString();

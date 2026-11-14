@@ -28,8 +28,9 @@ export interface FakeServerOptions {
   readonly crash?: () => void;
   /** Notes kept across connections. */
   readonly notes?: string[];
-  /** What spawn_tree does. The program starts a child that starts a grandchild, and says their ids. */
-  readonly spawnTree?: () => Promise<{ server: number; child: number; grandchild: number }>;
+  /** What spawn_tree does. The program starts a child that starts a grandchild, each carrying the
+      token on its command line, and says their ids. */
+  readonly spawnTree?: (token: string) => Promise<{ server: number; child: number; grandchild: number }>;
 }
 
 export const SERVER_NAME = 'familiar-fake';
@@ -103,8 +104,13 @@ export function fakeTools(variant: Variant = 'a'): Tool[] {
     },
     {
       name: 'spawn_tree',
-      description: 'Starts a long-lived child process, which starts a grandchild, and returns the three process ids.',
-      inputSchema: noInput,
+      description: 'Starts a long-lived child process, which starts a grandchild, which later starts one more, each carrying the token on its command line, and returns the first three process ids.',
+      inputSchema: {
+        type: 'object',
+        properties: { token: { type: 'string', pattern: '^[a-z0-9]{8,64}$' } },
+        required: ['token'],
+        additionalProperties: false
+      },
       annotations: { readOnlyHint: false, destructiveHint: false }
     },
     {
@@ -169,7 +175,8 @@ export function createFakeServer(options: FakeServerOptions = {}): Server {
         return text(OUTSIDE_CONTENT);
       case 'spawn_tree': {
         if (!options.spawnTree) return toolError('This server can not start processes.');
-        return text(JSON.stringify(await options.spawnTree()));
+        if (typeof args.token !== 'string' || !/^[a-z0-9]{8,64}$/.test(args.token)) return toolError('token must be 8 to 64 lower-case letters and digits.');
+        return text(JSON.stringify(await options.spawnTree(args.token)));
       }
       default:
         throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${request.params.name}`);
