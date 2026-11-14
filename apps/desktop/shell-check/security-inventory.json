@@ -49,6 +49,7 @@
     "server.links",
     "server.settings",
     "server.env",
+    "server.blank",
     "server.start-failed",
     "server.store-recovery",
     "server.kill",

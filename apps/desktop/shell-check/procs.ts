@@ -106,7 +106,13 @@ async function refusedBefore(setup: Setup, kind: string): Promise<string | null>
   return null;
 }
 
-async function main(info: Info) {
+/* What core.ts hands over: asking another check page, and waiting for one to load. */
+export interface Ctx {
+  ask<T = unknown>(to: string, cmd: string, args?: unknown, ms?: number): Promise<T>;
+  up(role: string): Promise<unknown>;
+}
+
+async function main(info: Info, ctx: Ctx) {
   const p = await step<Paths>('proc-paths', {}, 120000);
   const bad = (problems: (string | null)[]) => problems.filter(Boolean) as string[];
 
@@ -275,6 +281,36 @@ async function main(info: Info) {
   });
 
   // Last in this phase, since the driver's job stops the exe making any process after it.
+  await check('security.server.blank', async () => {
+    // A key typed into Settings by real key presses, stored as the setup's secret. The page never
+    // learns it: the driver keeps it, and says only its first and last characters.
+    await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
+    await ctx.up('settings');
+    await ctx.ask('settings', 'paste-ready');
+    const typed = await step<{ head: string; tail: string; length: number }>('type-key', { title: 'Familiar check settings', long: false });
+    const id = 'fake-s';
+    const saved = await ctx.ask<string>('settings', 'save-key', `server:${id}:FAKE_SECRET`);
+    ok(saved === 'ok', 'Settings could not save the secret: ' + saved);
+    await shell.windowCtl('settings', 'close');
+    const m = new Mcp();
+    const r = await startWith(m, fakeSetup(p, id, { secrets: ['FAKE_SECRET'] }), 'yes');
+    ok(r.started === 'started', 'the start: ' + r.started);
+    ok(r.dialog.text.includes('FAKE_SECRET (kept in Credential Manager)'), 'the dialog does not name the secret');
+    await m.initialize();
+    const reply = await m.tool('print_secret');
+    await sleep(500);
+    const all = [reply, ...m.out, ...m.err];
+    const leaked = all.filter(t => t.includes(typed.head) || t.includes(typed.tail));
+    ok(reply.includes('[hidden]'), 'the reply: ' + reply.slice(0, 80));
+    ok(m.err.some(l => l.includes('the secret is [hidden]')), 'stderr: ' + m.err.slice(-3).join(' | '));
+    ok(leaked.length === 0, `${leaked.length} lines carry the secret`);
+    await shell.serverStop(m.run);
+    await m.exited(5000);
+    const search = await step<{ files: number; found: string[] }>('secret-search', { dirs: [info.dataDir, info.webviewDir] });
+    ok(search.found.length === 0, 'the secret is in ' + search.found.join(' '));
+    return `a ${typed.length}-character secret from Credential Manager came back [hidden] on stdout and stderr; no copy in ${search.files} files of the data folder, WebView2's folder and the log`;
+  });
+
   await check('security.server.start-failed', async () => {
     const s = fakeSetup(p, 'fake-c');
     const m = new Mcp();
@@ -405,8 +441,8 @@ async function wake(messages: CoreMessage[]) {
   });
 }
 
-export async function procPhase(phase: string, info: Info, messages: CoreMessage[]) {
-  if (phase === 'proc-main') await main(info);
+export async function procPhase(phase: string, info: Info, messages: CoreMessage[], ctx: Ctx) {
+  if (phase === 'proc-main') await main(info, ctx);
   else if (phase === 'proc-files') await filesAndLinks(info);
   else if (phase === 'proc-recover') await recover(info);
   else if (phase === 'proc-kill') await kill();

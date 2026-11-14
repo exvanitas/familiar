@@ -146,6 +146,20 @@ $procSteps = @{
     $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
     @{ repo = $repo; mainTs = (Join-Path $repo 'tools\fake-mcp-server\src\main.ts'); node = (Get-Command node -CommandType Application | Select-Object -First 1).Source; tmp = $tmp; exeDir = (Split-Path $Exe); smb = $script:smb }
   }
+  'secret-search' = {
+    param($a)
+    # Every key the driver typed (driver-net.ps1 keeps them), in UTF-8 and UTF-16.
+    $files = @(foreach ($d in $a.dirs) { Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue }) + @(Get-Item $script:log -ErrorAction SilentlyContinue)
+    $found = @()
+    foreach ($f in $files) {
+      try { $b = [IO.File]::ReadAllBytes($f.FullName) } catch { continue }
+      $t8 = [Text.Encoding]::UTF8.GetString($b); $t16 = [Text.Encoding]::Unicode.GetString($b)
+      $t16b = if ($b.Length -gt 1) { [Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { '' }
+      foreach ($k in $script:keys) { if ($t8.Contains($k) -or $t16.Contains($k) -or $t16b.Contains($k)) { $found += $f.Name } }
+    }
+    if ($script:keys.Count -eq 0) { $found += 'no key was typed' }
+    @{ files = $files.Count; found = @($found) }
+  }
   'smb-save' = { param($a); $c = Save-SmbCounts $a.name; @{ opens = $c.opens } }
   'smb-compare' = {
     param($a)

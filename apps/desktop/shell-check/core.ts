@@ -461,7 +461,7 @@ async function pinRead(info: Info, value: string, id: string) {
       await say('DONE');
       await shell.quit();
     } else if (phase.startsWith('proc-')) {
-      await procPhase(phase, info, messages);
+      await procPhase(phase, info, messages, { ask, up });
       onQuitting = () => { shell.quitReady().catch(() => {}); };
       await say('DONE');
       await shell.quit();
