@@ -71,6 +71,26 @@ describe('guardedFetch', () => {
     expect(f.calls).toContain('cancel');
   });
 
+  it('an abort while the body is being prepared never reaches the exe', async () => {
+    const f = fakeShell({});
+    const c = new AbortController();
+    const p = guardedFetch('a', {}, f.shell)('https://x.example', { method: 'POST', body: new Blob(['a body to read first']), signal: c.signal });
+    c.abort();
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+    expect(f.calls).toEqual([]);
+  });
+
+  it('a read after an abort errors with AbortError, and never hangs', async () => {
+    const f = fakeShell({ chunks: [text('a'), text('b')] });
+    const c = new AbortController();
+    const r = await guardedFetch('a', {}, f.shell)('https://x.example', { signal: c.signal });
+    c.abort();
+    const reader = r.body!.getReader();
+    const result = await Promise.race([reader.read().then(() => 'read', e => e.name), new Promise(res => setTimeout(() => res('hung'), 500))]);
+    expect(result).toBe('AbortError');
+    expect(f.calls).toContain('cancel');
+  });
+
   it('the exe refusing is a TypeError with its kind, as a network failure is', async () => {
     const f = fakeShell({ fetchError: { kind: 'not-saved', message: 'the request ended: not-saved' } });
     const e = await guardedFetch('a', {}, f.shell)('https://x.example').catch(x => x);
