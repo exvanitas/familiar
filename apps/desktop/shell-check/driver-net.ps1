@@ -151,6 +151,15 @@ function Net-Lookups {
   if ($code -eq 0 -and $l) { $results.Add([string]$l) } else { Result 'FAIL' 'security.fetch.no-lookup-before-allow' "the analysis failed: node exit $code" }
 }
 
+# Presses a dialog's button: through UI Automation by its name, or, if UI Automation doesn't show
+# it, with TDM_CLICK_BUTTON and the exe's button id. Says which.
+function Answer-Dialog($h, $el, [string]$name, [int]$id) {
+  $b = Dialog-Button $el $name
+  if ($b -and (Invoke-El $b)) { return 'ui automation' }
+  [void][W]::Post($h, 0x466, $id, 0)
+  return 'TDM_CLICK_BUTTON'
+}
+
 function Do-NetStep($action, $a) {
   switch ($action) {
     'type-key' {
@@ -201,55 +210,58 @@ function Do-NetStep($action, $a) {
       return ($r | ConvertFrom-Json)
     }
     'dialog' {
-      $out = [ordered]@{ found = $false; title = ''; texts = @(); details = ''; buttons = @(); approveAtStart = $false; approveLater = $false; invokedEarly = ''; owner = ''; topmost = $false; answered = '' }
+      $res = [ordered]@{ tree = @(); found = $false; title = ''; texts = @(); details = ''; buttons = @(); approveAtStart = $false; approveLater = $false; invokedEarly = ''; owner = ''; topmost = $false; answered = '' }
       $wait = if ($a.act -eq 'none') { 2500 } else { 15000 }
       $h = Wait-Dialog $wait
-      if (-not $h) { return $out }
-      $out.found = $true
+      if (-not $h) { return $res }
+      $res.found = $true
       $script:shotN++
       Write-Host "dialog $($a.act): found $h"
       if (-not [WN]::Responds($h)) {
         Screen-Shot "dialog-$($script:shotN)-hung"
-        $out.answered = 'the dialog does not respond'
-        return $out
+        $res.answered = 'the dialog does not respond'
+        return $res
       }
       $el = $UIA::FromHandle([IntPtr]$h)
+      # What UI Automation sees of the dialog, for the results.
+      $res.tree = @($el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Select-Object -First 60 | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''):$($_.Current.Name):$($_.Current.AutomationId)" })
+      if ($script:shotN -le 2) { Write-Host "dialog tree: $($res.tree -join ' | ')" }
       $approve = Dialog-Button $el $a.approve
-      $out.approveAtStart = [bool]($approve -and $approve.Current.IsEnabled)
-      $out.owner = [WN]::OwnerTitle($h)
-      $out.topmost = [WN]::Topmost($h)
+      $res.approveAtStart = [bool]($approve -and $approve.Current.IsEnabled)
+      $res.owner = [WN]::OwnerTitle($h)
+      $res.topmost = [WN]::Topmost($h)
       if ($a.act -eq 'enter') {
         # A click within the first second must do nothing.
-        try { if (Invoke-El $approve) { Start-Sleep -Milliseconds 300; $out.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' } } else { $out.invokedEarly = 'no invoke pattern' } }
-        catch { $out.invokedEarly = 'refused' }
+        try { if (Invoke-El $approve) { Start-Sleep -Milliseconds 300; $res.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' } } else { $res.invokedEarly = 'no invoke pattern' } }
+        catch { $res.invokedEarly = 'refused' }
       }
       Start-Sleep -Milliseconds 1300
-      if ($out.invokedEarly -ne 'closed it') {
+      if ($res.invokedEarly -ne 'closed it') {
         $approve = Dialog-Button $el $a.approve
-        $out.approveLater = [bool]($approve -and $approve.Current.IsEnabled)
-        $out.texts = Dialog-Texts $el
-        $out.buttons = @(Uia-All $el ([System.Windows.Automation.ControlType]::Button) | ForEach-Object { @{ name = $_.Current.Name; enabled = $_.Current.IsEnabled } })
+        $res.approveLater = [bool]($approve -and $approve.Current.IsEnabled)
+        $res.texts = Dialog-Texts $el
+        $res.buttons = @(Uia-All $el ([System.Windows.Automation.ControlType]::Button) | ForEach-Object { @{ name = $_.Current.Name; enabled = $_.Current.IsEnabled } })
         if ($a.details) {
           $more = Dialog-Button $el 'Show details'
           if ($more) { [void](Invoke-El $more); Start-Sleep -Milliseconds 400 }
           $after = Dialog-Texts $el
-          $out.details = (@($after | Where-Object { $out.texts -notcontains $_ }) -join "`n")
+          $res.details = (@($after | Where-Object { $res.texts -notcontains $_ }) -join "`n")
         }
       }
       if ($script:shotN -le 3) { Screen-Shot "dialog-$($script:shotN)" }
       switch ($a.act) {
-        'approve' { $out.answered = [string](Invoke-El (Dialog-Button $el $a.approve)) }
-        'refuse' { $out.answered = [string](Invoke-El (Dialog-Button $el $a.refuse)) }
-        'close' { [void][W]::Post($h, 0x10, 0, 0); $out.answered = 'closed' }
+        'approve' { $res.answered = Answer-Dialog $h $el $a.approve 100 }
+        'refuse' { $res.answered = Answer-Dialog $h $el $a.refuse 101 }
+        'close' { [void][W]::Post($h, 0x10, 0, 0); $res.answered = 'closed' }
         'enter' {
           [void][W]::Foreground($h)
           Start-Sleep -Milliseconds 300
           [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-          $out.answered = 'enter'
+          $res.answered = 'enter'
         }
-        default { $out.answered = 'held' }
+        default { $res.answered = 'held' }
       }
-      return $out
+      return $res
     }
     'winstate' {
       $o = [ordered]@{}
