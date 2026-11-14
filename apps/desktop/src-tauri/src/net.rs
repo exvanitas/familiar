@@ -1,13 +1,20 @@
 //! The guarded fetch: the only way out of Familiar to the network, and only to saved addresses.
 //! See "5c. The guarded fetch" in docs/shell-design.md. The rules are shell-core's: where it may
 //! connect (`address`), the request and its limits and redirects (`fetch`), the key swap
-//! (`secret`) and redaction (`redact`). This file runs them on reqwest.
+//! (`secret`), redaction (`redact`), and every request's state (`owner`). This file runs them on
+//! reqwest.
 //!
 //! A request is pull-based: `net_fetch` returns the head, then each `net_read` returns up to 1 MiB
-//! of the body after redaction, and an empty read only at the real end. `net_cancel` ends it at any
-//! moment, and removing its address ends it with `revoked`.
+//! of the body after redaction, and an empty read only at the real end. Its state is the owner's
+//! (`crate::owner`): registered with its address checked, resolving under a deadline, sending,
+//! streaming, ended. `net_cancel` and removing its address are transitions there, and every wait
+//! here checks the state on entering and leaving.
 
-use crate::{addresses::Addresses, secrets, shell::lock};
+use crate::{
+    addresses::{Addresses, Saved},
+    owner::{Live, Stop},
+    secrets,
+};
 use reqwest::{
     dns::{Addrs, Name, Resolve, Resolving},
     redirect::Policy,
@@ -17,16 +24,18 @@ use serde::{Deserialize, Serialize};
 use shell_core::{
     address::{self, Kind, Normalized, Reach},
     fetch::{self, FetchError, Limits},
+    owner::{ReqState, RESOLVE_DEADLINE},
     redact::{self, Redactor, KEY_MARK},
     secret,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    future::Future,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::{Arc, Mutex, OnceLock},
+    sync::OnceLock,
+    time::Duration,
 };
-use tauri::{ipc::Response, AppHandle, Manager, State};
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tauri::{ipc::Response, AppHandle, Manager};
+use tokio::sync::watch;
 
 #[derive(Debug, Serialize)]
 pub struct Fail {
@@ -38,15 +47,8 @@ fn fail(e: FetchError) -> Fail {
     Fail { kind: e.kind(), message: format!("the request ended: {}", e.kind()) }
 }
 
-/// Why a request was ended from outside: `net_cancel`, or its address removed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stop {
-    Running,
-    Cancelled,
-    Revoked,
-}
-
-struct Body {
+/// A request's body, once its head has come.
+pub struct Body {
     response: reqwest::Response,
     redactor: Redactor,
     out: Vec<u8>,
@@ -55,29 +57,18 @@ struct Body {
     ended: bool,
 }
 
-struct Request {
-    address: String,
-    stop: watch::Sender<Stop>,
-    body: AsyncMutex<Option<Body>>,
-}
+pub type Owner = crate::owner::Owner<Body>;
 
-/// Open requests, and every id used this run, since an id is never reused.
+/// The kept clients. Every request's state is the owner's, in `Addresses`.
 #[derive(Default)]
 pub struct Net {
-    open: Mutex<HashMap<String, Arc<Request>>>,
-    used: Mutex<HashSet<String>>,
-    /// Requests ended from outside, and why, so a later read says `revoked` rather than only that
-    /// the request is gone.
-    ended: Mutex<HashMap<String, FetchError>>,
-    /// Addresses being removed: no new request may start under one. Kept under `open`'s lock.
-    revoked: Mutex<HashSet<String>>,
     /// Lan and loopback, which never use a proxy, so they can be kept.
     local: OnceLock<[Client; 2]>,
 }
 
-/// A resolver that keeps only answers of the address's reach, so a name that later resolves
-/// somewhere else (DNS rebinding) reaches nothing. TLS still checks the certificate against the
-/// name.
+/// A resolver that uses a lookup only if every answer is of the address's reach, so a name that
+/// later resolves somewhere else (DNS rebinding) reaches nothing. TLS still checks the certificate
+/// against the name.
 struct KeepReach(Reach);
 
 #[derive(Debug)]
@@ -129,38 +120,6 @@ impl Net {
             Reach::Loopback => local[1].clone(),
         }
     }
-
-    fn take(&self, id: &str) -> Option<Arc<Request>> {
-        lock(&self.open).remove(id)
-    }
-}
-
-/// Ends every open request under an address, with `revoked`. Called when it's removed.
-pub fn revoke(app: &AppHandle, address_id: &str) {
-    let Some(net) = app.try_state::<Net>() else { return };
-    let (ids, gone): (Vec<String>, Vec<Arc<Request>>) = {
-        let mut open = lock(&net.open);
-        // Under the same lock a new request registers under, so none can slip in after this.
-        lock(&net.revoked).insert(address_id.to_string());
-        let ids: Vec<String> = open.iter().filter(|(_, r)| r.address == address_id).map(|(id, _)| id.clone()).collect();
-        let gone = ids.iter().filter_map(|id| open.remove(id)).collect();
-        (ids, gone)
-    };
-    let mut ended = lock(&net.ended);
-    for r in gone {
-        let _ = r.stop.send(Stop::Revoked);
-    }
-    for id in ids {
-        ended.insert(id, FetchError::Revoked);
-    }
-}
-
-/// The address is staying after all (its removal couldn't be saved): requests may start again.
-pub fn unrevoke(app: &AppHandle, address_id: &str) {
-    if let Some(net) = app.try_state::<Net>() {
-        let _open = lock(&net.open);
-        lock(&net.revoked).remove(address_id);
-    }
 }
 
 /// The request's spec, from the `x-spec` header, percent-encoded JSON.
@@ -208,38 +167,21 @@ fn kind_of(e: &reqwest::Error) -> FetchError {
     FetchError::Network
 }
 
-/// Waits for `f`, or for the request to be stopped from outside, or for `limit`.
-async fn guarded<T>(stop: &mut watch::Receiver<Stop>, limit: std::time::Duration, f: impl std::future::Future<Output = Result<T, reqwest::Error>>) -> Result<T, FetchError> {
-    let stopped = |s: Stop| if s == Stop::Revoked { FetchError::Revoked } else { FetchError::Cancelled };
-    if *stop.borrow() != Stop::Running {
-        return Err(stopped(*stop.borrow()));
-    }
-    tokio::select! {
-        r = tokio::time::timeout(limit, f) => match r {
-            Err(_) => Err(FetchError::Timeout),
-            Ok(Err(e)) => Err(kind_of(&e)),
-            Ok(Ok(v)) => Ok(v),
-        },
-        _ = stop.changed() => Err(stopped(*stop.borrow())),
-    }
+/// One wait of a request: `f`, unless the owner ends the request first or `limit` passes. The
+/// request's state is checked on entering and on leaving, so an end that came in between wins.
+async fn wait<T>(owner: &Owner, id: &str, stop: &mut watch::Receiver<Stop>, limit: Duration, f: impl Future<Output = Result<T, FetchError>>) -> Result<T, FetchError> {
+    owner.check(id)?;
+    let r = tokio::select! {
+        r = tokio::time::timeout(limit, f) => r.unwrap_or(Err(FetchError::Timeout)),
+        _ = stop.changed() => Err(match *stop.borrow() { Stop::Ended(e) => e, Stop::Running => FetchError::Cancelled }),
+    };
+    owner.check(id)?;
+    r
 }
 
-/// For a public name, looked up by Familiar first even when a proxy will resolve it: any answer
-/// that isn't public is refused.
-async fn check_public_name(n: &Normalized, stop: &mut watch::Receiver<Stop>) -> Result<(), FetchError> {
-    if n.reach.is_some() {
-        return Ok(());
-    }
-    let host = n.host.clone();
-    let lookup = async {
-        let answers = tokio::task::spawn_blocking(move || look_up(&host)).await.map_err(|_| FetchError::Network)?.map_err(|_| FetchError::Network)?;
-        shell_core::reach::all_of(Reach::Public, &answers).map(|_| ()).ok_or(FetchError::BlockedAddress)
-    };
-    // A cancel or a removal ends a slow lookup too.
-    tokio::select! {
-        r = lookup => r,
-        _ = stop.changed() => Err(if *stop.borrow() == Stop::Revoked { FetchError::Revoked } else { FetchError::Cancelled }),
-    }
+/// Blocking work, off the async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, FetchError> {
+    tokio::task::spawn_blocking(f).await.map_err(|_| FetchError::Network)
 }
 
 #[tauri::command]
@@ -254,46 +196,51 @@ pub async fn net_fetch(app: AppHandle, request: tauri::ipc::Request<'_>) -> Resu
 }
 
 async fn run(app: &AppHandle, spec: Spec, body: Vec<u8>) -> Result<Head, FetchError> {
-    let net = app.state::<Net>();
-    if !fetch::valid_id(&spec.id) || !lock(&net.used).insert(spec.id.clone()) {
+    if !fetch::valid_id(&spec.id) {
         return Err(FetchError::Invalid);
     }
-    // Registered first, atomically with the address check, so a cancel or a removal reaches the
-    // request from here on, before its key is loaded or its name resolved.
-    let (stop, mut stopped) = watch::channel(Stop::Running);
-    let (saved, norm, req) = {
-        let mut open = lock(&net.open);
-        if let Some(e) = lock(&net.ended).get(&spec.id) {
-            return Err(*e);
+    let addresses = app.state::<Addresses>();
+    let owner = &addresses.owner;
+    let found = addresses.get(&spec.address);
+    let fetchable = found.as_ref().is_some_and(|(a, _)| matches!(Kind::parse(&a.kind), Some(Kind::Model | Kind::Server)));
+    // Registered first, with its address checked, in one step of the owner: from here a cancel or
+    // a removal ends it, in whatever state it's in.
+    let (live, mut stop) = owner.register(&spec.id, &spec.address, fetchable)?;
+    let id = spec.id.clone();
+    let result = go(app, owner, &live, &mut stop, found.expect("registered, so it's saved"), spec, body).await;
+    if let Err(e) = result {
+        owner.end(&id, Some(e));
+    }
+    result
+}
+
+async fn go(app: &AppHandle, owner: &Owner, live: &Live<Body>, stop: &mut watch::Receiver<Stop>, (saved, norm): (Saved, Normalized), spec: Spec, body: Vec<u8>) -> Result<Head, FetchError> {
+    let id = spec.id.as_str();
+    let reach = crate::addresses::reach(&saved).ok_or(FetchError::NotSaved)?;
+    let mut url = address::under(&norm, spec.url.as_str())?;
+    let method = Method::from_bytes(fetch::check_method(&spec.method)?.as_bytes()).map_err(|_| FetchError::Invalid)?;
+    let headers = fetch::request_headers(spec.headers)?;
+    fetch::check_body(body.len())?;
+    let limits = fetch::limits(spec.max_bytes, spec.headers_ms, spec.idle_ms)?;
+    // Resolving: the key read and, for a public name, Familiar's own lookup first even when a
+    // proxy will resolve it, together under one deadline.
+    owner.advance(id, ReqState::Resolving)?;
+    let (address_id, host, public_name) = (saved.id.clone(), norm.host.clone(), reach == Reach::Public && norm.reach.is_none());
+    let key = wait(owner, id, stop, RESOLVE_DEADLINE, async move {
+        let key = blocking(move || secrets::address_key(&address_id)).await?;
+        if public_name {
+            let answers = blocking(move || look_up(&host)).await?.map_err(|_| FetchError::Network)?;
+            shell_core::reach::all_of(Reach::Public, &answers).ok_or(FetchError::BlockedAddress)?;
         }
-        let (saved, norm) = app.state::<Addresses>().get(&spec.address).ok_or(FetchError::NotSaved)?;
-        if lock(&net.revoked).contains(&saved.id) || !matches!(Kind::parse(&saved.kind), Some(Kind::Model | Kind::Server)) {
-            return Err(FetchError::NotSaved);
-        }
-        if open.len() >= fetch::MAX_OPEN {
-            return Err(FetchError::Busy);
-        }
-        let req = Arc::new(Request { address: saved.id.clone(), stop, body: AsyncMutex::new(None) });
-        open.insert(spec.id.clone(), req.clone());
-        (saved, norm, req)
-    };
-    let prepared = prepare(&saved, &norm, spec.url.as_str(), &spec.method, spec.headers, body.len(), (spec.max_bytes, spec.headers_ms, spec.idle_ms), &mut stopped).await;
-    let (reach, mut url, method, headers, secrets, limits) = match prepared {
-        Ok(p) => p,
-        Err(e) => {
-            net.take(&spec.id);
-            return Err(e);
-        }
-    };
-    // `send` checks the request wasn't cancelled or revoked right before it sends.
-    let result = send(&net.client(reach), &mut stopped, method, &mut url, &headers, body, &norm, &secrets, &limits).await;
-    let (response, redirected) = match result {
-        Ok(r) => r,
-        Err(e) => {
-            net.take(&spec.id);
-            return Err(e);
-        }
-    };
+        Ok(key)
+    })
+    .await?;
+    let swapped = secret::swap(headers, key.as_deref()).map_err(|_| FetchError::NoKey)?;
+    // The address's stored key is redacted from the response, and kept out of redirects, whether
+    // or not this request carried it: an endpoint can hold it from earlier requests.
+    let secrets: Vec<String> = key.into_iter().collect();
+    owner.advance(id, ReqState::Sending)?;
+    let (response, redirected) = send(owner, id, stop, &app.state::<Net>().client(reach), method, &mut url, &swapped.headers, body, &norm, &secrets, &limits).await?;
     let head = redact::redact_head(
         redact::Head {
             status_text: response.status().canonical_reason().unwrap_or("").to_string(),
@@ -308,50 +255,21 @@ async fn run(app: &AppHandle, spec: Spec, body: Vec<u8>) -> Result<Head, FetchEr
         &secrets,
     );
     if !fetch::response_headers_fit(&head.headers) {
-        net.take(&spec.id);
         return Err(FetchError::TooLarge);
     }
     let status = response.status().as_u16();
-    *req.body.lock().await = Some(Body { response, redactor: Redactor::new(&secrets, KEY_MARK), out: vec![], total: 0, limits, ended: false });
+    *live.body.lock().await = Some(Body { response, redactor: Redactor::new(&secrets, KEY_MARK), out: vec![], total: 0, limits, ended: false });
+    owner.advance(id, ReqState::Streaming)?;
     Ok(Head { status, status_text: head.status_text, headers: head.headers, url: head.url, redirected })
-}
-
-type Prepared = (Reach, url::Url, Method, Vec<(String, String)>, Vec<String>, Limits);
-
-/// Everything a request needs before it's sent, checked while it can already be cancelled.
-#[allow(clippy::too_many_arguments)]
-async fn prepare(
-    saved: &crate::addresses::Saved,
-    norm: &Normalized,
-    url: &str,
-    method: &str,
-    headers: Vec<(String, String)>,
-    body_len: usize,
-    (max_bytes, headers_ms, idle_ms): (Option<u64>, Option<u64>, Option<u64>),
-    stopped: &mut watch::Receiver<Stop>,
-) -> Result<Prepared, FetchError> {
-    let reach = crate::addresses::reach(saved).ok_or(FetchError::NotSaved)?;
-    let url = address::under(norm, url)?;
-    let method = Method::from_bytes(fetch::check_method(method)?.as_bytes()).map_err(|_| FetchError::Invalid)?;
-    let headers = fetch::request_headers(headers)?;
-    fetch::check_body(body_len)?;
-    let limits = fetch::limits(max_bytes, headers_ms, idle_ms)?;
-    let key = secrets::address_key(&saved.id);
-    let swapped = secret::swap(headers, key.as_deref()).map_err(|_| FetchError::NoKey)?;
-    // The address's stored key is redacted from the response, and kept out of redirects, whether
-    // or not this request carried it: an endpoint can hold it from earlier requests.
-    let secrets: Vec<String> = key.into_iter().collect();
-    if reach == Reach::Public {
-        check_public_name(norm, stopped).await?;
-    }
-    Ok((reach, url, method, swapped.headers, secrets, limits))
 }
 
 /// Sends, following redirects only under the same saved address.
 #[allow(clippy::too_many_arguments)]
 async fn send(
+    owner: &Owner,
+    id: &str,
+    stop: &mut watch::Receiver<Stop>,
     client: &Client,
-    stopped: &mut watch::Receiver<Stop>,
     mut method: Method,
     url: &mut url::Url,
     headers: &[(String, String)],
@@ -371,7 +289,7 @@ async fn send(
                 rb = rb.body(b.clone());
             }
         }
-        let response = guarded(stopped, limits.headers, rb.send()).await?;
+        let response = wait(owner, id, stop, limits.headers, async { rb.send().await.map_err(|e| kind_of(&e)) }).await?;
         let status = response.status();
         if !status.is_redirection() || status == StatusCode::NOT_MODIFIED {
             return Ok((response, hop > 0));
@@ -388,12 +306,17 @@ async fn send(
 
 /// Up to 1 MiB of the body, after redaction. Waits for output; empty only at the real end.
 #[tauri::command]
-pub async fn net_read(net: State<'_, Net>, id: String) -> Result<Response, Fail> {
-    let Some(req) = lock(&net.open).get(&id).cloned() else {
-        return Err(fail(lock(&net.ended).get(&id).copied().unwrap_or(FetchError::Cancelled)));
+pub async fn net_read(app: AppHandle, id: String) -> Result<Response, Fail> {
+    let addresses = app.state::<Addresses>();
+    let owner = &addresses.owner;
+    let Some(live) = owner.live(&id) else {
+        return Err(fail(owner.check(&id).err().unwrap_or(FetchError::Invalid)));
     };
-    let mut stopped = req.stop.subscribe();
-    let mut guard = req.body.lock().await;
+    if owner.check(&id).map_err(fail)? != ReqState::Streaming {
+        return Err(fail(FetchError::Invalid));
+    }
+    let mut stop = live.stop.subscribe();
+    let mut guard = live.body.lock().await;
     let Some(b) = guard.as_mut() else { return Err(fail(FetchError::Invalid)) };
     let outcome: Result<Vec<u8>, FetchError> = loop {
         if !b.out.is_empty() {
@@ -403,7 +326,8 @@ pub async fn net_read(net: State<'_, Net>, id: String) -> Result<Response, Fail>
         if b.ended {
             break Ok(vec![]);
         }
-        match guarded(&mut stopped, b.limits.idle, b.response.chunk()).await {
+        let response = &mut b.response;
+        match wait(owner, &id, &mut stop, b.limits.idle, async { response.chunk().await.map_err(|e| kind_of(&e)) }).await {
             Ok(Some(chunk)) => {
                 // Counted after decompression, so a small compressed body can't grow past it.
                 b.total += chunk.len() as u64;
@@ -423,24 +347,15 @@ pub async fn net_read(net: State<'_, Net>, id: String) -> Result<Response, Fail>
     };
     // The end, or an error: the request is over either way.
     drop(guard);
-    net.take(&id);
+    owner.end(&id, outcome.as_ref().err().copied());
     outcome.map(Response::new).map_err(fail)
 }
 
-/// Ends a request at any moment, before or after its head.
+/// Ends a request at any moment, before or after its head: one step of the owner.
 #[tauri::command]
-pub fn net_cancel(net: State<'_, Net>, id: String) {
-    match net.take(&id) {
-        Some(r) => {
-            let _ = r.stop.send(Stop::Cancelled);
-        }
-        // A cancel that comes before its request: the request is refused when it arrives.
-        None if fetch::valid_id(&id) => {
-            let _open = lock(&net.open);
-            lock(&net.ended).entry(id).or_insert(FetchError::Cancelled);
-        }
-        None => {}
-    }
+pub async fn net_cancel(app: AppHandle, id: String) -> Result<(), Fail> {
+    app.state::<Addresses>().owner.cancel(&id);
+    Ok(())
 }
 
 /// The per-user system proxy setting, and whether the guarded fetch uses it. Settings shows it:
@@ -453,10 +368,10 @@ pub struct Proxy {
     kind: &'static str,
 }
 
-#[tauri::command(async)]
-pub fn net_proxy() -> Proxy {
-    let kind = proxy_kind();
-    Proxy { in_use: kind == "manual", kind }
+#[tauri::command]
+pub async fn net_proxy() -> Result<Proxy, Fail> {
+    let kind = blocking(proxy_kind).await.map_err(fail)?;
+    Ok(Proxy { in_use: kind == "manual", kind })
 }
 
 #[cfg(windows)]

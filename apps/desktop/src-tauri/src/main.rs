@@ -11,6 +11,7 @@ mod confirm;
 mod files;
 mod net;
 mod notify;
+mod owner;
 mod pages;
 mod platform;
 mod secrets;

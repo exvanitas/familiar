@@ -3,11 +3,16 @@
 //! blob bound to an address or setup, the hint, and who may set what. There is no command that
 //! reads a key back. Inside the exe, `address_key` gives the guarded fetch its address's key and
 //! `server_secret` gives a server start its setup's secret; nothing else reads one.
+//!
+//! A write or delete of an `addr:` key is one of the owner's transitions (`crate::owner`): it may
+//! start only while the address is `Saved`, and a removal deletes the key only once no write is
+//! running. Every command is async; Credential Manager is called off the async workers.
 
 use crate::addresses::Addresses;
 use serde::Serialize;
 use shell_core::{
     address::Kind,
+    owner::WriteRefused,
     secret::{self, Caller, SecretError, SecretRef},
 };
 use tauri::{AppHandle, Manager, WebviewWindow};
@@ -80,21 +85,37 @@ pub fn delete(r: &SecretRef) -> Result<(), Fail> {
     }
 }
 
+/// Blocking work, off the async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Fail> {
+    tokio::task::spawn_blocking(f).await.map_err(|_| fail("failed", "the work stopped"))
+}
+
+/// Runs a write of `r`'s credential. For an `addr:` ref it's counted by the owner, and refused
+/// unless the address is `Saved`.
+async fn blocking_write(app: &AppHandle, r: &SecretRef, f: impl FnOnce() -> Result<(), Fail> + Send + 'static) -> Result<(), Fail> {
+    let SecretRef::Addr { id } = r else { return blocking(f).await? };
+    let owner = &app.state::<Addresses>().owner;
+    owner.begin_write(id).map_err(|e| match e {
+        WriteRefused::NotSaved => fail("not-saved", "no such address"),
+        WriteRefused::Removing => fail("revoked", "the address is being removed"),
+    })?;
+    let r = blocking(f).await;
+    owner.end_write(id);
+    r?
+}
+
 /// Settings stores any `addr:` key for a saved address and any `server:` secret. Core stores only
 /// a peer address's token. The caller is the window the request came from, never the page's word.
-#[tauri::command(async)]
-pub fn secret_set(app: AppHandle, window: WebviewWindow, id: String, value: String) -> Result<(), Fail> {
+#[tauri::command]
+pub async fn secret_set(app: AppHandle, window: WebviewWindow, id: String, value: String) -> Result<(), Fail> {
     let r = SecretRef::parse(&id)?;
-    // From the address check through the credential's commit, no removal can run: a key is never
-    // stored for an address that's gone.
-    let addresses = app.state::<Addresses>();
-    let _keys = addresses.keys();
     let (bound, kind) = binding(&app, &r);
     if !secret::may_set(Caller::from_label(window.label()), &r, kind) {
         return Err(SecretError::NotAllowed.into());
     }
     let blob = secret::seal(&bound, &value)?;
-    entry(&r)?.set_secret(&blob).map_err(|_| fail("failed", "the key couldn't be stored"))?;
+    let target = r.clone();
+    blocking_write(&app, &r, move || entry(&target)?.set_secret(&blob).map_err(|_| fail("failed", "the key couldn't be stored"))).await?;
     // The value is never logged; the ref names only ids.
     if let Some(shell) = app.try_state::<crate::shell::Shell>() {
         shell.log.line(&format!("key set for {}", r.user()));
@@ -103,17 +124,20 @@ pub fn secret_set(app: AppHandle, window: WebviewWindow, id: String, value: Stri
 }
 
 /// Whether a key is set, what it's bound to, and a hint for a long one. Never the key.
-#[tauri::command(async)]
-pub fn secret_status(app: AppHandle, id: String) -> Result<Status, Fail> {
+#[tauri::command]
+pub async fn secret_status(app: AppHandle, id: String) -> Result<Status, Fail> {
     let r = SecretRef::parse(&id)?;
     let (bound, _) = binding(&app, &r);
-    Ok(match read(&r, &bound) {
+    blocking(move || match read(&r, &bound) {
         Some(v) => Status { present: true, bound_to: Some(bound), hint: secret::hint(&v) },
         None => Status { present: false, bound_to: None, hint: None },
     })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn secret_delete(id: String) -> Result<(), Fail> {
-    delete(&SecretRef::parse(&id)?)
+#[tauri::command]
+pub async fn secret_delete(app: AppHandle, id: String) -> Result<(), Fail> {
+    let r = SecretRef::parse(&id)?;
+    let target = r.clone();
+    blocking_write(&app, &r, move || delete(&target)).await
 }

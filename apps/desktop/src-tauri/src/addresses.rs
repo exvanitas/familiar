@@ -4,8 +4,13 @@
 //! only after Allow one lookup of a name and its class. Nothing touches the network before the
 //! person says yes. The list is `shell\addresses.json`, written only here, atomically; a file that
 //! can't be read counts as an empty list.
+//!
+//! Whether an address may be used is the owner's (`crate::owner`): `Saved`, `Removing` from the
+//! moment its removal begins until the list without it is durably written, then `Removed`. Every
+//! command here is async, and anything that blocks (the dialog, a lookup, a file or credential
+//! write) runs off the async workers.
 
-use crate::{confirm, shell::lock};
+use crate::{confirm, net::Owner, shell::lock};
 use serde::{Deserialize, Serialize};
 use shell_core::{
     address::{self, AddrError, Kind, Normalized, Reach},
@@ -16,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager};
 
 /// One saved address, as stored and as pages see it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,11 +43,13 @@ struct File {
 
 pub struct Addresses {
     path: PathBuf,
+    /// Held only for a moment, never across a write.
     list: Mutex<Vec<Saved>>,
+    /// Held by whoever writes the list, on a blocking thread, from reading it through the write.
+    save: Mutex<()>,
     log: Arc<Log>,
-    /// Held by a key write from its address check through the credential's commit, and by a
-    /// removal from its revocation through the list's save, so a key can't outlive its address.
-    keys: Mutex<()>,
+    /// Every address's and every request's state.
+    pub owner: Owner,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,7 +120,8 @@ impl Addresses {
                 }
             },
         };
-        Addresses { path, list: Mutex::new(list), log, keys: Mutex::new(()) }
+        let owner = Owner::new(list.iter().map(|a| a.id.clone()));
+        Addresses { path, list: Mutex::new(list), save: Mutex::new(()), log, owner }
     }
 
     fn sound(a: &Saved) -> bool {
@@ -126,9 +134,27 @@ impl Addresses {
         write_atomic(&self.path, &bytes).map_err(|e| fail("failed", format!("the list couldn't be saved: {e}")))
     }
 
-    /// The lock a key write and a removal share.
-    pub fn keys(&self) -> std::sync::MutexGuard<'_, ()> {
-        lock(&self.keys)
+    /// Adds an address, written durably before it's in memory. An identical one already saved is
+    /// returned instead. Blocking.
+    fn add_durably(&self, saved: Saved, same: impl Fn(&Saved) -> bool) -> Result<Saved, Fail> {
+        let _save = lock(&self.save);
+        let mut next = lock(&self.list).clone();
+        if let Some(a) = next.iter().find(|a| same(a)) {
+            return Ok(a.clone());
+        }
+        next.push(saved.clone());
+        self.save(&next)?;
+        *lock(&self.list) = next;
+        Ok(saved)
+    }
+
+    /// Writes the list without the address, then drops it from memory. Blocking.
+    fn remove_durably(&self, id: &str) -> Result<(), Fail> {
+        let _save = lock(&self.save);
+        let next: Vec<Saved> = lock(&self.list).iter().filter(|a| a.id != id).cloned().collect();
+        self.save(&next)?;
+        *lock(&self.list) = next;
+        Ok(())
     }
 
     pub fn all(&self) -> Vec<Saved> {
@@ -155,32 +181,46 @@ fn look_up(n: &Normalized) -> Result<Reach, AddrError> {
     address::class_answers(&n.scheme, &answers)
 }
 
-#[tauri::command(async)]
-pub fn address_list(addresses: State<Addresses>) -> Vec<Saved> {
-    addresses.all()
+/// Blocking work, off the async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Fail> {
+    tokio::task::spawn_blocking(f).await.map_err(|_| fail("failed", "the work stopped"))
 }
 
-#[tauri::command(async)]
-pub fn address_add(app: AppHandle, kind: String, url: String, label: String, owner: Option<String>, ports: Option<(u16, u16)>) -> Result<Saved, Fail> {
-    let addresses = app.state::<Addresses>();
+#[tauri::command]
+pub async fn address_list(app: AppHandle) -> Result<Vec<Saved>, Fail> {
+    Ok(app.state::<Addresses>().all())
+}
+
+#[tauri::command]
+pub async fn address_add(app: AppHandle, kind: String, url: String, label: String, owner: Option<String>, ports: Option<(u16, u16)>) -> Result<Saved, Fail> {
     // 1. The form, with no network access.
     let kind = Kind::parse(&kind).ok_or_else(|| fail("invalid", "kind is model, server or peer"))?;
     let candidate = address::check_add(kind, &url, &label, ports)?;
     // 2. An identical address: returned, with no dialog.
-    let same = |a: &Saved| a.kind == kind.as_str() && a.url == candidate.identity.url && a.ports == candidate.identity.ports;
-    if let Some(a) = lock(&addresses.list).iter().find(|a| same(a)) {
-        return Ok(a.clone());
+    let identity = candidate.identity.clone();
+    let same = move |a: &Saved| a.kind == kind.as_str() && a.url == identity.url && a.ports == identity.ports;
+    if let Some(a) = app.state::<Addresses>().all().into_iter().find(|a| same(a)) {
+        return Ok(a);
     }
-    // 3. The confirm state, before any lookup. 4. The ask, on a copy made now.
-    let ticket = confirm::reserve(&app).map_err(|e| fail(e.kind(), "not asked"))?;
+    // 3. The confirm state, before any lookup. 4. The ask, on a copy made now. Both wait, so
+    // they run on a blocking thread; the dialog itself has a thread of its own.
     let ask = shell_core::confirm::add_address(&candidate, &label);
-    if !ticket.ask(owner.as_deref(), ask).map_err(|e| fail(e.kind(), "the dialog couldn't be shown"))? {
+    let a = app.clone();
+    let approved = blocking(move || {
+        let ticket = confirm::reserve(&a).map_err(|e| fail(e.kind(), "not asked"))?;
+        ticket.ask(owner.as_deref(), ask).map_err(|e| fail(e.kind(), "the dialog couldn't be shown"))
+    })
+    .await??;
+    if !approved {
         return Err(fail("declined", "the person didn't allow it"));
     }
     // 5. After Allow: a literal's reach is known; a name is looked up once and classed.
     let reach = match candidate.normalized.reach {
         Some(r) => r,
-        None => look_up(&candidate.normalized)?,
+        None => {
+            let n = candidate.normalized.clone();
+            blocking(move || look_up(&n)).await??
+        }
     };
     let saved = Saved {
         id: new_id(),
@@ -190,40 +230,34 @@ pub fn address_add(app: AppHandle, kind: String, url: String, label: String, own
         reach: reach.as_str().into(),
         ports: candidate.identity.ports,
     };
-    let mut list = lock(&addresses.list);
-    if let Some(a) = list.iter().find(|a| same(a)) {
-        return Ok(a.clone());
-    }
-    list.push(saved.clone());
-    addresses.save(&list)?;
-    addresses.log.line(&format!("address added {} ({}, {})", saved.id, saved.kind, saved.reach));
-    Ok(saved)
+    let a = app.clone();
+    let stored = blocking(move || a.state::<Addresses>().add_durably(saved, same)).await??;
+    let addresses = app.state::<Addresses>();
+    addresses.owner.saved(&stored.id);
+    addresses.log.line(&format!("address added {} ({}, {})", stored.id, stored.kind, stored.reach));
+    Ok(stored)
 }
 
-#[tauri::command(async)]
-pub fn address_remove(app: AppHandle, id: String) -> Result<(), Fail> {
+/// Removes an address. From the first moment it's `Removing`: its requests end `revoked`, and new
+/// requests and key writes are refused. Once no key write is running its key is deleted, then the
+/// list without it is written, and only then is it `Removed`. If either fails, it stays
+/// `Removing`, still refusing everything, and a retry continues from there.
+#[tauri::command]
+pub async fn address_remove(app: AppHandle, id: String) -> Result<(), Fail> {
     let addresses = app.state::<Addresses>();
-    let _keys = addresses.keys();
-    if !lock(&addresses.list).iter().any(|a| a.id == id) {
-        return Err(fail("not-saved", "no such address"));
-    }
-    // What is always safe goes first: its requests end with `revoked`, and its key goes. Then the
-    // list is written, and only then is the address dropped from memory. If anything fails, the
-    // address stays listed, without a key, and a retry works.
-    crate::net::revoke(&app, &id);
-    if crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id: id.clone() }).is_err() {
-        crate::net::unrevoke(&app, &id);
-        return Err(fail("failed", "the address's key couldn't be deleted"));
-    }
-    let mut list = lock(&addresses.list);
-    let remaining: Vec<Saved> = list.iter().filter(|a| a.id != id).cloned().collect();
-    if let Err(e) = addresses.save(&remaining) {
-        drop(list);
-        crate::net::unrevoke(&app, &id);
-        addresses.log.line(&format!("address {id} not removed: the list couldn't be saved"));
+    addresses.owner.begin_remove(&id).map_err(|_| fail("not-saved", "no such address"))?;
+    addresses.owner.writes_over(&id).await;
+    let (a, i) = (app.clone(), id.clone());
+    let done = blocking(move || {
+        crate::secrets::delete(&shell_core::secret::SecretRef::Addr { id: i.clone() }).map_err(|_| fail("failed", "the address's key couldn't be deleted"))?;
+        a.state::<Addresses>().remove_durably(&i)
+    })
+    .await?;
+    if let Err(e) = done {
+        addresses.log.line(&format!("address {id} not removed yet: it stays refused until a retry completes"));
         return Err(e);
     }
-    *list = remaining;
+    addresses.owner.removed(&id);
     addresses.log.line(&format!("address removed {id}"));
     Ok(())
 }

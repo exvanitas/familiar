@@ -87,16 +87,21 @@ fn quit_ready(shell: State<Shell>) -> Res<()> {
     shell.run().quit_ready().map_err(|e| fail("refused", e))
 }
 
-#[tauri::command(async)]
-fn tray_set(app: AppHandle, spec: TraySpec) -> Res<()> {
-    tray::set(&app, spec).map_err(|e| fail("invalid", e))
+/// Window work waits on the main thread, so it runs on a blocking thread, never an async worker.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
+    tokio::task::spawn_blocking(f).await.map_err(|_| fail("failed", "the work stopped"))?
 }
 
-#[tauri::command(async)]
-fn view_open(app: AppHandle, spec: ViewSpec) -> Res<()> {
+#[tauri::command]
+async fn tray_set(app: AppHandle, spec: TraySpec) -> Res<()> {
+    blocking(move || tray::set(&app, spec).map_err(|e| fail("invalid", e))).await
+}
+
+#[tauri::command]
+async fn view_open(app: AppHandle, spec: ViewSpec) -> Res<()> {
     // Built and hardened to the end inside the window gate, so a confirm can't freeze the windows
     // part-way through.
-    window_op(&app, || pages::open(&app, spec).map_err(|e| fail("refused", e)))
+    blocking(move || window_op(&app, || pages::open(&app, spec).map_err(|e| fail("refused", e)))).await
 }
 
 /// A window operation through the confirm gate: `busy` while a confirm is reserved or open.
@@ -126,9 +131,9 @@ pub struct Bounds {
 }
 
 /// Show, hide, focus, close, and get or set bounds, on Settings or a view. Never core.
-#[tauri::command(async)]
-fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>) -> Res<Option<Bounds>> {
-    window_op(&app, || window_ctl_now(&app, label, op, bounds))
+#[tauri::command]
+async fn window_ctl(app: AppHandle, label: String, op: String, bounds: Option<Bounds>) -> Res<Option<Bounds>> {
+    blocking(move || window_op(&app, || window_ctl_now(&app, label, op, bounds))).await
 }
 
 fn window_ctl_now(app: &AppHandle, label: String, op: String, bounds: Option<Bounds>) -> Res<Option<Bounds>> {
@@ -168,10 +173,10 @@ fn window_ctl_now(app: &AppHandle, label: String, op: String, bounds: Option<Bou
 
 /// Drag, minimize, toggle maximize or close, on the calling window. The label is the caller's,
 /// read from the request, never from what the page sent.
-#[tauri::command(async)]
-fn window_self(window: WebviewWindow, op: String) -> Res<()> {
+#[tauri::command]
+async fn window_self(window: WebviewWindow, op: String) -> Res<()> {
     let app = window.app_handle().clone();
-    window_op(&app, || window_self_now(&window, op))
+    blocking(move || window_op(&app, || window_self_now(&window, op))).await
 }
 
 fn window_self_now(window: &WebviewWindow, op: String) -> Res<()> {
