@@ -80,7 +80,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| std::io::Error::other("no folder"))?;
     std::fs::create_dir_all(dir)?;
     let temp = dir.join(format!(".~{}.tmp", &new_id()[..16]));
-    let written = std::fs::write(&temp, bytes).and_then(|()| std::fs::File::open(&temp)?.sync_all()).and_then(|()| std::fs::rename(&temp, path));
+    let written = (|| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        f.write_all(bytes)?;
+        // Flushed through the handle it was written with: a read-only one can't be flushed.
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&temp, path)
+    })();
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }

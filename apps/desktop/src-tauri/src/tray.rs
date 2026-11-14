@@ -14,7 +14,8 @@ use tauri::{
 const ID: &str = "main";
 /// The exe's own item, shown only while three refusals have stopped the confirms.
 pub const ASK_AGAIN_ID: &str = "shell:ask-again";
-const ASK_AGAIN_LABEL: &str = "Let Familiar ask again";
+/// With `a` as its access key, so the menu can be answered from the keyboard too.
+const ASK_AGAIN_LABEL: &str = "Let Familiar &ask again";
 
 /// The app's last menu, so the exe can rebuild the tray when its own items change.
 static APP_ITEMS: std::sync::Mutex<Vec<Item>> = std::sync::Mutex::new(Vec::new());

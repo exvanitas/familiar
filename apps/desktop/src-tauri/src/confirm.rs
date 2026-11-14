@@ -158,6 +158,9 @@ impl Freeze {
             saved.push((label, h, enabled, on_top));
             if on_top {
                 let _ = w.set_always_on_top(false);
+                // The window's styles are rebuilt on its own thread when always-on-top changes,
+                // which would undo a disable made before it. A read waits for that thread.
+                let _ = w.is_always_on_top();
             }
             platform::enable(h, false);
         }
@@ -172,10 +175,11 @@ impl Drop for Freeze {
             if platform::hwnd(&w) != Some(*h) {
                 continue;
             }
-            platform::enable(*h, *enabled);
             if *on_top {
                 let _ = w.set_always_on_top(true);
+                let _ = w.is_always_on_top();
             }
+            platform::enable(*h, *enabled);
         }
     }
 }

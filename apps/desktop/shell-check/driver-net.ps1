@@ -62,8 +62,19 @@ function Dialog-Texts($el) {
   return @(Uia-All $el ([System.Windows.Automation.ControlType]::Text) | ForEach-Object { $_.Current.Name } | Where-Object { $_ })
 }
 
+# A task dialog's button shows in UI Automation as a pane, CommandButton_<id>, named by its text.
 function Dialog-Button($el, [string]$name) {
-  return Uia-All $el ([System.Windows.Automation.ControlType]::Button) | Where-Object { ($_.Current.Name -replace '&', '') -eq $name } | Select-Object -First 1
+  return @($el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) |
+    Where-Object { ($_.Current.Name -replace '&', '') -eq $name -and ($_.Current.AutomationId -like 'CommandButton_*' -or $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) } |
+    Select-Object -First 1
+}
+
+# A real mouse click in the middle of an element. True if the input went in.
+function Click-El($b) {
+  if (-not $b) { return $false }
+  $r = $b.Current.BoundingRectangle
+  if ($r.IsEmpty) { return $false }
+  return [W]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
 }
 
 function Invoke-El($b) {
@@ -155,7 +166,11 @@ function Net-Lookups {
 # it, with TDM_CLICK_BUTTON and the exe's button id. Says which.
 function Answer-Dialog($h, $el, [string]$name, [int]$id) {
   $b = Dialog-Button $el $name
-  if ($b -and (Invoke-El $b)) { return 'ui automation' }
+  try { if ($b -and (Invoke-El $b)) { return 'ui automation' } } catch { }
+  if (Click-El $b) {
+    Start-Sleep -Milliseconds 400
+    if (-not [WN]::Shown([uint32]$script:proc.Id, '#32770')) { return 'a click' }
+  }
   [void][W]::Post($h, 0x466, $id, 0)
   return 'TDM_CLICK_BUTTON'
 }
@@ -232,8 +247,11 @@ function Do-NetStep($action, $a) {
       $res.topmost = [WN]::Topmost($h)
       if ($a.act -eq 'enter') {
         # A click within the first second must do nothing.
-        try { if (Invoke-El $approve) { Start-Sleep -Milliseconds 300; $res.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' } } else { $res.invokedEarly = 'no invoke pattern' } }
-        catch { $res.invokedEarly = 'refused' }
+        # A real click on it within the first second must do nothing.
+        if (Click-El $approve) {
+          Start-Sleep -Milliseconds 300
+          $res.invokedEarly = if ([WN]::Shown([uint32]$script:proc.Id, '#32770')) { 'no effect' } else { 'closed it' }
+        } else { $res.invokedEarly = 'could not click' }
       }
       Start-Sleep -Milliseconds 1300
       if ($res.invokedEarly -ne 'closed it') {
@@ -278,14 +296,21 @@ function Do-NetStep($action, $a) {
       [void][W]::Post($h, 6002, 0, 0x204)
       [void][W]::Post($h, 6002, 0, 0x205)
       $menu = 0
-      for ($i = 0; $i -lt 50 -and -not $menu; $i++) { Start-Sleep -Milliseconds 100; $menu = [WN]::AnyShown('#32768') }
+      for ($i = 0; $i -lt 50 -and -not $menu; $i++) { Start-Sleep -Milliseconds 100; $menu = [WN]::Shown([uint32]$script:proc.Id, '#32768') }
       if (-not $menu) { return @{ done = $false; how = 'no menu appeared' } }
+      Start-Sleep -Milliseconds 300
       $el = $UIA::FromHandle([IntPtr]$menu)
-      $item = Uia-All $el ([System.Windows.Automation.ControlType]::MenuItem) | Where-Object { $_.Current.Name -eq 'Let Familiar ask again' } | Select-Object -First 1
-      if (-not $item) { return @{ done = $false; how = 'the menu has no "Let Familiar ask again": ' + ((Uia-All $el ([System.Windows.Automation.ControlType]::MenuItem) | ForEach-Object { $_.Current.Name }) -join ', ') } }
-      $ok = Invoke-El $item
+      $items = @($el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition))
+      $item = $items | Where-Object { ($_.Current.Name -replace '&', '') -eq 'Let Familiar ask again' } | Select-Object -First 1
+      $how = ''
+      try { if ($item -and (Invoke-El $item)) { $how = 'picked from the tray menu through UI Automation' } } catch { }
+      if (-not $how) {
+        # Its access key, from the keyboard, as a person could.
+        [System.Windows.Forms.SendKeys]::SendWait('a')
+        $how = "its access key (UI Automation saw: $(($items | ForEach-Object { $_.Current.Name }) -join ', '))"
+      }
       Start-Sleep -Milliseconds 500
-      return @{ done = $ok; how = 'picked from the tray menu through UI Automation' }
+      return @{ done = -not [WN]::Shown([uint32]$script:proc.Id, '#32768'); how = $how }
     }
     default { return $null }
   }

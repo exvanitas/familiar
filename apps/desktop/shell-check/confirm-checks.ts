@@ -109,7 +109,7 @@ export async function confirmChecks(ctx: { ask: <T>(to: string, cmd: string, arg
   });
   await check('security.confirm.defaults', async () => {
     ok(defaults !== 'not reached', 'the throttle check never got there');
-    ok(/enabled at first false, after a second true, an early click (refused|no effect), Enter gave refused:declined/.test(defaults), defaults);
+    ok(/enabled at first false, after a second true, an early click no effect, Enter gave refused:declined/.test(defaults), defaults);
     return defaults;
   });
   await shell.windowCtl('view-top', 'close');
