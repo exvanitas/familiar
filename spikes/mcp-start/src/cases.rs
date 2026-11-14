@@ -506,6 +506,30 @@ pub fn hold(no_job: bool) -> i32 {
         println!("HOLD-SERVER {} pid={} in_job={}", s.label, client.server.child.id(), client.server.job.is_some());
         clients.push(client);
     }
+    // A server busy in a call when the app dies. MCP servers exit when stdin closes, but not while a call is running.
+    // Through a .cmd, so cmd.exe sits between the app and node, as with npx.
+    let fake_cmd = spike_dir().join("fixtures/fake-server.cmd").to_string_lossy().into_owned();
+    let busy = setup("busy fake server via .cmd", &fake_cmd, &[], &repo_root(), &[]);
+    match start(&busy, &opts) {
+        Ok(server) => {
+            let mut client = Client::new(server);
+            if let Err(e) = client.initialize(QUICK) {
+                eprintln!("hold: busy server: {e}");
+                return 1;
+            }
+            let call = json!({ "jsonrpc": "2.0", "id": 900, "method": "tools/call", "params": { "name": "slow", "arguments": { "ms": 60000 } } });
+            if let Err(e) = client.server.send_line(&call.to_string()) {
+                eprintln!("hold: busy server: {e}");
+                return 1;
+            }
+            println!("HOLD-SERVER {} pid={} in_job={} (a 60 s call in flight)", busy.label, client.server.child.id(), client.server.job.is_some());
+            clients.push(client);
+        }
+        Err(e) => {
+            eprintln!("hold: busy server did not start: {e}");
+            return 1;
+        }
+    }
     println!("HOLD-READY");
     std::thread::sleep(Duration::from_secs(600));
     drop(clients);
@@ -572,6 +596,7 @@ pub fn kill_test(no_job: bool) -> i32 {
         let left = limit.saturating_sub(t0.elapsed());
         if h.wait_ms(left.as_millis() as u32) {
             last_exit = last_exit.max(t0.elapsed());
+            println!("EXITED {} pid={} by {} ms", p.exe, p.pid, t0.elapsed().as_millis());
         } else {
             survivors.push(p.clone());
         }
@@ -585,7 +610,11 @@ pub fn kill_test(no_job: bool) -> i32 {
 
     if no_job {
         info(case, &format!("without a job, {} of {} processes outlived the app: {:?}", survivors.len(), handles.len(), survivors.iter().map(|p| &p.exe).collect::<Vec<_>>()));
-        check(case, !survivors.is_empty(), "the control shows the job is what does the cleanup (orphans survive without it)");
+        check(
+            case,
+            survivors.iter().any(|p| p.exe.eq_ignore_ascii_case("node.exe")),
+            "the control shows the job is what ends a busy server: without it, node outlives the app",
+        );
         for (p, h) in &handles {
             if let Some(h) = h {
                 if survivors.iter().any(|s| s.pid == p.pid) {
