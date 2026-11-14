@@ -26,9 +26,19 @@ concurrency:
 
 jobs:
   windows:
+    # `both` is the exe as it ships. The others are measurement builds of the same source with one
+    # WebRTC closure taken out, or other switches tried, so each closure is measured on its own. They
+    # never ship, and their gate is information only.
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [both, csp-only, script-only, switches]
+    name: windows (${{ matrix.variant }})
+    continue-on-error: ${{ matrix.variant != 'both' }}
     runs-on: windows-latest
     timeout-minutes: 75
     env:
+      VARIANT: ${{ matrix.variant }}
       REUSE: ${{ inputs.reuse || false }}
     defaults:
       run:
@@ -58,13 +68,31 @@ jobs:
           rustc --version
           cargo test --locked
 
+      - name: Measurement variant
+        if: env.REUSE != 'true' && env.VARIANT != 'both'
+        run: |
+          $pages = 'apps/desktop/src-tauri/src/pages.rs'
+          $conf = 'apps/desktop/src-tauri/tauri.conf.json'
+          $web = 'apps/desktop/shell-core/src/web.rs'
+          if ($env:VARIANT -eq 'csp-only' -or $env:VARIANT -eq 'switches') {
+            (Get-Content $pages) | Where-Object { $_ -notmatch 'initialization_script_for_all_frames' } | Set-Content $pages
+          }
+          if ($env:VARIANT -eq 'script-only' -or $env:VARIANT -eq 'switches') {
+            (Get-Content -Raw $conf).Replace("; webrtc 'block'", '') | Set-Content -NoNewline $conf
+          }
+          if ($env:VARIANT -eq 'switches') {
+            (Get-Content -Raw $web).Replace('--dns-prefetch-disable";', '--dns-prefetch-disable --enforce-webrtc-ip-permission-check --webrtc-ip-handling-policy=disable_non_proxied_udp";') | Set-Content -NoNewline $web
+          }
+          git diff --stat
+          git diff
+
       - name: Release build
         if: env.REUSE != 'true'
         working-directory: apps/desktop/src-tauri
         run: cargo build --release --locked
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.REUSE != 'true'
+        if: env.REUSE != 'true' && env.VARIANT == 'both'
         with:
           path: |
             ~/.cargo/registry
@@ -94,12 +122,12 @@ jobs:
           $f = Get-Item exe/familiar.exe
           $line = "``$($f.Name)`` $($f.Length) bytes, sha256 ``$((Get-FileHash $f -Algorithm SHA256).Hash)``"
           $line
-          "$line`n" >> $env:GITHUB_STEP_SUMMARY
+          "$env:VARIANT: $line`n" >> $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.REUSE != 'true'
         with:
-          name: familiar-windows
+          name: ${{ matrix.variant == 'both' && 'familiar-windows' || format('familiar-windows-{0}', matrix.variant) }}
           path: exe/familiar.exe
           retention-days: 30
           if-no-files-found: error
@@ -115,6 +143,7 @@ jobs:
       - name: Static gate
         run: |
           New-Item -ItemType Directory -Force results | Out-Null
+          if ($env:VARIANT -ne 'both') { "SKIP security.caps.static a measurement build, changed on purpose" | Set-Content results/static.txt; exit 0 }
           pnpm vitest run --project desktop
           $state = if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }
           "$state security.caps.static capabilities, COMMANDS, handlers, shell.ts, CSP, browser arguments and Trusted Types on every page" | Set-Content results/static.txt
@@ -134,7 +163,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: shell-results
+          name: ${{ matrix.variant == 'both' && 'shell-results' || format('shell-results-{0}', matrix.variant) }}
           path: results
           retention-days: 14
           if-no-files-found: warn

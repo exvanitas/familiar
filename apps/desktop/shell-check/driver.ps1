@@ -298,6 +298,12 @@ try {
   Result $(if ($quitParts.hung) { 'PASS' } else { 'FAIL' }) 'check.quit.hung' "exit $($p.ExitCode), quit took $hungMs ms with core silent"
   [void](No-Strays 'hung-quit')
 
+  # persist() raises permission kind 13, which the exe allows and nothing else.
+  $k13 = @(Get-ChildItem $Out -Filter '*.log' | Select-String -Pattern 'permission (allowed|denied) in \S+: persistent-storage \(13\)')
+  $k13Allowed = @($k13 | Where-Object { $_.Line -match 'allowed' }).Count
+  $k13Denied = $k13.Count - $k13Allowed
+  Result $(if ($k13Allowed -gt 0 -and $k13Denied -eq 0) { 'PASS' } else { 'FAIL' }) 'check.persist.kind13' "allowed $k13Allowed, denied $k13Denied, in the main, pin and hung runs"
+
   $landed = [bool]($results | Where-Object { $_ -like 'PASS check.quit.write-landed*' })
   $ok = $quitParts.main -and $quitParts.pinWrite -and $quitParts.hung -and $quitParts.strays -and $landed
   Result $(if ($ok) { 'PASS' } else { 'FAIL' }) 'security.quit.clean' "main exit 0 and done in $mainMs ms with its quitting write: $($quitParts.main); pin-write $writeMs ms: $($quitParts.pinWrite); that write read back: $landed; silent core ended in $hungMs ms: $($quitParts.hung); no strays: $($quitParts.strays)"

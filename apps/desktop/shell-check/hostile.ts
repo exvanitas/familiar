@@ -93,7 +93,7 @@ function style(css: (cls: string) => string): Promise<string> {
   return new Promise(r => setTimeout(() => r('added'), 1200));
 }
 
-function rtc(servers: RTCIceServer[], PC: typeof RTCPeerConnection = RTCPeerConnection): Promise<string> {
+function rtc(servers: RTCIceServer[], PC: typeof RTCPeerConnection): Promise<string> {
   return new Promise<string>(done => {
     let pc: RTCPeerConnection;
     try {
@@ -106,6 +106,19 @@ function rtc(servers: RTCIceServer[], PC: typeof RTCPeerConnection = RTCPeerConn
     setTimeout(() => { done(`gathered:${[...seen].sort().join('+') || 'none'}`); pc.close(); }, 5000);
   });
 }
+
+type PCtor = typeof RTCPeerConnection;
+const pcOf = (w: unknown): PCtor | undefined => {
+  try { return (w as { RTCPeerConnection?: PCtor } | null | undefined)?.RTCPeerConnection; } catch { return undefined; }
+};
+const stun = (w: Where, ctx: Ctx, fx: HostileFixtures): RTCIceServer[] => [
+  { urls: `stun:127.0.0.1:${fx.udp[`${ctx}-stun`]}` }, { urls: `stun:${fx.lan}:${w.lanPort}` }, { urls: `stun:${w.host}:${fx.udp[`${ctx}-stun`]}` }
+];
+/* What a found constructor gathers, tagged with where it came from, or that there was none. */
+function rtcVia(PC: PCtor | undefined, tag: string, servers: RTCIceServer[]): Promise<string> {
+  return PC ? rtc(servers, PC).then(r => `${tag}-${r}`) : Promise.resolve(`${tag}-none`);
+}
+const rtcRoute = (f: () => Promise<string> | string) => attempt(f, 8000).then(r => ({ loop: r, lan: r, name: r }));
 
 function worker(code: string): Promise<string> {
   return new Promise<string>((done, no) => {
@@ -164,30 +177,89 @@ export const ROUTES: Route[] = [
       return new Promise(r => setTimeout(() => r('added'), 1200));
     })
   },
+  /* WebRTC: the page's own constructor, then every way a page might find another one if the
+     exe's script took the page's away: frames made by script (read before any await, nested,
+     read later through a saved reference, by srcdoc), object and embed and frame elements, and
+     whatever RTC-looking globals are left. Each gathers against the route's own STUN names. */
+  { id: 'webrtc-stun', go: (w, ctx, fx) => rtcRoute(() => rtcVia(pcOf(globalThis), 'page', stun(w, ctx, fx))) },
   {
-    id: 'webrtc-stun', go: (w, ctx, fx) => attempt(() => rtc([
-      { urls: `stun:127.0.0.1:${fx.udp[`${ctx}-stun`]}` },
-      { urls: `stun:${fx.lan}:${w.lanPort}` },
-      { urls: `stun:${w.host}:${fx.udp[`${ctx}-stun`]}` }
-    ]), 7000).then(r => ({ loop: r, lan: r, name: r }))
-  },
-  {
-    id: 'webrtc-turn', go: (w, ctx, fx) => attempt(() => rtc([
+    id: 'webrtc-turn', go: (w, ctx, fx) => rtcRoute(() => rtcVia(pcOf(globalThis), 'page', [
       { urls: [`turn:127.0.0.1:${fx.udp[`${ctx}-turn`]}?transport=udp`, `turn:127.0.0.1:${fx.turnTcp[ctx]}?transport=tcp`], username: 'u', credential: 'p' },
       { urls: [`turn:${fx.lan}:${w.lanPort}?transport=udp`, `turn:${fx.lan}:${w.lanPort}?transport=tcp`], username: 'u', credential: 'p' },
       { urls: [`turn:${w.host}:${fx.turnTcp[ctx]}?transport=tcp`, `turn:${w.host}:${fx.udp[`${ctx}-turn`]}?transport=udp`], username: 'u', credential: 'p' }
-    ]), 7000).then(r => ({ loop: r, lan: r, name: r }))
+    ]))
   },
-  /* Whether a fresh about:blank frame hands out its own RTCPeerConnection: if it does, deleting
-     the page's own copy, from the app or from an exe script that misses such frames, closes
-     nothing. */
   {
-    id: 'webrtc-frame', go: (w, ctx, fx) => attempt(() => {
+    id: 'webrtc-frame', go: (w, ctx, fx) => rtcRoute(() => {
+      const f = document.createElement('iframe');
+      document.body.appendChild(f);
+      const PC = pcOf(f.contentWindow); // straight after appendChild, before any await
+      return rtcVia(PC, 'frame', stun(w, ctx, fx));
+    })
+  },
+  {
+    id: 'webrtc-frame-nested', go: (w, ctx, fx) => rtcRoute(() => {
       const f = element('iframe', () => {});
-      const PC = (f.contentWindow as unknown as { RTCPeerConnection?: typeof RTCPeerConnection } | null)?.RTCPeerConnection;
-      if (!PC) return 'frame-has-none';
-      return rtc([{ urls: `stun:127.0.0.1:${fx.udp[`${ctx}-stun`]}` }, { urls: `stun:${fx.lan}:${w.lanPort}` }, { urls: `stun:${w.host}:${fx.udp[`${ctx}-stun`]}` }], PC).then(r => 'frame-' + r);
-    }, 7000).then(r => ({ loop: r, lan: r, name: r }))
+      const doc = f.contentDocument;
+      if (!doc) return 'no-inner-document';
+      const inner = doc.createElement('iframe');
+      (doc.body ?? doc.documentElement).appendChild(inner);
+      return rtcVia(pcOf(inner.contentWindow), 'nested', stun(w, ctx, fx));
+    })
+  },
+  {
+    id: 'webrtc-frame-later', go: (w, ctx, fx) => rtcRoute(async () => {
+      const f = element('iframe', () => {});
+      const win = f.contentWindow;
+      await new Promise(r => setTimeout(r, 1500));
+      return rtcVia(pcOf(win), 'later', stun(w, ctx, fx));
+    })
+  },
+  {
+    id: 'webrtc-srcdoc', go: (w, ctx, fx) => rtcRoute(async () => {
+      const f = document.createElement('iframe');
+      f.srcdoc = '<p>x</p>';
+      document.body.appendChild(f);
+      await new Promise(r => setTimeout(r, 1200));
+      return rtcVia(pcOf(f.contentWindow), 'srcdoc', stun(w, ctx, fx));
+    })
+  },
+  {
+    id: 'webrtc-object', go: (w, ctx, fx) => rtcRoute(async () => {
+      const o = document.createElement('object');
+      o.type = 'text/html';
+      o.data = 'about:blank';
+      document.body.appendChild(o);
+      await new Promise(r => setTimeout(r, 1200));
+      return rtcVia(pcOf(o.contentWindow), 'object', stun(w, ctx, fx));
+    })
+  },
+  {
+    id: 'webrtc-frame-embed', go: (w, ctx, fx) => rtcRoute(async () => {
+      const fr = document.createElement('frame');
+      document.body.appendChild(fr);
+      const e = document.createElement('embed');
+      e.type = 'text/html';
+      e.src = 'about:blank';
+      document.body.appendChild(e);
+      await new Promise(r => setTimeout(r, 1200));
+      const fromFrame = pcOf(fr.contentWindow);
+      const fromEmbed = pcOf(e.getSVGDocument?.()?.defaultView);
+      if (fromFrame) return rtcVia(fromFrame, 'frame-element', stun(w, ctx, fx));
+      return rtcVia(fromEmbed, 'embed', stun(w, ctx, fx));
+    })
+  },
+  {
+    id: 'webrtc-leftovers', go: (w, ctx, fx) => rtcRoute(() => {
+      const g = globalThis as unknown as Record<string, unknown>;
+      const names = Object.getOwnPropertyNames(globalThis).filter(n => /rtc|peerconnection/i.test(n));
+      for (const n of names) {
+        const v = g[n] as ((...a: unknown[]) => unknown) & { prototype?: object };
+        if (typeof v === 'function' && v.prototype && 'createOffer' in v.prototype) return rtcVia(v as unknown as typeof RTCPeerConnection, 'left-' + n, stun(w, ctx, fx));
+      }
+      // An event's prototype chain leads to Event, not to a peer connection, but say what's left.
+      return `none-of:${names.slice(0, 12).join('+') || 'nothing'}`;
+    })
   },
   { id: 'window-open', go: w => three(w, u => 'returned:' + (window.open(u) === null ? 'null' : 'window')) },
   { id: 'blank-link', go: w => three(w, u => { element('a', a => { a.href = u; a.target = '_blank'; a.rel = 'noopener'; }).click(); return 'clicked'; }) },

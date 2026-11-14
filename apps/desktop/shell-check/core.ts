@@ -41,8 +41,9 @@ async function persist(when: string) {
     await say('INFO persist asking');
     const granted = before || await navigator.storage.persist();
     await say('INFO persist answered');
+    const after = await navigator.storage.persisted();
     const { quota, usage } = await navigator.storage.estimate();
-    return `persisted=${before} granted=${granted} quota=${quota} usage=${usage}`;
+    return `persisted=${before} granted=${granted} persisted-after=${after} quota=${quota} usage=${usage}`;
   });
 }
 

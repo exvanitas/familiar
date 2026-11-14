@@ -96,7 +96,7 @@ describe('the egress analysis', () => {
     const coreFetch = label(fx, 'core', 0);
     const hits = [
       { kind: 'http', label: label(fx, 'driver', 0) }, { kind: 'udp', listener: 'driver-stun', stun: true }, { kind: 'udp', listener: 'driver-turn' },
-      { kind: 'tcp', listener: 'driver-turn-tcp' }, { kind: 'http', label: label(fx, 'edge', 0) }
+      { kind: 'tcp', listener: 'driver-turn-tcp' }, { kind: 'http', label: label(fx, 'edge', 0) }, { kind: 'udp', listener: 'edge-stun', stun: true }
     ];
     const packets = [
       { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${label(fx, 'driver', 1)}.familiar-check.test`], at: 1 },
@@ -113,6 +113,10 @@ describe('the egress analysis', () => {
 
     const leaky = egress({ ...base, packets: [...packets, { proto: 'udp', dst: '168.63.129.16', dport: 53, names: [`${coreFetch}.familiar-check.test`], at: 1 }] });
     expect(leaky.lines.find((l: string) => l.includes('egress.core'))).toMatch(/^FAIL .*core:fetch\(dns 1\)/);
+
+    const rtc = egress({ ...base, hits: [...hits, { kind: 'udp', listener: 'view-stun', stun: true }] });
+    expect(rtc.lines.find((l: string) => l.includes('egress.view'))).toMatch(/^FAIL .*view:webrtc-loopback\(1\)/);
+    expect(rtc.lines.find((l: string) => l.includes('egress.core'))).toMatch(/^PASS/);
 
     const blind = egress({ ...base, hits: hits.slice(1) });
     expect(blind.lines.find((l: string) => l.includes('egress.controls'))).toMatch(/^FAIL .*MISSING driver http/);

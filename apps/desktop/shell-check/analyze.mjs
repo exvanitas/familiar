@@ -131,11 +131,13 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
       if (lan) seen.push(`lan ${lan}`);
       const logged = dnsLog.split('\n').filter(m => has(m.toLowerCase(), l)).length;
       if (logged) seen.push(`dns-log ${logged}`);
-      if (r.id.startsWith('webrtc') && udpTcp.length) seen.push(`webrtc ${udpTcp.length}`);
       const page = egressLines.find(x => x.includes(`EGRESS ${ctx} ${r.id} `))?.replace(/^.* EGRESS \S+ \S+ /, '') ?? '';
       if (seen.length) open[ctx].push(`${r.id}(${seen.join(',')})`);
       table.push(`| ${ctx} | ${r.id} | ${seen.length ? 'OPEN ' + seen.join(', ') : 'closed'} | ${page.replace(/\|/g, '/').slice(0, 160)} |`);
     }
+    // The loopback STUN and TURN listeners are one set per page, shared by its WebRTC routes.
+    if (udpTcp.length) open[ctx].push(`webrtc-loopback(${udpTcp.length})`);
+    table.push(`| ${ctx} | webrtc-loopback | ${udpTcp.length ? 'OPEN ' + udpTcp.length + ' packets or connections' : 'closed'} | the page's STUN and TURN listeners on 127.0.0.1 |`);
   }
 
   // The sink: the count must have moved, and the more so while the pages tried.
@@ -162,6 +164,8 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
   ctl(edgeHttp > 0, `Edge's requests at the listener (${edgeHttp})`);
   ctl(edgeDns > 0, `Edge's lookups in the capture (${edgeDns})`);
   ctl(edgeLan > 0, `Edge's packets to the LAN address in the capture (${edgeLan})`);
+  const edgeRtc = hits.filter(h => (h.kind === 'udp' || h.kind === 'tcp') && listenerFor('edge').has(h.listener)).length;
+  ctl(edgeRtc > 0, `Edge's WebRTC at the STUN and TURN listeners (${edgeRtc})`);
   ctl(sinkTotal > 0, `sink refusals (${sinkTotal})`);
   const controlsOk = c.every(x => x.startsWith('ok'));
   lines.push(`${controlsOk ? 'PASS' : 'FAIL'} security.egress.controls ${c.join('; ')}`);

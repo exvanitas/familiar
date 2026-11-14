@@ -8,6 +8,7 @@
     "persist.fresh",
     "persist.second",
     "persist.moved",
+    "persist.kind13",
     "perm.paste",
     "clipboard.write",
     "egress.pages-alive",
