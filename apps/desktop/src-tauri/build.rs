@@ -14,6 +14,15 @@ const COMMANDS: &[&str] = &[
     "view_open",
     "window_ctl",
     "window_self",
+    "address_list",
+    "address_add",
+    "address_remove",
+    "net_fetch",
+    "net_read",
+    "net_cancel",
+    "secret_set",
+    "secret_status",
+    "secret_delete",
 ];
 
 fn main() {

@@ -247,7 +247,7 @@ export function judge({ fx, hits, packets, dnsLog, marks, log, edge }) {
 
 /* ---------- the command line ---------- */
 
-if (process.argv[1]?.endsWith('analyze.mjs')) {
+if (/(^|[\\/])analyze\.mjs$/.test(process.argv[1] ?? '')) {
   const out = process.argv[2];
   const read = (f, d) => (existsSync(join(out, f)) ? readFileSync(join(out, f)) : d);
   const fx = JSON.parse(read('fixtures.json', '{}').toString());

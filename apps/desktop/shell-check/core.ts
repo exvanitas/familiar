@@ -7,6 +7,8 @@ import { bus, check, fail, fixtures, gate, ok, rand, raw, say, shell, skip, slee
 import { hostile } from './hostile.ts';
 import { CORE_EVENT_NAMES, CORE_ONLY, EVENTS, NOT_YET, PLUGINS } from './lists.ts';
 import { allowed, trySinks } from './tt.ts';
+import { confirmChecks } from './confirm-checks.ts';
+import { netChecks } from './net-checks.ts';
 
 const messages: CoreMessage[] = [];
 let onQuitting: () => void = () => {};
@@ -308,6 +310,9 @@ async function main(info: Info) {
     ok(r.answered.startsWith('HTTP/1.1 403'), `a request after 70 slow clients got: ${r.answered || 'nothing'}`);
     return `70 clients trickling a byte a second; a new request got 403 in ${r.ms} ms; the port is familiar.exe's`;
   });
+
+  await confirmChecks({ ask, up });
+  await netChecks({ ask, up });
 
   // Egress: core, a view, and a view without Trusted Types, one after another.
   const fx = await fixtures();

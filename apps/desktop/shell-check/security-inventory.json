@@ -21,6 +21,26 @@
     "quit.clean",
     "download.refused",
     "assets.inside",
-    "harden.before-page"
+    "harden.before-page",
+    "confirm.defaults",
+    "confirm.throttle",
+    "confirm.escaping",
+    "confirm.frozen",
+    "key.roundtrip",
+    "key.echo",
+    "key.no-copy",
+    "key.bound",
+    "key.rebind",
+    "key.write-only",
+    "fetch.saved-only",
+    "fetch.no-lookup-before-allow",
+    "fetch.stream-stop",
+    "fetch.live-stream",
+    "fetch.limits",
+    "fetch.redirects",
+    "fetch.rebinding",
+    "fetch.literal",
+    "fetch.proxy",
+    "fetch.revoke"
   ]
 }

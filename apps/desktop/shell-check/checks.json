@@ -27,6 +27,8 @@
     "webrtc.env-override",
     "sink.slow-clients",
     "queue.early",
-    "start.overlap"
+    "start.overlap",
+    "fetch.no-lookup-flow",
+    "tls.roots"
   ]
 }

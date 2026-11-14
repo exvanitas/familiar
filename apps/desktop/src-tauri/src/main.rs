@@ -4,10 +4,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod addresses;
 mod assets;
 mod commands;
+mod confirm;
+mod net;
 mod pages;
 mod platform;
+mod secrets;
 mod shell;
 mod sink;
 mod tray;
@@ -79,6 +83,9 @@ fn start(app: &AppHandle, args: Args, app_dir: PathBuf, log: Arc<Log>) -> Result
     log.line(&format!("sink listening on 127.0.0.1:{sink_port}"));
 
     let seconds = args.seconds;
+    app.manage(confirm::Confirms::default());
+    app.manage(net::Net::default());
+    app.manage(addresses::Addresses::load(&data_dir, log.clone()));
     app.manage(Shell::new(app_dir, data_dir, webview_dir, log_path, &args, log.clone(), sink_port, sink));
 
     // The tray first, so Quit works whatever the pages do.

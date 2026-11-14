@@ -39,9 +39,24 @@ export interface Bounds { x: number; y: number; width: number; height: number }
 export type CtlOp = 'show' | 'hide' | 'focus' | 'close' | 'get-bounds' | 'set-bounds';
 export type SelfOp = 'drag' | 'minimize' | 'toggle-maximize' | 'close';
 
+/* A place data may go, approved by the person in the exe's own dialog. */
+export interface Address { id: string; kind: 'model' | 'server' | 'peer'; url: string; label: string; reach: 'public' | 'lan' | 'loopback'; ports?: [number, number] }
+export interface AddressSpec { kind: Address['kind']; url: string; label: string; owner?: string; ports?: [number, number] }
+
+/* The guarded fetch's request: `address` is a saved address id, `url` must be under it. */
+export interface NetSpec {
+  id: string; address: string; url: string; method: string; headers: [string, string][];
+  maxBytes?: number; headersMs?: number; idleMs?: number;
+}
+export interface NetHead { status: number; statusText: string; headers: [string, string][]; url: string; redirected: boolean }
+export interface SecretStatus { present: boolean; boundTo: string | null; hint: string | null }
+
 /* What a command rejects with. A refusal by the command gate is a plain string instead:
    "Command <name> not allowed by ACL". */
-export interface ShellError { kind: 'invalid' | 'refused' | 'missing' | 'failed'; message: string }
+export interface ShellError {
+  kind: 'invalid' | 'refused' | 'missing' | 'failed' | 'busy' | 'asks-stopped' | 'declined' | 'insecure' | 'blocked-address' | 'not-saved';
+  message: string;
+}
 
 /* The little of Tauri's injected script this file uses. */
 export interface Internals {
@@ -65,6 +80,22 @@ export interface Shell {
   windowCtl(label: string, op: CtlOp, bounds?: Bounds): Promise<Bounds | null>;
   /* Views and Settings, on their own window. */
   windowSelf(op: SelfOp): Promise<void>;
+  /* Core and Settings. */
+  addressList(): Promise<Address[]>;
+  /* Core. Asks the person in a native dialog unless an identical address is saved. */
+  addressAdd(spec: AddressSpec): Promise<Address>;
+  /* Core. Ends the address's open requests and deletes its key. */
+  addressRemove(id: string): Promise<void>;
+  /* Core. The body goes as raw bytes, the spec in a header. src/net.ts builds fetch on these. */
+  netFetch(spec: NetSpec, body: Uint8Array): Promise<NetHead>;
+  /* Up to 1 MiB of the body; empty only at the real end. */
+  netRead(id: string): Promise<Uint8Array>;
+  netCancel(id: string): Promise<void>;
+  /* Settings, for `addr:<id>` and `server:<setup>:<NAME>`; core, for a peer's `addr:` only.
+     Write-only: no command reads a key back. */
+  secretSet(ref: string, value: string): Promise<void>;
+  secretStatus(ref: string): Promise<SecretStatus>;
+  secretDelete(ref: string): Promise<void>;
 }
 
 /* A channel's messages come numbered and can arrive out of order. This hands them on in order, as
@@ -102,7 +133,17 @@ export function createShell(internals: Internals = window.__TAURI_INTERNALS__): 
     traySet: spec => call('tray_set', { spec }),
     viewOpen: spec => call('view_open', { spec }),
     windowCtl: (label, op, bounds) => call<Bounds | null>('window_ctl', { label, op, bounds }),
-    windowSelf: op => call('window_self', { op })
+    windowSelf: op => call('window_self', { op }),
+    addressList: () => call<Address[]>('address_list'),
+    addressAdd: spec => call<Address>('address_add', { ...spec }),
+    addressRemove: id => call('address_remove', { id }),
+    netFetch: (spec, body) =>
+      internals.invoke('net_fetch', body, { headers: { 'x-spec': encodeURIComponent(JSON.stringify(spec)) } }) as Promise<NetHead>,
+    netRead: id => call<ArrayBuffer>('net_read', { id }).then(b => new Uint8Array(b)),
+    netCancel: id => call('net_cancel', { id }),
+    secretSet: (ref, value) => call('secret_set', { id: ref, value }),
+    secretStatus: ref => call<SecretStatus>('secret_status', { id: ref }),
+    secretDelete: ref => call('secret_delete', { id: ref })
   };
 }
 
