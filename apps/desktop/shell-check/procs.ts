@@ -232,52 +232,6 @@ async function main(info: Info) {
     return `no dialog the second time; stop during a call ended it in ${stopMs} ms; --variant b asked and No gave declined; forget during a call stopped it and the next start asked; no node left`;
   });
 
-  await check('security.link.confirm', async () => {
-    for (const url of ['http://example.com/', 'javascript:alert(1)', 'file:///C:/Windows/win.ini', `https://${'a'.repeat(2050)}.example`]) {
-      const r = shell.openUrl(url).then(() => 'opened', e => errKind(e));
-      const dialog = await step<Dialog>('dialog', { press: 'none', within: 1500 });
-      ok(!dialog.shown, `a dialog for ${url.slice(0, 40)}`);
-      ok(await r === 'invalid', `${url.slice(0, 40)}: ${await r}`);
-    }
-    const { port } = await step<{ port: number }>('listen-start');
-    const url = `https://127.0.0.1:${port}/familiar-check-${rand(6)}`;
-    const no = shell.openUrl(url).then(() => 'opened', e => errKind(e));
-    const d1 = await step<Dialog>('dialog', { press: 'no' });
-    ok(d1.shown && await no === 'declined', `Don't open: dialog ${d1.shown}, ${await no}`);
-    ok(d1.text.includes('127.0.0.1'), 'the dialog does not show the host');
-    const none = await step<{ count: number }>('listen-count', { ms: 4000 });
-    ok(none.count === 0, `the listener saw ${none.count} connections after Don't open`);
-    const yes = shell.openUrl(url).then(() => 'opened', e => errKind(e));
-    const d2 = await step<Dialog>('dialog', { press: 'yes' });
-    ok(d2.shown && await yes === 'opened', `Open: dialog ${d2.shown}, ${await yes}`);
-    const seen = await step<{ count: number }>('listen-count', { ms: 30000, until: 1 });
-    await step('listen-stop');
-    ok(seen.count > 0, 'the listener saw no connection after Open');
-    return `http, javascript, file and too long refused with no dialog; Don't open: no connection; Open: ${seen.count} connections`;
-  });
-
-  await check('security.files.save-refused', async () => {
-    const bytes = new TextEncoder().encode('familiar check ' + rand(8));
-    const save = async (dir: string) => {
-      const name = `familiar-check-${rand(6)}.txt`;
-      const r = shell.saveAs({ name, filters: [{ name: 'Text', extensions: ['txt'] }] }, bytes).then(v => (v ? 'saved' : 'cancelled'), e => errKind(e));
-      const d = await step<{ shown: boolean; why?: string }>('save-dialog', { path: `${dir}\\${name}` });
-      ok(d.shown, `no save dialog: ${d.why ?? ''}`);
-      const outcome = await r;
-      const there = await step<{ length: number }>('file-length', { path: `${dir}\\${name}` });
-      return { outcome, length: there.length };
-    };
-    const normal = await save(p.tmp);
-    ok(normal.outcome === 'saved' && normal.length === bytes.length, `a normal folder: ${normal.outcome}, ${normal.length} bytes`);
-    const data = await save(info.dataDir);
-    ok(data.outcome === 'refused' && data.length < 0, `the data folder: ${data.outcome}, ${data.length}`);
-    const webview = await save(info.webviewDir);
-    ok(webview.outcome === 'refused' && webview.length < 0, `the WebView2 folder: ${webview.outcome}, ${webview.length}`);
-    const exe = await save(p.exeDir);
-    ok(exe.outcome === 'refused' && exe.length < 0, `beside the exe: ${exe.outcome}, ${exe.length}`);
-    return 'a normal folder saved whole; the data folder, the WebView2 folder and the exe\'s folder refused, nothing written';
-  });
-
   await check('check.system.idle', async () => {
     const s0 = await shell.system();
     await sleep(3000);
@@ -326,6 +280,58 @@ async function main(info: Info) {
     ok(left.count === 0, `${left.count} node processes left, ${left.suspended} suspended`);
     return 'start-failed when no process could be made, and nothing left';
   });
+}
+
+/* Links and saving, in a run of their own: the confirms stop after three refusals in a run. */
+async function filesAndLinks(info: Info) {
+  const p = await step<Paths>('proc-paths', {}, 120000);
+  await check('security.link.confirm', async () => {
+    for (const url of ['http://example.com/', 'javascript:alert(1)', 'file:///C:/Windows/win.ini', `https://${'a'.repeat(2050)}.example`]) {
+      const r = shell.openUrl(url).then(() => 'opened', e => errKind(e));
+      const dialog = await step<Dialog>('dialog', { press: 'none', within: 1500 });
+      ok(!dialog.shown, `a dialog for ${url.slice(0, 40)}`);
+      ok(await r === 'invalid', `${url.slice(0, 40)}: ${await r}`);
+    }
+    const { port } = await step<{ port: number }>('listen-start');
+    const url = `https://127.0.0.1:${port}/familiar-check-${rand(6)}`;
+    const no = shell.openUrl(url).then(() => 'opened', e => errKind(e));
+    const d1 = await step<Dialog>('dialog', { press: 'no' });
+    ok(d1.shown && await no === 'declined', `Don't open: dialog ${d1.shown}, ${await no}`);
+    ok(d1.text.includes('127.0.0.1'), 'the dialog does not show the host');
+    const none = await step<{ count: number }>('listen-count', { ms: 4000 });
+    ok(none.count === 0, `the listener saw ${none.count} connections after Don't open`);
+    const yes = shell.openUrl(url).then(() => 'opened', e => errKind(e));
+    const d2 = await step<Dialog>('dialog', { press: 'yes' });
+    ok(d2.shown && await yes === 'opened', `Open: dialog ${d2.shown}, ${await yes}`);
+    const seen = await step<{ count: number }>('listen-count', { ms: 30000, until: 1 });
+    await step('listen-stop');
+    ok(seen.count > 0, 'the listener saw no connection after Open');
+    return `http, javascript, file and too long refused with no dialog; Don't open: no connection; Open: ${seen.count} connections`;
+  });
+
+  await check('security.files.save-refused', async () => {
+    const bytes = new TextEncoder().encode('familiar check ' + rand(8));
+    const save = async (dir: string) => {
+      const name = `familiar-check-${rand(6)}.txt`;
+      const r = shell.saveAs({ name, filters: [{ name: 'Text', extensions: ['txt'] }] }, bytes).then(v => (v ? 'saved' : 'cancelled'), e => errKind(e));
+      const d = await step<{ shown: boolean; why?: string; typed?: string }>('save-dialog', { path: `${dir}\\${name}` });
+      ok(d.shown, `no save dialog: ${d.why ?? ''}`);
+      const outcome = await r;
+      const there = await step<{ length: number; found: string[] }>('file-length', { path: `${dir}\\${name}`, find: name });
+      if (outcome === 'saved' && there.length < 0) fail(`saved, but not at ${dir}: found at ${there.found.join(' | ') || 'nowhere looked'}; the box read ${d.typed}`);
+      return { outcome, length: there.length };
+    };
+    const normal = await save(p.tmp);
+    ok(normal.outcome === 'saved' && normal.length === bytes.length, `a normal folder: ${normal.outcome}, ${normal.length} bytes`);
+    const data = await save(info.dataDir);
+    ok(data.outcome === 'refused' && data.length < 0, `the data folder: ${data.outcome}, ${data.length}`);
+    const webview = await save(info.webviewDir);
+    ok(webview.outcome === 'refused' && webview.length < 0, `the WebView2 folder: ${webview.outcome}, ${webview.length}`);
+    const exe = await save(p.exeDir);
+    ok(exe.outcome === 'refused' && exe.length < 0, `beside the exe: ${exe.outcome}, ${exe.length}`);
+    return 'a normal folder saved whole; the data folder, the WebView2 folder and the exe\'s folder refused, nothing written';
+  });
+
 }
 
 async function recover(info: Info) {
@@ -390,6 +396,7 @@ async function wake(messages: CoreMessage[]) {
 
 export async function procPhase(phase: string, info: Info, messages: CoreMessage[]) {
   if (phase === 'proc-main') await main(info);
+  else if (phase === 'proc-files') await filesAndLinks(info);
   else if (phase === 'proc-recover') await recover(info);
   else if (phase === 'proc-kill') await kill();
   else if (phase === 'proc-wake') await wake(messages);

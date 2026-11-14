@@ -57,13 +57,22 @@ public static class P {
     return "";
   }
 
-  /* The file name box of a common save dialog: an Edit inside a ComboBox. */
-  public static bool SetFileName(long dialog, string text) {
-    IntPtr found = IntPtr.Zero;
-    EnumChildWindows(new IntPtr(dialog), (h, l) => { if (found == IntPtr.Zero && Class(h) == "Edit" && IsWindowVisible(h) && Class(GetParent(h)).StartsWith("ComboBox")) found = h; return true; }, IntPtr.Zero);
-    if (found == IntPtr.Zero) return false;
+  [DllImport("user32", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+  /* The file name box of a common save dialog: the Edit with id 1001 (edt1), or the one inside the
+     file name combo box (cmb13, 1148), never the address bar's. What it reads after, or null. */
+  public static string SetFileName(long dialog, string text) {
+    IntPtr found = IntPtr.Zero, combo = IntPtr.Zero;
+    EnumChildWindows(new IntPtr(dialog), (h, l) => {
+      if (Class(h) != "Edit") return true;
+      if (found == IntPtr.Zero && GetDlgCtrlID(h) == 1001) found = h;
+      if (combo == IntPtr.Zero && GetDlgCtrlID(GetParent(h)) == 1148) combo = h;
+      return true;
+    }, IntPtr.Zero);
+    if (found == IntPtr.Zero) found = combo;
+    if (found == IntPtr.Zero) return null;
     SendMessageW(found, 0x000C, IntPtr.Zero, text);
-    return true;
+    var s = new StringBuilder(1024); GetWindowTextW(found, s, 1024);
+    return s.ToString();
   }
 
   /* BM_CLICK on the button with id 1, the dialog's OK (Save or Open). */
@@ -200,18 +209,26 @@ $procSteps = @{
     $h = Find-Dialog 15000
     if (-not $h) { return @{ shown = $false; why = 'no dialog' } }
     Start-Sleep -Milliseconds 500
-    if (-not [P]::SetFileName($h, $a.path)) { [W]::Press($h, 2); return @{ shown = $false; why = 'no file name box' } }
+    $typed = [P]::SetFileName($h, $a.path)
+    if ($null -eq $typed) { [W]::Press($h, 2); return @{ shown = $false; why = 'no file name box' } }
     Start-Sleep -Milliseconds 200
     [void][P]::ClickOk($h)
     for ($i = 0; $i -lt 50 -and [W]::Dialog([uint32]$script:proc.Id) -eq $h; $i++) { Start-Sleep -Milliseconds 100 }
     $still = [W]::Dialog([uint32]$script:proc.Id) -eq $h
     if ($still) { [W]::Press($h, 2); return @{ shown = $false; why = 'the dialog stayed: ' + [W]::DialogText($h) } }
     Start-Sleep -Milliseconds 500
-    @{ shown = $true }
+    @{ shown = $true; typed = $typed }
   }
   'file-length' = {
     param($a)
-    if (Test-Path -LiteralPath $a.path) { @{ length = (Get-Item -LiteralPath $a.path).Length } } else { @{ length = -1 } }
+    if (Test-Path -LiteralPath $a.path) { return @{ length = (Get-Item -LiteralPath $a.path).Length; found = @() } }
+    $found = @()
+    if ($a.find) {
+      foreach ($d in @("$env:USERPROFILE\Documents", "$env:USERPROFILE\Desktop", "$env:USERPROFILE\Downloads", $tmp)) {
+        $found += @(Get-ChildItem -LiteralPath $d -Filter $a.find -Recurse -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+      }
+    }
+    @{ length = -1; found = $found }
   }
   'run-entry' = {
     param($a)
@@ -257,6 +274,10 @@ function Run-ProcChecks {
 
     # An unreadable approval store: every setup asks again.
     Set-Content (Join-Path $data 'shell\servers.json') 'not a store {'
+    $log = Join-Path $Out 'proc-files.log'
+    [void](Run-Phase 'proc-files' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-files-data'), '--log', $log, '--seconds', '300', '--phase', 'proc-files') 330)
+    [void](No-Strays 'proc-files')
+
     $log = Join-Path $Out 'proc-recover.log'
     [void](Run-Phase 'proc-recover' $log @('--app-dir', $App, '--data-dir', $data, '--log', $log, '--seconds', '120', '--phase', 'proc-recover') 150)
     [void](No-Strays 'proc-recover')

@@ -220,7 +220,10 @@ async function main(info: Info) {
     for (const [who, r] of [['settings', settings], ['chat', chat]] as const) {
       if (!r.clipboard.startsWith('rejected')) bad.push(`${who} clipboard ${r.clipboard}`);
       for (const k of ['mic', 'camera', 'location', 'sysex']) if (!r[k].startsWith('rejected') && !r[k].startsWith('resolved:absent')) bad.push(`${who} ${k} ${r[k]}`);
-      if (!/^resolved:(denied|absent)/.test(r.notification)) bad.push(`${who} notification ${r.notification}`);
+      // The notification plugin replaces window.Notification in every page with its own, which
+      // calls its commands, so a view or Settings asking is refused by the command gate (a
+      // string), not by WebView2's permission handler.
+      if (!/^(resolved:(denied|absent)|rejected:string)/.test(r.notification)) bad.push(`${who} notification ${r.notification}`);
       for (const v of Object.values(r)) if (v.startsWith('pending')) bad.push(`${who} waited: a prompt?`);
     }
     ok(fresh.length === 0, 'new windows appeared: ' + fresh.join(' | '));
