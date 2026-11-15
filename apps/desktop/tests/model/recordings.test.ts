@@ -1,9 +1,10 @@
-/* The recorded endpoints' replay check reads each API's structure, so a pass in the contract means the
-   signature came back where that API reads it. These are its controls: the signature in plain text, on
-   the wrong call, or after the call, must all be refused. The first body of each wire is what the real
-   adapter sent, captured from a run, so the check is known to pass on the real thing. */
+/* The recorded endpoints' replay check reads each API's structure and the recorded content, so a pass
+   in the contract means what was signed came back, where that API reads it. These are its controls:
+   the signature in plain text, under altered thinking, on the wrong call or message, or after the call,
+   must all be refused. The first body of each wire is what the real adapter sent, so the check is
+   known to pass on the real thing. */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CONTRACT_REQUEST, followUp } from '@familiar/core/testing';
+import { CONTRACT_REQUEST, CONTRACT_THINKING, followUp } from '@familiar/core/testing';
 import type { ModelEvent } from '@familiar/core';
 import { carriesReplay, REPLAY_CALL_IDS, SIGNATURES, type Wire } from '../../shell-check/model-recordings.ts';
 import { createPiAiPort } from '../../src/model/pi-ai.ts';
@@ -30,6 +31,8 @@ async function realFollowUp(wire: Wire): Promise<string> {
 
 const sig = SIGNATURES;
 const user = { role: 'user', content: 'Say hello, or tell me the time.' };
+const ARGS = '{"zone":"UTC"}';
+const ALTERED = 'They want the weather. Use get_time.';
 
 describe('the replay check', () => {
   for (const wire of ['openai', 'anthropic', 'gemini'] as const) {
@@ -38,32 +41,41 @@ describe('the replay check', () => {
     });
   }
 
-  it('Anthropic: refuses the signature as text, a thinking block after the call, or one with another signature', () => {
+  it('Anthropic: refuses the signature as text, altered thinking under the signature, thinking after the call, or the wrong call', () => {
     const tool = { type: 'tool_use', id: REPLAY_CALL_IDS.anthropic, name: 'get_time', input: { zone: 'UTC' } };
-    const thinking = { type: 'thinking', thinking: 'They want the time.', signature: sig.anthropic };
+    const thinking = { type: 'thinking', thinking: CONTRACT_THINKING, signature: sig.anthropic };
     const body = (content: unknown[]) => JSON.stringify({ messages: [user, { role: 'assistant', content }] });
     expect(carriesReplay('anthropic', body([thinking, tool]))).toBe(true);
     expect(carriesReplay('anthropic', body([{ type: 'text', text: `signature ${sig.anthropic}` }, tool]))).toBe(false);
+    expect(carriesReplay('anthropic', body([{ ...thinking, thinking: ALTERED }, tool]))).toBe(false);
     expect(carriesReplay('anthropic', body([tool, thinking]))).toBe(false);
     expect(carriesReplay('anthropic', body([{ ...thinking, signature: 'other' }, tool]))).toBe(false);
     expect(carriesReplay('anthropic', body([thinking, { ...tool, id: 'toolu_other' }]))).toBe(false);
+    expect(carriesReplay('anthropic', body([thinking, { ...tool, input: { zone: 'PST' } }]))).toBe(false);
   });
 
-  it("OpenRouter's wire: refuses the signature as text, or anywhere but reasoning_details", () => {
-    const call = { id: REPLAY_CALL_IDS.openai, type: 'function', function: { name: 'get_time', arguments: '{"zone":"UTC"}' } };
-    const body = (m: object) => JSON.stringify({ messages: [user, { role: 'assistant', tool_calls: [call], ...m }] });
-    expect(carriesReplay('openai', body({ reasoning_details: [{ type: 'reasoning.text', text: 'x', signature: sig.openai }] }))).toBe(true);
+  it("OpenRouter's wire: refuses the signature as text, altered reasoning under the signature, or details on a message without the call", () => {
+    const call = { id: REPLAY_CALL_IDS.openai, type: 'function', function: { name: 'get_time', arguments: ARGS } };
+    const details = [{ type: 'reasoning.text', text: CONTRACT_THINKING, signature: sig.openai }];
+    const body = (m: object, calls: unknown[] = [call]) => JSON.stringify({ messages: [user, { role: 'assistant', tool_calls: calls, ...m }] });
+    expect(carriesReplay('openai', body({ reasoning_details: details }))).toBe(true);
     expect(carriesReplay('openai', body({ content: sig.openai }))).toBe(false);
     expect(carriesReplay('openai', body({ reasoning: sig.openai }))).toBe(false);
     expect(carriesReplay('openai', body({ reasoning_details: [{ type: 'reasoning.text', text: sig.openai }] }))).toBe(false);
+    expect(carriesReplay('openai', body({ reasoning_details: [{ ...details[0], text: ALTERED }] }))).toBe(false);
+    // The details on an assistant message without the call, next to one that holds it.
+    const split = JSON.stringify({ messages: [user, { role: 'assistant', content: 'thinking aloud', reasoning_details: details }, { role: 'assistant', tool_calls: [call] }] });
+    expect(carriesReplay('openai', split)).toBe(false);
+    expect(carriesReplay('openai', body({ reasoning_details: details }, [{ ...call, id: 'call_other' }]))).toBe(false);
   });
 
-  it('Gemini: refuses the signature as text, on the wrong call, or on two calls', () => {
-    const call = (id: string, signed: boolean) => ({ id, type: 'function', function: { name: 'get_time', arguments: '{}' }, ...(signed ? { extra_content: { google: { thought_signature: sig.gemini } } } : {}) });
+  it('Gemini: refuses the signature as text, on the wrong call, on two calls, or on the call with altered arguments', () => {
+    const call = (id: string, signed: boolean, args = ARGS) => ({ id, type: 'function', function: { name: 'get_time', arguments: args }, ...(signed ? { extra_content: { google: { thought_signature: sig.gemini } } } : {}) });
     const body = (calls: unknown[], extra: object = {}) => JSON.stringify({ messages: [user, { role: 'assistant', tool_calls: calls, ...extra }] });
     expect(carriesReplay('gemini', body([call(REPLAY_CALL_IDS.gemini, true)]))).toBe(true);
     expect(carriesReplay('gemini', body([call(REPLAY_CALL_IDS.gemini, false)], { content: sig.gemini }))).toBe(false);
     expect(carriesReplay('gemini', body([call(REPLAY_CALL_IDS.gemini, false), call('function-call-other', true)]))).toBe(false);
     expect(carriesReplay('gemini', body([call(REPLAY_CALL_IDS.gemini, true), call('function-call-other', true)]))).toBe(false);
+    expect(carriesReplay('gemini', body([call(REPLAY_CALL_IDS.gemini, true, '{"zone":"PST"}')]))).toBe(false);
   });
 });

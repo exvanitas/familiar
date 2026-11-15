@@ -101,7 +101,17 @@ function fingerprint(s: string): string {
   }
   return `${a.toString(16)}.${b.toString(16)}.${s.length}`;
 }
-const prefixOf = (r: ModelRequest, k: number) => fingerprint(JSON.stringify([r.system, r.tools, r.messages.slice(0, k)]));
+const prefixOf = (r: ModelRequest, k: number) => fingerprint(JSON.stringify([r.system, r.tools, r.thinking ?? null, r.messages.slice(0, k)]));
+/* A remembered input count holds only for the same endpoint and model: another tokenizer, or another
+   way of putting the request together, counts the same history differently. */
+const seenKey = (c: CallInfo) => JSON.stringify([c.conversation, c.endpoint ?? '', c.request.model]);
+
+/** A usage the endpoint reported as whole, non-negative numbers. Anything else isn't a count. */
+export function wholeUsage(u: Usage | undefined): u is Usage {
+  const ok = (n: unknown) => typeof n === 'number' && Number.isInteger(n) && n >= 0;
+  return !!u && typeof u === 'object' && ok(u.inputTokens) && ok(u.outputTokens)
+    && (u.cacheReadTokens === undefined || ok(u.cacheReadTokens)) && (u.cacheWriteTokens === undefined || ok(u.cacheWriteTokens));
+}
 
 /** The last final input count seen for a conversation, and the prefix it was for. */
 interface Seen {
@@ -140,8 +150,8 @@ export interface Reservation {
 
 export interface UsageStore {
   add(record: UsageRecord): Promise<void>;
-  /** Every settled record of one day. */
-  records(day: string): Promise<readonly UsageRecord[]>;
+  /** Every settled record of one day, or of every day. */
+  records(day?: string): Promise<readonly UsageRecord[]>;
   reserve(r: Reservation): Promise<void>;
   release(id: string): Promise<void>;
   /** Every open reservation. */
@@ -179,6 +189,8 @@ export interface CallInfo {
   readonly turn: string;
   /** The conversation, so a later call can reuse this one's input count for their shared prefix. */
   readonly conversation?: string;
+  /** The endpoint (its address, or its preset and API): a remembered input count is kept per endpoint and model. */
+  readonly endpoint?: string;
   readonly price: Price | undefined;
   /** Whether the endpoint may bill input as cache reads or writes. */
   readonly caching?: boolean;
@@ -202,7 +214,7 @@ export function localDay(ms: number): string {
 }
 
 const usdText = (n: number) => `$${n.toFixed(n < 1 ? 4 : 2)}`;
-const tokensOf = (u: Usage) => u.inputTokens + u.outputTokens;
+const tokensOf = (u: Usage | undefined) => (wholeUsage(u) ? u.inputTokens + u.outputTokens : 0);
 
 export interface CapsOptions {
   readonly dayOf?: (ms: number) => string;
@@ -238,7 +250,7 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
 
   function boundFor(call: CallInfo): number {
     const full = inputBound(call.request);
-    const s = call.conversation ? seen.get(call.conversation) : undefined;
+    const s = call.conversation ? seen.get(seenKey(call)) : undefined;
     const msgs = call.request.messages;
     if (!s || msgs.length < s.k || prefixOf(call.request, s.k) !== s.prefix) return full;
     const added = msgs.slice(s.k).reduce((t, m) => t + messageBytes(m) + MESSAGE_FRAME, 0);
@@ -255,12 +267,16 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
         const input = boundFor(call);
         const tokens = input + maxOutputTokens;
         const worst = worstCost(input, maxOutputTokens, call.price, call.caching ?? false);
-        const records = await store.records(day);
-        const open = (await store.open()).filter((r) => r.day === day);
+        // A turn is counted across every date, so one that runs past midnight keeps its cap; the
+        // daily limits count only today.
+        const everything = await store.records();
+        const records = everything.filter((r) => r.day === day);
+        const allOpen = await store.open();
+        const open = allOpen.filter((r) => r.day === day);
         const sum = (xs: readonly { tokens: number }[]) => xs.reduce((t, x) => t + x.tokens, 0);
 
         if (config.maxTurnTokens !== undefined) {
-          const used = sum(records.filter((r) => r.turn === call.turn)) + sum(open.filter((r) => r.turn === call.turn));
+          const used = sum(everything.filter((r) => r.turn === call.turn)) + sum(allOpen.filter((r) => r.turn === call.turn));
           if (used + tokens > config.maxTurnTokens) {
             return { go: false, pause: 'turn-tokens', message: `This turn has used or set aside ${used} tokens. One more reply could take it past its cap of ${config.maxTurnTokens}.` };
           }
@@ -309,17 +325,20 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
         await store.release(id);
         // The endpoint said it didn't take the request: nothing was billed.
         if (last?.type === 'error' && last.error.notProcessed) return { usd: 0 };
-        const final = last?.type === 'done' && !last.unreported ? last.usage : last?.type === 'error' && last.usageFinal ? last.usage : undefined;
+        // Final only when the endpoint said so and the counts are whole numbers: an empty or partial
+        // usage object is no count at all.
+        const said = last?.type === 'done' ? !last.unreported : last?.type === 'error' && last.usageFinal === true;
+        const final = said && wholeUsage(last?.usage) ? last!.usage : undefined;
         let tokens: number, cost: Cost;
         if (final) {
           tokens = tokensOf(final);
           cost = costOf(final, call.price);
-          if (call.conversation) seen.set(call.conversation, { k: call.request.messages.length, prefix: prefixOf(call.request, call.request.messages.length), inputTokens: final.inputTokens });
+          if (call.conversation) seen.set(seenKey(call), { k: call.request.messages.length, prefix: prefixOf(call.request, call.request.messages.length), inputTokens: final.inputTokens });
         } else {
           // Not the endpoint's final word: it stays spent as reserved, or as reported if that's more.
-          const partial = last?.usage;
+          const partial = wholeUsage(last?.usage) ? last.usage : undefined;
           const reportedCost = partial ? costOf(partial, call.price) : undefined;
-          tokens = Math.max(r.tokens, partial ? tokensOf(partial) : 0);
+          tokens = Math.max(r.tokens, tokensOf(partial));
           cost = r.usd === 'unknown' || reportedCost?.usd === 'unknown' ? { usd: 'unknown' } : { usd: Math.max(r.usd, reportedCost?.usd ?? 0) };
         }
         await store.add({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens, cost, reservation: r.id });
@@ -363,7 +382,7 @@ export function memoryUsageStore(pause: () => Promise<void> = async () => {}): U
     all,
     reservations,
     async add(record) { await pause(); all.push(record); },
-    async records(day) { await pause(); return all.filter((r) => r.day === day); },
+    async records(day) { await pause(); return all.filter((r) => day === undefined || r.day === day); },
     async reserve(r) { await pause(); reservations.push(r); },
     async release(id) {
       await pause();

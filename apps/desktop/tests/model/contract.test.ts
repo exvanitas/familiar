@@ -85,11 +85,12 @@ describe('the fetch the adapter uses', () => {
     expect(server.seen.length).toBe(before);
   });
 
-  it('an address that refuses connections is a network error, not processed', async () => {
+  it('a refused connection is a network error, never marked not processed: a later hop could refuse one too', async () => {
     // A port that was free a moment ago, so nothing listens there.
     const port = await new Promise<number>(done => { const s = createServer().listen(0, '127.0.0.1', () => { const p = (s.address() as AddressInfo).port; s.close(() => done(p)); }); });
     const events = await drain(createPiAiPort(adapterOptions({ preset: 'ollama', baseUrl: `http://127.0.0.1:${port}/v1`, hasKey: false, fetch: injected, userAgent: 'Familiar/test' })).stream(CONTRACT_REQUEST));
-    expect(events).toEqual([{ type: 'error', error: expect.objectContaining({ kind: 'network', transport: 'ECONNREFUSED', notProcessed: true }) }]);
+    expect(events).toEqual([{ type: 'error', error: expect.objectContaining({ kind: 'network', transport: 'ECONNREFUSED' }) }]);
+    expect(events[0]).not.toHaveProperty('error.notProcessed');
   });
 });
 

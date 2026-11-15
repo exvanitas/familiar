@@ -252,12 +252,15 @@ const obj = (v: unknown): Json | undefined => (v && typeof v === 'object' && !Ar
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
 /**
- * Whether a request carries back the thinking-tool-call reply's replay in the place each API reads it:
- * - Anthropic: in the assistant turn, a thinking block with the signature, before the tool_use block of
- *   the recorded call.
- * - OpenRouter's wire: on the assistant message, `reasoning_details` holding an entry with the signature.
- * - Gemini: on the recorded tool call, `extra_content.google.thought_signature`, and on no other call.
- * The signature anywhere else, as text or on the wrong call, doesn't count.
+ * Whether a request carries back the thinking-tool-call reply's replay, as recorded and where each API
+ * reads it. The signed content must be what was recorded, not just the signature:
+ * - Anthropic: in one assistant turn, a thinking block with the recorded thinking text and signature,
+ *   before the tool_use block of the recorded call with its recorded input.
+ * - OpenRouter's wire: on the assistant message that holds the recorded tool call, `reasoning_details`
+ *   whose text is the recorded thinking, with the signature on one of them.
+ * - Gemini: the signature on the recorded tool call, with its recorded name and arguments, and on no
+ *   other call.
+ * The signature anywhere else, with altered thinking, or on the wrong call or message, doesn't count.
  */
 export function carriesReplay(wire: Wire, body: string): boolean {
   let j: unknown;
@@ -267,18 +270,32 @@ export function carriesReplay(wire: Wire, body: string): boolean {
     return false;
   }
   const sig = SIGNATURES[wire], id = REPLAY_CALL_IDS[wire];
+  const recordedArgs = (v: unknown) => {
+    try {
+      const a = typeof v === 'string' ? JSON.parse(v) : v;
+      return JSON.stringify(a) === JSON.stringify({ zone: 'UTC' });
+    } catch {
+      return false;
+    }
+  };
   const turns = arr(obj(j)?.messages).map(obj).filter((m): m is Json => m?.role === 'assistant');
   return turns.some(m => {
     if (wire === 'anthropic') {
       const blocks = arr(m.content).map(obj);
-      const thinking = blocks.findIndex(b => b?.type === 'thinking' && b.signature === sig);
-      const call = blocks.findIndex(b => b?.type === 'tool_use' && b.id === id);
+      const thinking = blocks.findIndex(b => b?.type === 'thinking' && b.signature === sig && b.thinking === CONTRACT_THINKING);
+      const call = blocks.findIndex(b => b?.type === 'tool_use' && b.id === id && b.name === 'get_time' && recordedArgs(b.input));
       return thinking >= 0 && call > thinking;
     }
-    if (wire === 'openai') return arr(m.reasoning_details).some(d => obj(d)?.signature === sig);
     const calls = arr(m.tool_calls).map(obj);
+    const recordedCall = (c: Json | undefined) => c?.id === id && obj(c.function)?.name === 'get_time' && recordedArgs(obj(c.function)?.arguments);
+    if (wire === 'openai') {
+      if (!calls.some(recordedCall)) return false;
+      const details = arr(m.reasoning_details).map(obj);
+      const said = details.map(d => (d?.type === 'reasoning.text' && typeof d.text === 'string' ? d.text : '')).join('');
+      return said === CONTRACT_THINKING && details.some(d => d?.signature === sig);
+    }
     const signed = calls.filter(c => obj(obj(c?.extra_content)?.google)?.thought_signature === sig);
-    return signed.length === 1 && signed[0]!.id === id;
+    return signed.length === 1 && recordedCall(signed[0]);
   });
 }
 

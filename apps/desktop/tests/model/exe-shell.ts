@@ -8,7 +8,8 @@ import type { NetHead, NetSpec, Shell } from '../../src/shell.ts';
 
 const KEY_HEADERS = new Set(['authorization', 'x-api-key', 'api-key', 'x-goog-api-key']);
 
-export function exeShell(saved: { id: string; url: string; key?: string }): Shell & { readonly sent: { url: string; headers: [string, string][] }[] } {
+/* `refuse`: every fetch fails with this kind, as the exe's would. */
+export function exeShell(saved: { id: string; url: string; key?: string; refuse?: string }): Shell & { readonly sent: { url: string; headers: [string, string][] }[] } {
   const open = new Map<string, { reader: ReadableStreamDefaultReader<Uint8Array>; abort: AbortController; spec: NetSpec; total: number }>();
   const sent: { url: string; headers: [string, string][] }[] = [];
   const blank = (s: string) => (saved.key ? s.replaceAll(saved.key, '[key]') : s);
@@ -22,6 +23,7 @@ export function exeShell(saved: { id: string; url: string; key?: string }): Shel
         return [k, v.replaceAll(PLACEHOLDER, saved.key)];
       });
       sent.push({ url: spec.url, headers: spec.headers });
+      if (saved.refuse) throw { kind: saved.refuse, message: saved.refuse };
       const abort = new AbortController();
       let r: Response;
       try {

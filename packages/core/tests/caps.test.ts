@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cappedPort, costOf, createCaps, inputBound, localDay, memoryUsageStore, withRetries, worstCost } from '../src/index.ts';
+import { cappedPort, costOf, createCaps, inputBound, localDay, memoryUsageStore, wholeUsage, withRetries, worstCost } from '../src/index.ts';
 import type { CallInfo, Caps, ModelError, ModelEvent, ModelRequest, Price, Usage } from '../src/index.ts';
 import { createFakeModel } from '../src/testing/index.ts';
 
@@ -83,6 +83,34 @@ describe('the ledger', () => {
     expect([a.go, b.go].sort()).toEqual([false, true]);
   });
 
+  it('a turn that runs past midnight keeps its cap; only the daily caps start again', async () => {
+    let now = new Date('2026-11-15T23:59:00Z').getTime();
+    const worst = inputBound(request) + 100;
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2, maxDayTokens: worst * 2 }, memoryUsageStore(), { now: () => now }, { dayOf: day });
+    const first = await go(caps, call());
+    await caps.settle(first.reservation, done({ inputTokens: worst - 100, outputTokens: 100 }));
+    await go(caps, call());
+    now = new Date('2026-11-16T00:01:00Z').getTime();
+    expect(await caps.before(call())).toMatchObject({ go: false, pause: 'turn-tokens' });
+    expect((await caps.before(call({ turn: 'next' }))).go).toBe(true);
+  });
+
+  it('a remembered input count holds only for the same endpoint and model, thinking and prompt', async () => {
+    const caps = createCaps({ maxReplyTokens: 100 }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    const big: ModelRequest = { ...request, messages: [{ role: 'user', content: 'x'.repeat(4000) }] };
+    const first = await go(caps, call({ request: big, conversation: 'c', endpoint: 'openai' }));
+    await caps.settle(first.reservation, done({ inputTokens: 1010, outputTokens: 20 }));
+    expect((await go(caps, call({ request: big, conversation: 'c', endpoint: 'openai' }))).inputBound).toBe(1010);
+    for (const [what, c] of [
+      ['another model', call({ request: { ...big, model: 'other' }, conversation: 'c', endpoint: 'openai' })],
+      ['another endpoint', call({ request: big, conversation: 'c', endpoint: 'anthropic' })],
+      ['thinking on', call({ request: { ...big, thinking: 'low' }, conversation: 'c', endpoint: 'openai' })],
+      ['another system prompt', call({ request: { ...big, system: 'Be brief.' }, conversation: 'c', endpoint: 'openai' })]
+    ] as const) {
+      expect((await go(caps, c)).inputBound, what).toBe(inputBound(c.request));
+    }
+  });
+
   it('a turn and a day count open reservations, and a new day starts again', async () => {
     let now = new Date('2026-11-15T10:00:00Z').getTime();
     const worst = inputBound(request) + 100;
@@ -146,6 +174,18 @@ describe('the ledger', () => {
       const huge = { inputTokens: r.reserved.tokens * 2, outputTokens: 0 };
       await caps.settle(r.reservation, failed({ kind: 'network', message: 'x' }, { usage: huge }));
       expect(store.all[0]!.tokens).toBe(huge.inputTokens);
+    });
+    it('an empty, partial or malformed usage object is no count: the reservation stays spent', async () => {
+      for (const usage of [{}, { inputTokens: 10 }, { inputTokens: '10', outputTokens: '2' }, { inputTokens: 10, outputTokens: -1 }, { inputTokens: NaN, outputTokens: 1 }]) {
+        const { store, caps } = fresh();
+        const r = await go(caps, call());
+        await caps.settle(r.reservation, done(usage as unknown as Usage));
+        expect(store.all.map((x) => x.tokens), JSON.stringify(usage)).toEqual([r.reserved.tokens]);
+      }
+      const { store, caps } = fresh();
+      const r = await go(caps, call());
+      await caps.settle(r.reservation, failed({ kind: 'filtered', message: 'x' }, { usage: {}, usageFinal: true }));
+      expect(store.all.map((x) => x.tokens)).toEqual([r.reserved.tokens]);
     });
     it('releases only when the endpoint said it did not take the request', async () => {
       const { store, caps } = fresh();
@@ -235,15 +275,22 @@ async function interleave(seed: number): Promise<string[]> {
   await Promise.all(
     Array.from({ length: 24 }, async () => {
       for (let n = Math.floor(rand() * 3); n > 0; n--) await tick();
-      const c = call({ persona: rand() < 0.5 ? 'a' : 'b', turn: `t${Math.floor(rand() * 3)}` });
+      // One conversation, switching between a model that counts a quarter of the bytes and one that
+      // counts every byte, so a count remembered for one and used for the other would show.
+      const model = rand() < 0.5 ? 'small' : 'big';
+      const c = call({ persona: rand() < 0.5 ? 'a' : 'b', turn: `t${Math.floor(rand() * 3)}`, conversation: 'c', request: { ...request, model } });
       const r = await caps.before(c);
       check();
       if (!r.go) return;
       for (let n = Math.floor(rand() * 4); n > 0; n--) await tick();
-      const input = Math.floor(rand() * r.inputBound), output = Math.floor(rand() * r.maxOutputTokens);
+      const input = model === 'big' ? inputBound(c.request) : Math.floor(inputBound(c.request) / 4), output = Math.floor(rand() * r.maxOutputTokens);
       const usage = { inputTokens: input, outputTokens: output };
       const outcomes: (Terminal | undefined)[] = [
         done(usage),
+        done({} as Usage),
+        done({ inputTokens: input } as Usage),
+        done({ inputTokens: String(input), outputTokens: -1 } as unknown as Usage),
+        failed({ kind: 'filtered', message: 'x' }, { usage: {}, usageFinal: true }),
         done({ inputTokens: 0, outputTokens: 0 }, { unreported: true }),
         failed({ kind: 'rate-limit', message: 'x', notProcessed: true }),
         failed({ kind: 'server', message: 'x' }, { usage }),
@@ -255,7 +302,16 @@ async function interleave(seed: number): Promise<string[]> {
       await caps.settle(r.reservation, last);
       check();
       const added = store.all.find((x) => x.reservation === r.reservation);
-      if (last?.usage && !(last.type === 'error' && last.error.notProcessed) && (!added || added.tokens < last.usage.inputTokens + last.usage.outputTokens)) {
+      // Whatever the endpoint said, or failed to say, the call really used input + output tokens; a
+      // processed call must never be recorded as less.
+      const processed = !(last?.type === 'error' && last.error.notProcessed);
+      if (processed && (added?.tokens ?? 0) < input + output) {
+        problems.push(`seed ${seed}: recorded ${added?.tokens ?? 'nothing'}, below the ${input + output} it really used (${JSON.stringify(last)})`);
+      }
+      if (added && added.tokens > r.reserved.tokens && last?.type === 'done' && !last.unreported) {
+        problems.push(`seed ${seed}: ${model} used ${added.tokens}, past the ${r.reserved.tokens} reserved for it: its bound wasn't an upper bound`);
+      }
+      if (wholeUsage(last?.usage) && !(last.type === 'error' && last.error.notProcessed) && (!added || added.tokens < last.usage.inputTokens + last.usage.outputTokens)) {
         problems.push(`seed ${seed}: settled to ${added?.tokens ?? "nothing"}, below the reported ${last.usage.inputTokens + last.usage.outputTokens}`);
       }
     })
@@ -265,7 +321,7 @@ async function interleave(seed: number): Promise<string[]> {
 }
 
 describe('the ledger under concurrent calls', () => {
-  it('over 200 seeded interleavings, recorded plus reserved spend never passes a cap, and nothing settles below reported usage', { timeout: 60000 }, async () => {
+  it('over 200 seeded interleavings, with model switches and empty or partial usage, recorded plus reserved spend never passes a cap, and nothing settles below reported or real usage', { timeout: 60000 }, async () => {
     const problems: string[] = [];
     for (let seed = 1; seed <= 200; seed++) problems.push(...(await interleave(seed)));
     expect(problems.slice(0, 5)).toEqual([]);

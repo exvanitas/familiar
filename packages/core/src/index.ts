@@ -33,7 +33,7 @@ export type {
 } from './decide/port.ts';
 export { BACK_AFTER_MINUTES, BUBBLE_GAP_MINUTES, SETTLE_MINUTES, decideByRules, isLateNight, rulesDecider } from './decide/rules.ts';
 
-export { cappedPort, costOf, createCaps, inputBound, localDay, MESSAGE_FRAME, memoryUsageStore, REQUEST_FRAME, worstCost } from './model/caps.ts';
+export { cappedPort, costOf, createCaps, inputBound, localDay, MESSAGE_FRAME, memoryUsageStore, REQUEST_FRAME, wholeUsage, worstCost } from './model/caps.ts';
 export type { CallInfo, CapCheck, Caps, CapsConfig, CapsOptions, Clock, Cost, PauseReason, Price, PriceTier, Rates, Reservation, UsageRecord, UsageStore } from './model/caps.ts';
 export { retryable, waitBefore, withRetries } from './model/retry.ts';
 export type { RetryOptions } from './model/retry.ts';

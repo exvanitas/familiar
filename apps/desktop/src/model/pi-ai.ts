@@ -93,15 +93,27 @@ interface Seen {
 
 /* What one call has seen so far, beside pi-ai's own events. */
 interface CallState {
+  api: WireApi;
   seen: Seen;
   google: Record<string, string>;
   ids: Map<number, string>;
-  /** The endpoint sent its final usage count (OpenAI's usage chunk, Anthropic's message_delta). */
-  finalUsage: boolean;
+  /* What the raw stream showed about usage, for `finalUsage`. */
+  marks: { usage?: boolean; finished?: boolean; input?: boolean; output?: boolean; stopReason?: boolean; messageStop?: boolean; bad?: boolean };
   /** The latest usage pi-ai had, partial or not. */
   usage?: PiUsage;
   /** A tool call that can't be passed on. The reply is read to its end for its usage, then this ends it. */
   badCall?: ModelError;
+}
+
+/* Whether the endpoint sent its final usage: every counter the API defines for it as a whole,
+   non-negative number it really sent, and the API's own sign that the reply is over. OpenAI-compatible:
+   a usage chunk with prompt_tokens and completion_tokens, and a finish_reason. Anthropic: input_tokens in
+   message_start, output_tokens in message_delta with its stop_reason, then message_stop. A counter that's
+   missing, malformed or partial anywhere makes it unreported. */
+function finalUsage(st: CallState): boolean {
+  const m = st.marks;
+  if (m.bad) return false;
+  return st.api === 'openai-completions' ? !!(m.usage && m.finished) : !!(m.input && m.output && m.stopReason && m.messageStop);
 }
 
 export function createPiAiPort(options: AdapterOptions): ModelPort {
@@ -110,20 +122,26 @@ export function createPiAiPort(options: AdapterOptions): ModelPort {
 
 const isUsage = (u: Usage) => u.inputTokens > 0 || u.outputTokens > 0;
 
-/* One terminal error, with whatever usage is known, and whether it's the endpoint's final count. */
-function failure(error: ModelError, st: CallState, usage?: PiUsage): Extract<ModelEvent, { type: 'error' }> {
-  const u = toUsage(usage ?? st.usage ?? zeroUsage());
-  return { type: 'error', error, ...(isUsage(u) ? { usage: u, ...(st.finalUsage ? { usageFinal: true as const } : {}) } : {}) };
+/* One terminal error, with whatever usage is known, and whether it's the endpoint's final count.
+   Never throws: if the usage can't be read, the error goes without it. */
+function failure(error: ModelError, st: CallState, usage?: PiUsage, final = finalUsage(st)): Extract<ModelEvent, { type: 'error' }> {
+  try {
+    const u = toUsage(usage ?? st.usage ?? zeroUsage());
+    return { type: 'error', error, ...(isUsage(u) ? { usage: u, ...(final ? { usageFinal: true as const } : {}) } : {}) };
+  } catch {
+    return { type: 'error', error };
+  }
 }
 
 /* Never throws: every step, from building the request to the last event, is inside one catch, which
-   ends the reply with exactly one plain error. */
+   ends the reply with exactly one plain error. Each terminal event is built in full before it counts
+   as sent, so a hostile value that throws while building it still ends in the catch's error. */
 async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSignal): AsyncGenerator<ModelEvent> {
   if (signal?.aborted) {
     yield aborted();
     return;
   }
-  const st: CallState = { seen: {}, google: {}, ids: new Map(), finalUsage: false };
+  const st: CallState = { api: o.api, seen: {}, google: {}, ids: new Map(), marks: {} };
   let source: AsyncIterator<AssistantMessageEvent> | undefined;
   let stopped: ReturnType<typeof stopPromise> | undefined;
   let ended = false;
@@ -144,7 +162,13 @@ async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSign
       ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
       ...thinkingOptions(o.api, request),
       // Gemini's signatures ride on tool calls as `extra_content`, which pi-ai neither reads nor writes.
-      onProviderStreamEvent: (chunk: unknown) => noteChunk(chunk, st),
+      onProviderStreamEvent: (chunk: unknown) => {
+        try {
+          noteChunk(chunk, st);
+        } catch {
+          st.marks.bad = true;
+        }
+      },
       ...(outgoing.size ? { onPayload: (payload: unknown) => addGoogle(payload, outgoing) } : {})
     };
     source = mod.stream(model, context, stream)[Symbol.asyncIterator]();
@@ -155,23 +179,25 @@ async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSign
       const next = source.next();
       const result = stopped ? await Promise.race([next, stopped.promise]) : await next;
       if (result === STOPPED) {
+        const e = failure(aborted().error, st, undefined, false);
         ended = true;
-        yield failure(aborted().error, { ...st, finalUsage: false });
+        yield e;
         return;
       }
       if (result.done) {
+        const e = failure({ kind: 'unknown', message: 'The reply ended without finishing.' }, st);
         ended = true;
-        yield failure({ kind: 'unknown', message: 'The reply ended without finishing.' }, st);
+        yield e;
         return;
       }
       const event = result.value;
       if ('partial' in event && event.partial?.usage) st.usage = event.partial.usage;
       switch (event.type) {
         case 'text_delta':
-          if (event.delta && !st.badCall) yield { type: 'text', delta: event.delta };
+          if (typeof event.delta === 'string' && event.delta && !st.badCall) yield { type: 'text', delta: event.delta };
           break;
         case 'thinking_delta':
-          if (event.delta && !st.badCall) yield { type: 'thinking', delta: event.delta };
+          if (typeof event.delta === 'string' && event.delta && !st.badCall) yield { type: 'thinking', delta: event.delta };
           break;
         case 'toolcall_end': {
           if (st.badCall) break;
@@ -181,22 +207,25 @@ async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSign
           break;
         }
         case 'done': {
-          ended = true;
-          if (st.badCall) {
-            yield failure(st.badCall, st, event.message.usage);
-            return;
+          let e: ModelEvent;
+          if (st.badCall) e = failure(st.badCall, st, event.message.usage);
+          else {
+            const replay = toReplay(o, request, event.message, st.google);
+            e = {
+              type: 'done', stopReason: toStopReason(event.reason), usage: toUsage(event.message.usage),
+              ...(replay ? { replay } : {}), ...(finalUsage(st) ? {} : { unreported: true as const })
+            };
           }
-          const replay = toReplay(o, request, event.message, st.google);
-          yield {
-            type: 'done', stopReason: toStopReason(event.reason), usage: toUsage(event.message.usage),
-            ...(replay ? { replay } : {}), ...(st.finalUsage ? {} : { unreported: true as const })
-          };
+          ended = true;
+          yield e;
           return;
         }
-        case 'error':
+        case 'error': {
+          const e = failure(st.badCall ?? toError(event.error, st.seen, signal), st, event.error.usage);
           ended = true;
-          yield failure(st.badCall ?? toError(event.error, st.seen, signal), st, event.error.usage);
+          yield e;
           return;
+        }
         default:
           break;
       }
@@ -204,12 +233,13 @@ async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSign
   } catch {
     if (!ended) {
       ended = true;
+      // Fixed words and a kind only: nothing here reads what the endpoint sent.
       const error: ModelError = signal?.aborted
         ? aborted().error
         : !st.seen.sent
           ? { kind: 'bad-request', message: "Familiar couldn't build the request.", notProcessed: true }
-          : toError(undefined, st.seen, signal);
-      yield failure(error, { ...st, finalUsage: false });
+          : { kind: 'unknown', message: MESSAGES.unknown };
+      yield failure(error, st, undefined, false);
     }
   } finally {
     stopped?.dispose();
@@ -356,14 +386,40 @@ function addGoogle(payload: unknown, sigs: Map<string, string>): unknown {
 /* Notes a tool call's Gemini signature from a raw chunk. Ids come once, on the call's first chunk. */
 /* Reads what pi-ai doesn't keep from a raw chunk: a Gemini signature on a tool call (ids come once, on
    the call's first chunk), and whether the endpoint has sent its final usage count. */
+const count = (n: unknown) => typeof n === 'number' && Number.isInteger(n) && n >= 0;
+const optionalCount = (n: unknown) => n === undefined || n === null || count(n);
+const record = (v: unknown): Record<string, unknown> | undefined => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined);
+
 function noteChunk(chunk: unknown, st: CallState): void {
-  const c = chunk as { type?: unknown; usage?: unknown; choices?: { delta?: { tool_calls?: { index?: number; id?: string; extra_content?: { google?: { thought_signature?: unknown } } }[] } }[] } | null;
-  if (!c || typeof c !== 'object') return;
-  // OpenAI-compatible: the usage chunk. Anthropic: message_delta's usage, which ends the message.
-  if (c.usage && typeof c.usage === 'object' && (c.type === undefined || c.type === 'message_delta')) st.finalUsage = true;
-  for (const call of c.choices?.[0]?.delta?.tool_calls ?? []) {
+  const c = record(chunk);
+  if (!c) return;
+  const m = st.marks;
+  if (st.api === 'openai-completions') {
+    const choice = record(Array.isArray(c.choices) ? c.choices[0] : undefined);
+    if (typeof choice?.finish_reason === 'string' && choice.finish_reason) m.finished = true;
+    if (c.usage !== undefined && c.usage !== null) {
+      const u = record(c.usage);
+      const details = record(u?.prompt_tokens_details);
+      if (u && count(u.prompt_tokens) && count(u.completion_tokens) && optionalCount(details?.cached_tokens)) m.usage = true;
+      else m.bad = true;
+    }
+  } else if (c.type === 'message_start') {
+    const u = record(record(c.message)?.usage);
+    if (u && count(u.input_tokens) && optionalCount(u.cache_read_input_tokens) && optionalCount(u.cache_creation_input_tokens)) m.input = true;
+    else m.bad = true;
+  } else if (c.type === 'message_delta') {
+    const u = record(c.usage);
+    if (u && count(u.output_tokens) && optionalCount(u.input_tokens) && optionalCount(u.cache_read_input_tokens) && optionalCount(u.cache_creation_input_tokens)) m.output = true;
+    else m.bad = true;
+    if (typeof record(c.delta)?.stop_reason === 'string') m.stopReason = true;
+  } else if (c.type === 'message_stop') {
+    m.messageStop = true;
+  }
+  const delta = record(record(Array.isArray(c.choices) ? c.choices[0] : undefined)?.delta) as { tool_calls?: unknown } | undefined;
+  const calls = (Array.isArray(delta?.tool_calls) ? delta.tool_calls : []) as { index?: number; id?: string; extra_content?: { google?: { thought_signature?: unknown } } }[];
+  for (const call of calls) {
     const index = call.index ?? 0;
-    if (call.id) st.ids.set(index, call.id);
+    if (typeof call.id === 'string' && call.id) st.ids.set(index, call.id);
     const sig = call.extra_content?.google?.thought_signature;
     const id = st.ids.get(index);
     if (typeof sig === 'string' && id) st.google[id] = sig;
@@ -394,10 +450,11 @@ function toStopReason(reason: 'stop' | 'length' | 'toolUse' | 'deferred'): StopR
   return reason === 'toolUse' ? 'tool-calls' : reason === 'length' ? 'length' : 'end';
 }
 
-const whole = (n: number | undefined) => (n !== undefined && Number.isFinite(n) && n > 0 ? Math.round(n) : 0);
+const whole = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.round(n) : 0);
 
 /* pi-ai's `input` leaves cached tokens out; the port's counts them in. */
-function toUsage(u: PiUsage): Usage {
+function toUsage(u: PiUsage | undefined): Usage {
+  if (!u || typeof u !== 'object') return { inputTokens: 0, outputTokens: 0 };
   const read = whole(u.cacheRead), write = whole(u.cacheWrite);
   return {
     inputTokens: whole(u.input) + read + write,
@@ -431,7 +488,10 @@ const TRANSPORT: Record<string, [ModelErrorKind, string]> = {
   invalid: ['bad-request', 'The request was malformed.']
 };
 /* Refused or failed before a connection: sending again can't do anything twice. */
-const UNSENT = new Set([...Object.keys(TRANSPORT), 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+/* Refused before any network: the exe checks the saved address (not-saved), its open-request limit (busy)
+   and the key (no-key) before its first send. Every other kind (blocked-address, network, tls, insecure,
+   a connect refusal) can come from a later hop, such as a redirect, after a request was sent. */
+const UNSENT = new Set(['no-key', 'not-saved', 'busy']);
 const AFTER: Record<string, string> = {
   timeout: "The endpoint didn't answer in time.",
   tls: "The endpoint's secure connection couldn't be checked.",
@@ -440,6 +500,8 @@ const AFTER: Record<string, string> = {
   'too-large': 'The reply was too large.'
 };
 const FILTERED = /content_filter|refusal|sensitive|SAFETY|PROHIBITED_CONTENT|BLOCKLIST/;
+
+const text = (v: unknown) => (typeof v === 'string' ? v : '');
 
 function toError(message: AssistantMessage | undefined, seen: Seen, signal?: AbortSignal, thrown?: unknown): ModelError {
   if (signal?.aborted || message?.stopReason === 'aborted') return aborted().error;
@@ -451,7 +513,8 @@ function toError(message: AssistantMessage | undefined, seen: Seen, signal?: Abo
   const status = seen.status !== undefined && seen.status >= 400 ? seen.status : undefined;
   if (status === undefined) {
     // The head was fine, so the stream itself ended badly: a filter, a stop reason, or a failure part way.
-    const raw = `${message?.rawStopReason ?? ''} ${message?.errorMessage ?? ''}`;
+    // Read as text only if it is text: an endpoint's value can be any shape.
+    const raw = `${text(message?.rawStopReason)} ${text(message?.errorMessage)}`;
     if (FILTERED.test(raw)) return { kind: 'filtered', message: MESSAGES.filtered };
     if (/overloaded|api_error|server_error/i.test(raw)) return { kind: 'server', message: MESSAGES.server };
     void thrown;
