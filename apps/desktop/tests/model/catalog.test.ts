@@ -8,7 +8,8 @@ import { CATALOG_LABEL, preset, priceFor } from '../../src/model/presets.ts';
 
 describe('catalog prices', () => {
   it('the table is what the installed pi-ai lists, so it cannot drift', () => {
-    expect(readFileSync(new URL('../../src/model/catalog-prices.ts', import.meta.url), 'utf8')).toBe(render(catalogPrices()));
+    // A Windows checkout may give the file CRLF line ends.
+    expect(readFileSync(new URL('../../src/model/catalog-prices.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n')).toBe(render(catalogPrices()));
     expect(Object.keys(CATALOG_PRICES.openai).length).toBeGreaterThan(10);
     expect(Object.keys(CATALOG_PRICES.anthropic).length).toBeGreaterThan(5);
     expect(Object.keys(CATALOG_PRICES.gemini).length).toBeGreaterThan(5);
