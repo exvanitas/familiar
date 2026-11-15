@@ -42,9 +42,11 @@ pub struct Info {
     autostarted: bool,
 }
 
+/// Async, so it's answered where every async command runs: security.exec.responsive times it to
+/// show no command holds those threads.
 #[tauri::command]
-fn shell_info(shell: State<Shell>) -> Info {
-    Info {
+async fn shell_info(shell: State<'_, Shell>) -> Res<Info> {
+    Ok(Info {
         api: identity::SHELL_API,
         version: env!("CARGO_PKG_VERSION"),
         args: shell.args.clone(),
@@ -52,7 +54,7 @@ fn shell_info(shell: State<Shell>) -> Info {
         webview_dir: shell.webview_dir.display().to_string(),
         origin: identity::ORIGIN,
         autostarted: shell.autostarted,
-    }
+    })
 }
 
 /// Core is up, and hands over the one channel for everything the exe tells it. Once a run.

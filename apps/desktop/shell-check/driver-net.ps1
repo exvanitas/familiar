@@ -340,7 +340,7 @@ function Do-NetStep($action, $a) {
       return @{ lanIp = $script:lanIp }
     }
     'dns-queries' {
-      $q = @(Dns-Log | Where-Object { $_.name -eq $a.name -and $_.type -eq 1 })
+      $q = @(Dns-Log | Where-Object { $_.name -eq $a.name -and ($a.all -or $_.type -eq 1) })
       return @{ count = $q.Count; queries = @($q | ForEach-Object { @{ at = $_.at; n = $_.n; answered = ($_.answered -join ',') } }) }
     }
     'dns-canary' {
