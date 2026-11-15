@@ -139,6 +139,8 @@ export interface OpenOptions {
   readonly stepCap?: number;
   readonly caps?: { maxDayTokens?: number; maxTurnTokens?: number };
   readonly onDeliver?: (text: string, at: number, firedAt: number) => void;
+  /** Called when a notification is first shown, with its id. */
+  readonly onNotify?: (id: string) => void;
   readonly chatInFront?: () => boolean;
   readonly decider?: DecisionPort;
   readonly onReaction?: (decision: Decision, event: PersonaEvent) => void;
@@ -183,10 +185,16 @@ export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
     newGen: o.newGen,
     stepCap: o.stepCap,
     resendDelayMs: 50,
-    wakeTask: {
-      deliver: (input, firedAt) => {
+    // A notifier that shows each id once, as the real one must. Calls and ids are counted apart.
+    notifier: {
+      notify: (n) => {
+        env.counters.bump('notify-calls');
+        env.counters.note(`notify-call-${env.counters.get('notify-calls')}`, n.id);
+        if (env.counters.note(`shown:${n.id}`)) return;
+        env.counters.note(`shown:${n.id}`, '1');
         env.counters.bump('delivered');
-        o.onDeliver?.(input.text, input.at, firedAt);
+        o.onNotify?.(n.id);
+        o.onDeliver?.(n.text, n.at, clock.now());
       }
     }
   });
@@ -493,7 +501,46 @@ export function writeWindowPath(s: any): 'receipt' | 'made-again' | 'before-tool
   return 'other';
 }
 
+/**
+ * A wake killed after its notification went out but before the commit that writes its chat line and marks
+ * it done. Life 2 runs the delivery again: the same notification id, so one notification, and one line.
+ */
+export const WAKE_DELIVERY: Scenario = {
+  name: 'wake-delivery',
+  async run(env) {
+    const store = await env.openStore('wake-delivery');
+    let kill: (() => void) | undefined;
+    let fired = false;
+    const opened = await openFor(env, store, {
+      script: () => ({ text: 'unused' }),
+      onNotify: () => {
+        if (env.life !== 1) return;
+        // Right after the notification, before the delivery's commit: no shutdown path.
+        fired = true;
+        kill?.();
+        env.ready(() => {});
+      }
+    });
+    const { journal, clock } = opened;
+    kill = () => journal.kill();
+    if (env.life === 1) {
+      await journal.parkUntil('stretch', clock.now() + 50);
+      while (!fired) await sleep(5);
+      return undefined;
+    }
+    for (let i = 0; i < 200 && (await journal.transcript()).every((e) => e.kind !== 'familiar.reminder'); i++) await sleep(10);
+    await sleep(100);
+    const lines = (await journal.transcript()).filter((e) => e.kind === 'familiar.reminder');
+    const calls = env.counters.get('notify-calls');
+    const ids = Array.from({ length: calls }, (_, i) => env.counters.note(`notify-call-${i + 1}`));
+    const summary = { lines: lines.map((l) => l.text), calls, ids, shown: env.counters.get('delivered') };
+    await journal.close();
+    return summary;
+  }
+};
+
 export function scenario(name: string): Scenario {
+  if (name === WAKE_DELIVERY.name) return WAKE_DELIVERY;
   if (name === WRITE_WINDOW.name) return WRITE_WINDOW;
   const s = SCENARIOS.find((x) => x.name === name);
   if (!s) throw new Error(`no scenario ${name}`);

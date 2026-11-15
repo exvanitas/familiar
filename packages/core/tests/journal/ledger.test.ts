@@ -52,21 +52,45 @@ describe("the caps ledger in the journal's store", () => {
     expect(second).toBe(true);
   });
 
-  it('settled records older than two days fold into per-turn totals, and a turn keeps its cap', async () => {
+  it('settled records of a finished turn older than two days fold into per-turn totals, and the turn keeps its cap', async () => {
     const world = nodeWorld();
     let now = new Date('2026-11-01T10:00:00Z').getTime();
     const { usage } = await openLedger(world);
     const worst = inputBound(request) + 100;
-    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2 }, usage, { now: () => now });
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2 - 1 }, usage, { now: () => now });
     const r = await caps.before(call({ turn: 'long' }));
     if (!r.go) throw new Error('paused');
     await caps.settle(r.reservation, done({ inputTokens: worst - 100, outputTokens: 100 }));
     now += 3 * 24 * 60 * 60_000;
-    await caps.before(call({ turn: 'long' }));
+    // Another turn's call tidies the ledger: "long" isn't asking, and nothing says it's unfinished.
+    await caps.before(call({ turn: 'other' }));
     const ledger: Ledger = await usage.read();
     expect(ledger.records.some((x) => x.reservation === r.reservation)).toBe(false);
     expect(ledger.turns.long?.tokens).toBe(worst);
     expect(await caps.before(call({ turn: 'long' }))).toMatchObject({ go: false, pause: 'turn-tokens' });
+  });
+
+  it('a turn that is not finished keeps its spend whole, however old: never folded, never dropped', async () => {
+    const world = nodeWorld();
+    let now = new Date('2026-10-01T10:00:00Z').getTime();
+    const { usage } = await openLedger(world);
+    const worst = inputBound(request) + 100;
+    const waiting = new Set(['waiting']);
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2 - 1 }, usage, { now: () => now }, { unfinished: () => waiting });
+    for (const turn of ['waiting', 'done']) {
+      const r = await caps.before(call({ turn }));
+      if (!r.go) throw new Error('paused');
+      await caps.settle(r.reservation, done({ inputTokens: worst - 100, outputTokens: 100 }));
+    }
+    // 31 days on, other turns' calls tidy the ledger.
+    now += 31 * 24 * 60 * 60_000;
+    await caps.before(call({ turn: 'new-1' }));
+    await caps.before(call({ turn: 'new-2' }));
+    const ledger: Ledger = await usage.read();
+    expect(ledger.records.filter((x) => x.turn === 'waiting')).toHaveLength(1);
+    expect(ledger.records.some((x) => x.turn === 'done')).toBe(false);
+    expect(ledger.turns.done).toBeUndefined();
+    expect(await caps.before(call({ turn: 'waiting' }))).toMatchObject({ go: false, pause: 'turn-tokens' });
   });
 });
 

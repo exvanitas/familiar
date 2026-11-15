@@ -124,6 +124,26 @@ describe('caps that pause, not fail', () => {
     await journal.close();
   });
 
+  it('a turn waiting 31 days on a consent card, then approved, still counts what it spent before toward its turn cap', async () => {
+    const env = envOf();
+    let answer: ((ok: boolean) => void) | undefined;
+    const { journal, clock } = await openFor(env, await env.world.open('month'), {
+      // The first reply reports a big input; the reply after the tool would pass the turn cap.
+      script: (r) => (lastIsTool(r) ? { text: 'Sent.', usage: { inputTokens: 10, outputTokens: 2 } } : { toolCalls: [{ id: 'c', name: 'send_message', arguments: { to: 'Sam', text: 'hi' } }], usage: { inputTokens: 4000, outputTokens: 2 } }),
+      consent: () => new Promise<boolean>((r) => (answer = r)),
+      caps: { maxTurnTokens: 5000 }
+    });
+    const sent = await journal.send('Tell Sam hi.', 'r1');
+    if (!sent.replied) throw new Error('no reply');
+    while (!answer) await new Promise((r) => setTimeout(r, 5));
+    clock.advance(31 * 24 * 60 * 60_000);
+    answer(true);
+    const end = await sent.turn.wait();
+    expect(end).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'turn-tokens' } });
+    expect(env.counters.get('starts:send_message')).toBe(1);
+    await journal.close();
+  });
+
   it("a model error is not sent again by pi-durable: Familiar's own retries already ran", async () => {
     const env = envOf();
     const { journal, model, presence } = await openFor(env, await env.world.open('err'), {

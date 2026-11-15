@@ -238,6 +238,8 @@ export interface CapsOptions {
   /** How long a reservation may stay open before it counts as spent. Default 30 minutes. */
   readonly reservationMs?: number;
   readonly newId?: () => string;
+  /** Turns that aren't finished and can still go on: their spend is never folded away or dropped. */
+  readonly unfinished?: () => Iterable<string>;
 }
 
 /** Records settled longer ago than this fold into per-turn totals. Two days, so today and yesterday stay whole. */
@@ -261,20 +263,30 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
   const seen = new Map<string, Seen>();
 
   /** Open past their deadline: spent as reserved. Old records fold into per-turn totals. */
-  function tidy(ledger: Ledger, now: number): void {
+  /**
+   * Open past their deadline: spent as reserved. Old records of finished turns fold into per-turn totals,
+   * and a folded turn unused for a month is dropped. A turn that isn't finished, the one asking now or
+   * any `unfinished` says, keeps its records whole and is never dropped, however old: a turn can wait
+   * weeks on a consent card and then go on.
+   */
+  function tidy(ledger: Ledger, now: number, asking?: string): void {
     for (const r of ledger.open.filter((x) => x.deadline <= now)) {
       ledger.open.splice(ledger.open.indexOf(r), 1);
       ledger.records.push({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens: r.tokens, cost: { usd: r.usd } as Cost, reservation: r.id });
       pending.delete(r.id);
     }
-    if (ledger.records.some((r) => r.at < now - FOLD_AFTER_MS)) {
-      for (const r of ledger.records.filter((x) => x.at < now - FOLD_AFTER_MS)) {
+    const live = new Set(opts.unfinished?.() ?? []);
+    if (asking !== undefined) live.add(asking);
+    for (const p of pending.values()) live.add(p.turn);
+    const folds = (r: UsageRecord) => r.at < now - FOLD_AFTER_MS && !live.has(r.turn);
+    if (ledger.records.some(folds)) {
+      for (const r of ledger.records.filter(folds)) {
         const t = ledger.turns[r.turn];
         ledger.turns[r.turn] = { tokens: (t?.tokens ?? 0) + r.tokens, last: Math.max(t?.last ?? 0, r.at) };
       }
-      ledger.records = ledger.records.filter((r) => r.at >= now - FOLD_AFTER_MS);
+      ledger.records = ledger.records.filter((r) => !folds(r));
     }
-    for (const [turn, t] of Object.entries(ledger.turns)) if (t.last < now - DROP_TURN_AFTER_MS) delete ledger.turns[turn];
+    for (const [turn, t] of Object.entries(ledger.turns)) if (t.last < now - DROP_TURN_AFTER_MS && !live.has(turn)) delete ledger.turns[turn];
   }
 
   function boundFor(call: CallInfo): number {
@@ -296,7 +308,7 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
       const id = newId();
       const result = await store.update((ledger): CapCheck => {
         const now = clock.now();
-        tidy(ledger, now);
+        tidy(ledger, now, call.turn);
         const day = dayOf(now);
         // A turn is counted across every date, so one that runs past midnight keeps its cap; the
         // daily limits count only today.
@@ -352,7 +364,7 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
       const said = last?.type === 'done' ? !last.unreported : last?.type === 'error' && last.usageFinal === true;
       const final = said && wholeUsage(last?.usage) ? last!.usage : undefined;
       const cost = await store.update((ledger): Cost | undefined => {
-        tidy(ledger, clock.now());
+        tidy(ledger, clock.now(), call.turn);
         const i = ledger.open.findIndex((r) => r.id === id);
         if (i < 0) return undefined;
         const r = ledger.open.splice(i, 1)[0]!;

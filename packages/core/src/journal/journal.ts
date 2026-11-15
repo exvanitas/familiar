@@ -107,6 +107,8 @@ export interface JournalOptions {
   readonly tools: readonly FamiliarTool[];
   readonly clock?: JournalClock;
   readonly wake: WakePort;
+  /** Shows a parked wake's notification when it fires. */
+  readonly notifier: NotifierPort;
   readonly consent: ConsentPort;
   readonly presence: PresencePort;
   readonly persona: { readonly id: string; readonly name: string; readonly instructions: string };
@@ -139,10 +141,20 @@ export type SendResult =
   /** A bare acknowledgement: no reply message. `decision` is the reaction, a gesture at most. */
   | { readonly replied: false; readonly decision: Decision };
 
-/** A reminder-style task: parks until `at`, then delivers. Step 8 gives it the real reminder. */
-export interface WakeTask {
-  /** Runs when the wait is over. */
-  deliver(input: { text: string; at: number }, firedAt: number): void | Promise<void>;
+export interface Notification {
+  /**
+   * Stable for one delivery: derived from the parked wake's task id, so a delivery a kill cut off and
+   * ran again has the same id. On Windows it becomes the toast's tag.
+   */
+  readonly id: string;
+  readonly text: string;
+  /** When it was due. */
+  readonly at: number;
+}
+
+/** Shows notifications. It must show each id once: a delivery can run again after a kill. */
+export interface NotifierPort {
+  notify(notification: Notification): void | Promise<void>;
 }
 
 const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; answered: Record<string, { yes: boolean; submission?: string }>; opened?: number }>(
@@ -165,19 +177,29 @@ const BudgetDoc = defineJournalDoc<{ budget: Budget; turns: Record<string, strin
 
 const STOPPED_WORDS = 'Not done: the app closed while this was running, and it was not run again. The person was asked whether to do it now.';
 
-// pi-durable finds a task's code by its name in the registry, not by a closure per open, so the parked
-// wake reads the hooks of the journal this page opened. Familiar opens one journal per page.
-let reminderHooks: WakeTask | undefined;
-/** A parked wake: sleeps durably until `at`, then delivers. */
-const WakeAt = defineTask<{ text: string; at: number }, { phase: 'wait' } | { phase: 'deliver' }, null>({
+const ReminderEntry = 'familiar.reminder';
+
+/**
+ * A parked wake: sleeps durably until `at`, then delivers. Each journal makes its own, around its own
+ * notifier: pi-durable finds a task's code by name in the journal's registry, so nothing is shared.
+ */
+const wakeAtTask = (notifier: NotifierPort) => defineTask<{ text: string; at: number }, { phase: 'wait' } | { phase: 'deliver' }, null>({
   name: 'familiar.wake-at',
   version: 1,
   initial: () => ({ phase: 'wait' }),
   phases: {
     wait: (task: any, runtime: any, context: any) => runtime.sleepUntil(task.input.at, { phase: 'deliver' }, context),
+    // The notification goes out first, with an id the notifier shows once; then one commit writes the
+    // chat line and marks the wake done. A kill between the two runs this phase again: the same id, so
+    // one notification, and the line is written once, with the done mark.
     deliver: async (task: any, runtime: any, context: any) => {
-      await reminderHooks?.deliver(task.input, runtime.now());
-      await runtime.commit(() => ({ status: 'terminal', outcome: { status: 'completed', result: null } }), context);
+      const id = `wake:${task.id}`;
+      await notifier.notify({ id, text: task.input.text, at: task.input.at });
+      const chat = await runtime.conversation(runtime.conversationId, context);
+      await runtime.commit(async (tx: any) => {
+        await chat.submit(tx, { type: 'write', entry: { kind: ReminderEntry, data: { text: task.input.text, at: task.input.at, notification: id } } });
+        return { status: 'terminal', outcome: { status: 'completed', result: null } };
+      }, context);
     }
   },
   abort: (_task: any, runtime: any, context: any) => runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context)
@@ -218,13 +240,13 @@ export interface Journal {
   kill(): void;
 }
 
-export async function openJournal(options: JournalOptions & { wakeTask?: WakeTask }): Promise<Journal> {
+export async function openJournal(options: JournalOptions): Promise<Journal> {
   const clock = options.clock ?? systemClock;
   const owner = await options.owner.acquire(options.store.name);
   const tools = new Map(options.tools.map((t) => [t.name, t]));
   const gen = options.newGen?.() ?? Math.random().toString(36).slice(2, 10);
   const presence = presenceReporter(options.presence, options.persona.id, gen);
-  reminderHooks = options.wakeTask;
+  const WakeAt = wakeAtTask(options.notifier);
   let dead = false;
   let rootId: any;
   let harness: any;
@@ -242,9 +264,17 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
         resolve();
       });
     });
+  // The caps count a turn as the tool-call bound does (bounds.ts): from your message, across every
+  // "go on". The turns that can still go on keep their spend whole, however long they wait.
+  const unfinished = new Set<string>();
   const turnOf = async (): Promise<string> => {
     const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
-    return String(live?.run?.inputs?.[0] ?? live?.run?.taskId ?? 'turn');
+    const budget: any = await harness.snapshot(BudgetDoc, ctx);
+    const key = turnKeyOf(live, budget);
+    unfinished.clear();
+    unfinished.add(key);
+    if (budget?.current) unfinished.add(budget.current);
+    return key;
   };
   const port = async (): Promise<ModelPort> => {
     const turn = await turnOf();
@@ -257,6 +287,15 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
 
   /* ---------- consent, and the questions a restart leaves ---------- */
 
+  /**
+   * The turn a run belongs to: the newest of its inputs that belongs to one. A run with none (a continue)
+   * goes on with the turn it continues.
+   */
+  const turnKeyOf = (live: any, budget: any): string => {
+    const inputs: string[] = (live?.run?.inputs ?? []).map(String);
+    return [...inputs].reverse().map((i) => budget?.turns?.[i]).find((k) => k !== undefined) ?? budget?.budget?.turn ?? budget?.current ?? 'turn';
+  };
+
   /** The bounds on tool calls (bounds.ts), counted in the journal before anything else about the call. */
   const bounded = async (api: any): Promise<string | undefined> => {
     const id = String(api.taskId);
@@ -264,12 +303,11 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
     const slots: any[] = live?.tools ?? [];
     const found = slots.findIndex((s) => String(s.taskId) === id);
     const index = found < 0 ? slots.length : found;
-    const inputs: string[] = (live?.run?.inputs ?? []).map(String);
     const verdict = await harness.commit(async (tx: any) => {
       const doc = await tx.doc(BudgetDoc);
       // The turn: the newest of the run's inputs that belongs to one. A run with none (a continue)
       // goes on counting the turn it continues.
-      const key = [...inputs].reverse().map((i) => doc.turns[i]).find((k) => k !== undefined) ?? doc.budget.turn;
+      const key = turnKeyOf(live, doc);
       const budget: Budget = key === doc.budget.turn ? JSON.parse(JSON.stringify(doc.budget)) : emptyBudget(key);
       const out = admit(budget, id, index);
       doc.budget = budget;
@@ -421,7 +459,7 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
   });
   rootId = root.id;
   const usage = journalUsageStore(harness);
-  caps = createCaps(options.caps.config, usage, clock, options.caps.options);
+  caps = createCaps(options.caps.config, usage, clock, { ...options.caps.options, unfinished: () => unfinished });
 
   /* ---------- questions from how the last run ended ---------- */
 

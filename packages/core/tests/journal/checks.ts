@@ -110,6 +110,17 @@ export const CHECKS: Record<string, Check> = {
       expect(s.states).toContain('waiting');
     }
   },
+  'wake-delivery': {
+    title: 'a wake killed after its notification but before its done commit gives one chat line and one notification id',
+    verify(s) {
+      expect(s.lines).toEqual(['stretch']);
+      // Delivered twice, by the same id, and shown once.
+      expect(s.calls).toBe(2);
+      expect(new Set(s.ids).size).toBe(1);
+      expect(s.ids[0]).toMatch(/^wake:/);
+      expect(s.shown).toBe(1);
+    }
+  },
   'wake-parked': {
     title: 'a parked wake survives a restart: still asked of the wake port, and fires once when due',
     verify(s) {
