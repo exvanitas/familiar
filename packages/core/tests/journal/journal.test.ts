@@ -23,12 +23,14 @@ describe('the store', () => {
   it('opens every transaction strict, and refuses to open when a transaction reports otherwise', async () => {
     const world = nodeWorld();
     const env = envOf(world);
-    const { journal } = await openFor(env, await world.open('strict'), { script: (r) => (lastIsTool(r) ? { text: 'ok' } : { toolCalls: [{ id: 'c', name: 'save_note', arguments: { text: 'x' } }] }) });
+    const { journal } = await openFor(env, await world.open('strict'), { script: (r) => (lastIsTool(r) ? { text: 'ok' } : { toolCalls: [{ id: 'c', name: 'note_add', arguments: { text: 'x' } }] }) });
     const sent = await journal.send('Note x.', 'r1');
     if (sent.replied) await sent.turn.wait();
     await journal.close();
     expect(world.transactions.length).toBeGreaterThan(10);
     expect(new Set(world.transactions.map((t) => (t as any).durability))).toEqual(new Set(['strict']));
+    // The one exception, recorded by name: the schema's upgrade, when the database was made.
+    expect(world.upgrades).toEqual(['default']);
 
     // A browser that drops the hint: the probe sees "default", and nothing opens.
     const real = new IDBFactory();
@@ -253,6 +255,36 @@ describe('waking', () => {
     for (let i = 0; i < 100 && env.counters.get('delivered') === 0; i++) await new Promise((r) => setTimeout(r, 20));
     expect(env.counters.get('delivered')).toBe(1);
     await journal.close();
+  });
+});
+
+describe('close', () => {
+  it('never hangs on a pending consent: it releases the owner lock, and the unanswered card is there on reopen', async () => {
+    const world = nodeWorld();
+    const env = envOf(world);
+    let answer: ((ok: boolean) => void) | undefined;
+    const first = await openFor(env, await world.open('close'), {
+      script: (r) => (lastIsTool(r) ? { text: 'Sent.' } : { toolCalls: [{ id: 'c', name: 'send_message', arguments: { to: 'Sam', text: 'hi' } }] }),
+      consent: () => new Promise<boolean>(() => {})
+    });
+    void first.journal.send('Tell Sam hi.', 'r1');
+    while ((await first.journal.consents()).length < 1) await new Promise((r) => setTimeout(r, 5));
+    const card = (await first.journal.consents())[0]!;
+    const closed = await Promise.race([first.journal.close().then(() => 'closed'), new Promise((r) => setTimeout(() => r('hung'), 3000))]);
+    expect(closed).toBe('closed');
+    // The lock is free: a new journal opens at once.
+    const second = await openFor(env, await world.open('close'), {
+      script: (r) => (lastIsTool(r) ? { text: 'Sent.' } : { toolCalls: [{ id: 'c', name: 'send_message', arguments: { to: 'Sam', text: 'hi' } }] }),
+      consent: () => new Promise<boolean>((r) => (answer = r))
+    });
+    expect(await second.journal.consents()).toEqual([card]);
+    while (!answer) await new Promise((r) => setTimeout(r, 5));
+    answer(true);
+    const sent = await second.journal.send('Tell Sam hi.', 'r1');
+    if (!sent.replied) throw new Error('no reply');
+    expect(await sent.turn.wait()).toMatchObject({ status: 'answered', text: 'Sent.' });
+    expect(env.counters.get('starts:send_message')).toBe(1);
+    await second.journal.close();
   });
 });
 

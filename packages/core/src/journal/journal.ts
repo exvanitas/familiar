@@ -67,7 +67,7 @@ export interface ConsentCard {
 
 export interface ConsentPort {
   /** Shows the card and resolves with the person's answer. After a restart the same card is asked again. */
-  ask(card: ConsentCard): Promise<boolean>;
+  ask(card: ConsentCard, signal?: AbortSignal): Promise<boolean>;
 }
 
 /** Something the turn loop asks the person, in chat. */
@@ -145,7 +145,13 @@ export interface WakeTask {
   deliver(input: { text: string; at: number }, firedAt: number): void | Promise<void>;
 }
 
-const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; opened?: number }>('familiar.questions', () => ({ open: {}, dismissed: {} }));
+const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; answered: Record<string, { yes: boolean; submission?: string }>; opened?: number }>(
+  'familiar.questions',
+  () => ({ open: {}, dismissed: {}, answered: {} })
+);
+type SentRecord = { kind: 'turn'; submission: string } | { kind: 'ack'; decision: Decision };
+/** What each request id of a person's message did, so a resend gets the same result. */
+const SentDoc = defineJournalDoc<{ byRequest: Record<string, SentRecord>; order: string[] }>('familiar.sent', () => ({ byRequest: {}, order: [] }));
 const ConsentDoc = defineJournalDoc<{ cards: Record<string, ConsentCard & { answer?: 'allow' | 'deny' }>; opened?: number }>('familiar.consent', () => ({ cards: {} }));
 const AckEntry = 'familiar.ack';
 const NoticeEntry = 'familiar.notice';
@@ -278,24 +284,41 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
   };
 
   /** Submits for the person's own message (a new turn) or for an answer that carries on the current one. */
-  const submitInTurn = async (draft: any, carry: boolean) => {
+  /**
+   * Submits for the person's own message (a new turn) or for an answer that carries on the current one,
+   * in one commit with `also`, the person's own record of what they did. Retried with the same request
+   * id, it finds the same submission.
+   */
+  const submitInTurn = async (draft: any, carry: boolean, also?: (tx: any, sid: string) => Promise<void>) => {
     const id = await harness.commit(async (tx: any) => {
-      const sid = String(await root.submit(tx, draft));
-      const doc = await tx.doc(BudgetDoc);
-      const key = carry ? doc.current || sid : sid;
-      if (!carry) doc.current = sid;
-      if (doc.turns[sid] === undefined) {
-        doc.turns[sid] = key;
-        doc.order.push(sid);
-        while (doc.order.length > 64) delete doc.turns[doc.order.shift()!];
+      const sid = draft ? String(await root.submit(tx, draft)) : '';
+      if (sid) {
+        const doc = await tx.doc(BudgetDoc);
+        const key = carry ? doc.current || sid : sid;
+        if (!carry) doc.current = sid;
+        if (doc.turns[sid] === undefined) {
+          doc.turns[sid] = key;
+          doc.order.push(sid);
+          while (doc.order.length > 64) delete doc.turns[doc.order.shift()!];
+        }
       }
+      await also?.(tx, sid);
       return sid;
     }, ctx);
-    return harness.submission(Number(id), ctx);
+    return id ? harness.submission(Number(id), ctx) : undefined;
+  };
+  /** What a request id already did: a person's message is acted on once, however often it's sent. */
+  const remembered = async (requestId: string) => ((await harness.snapshot(SentDoc, ctx)) as any)?.byRequest?.[requestId] as SentRecord | undefined;
+  const rememberIn = async (tx: any, requestId: string, record: SentRecord) => {
+    const sent = await tx.doc(SentDoc);
+    if (sent.byRequest[requestId]) return;
+    sent.byRequest[requestId] = record;
+    sent.order.push(requestId);
+    while (sent.order.length > 256) delete sent.byRequest[sent.order.shift()!];
   };
 
   const consentHook = hook(ToolTask, {
-    beforeTool: async (call: any, api: any) => {
+    beforeTool: async (call: any, api: any, context: any) => {
       const refused = await bounded(api);
       if (refused) return { block: refused };
       const tool = tools.get(call.name);
@@ -309,7 +332,15 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
           (await tx.doc(ConsentDoc)).cards[id] = card;
         }, ctx);
       }
-      const ok = await options.consent.ask(card);
+      // The wait observes the call's abort signal, so a close never hangs on an unanswered card. The card
+      // stays in the journal, unanswered, and is asked again on the next open.
+      const signal: AbortSignal | undefined = context?.abortSignal;
+      const ok = await new Promise<boolean | 'closed'>((resolve) => {
+        if (signal?.aborted) return resolve('closed');
+        signal?.addEventListener('abort', () => resolve('closed'), { once: true });
+        options.consent.ask(card, signal).then(resolve, () => resolve(false));
+      });
+      if (ok === 'closed') throw new Error('The journal closed while the card was open.');
       await harness.commit(async (tx: any) => {
         const doc = await tx.doc(ConsentDoc);
         if (doc.cards[id]) doc.cards[id].answer = ok ? 'allow' : 'deny';
@@ -518,6 +549,11 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
 
   harness.resume();
 
+  const resultOf = async (record: SentRecord): Promise<SendResult> => {
+    if (record.kind === 'ack') return { replied: false, decision: record.decision };
+    return { replied: true, turn: turnFor(await harness.submission(Number(record.submission), ctx)) };
+  };
+
   const questions = async (): Promise<readonly Question[]> => {
     const doc: any = (await harness.snapshot(QuestionsDoc, ctx)) ?? { open: {}, dismissed: {} };
     const fromRun = failureQuestion(await harness.snapshot(LiveDoc, rootId, ctx), doc.dismissed);
@@ -527,16 +563,21 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
   return {
     gen,
     async send(text, requestId) {
+      // A resend finds what the first send did, before the text is looked at again: by then her last
+      // message may have changed, and the same text would be read another way.
+      const prior = await remembered(requestId);
+      if (prior) return resultOf(prior);
       const at = clock.now();
       remember({ name: 'message-sent', at });
       if (!needsReply(text, await lastPersonaText(), { personaName: options.persona.name })) {
+        const decision = await notice({ name: 'ack-sent', at });
         // Kept in the transcript for you, never sent to the model: nothing is answered.
-        await root.submit({ type: 'write', entry: { kind: AckEntry, data: { text } }, requestId }, ctx);
-        return { replied: false, decision: await notice({ name: 'ack-sent', at }) };
+        await submitInTurn({ type: 'write', entry: { kind: AckEntry, data: { text } }, requestId }, true, (tx) => rememberIn(tx, requestId, { kind: 'ack', decision }));
+        return resultOf((await remembered(requestId))!);
       }
       lastChatAt = at;
-      const submission = await submitInTurn({ type: 'input', content: text, requestId }, false);
-      return { replied: true, turn: turnFor(submission) };
+      await submitInTurn({ type: 'input', content: text, requestId }, false, (tx, sid) => rememberIn(tx, requestId, { kind: 'turn', submission: sid }));
+      return resultOf((await remembered(requestId))!);
     },
     turn(id) {
       return {
@@ -554,18 +595,22 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
     },
     questions,
     async answer(id, yes, requestId) {
+      // Answered already, by this request or another: the same result again.
+      const before = ((await harness.snapshot(QuestionsDoc, ctx)) as any)?.answered?.[id] as { submission?: string } | undefined;
+      if (before) return before.submission ? turnFor(await harness.submission(Number(before.submission), ctx)) : undefined;
       const question = (await questions()).find((q) => q.id === id);
       if (!question) return undefined;
-      await harness.commit(async (tx: any) => {
+      // A yes carries on the same turn: its tool-call budget goes on counting.
+      const words = question.kind === 'redo' ? `Yes, do it now: ${tools.get(question.tool!)?.doing(question.arguments) ?? question.tool}.` : `Run ${question.tool} again.`;
+      const draft = !yes ? undefined : question.kind === 'steps' || question.kind === 'cap' ? { type: 'continue', requestId } : { type: 'input', content: words, requestId };
+      // The answer and what it starts are one commit, so a kill can't keep one without the other.
+      const submission = await submitInTurn(draft, true, async (tx, sid) => {
         const doc = await tx.doc(QuestionsDoc);
         delete doc.open[id];
         doc.dismissed[id] = true;
-      }, ctx);
-      if (!yes) return undefined;
-      // A yes carries on the same turn: its tool-call budget goes on counting.
-      if (question.kind === 'steps' || question.kind === 'cap') return turnFor(await submitInTurn({ type: 'continue', requestId }, true));
-      const words = question.kind === 'redo' ? `Yes, do it now: ${tools.get(question.tool!)?.doing(question.arguments) ?? question.tool}.` : `Run ${question.tool} again.`;
-      return turnFor(await submitInTurn({ type: 'input', content: words, requestId }, true));
+        (doc.answered ??= {})[id] = { yes, ...(sid ? { submission: sid } : {}) };
+      });
+      return submission ? turnFor(submission) : undefined;
     },
     async parkUntil(text, at) {
       await root.commit((tx: any) => tx.createTask(WakeAt, { text, at }, { ownership: { kind: 'conversation' }, background: true }), ctx);
@@ -586,9 +631,12 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
       dead = true;
       presence.stop();
       cancelWake?.();
-      await Promise.allSettled([liveWatch.stop(), consentWatch.stop(), questionsWatch.stop()]);
-      await harness.close(ctx);
-      owner.release();
+      try {
+        await Promise.allSettled([liveWatch.stop(), consentWatch.stop(), questionsWatch.stop()]);
+        await harness.close(ctx);
+      } finally {
+        owner.release();
+      }
     },
     kill() {
       dead = true;

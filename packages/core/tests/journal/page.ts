@@ -28,6 +28,10 @@ const counters: Counters = {
 
 /** Every transaction a journal store opened, with the durability it reported. */
 const durabilities: string[] = [];
+/** The schema's upgrade transactions, kept apart: the one exception to strict (store.ts). */
+const upgrades: string[] = [];
+const upgrade = (d: string) => upgrades.push(d);
+const seen = () => ({ data: [...new Set(durabilities)], schemaUpgrade: [...new Set(upgrades)] });
 const listeners = new Set<() => void>();
 const track = (t: IDBTransaction) => {
   durabilities.push(String((t as any).durability));
@@ -40,7 +44,7 @@ async function conformance() {
     assertions,
     withStorage: async (use: (storage: any) => Promise<void>) => {
       const name = `conf-${run}-${n++}`;
-      const store = await openJournalStore(name, { indexedDB, onTransaction: track });
+      const store = await openJournalStore(name, { indexedDB, onTransaction: track, onUpgrade: upgrade });
       try {
         await use(store.storage);
       } finally {
@@ -69,7 +73,7 @@ async function main() {
   }
   if (params.get('mode') === 'conformance') {
     const result = await conformance();
-    return out({ done: true, summary: { conformance: result, durabilities: [...new Set(durabilities)], transactions: durabilities.length } });
+    return out({ done: true, summary: { conformance: result, durabilities: seen(), transactions: durabilities.length, upgrades: upgrades.length } });
   }
   const life = counters.bump('life');
   if (life === 1 && params.has('killAfter')) counters.set('kill-after', Number(params.get('killAfter')));
@@ -77,7 +81,7 @@ async function main() {
     life,
     counters,
     owner: webLockOwner(navigator.locks as any),
-    openStore: (name) => openJournalStore(`${run}-${name}`, { indexedDB, onTransaction: track }),
+    openStore: (name) => openJournalStore(`${run}-${name}`, { indexedDB, onTransaction: track, onUpgrade: upgrade }),
     onTransaction: (l) => {
       listeners.add(l);
       return () => listeners.delete(l);
@@ -85,7 +89,7 @@ async function main() {
     // The driver closes the page here: no shutdown path runs.
     ready: () => out({ ready: true, life })
   });
-  if (summary) out({ done: true, life, summary: { ...summary, durabilities: [...new Set(durabilities)] } });
+  if (summary) out({ done: true, life, summary: { ...summary, durabilities: seen() } });
 }
 
 main().catch((error) => out({ done: true, failed: String(error?.stack ?? error) }));

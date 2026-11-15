@@ -81,7 +81,7 @@ export function toDurableTool(tool: FamiliarTool) {
       let writes = 0;
       const step: ToolStep = {
         id: String(api.taskId),
-        signal: (context as any)?.signal,
+        signal: context?.abortSignal,
         write: async (change) => {
           if (tool.kind !== 'write') throw new Error(`${tool.name} is not a built-in write, so it can't write.`);
           const index = writes++;

@@ -4,7 +4,8 @@
 // a strict write is the one the browser flushes to disk before it reports the commit done. The store is
 // opened through a wrapped IndexedDB factory that adds `durability: 'strict'` to every transaction the
 // database opens, and the open fails unless a probe transaction reports `strict` back. The schema's own
-// upgrade transaction is the browser's to open and takes no hint; it runs once, when the database is made.
+// upgrade transaction is the browser's to open and takes no hint; it runs once, when the database is made,
+// and holds no data. `onUpgrade` reports its durability, so tests record that exception by name.
 
 import { IndexedDbStorage } from '@earendil-works/pi-durable/storage/indexeddb';
 
@@ -19,6 +20,12 @@ export class NotStrict extends Error {
 export interface StrictFactoryOptions {
   /** Sees every transaction the database opens, after the hint is added. For tests. */
   readonly onTransaction?: (transaction: IDBTransaction) => void;
+  /**
+   * Sees the upgrade (versionchange) transaction, when the database is made. The browser opens it and no
+   * hint reaches it, so it is the one transaction that may not be strict: it creates the schema and holds
+   * no person's data. Reported, so the tests record it as the exception it is.
+   */
+  readonly onUpgrade?: (durability: string) => void;
   /** Sees each database connection once it's open. */
   readonly onOpen?: (database: IDBDatabase) => void;
 }
@@ -28,6 +35,7 @@ export function strictIndexedDB(factory: IDBFactory, options: StrictFactoryOptio
   const strict: Pick<IDBFactory, 'open' | 'deleteDatabase' | 'cmp' | 'databases'> = {
     open(name: string, version?: number) {
       const request = factory.open(name, version);
+      request.addEventListener('upgradeneeded', () => options.onUpgrade?.(String((request.transaction as { durability?: unknown } | null)?.durability)));
       // Added before the caller's own listener, so the connection is strict before anyone can use it.
       request.addEventListener('success', () => {
         forceStrict(request.result, options.onTransaction);

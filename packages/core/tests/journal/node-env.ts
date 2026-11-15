@@ -45,6 +45,8 @@ export interface NodeWorld {
   readonly owner: OwnerLock;
   readonly counters: Counters;
   readonly transactions: IDBTransaction[];
+  /** The durability each schema upgrade reported: the one exception to strict. */
+  readonly upgrades: string[];
   readonly listeners: Set<() => void>;
   open(name: string): Promise<JournalStore>;
 }
@@ -53,13 +55,15 @@ export function nodeWorld(): NodeWorld {
   const factory = new IDBFactory();
   const transactions: IDBTransaction[] = [];
   const listeners = new Set<() => void>();
+  const upgrades: string[] = [];
   return {
     listeners,
+    upgrades,
     factory,
     owner: memoryOwner(),
     counters: memoryCounters(),
     transactions,
-    open: (name) => openJournalStore(name, { indexedDB: factory as unknown as globalThis.IDBFactory, onTransaction: (t) => {
+    open: (name) => openJournalStore(name, { indexedDB: factory as unknown as globalThis.IDBFactory, onUpgrade: (d) => upgrades.push(d), onTransaction: (t) => {
         transactions.push(t);
         for (const l of [...listeners]) l();
       } })

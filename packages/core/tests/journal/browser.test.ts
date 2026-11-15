@@ -15,6 +15,11 @@ import { CHECKS } from './checks.ts';
 import { writeWindowPath, writeWindowProblems } from './scenarios.ts';
 
 const chrome = process.env.FAMILIAR_CHROME;
+/**
+ * What Chromium reports for the schema's upgrade (versionchange) transaction. No hint reaches it, so it
+ * is the one transaction that isn't strict: it creates the schema and holds no data. See turn-design.md.
+ */
+const CHROMIUM_UPGRADE = 'default';
 const required = process.env.FAMILIAR_REQUIRE_BROWSER === '1';
 
 describe.runIf(chrome || required)('the journal in headless Chromium (real IndexedDB, the page closed at the kill point)', () => {
@@ -70,7 +75,9 @@ describe.runIf(chrome || required)('the journal in headless Chromium (real Index
     expect(summary.conformance.total).toBe(32);
     expect(summary.conformance.passed).toBe(32);
     expect(summary.transactions).toBeGreaterThan(0);
-    expect(summary.durabilities).toEqual(['strict']);
+    // Every data transaction strict. The schema's upgrade, once per new database, is recorded apart.
+    expect(summary.upgrades).toBeGreaterThanOrEqual(32);
+    expect(summary.durabilities).toEqual({ data: ['strict'], schemaUpgrade: [CHROMIUM_UPGRADE] });
   }, 150_000);
 
   it('one owner: a second page waits for the Web Lock, and a reload of the first releases it', async () => {
@@ -143,7 +150,9 @@ describe.runIf(chrome || required)('the journal in headless Chromium (real Index
       const { life, summary } = await result(second, 'done');
       await context.close();
       expect(life).toBe(2);
-      expect(summary.durabilities).toEqual(['strict']);
+      expect(summary.durabilities.data).toEqual(['strict']);
+      // Life 2 opens a database that already exists: no upgrade runs.
+      expect(summary.durabilities.schemaUpgrade).toEqual([]);
       check.verify(summary);
     }, 60_000);
   }

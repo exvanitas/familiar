@@ -23,6 +23,12 @@ const ZERO_USAGE = {
 };
 
 const ERROR_PREFIX = 'familiar.model-error:';
+/**
+ * Where a reply's `replay` (signed thinking and the like, model/port.ts) rides on pi-ai's assistant
+ * message. pi-durable stores the message as JSON in the transcript, so it survives a restart, and
+ * `toModelRequest` hands it back on the next turn exactly as it came.
+ */
+export const REPLAY_FIELD = 'familiarReplay';
 
 function hex(text: string): string {
   return Array.from(new TextEncoder().encode(text), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -65,7 +71,9 @@ export function toModelRequest(model: { id: string }, context: any, options: any
       // reply, so it isn't sent back.
       if (m.stopReason === 'aborted' || m.stopReason === 'error') continue;
       const calls = m.content.filter((b: any) => b.type === 'toolCall').map((b: any) => ({ id: b.id, name: b.name, arguments: b.arguments }));
-      messages.push({ role: 'assistant', content: text(m.content), ...(calls.length ? { toolCalls: calls } : {}) });
+      // The adapter's opaque replay state, stored with the entry and given back unchanged.
+      const replay = m[REPLAY_FIELD];
+      messages.push({ role: 'assistant', content: text(m.content), ...(calls.length ? { toolCalls: calls } : {}), ...(replay ? { replay } : {}) });
     } else if (m.role === 'toolResult') {
       messages.push({ role: 'tool', toolCallId: m.toolCallId, toolName: m.toolName, content: text(m.content), ...(m.isError ? { isError: true } : {}) });
     }
@@ -162,7 +170,12 @@ export function portProvider(port: () => ModelPort | Promise<ModelPort>, options
           const reason = event.stopReason === 'tool-calls' ? 'toolUse' : event.stopReason === 'length' ? 'length' : 'stop';
           const input = event.usage.inputTokens;
           const output = event.usage.outputTokens;
-          const message = { ...snap(), stopReason: reason, usage: { ...ZERO_USAGE, input, output, totalTokens: input + output } };
+          const message = {
+            ...snap(),
+            stopReason: reason,
+            usage: { ...ZERO_USAGE, input, output, totalTokens: input + output },
+            ...(event.replay ? { [REPLAY_FIELD]: event.replay } : {})
+          };
           out.push({ type: 'done', reason, message });
           out.end(message);
           return;

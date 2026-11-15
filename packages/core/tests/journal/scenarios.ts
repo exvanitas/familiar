@@ -81,13 +81,13 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
       }
     },
     {
-      name: 'save_note',
+      name: 'note_add',
       description: 'Saves a note. A built-in write.',
       inputSchema: object({ text: { type: 'string' } }),
       kind: 'write',
       doing: (a: any) => `saving a note "${a.text}"`,
       async run(args: any, step) {
-        start('save_note', args);
+        start('note_add', args);
         // The token says which life made the row. A rerun that finds its receipt gets the first token back.
         const token = `${args.text}#life${env.life}`;
         const got = await step.write(async (tx) => {
@@ -96,7 +96,7 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
           (await tx.doc(NotesDoc)).notes.push({ step: step.id, text: args.text, token });
           return token;
         });
-        await maybeHang('save_note');
+        await maybeHang('note_add');
         return `saved: ${args.text} (${got})`;
       }
     },
@@ -245,7 +245,7 @@ export const SCENARIOS: readonly Scenario[] = [
   toolKill('read-started', 'read-started', 'look', { what: 'the time' }),
 
   // A built-in write that wrote, then hung before its step was done: run again, written once.
-  toolKill('write-started', 'write-started', 'save_note', { text: 'buy milk' }, async (env, j) => ({
+  toolKill('write-started', 'write-started', 'note_add', { text: 'buy milk' }, async (env, j) => ({
     rows: (await j.read(NotesDoc))?.notes ?? [],
     writeCalls: [env.counters.get('write-calls:life1'), env.counters.get('write-calls:life2')]
   })),
@@ -262,6 +262,36 @@ export const SCENARIOS: readonly Scenario[] = [
 
   // A server tool, started: never repeated on its own. Reported as interrupted, with Run again.
   toolKill('server-started', 'server-started', 'server_lookup', { q: 'trains' }),
+
+  // Replay state across a restart: the reply that called the tool gave replay state (signed thinking),
+  // and, as step 4's contract control does, the next request is refused unless it comes back unchanged.
+  {
+    name: 'replay-restart',
+    async run(env) {
+      const store = await env.openStore('replay-restart');
+      const REPLAY = { adapter: 'anthropic', data: { signature: 'sig-1', blocks: [{ type: 'thinking', thinking: 'Hm.' }] } };
+      const { journal } = await openFor(env, store, {
+        script: (r) => {
+          if (!lastIsTool(r)) return { thinking: 'Hm.', toolCalls: [{ id: 'call-1', name: 'look', arguments: { what: 'x' } }], replay: REPLAY };
+          const calling = r.messages.find((m) => m.role === 'assistant' && m.toolCalls?.length);
+          const back = calling?.role === 'assistant' && JSON.stringify(calling.replay) === JSON.stringify(REPLAY);
+          env.counters.bump(back ? 'replay-ok' : 'replay-missing');
+          return back ? { text: 'With the thinking, done.' } : { error: { kind: 'bad-request', message: 'The thinking was missing.' } };
+        },
+        hang: (n) => env.life === 1 && n === 'look'
+      });
+      if (env.life === 1) {
+        void journal.send('Please do the thing.', 'turn-1');
+        while (env.counters.get('hung:look') < 1) await sleep(10);
+        env.ready(() => journal.kill());
+        return undefined;
+      }
+      const end = await journal.turn(await turnId(journal)).wait();
+      const summary = { end, ok: env.counters.get('replay-ok'), missing: env.counters.get('replay-missing') };
+      await journal.close();
+      return summary;
+    }
+  },
 
   // A tool that finished, then the app died during the next model call. The result is reused.
   {
@@ -406,7 +436,7 @@ export const WRITE_WINDOW: Scenario = {
     let killed = false;
     let stop: (() => void) | undefined;
     const opened = await openFor(env, store, {
-      script: (r) => (lastIsTool(r) ? answerTool(r) : callOnce('save_note', { text: 'buy milk' })),
+      script: (r) => (lastIsTool(r) ? answerTool(r) : callOnce('note_add', { text: 'buy milk' })),
       onRun: () => {
         env.counters.bump(`tool-runs:life${env.life}`);
         if (env.life !== 1 || stop) return;

@@ -63,6 +63,14 @@ export const CHECKS: Record<string, Check> = {
       expect(s.end).toMatchObject({ status: 'answered' });
     }
   },
+  'replay-restart': {
+    title: "a reply's replay state is stored with its entry and given back unchanged on the next request, after a restart",
+    verify(s) {
+      expect(s.end).toMatchObject({ status: 'answered', text: 'With the thinking, done.' });
+      expect(s.ok).toBe(1);
+      expect(s.missing).toBe(0);
+    }
+  },
   'tool-finished': {
     title: 'a tool that finished has its result reused; the model call after it is sent again',
     verify(s) {
