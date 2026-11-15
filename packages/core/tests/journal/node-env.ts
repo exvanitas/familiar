@@ -47,14 +47,14 @@ export interface NodeWorld {
   readonly transactions: IDBTransaction[];
   /** The durability each schema upgrade reported: the one exception to strict. */
   readonly upgrades: string[];
-  readonly listeners: Set<() => void>;
+  readonly listeners: Set<(transaction?: IDBTransaction) => void>;
   open(name: string): Promise<JournalStore>;
 }
 
 export function nodeWorld(): NodeWorld {
   const factory = new IDBFactory();
   const transactions: IDBTransaction[] = [];
-  const listeners = new Set<() => void>();
+  const listeners = new Set<(transaction?: IDBTransaction) => void>();
   const upgrades: string[] = [];
   return {
     listeners,
@@ -65,12 +65,12 @@ export function nodeWorld(): NodeWorld {
     transactions,
     open: (name) => openJournalStore(name, { indexedDB: factory as unknown as globalThis.IDBFactory, onUpgrade: (d) => upgrades.push(d), onTransaction: (t) => {
         transactions.push(t);
-        for (const l of [...listeners]) l();
+        for (const l of [...listeners]) l(t);
       } })
   };
 }
 
-function listen(world: NodeWorld, listener: () => void): () => void {
+function listen(world: NodeWorld, listener: (transaction?: IDBTransaction) => void): () => void {
   world.listeners.add(listener);
   return () => world.listeners.delete(listener);
 }

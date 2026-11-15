@@ -26,7 +26,7 @@ export interface Env {
   /** Life 1: the step is under way. The driver kills the engine (Node) or closes the page (Chromium). */
   ready(kill: () => void): void;
   /** Called on every IndexedDB transaction the journal's store opens. Returns a stop. */
-  onTransaction(listener: () => void): () => void;
+  onTransaction(listener: (transaction?: IDBTransaction) => void): () => void;
 }
 
 export type Summary = Record<string, unknown>;
@@ -88,6 +88,8 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
       doing: (a: any) => `saving a note "${a.text}"`,
       async run(args: any, step) {
         start('note_add', args);
+        // Held before its write, for a kill that lands before anything is written.
+        await maybeHang('note_add:before');
         // The token says which life made the row. A rerun that finds its receipt gets the first token back.
         const token = `${args.text}#life${env.life}`;
         const got = await step.write(async (tx) => {

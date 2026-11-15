@@ -32,10 +32,10 @@ const durabilities: string[] = [];
 const upgrades: string[] = [];
 const upgrade = (d: string) => upgrades.push(d);
 const seen = () => ({ data: [...new Set(durabilities)], schemaUpgrade: [...new Set(upgrades)] });
-const listeners = new Set<() => void>();
+const listeners = new Set<(transaction?: IDBTransaction) => void>();
 const track = (t: IDBTransaction) => {
   durabilities.push(String((t as any).durability));
-  for (const l of [...listeners]) l();
+  for (const l of [...listeners]) l(t);
 };
 
 async function conformance() {

@@ -107,14 +107,16 @@ describe('turn extensions', () => {
     };
     expect((await spend('t')).go).toBe(true);
     expect(await spend('t')).toMatchObject({ go: false, pause: 'turn-tokens' });
-    await usage.update((l) => extendTurn(l, 't'));
+    await usage.update((l) => extendTurn(l, 't', 'yes-1'));
+    // The same Yes again grants nothing.
+    expect(await usage.update((l) => extendTurn(l, 't', 'yes-1'))).toBe(false);
     expect((await spend('t')).go).toBe(true);
     // One allowance, not more: the next needs another Yes.
     expect(await spend('t')).toMatchObject({ go: false, pause: 'turn-tokens' });
     expect((await usage.read()).extensions).toEqual({ t: 1 });
     // The day is full; extending the turn doesn't lift the daily cap.
     expect((await spend('u')).go).toBe(true);
-    await usage.update((l) => extendTurn(l, 'u'));
+    await usage.update((l) => extendTurn(l, 'u', 'yes-2'));
     expect(await spend('u')).toMatchObject({ go: false, pause: 'day-tokens', message: expect.stringMatching(/Raise the daily cap, or wait until tomorrow/) });
   });
 });

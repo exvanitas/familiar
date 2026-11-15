@@ -11,6 +11,7 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { defineDoc } from '@earendil-works/pi-durable';
 import type { Ledger, UsageStore } from '../model/caps.ts';
 import { emptyLedger } from '../model/caps.ts';
+import { resumableTurns, TurnsDoc } from './turns.ts';
 
 export const LedgerDoc = defineDoc<Ledger & Record<string, any>>({
   kind: 'familiar.caps-ledger',
@@ -29,7 +30,7 @@ export interface LedgerHost {
 
 const plain = (value: unknown): Ledger => {
   const l = JSON.parse(JSON.stringify(value ?? emptyLedger()));
-  return { records: l.records ?? [], open: l.open ?? [], turns: l.turns ?? {}, extensions: l.extensions ?? {} };
+  return { records: l.records ?? [], open: l.open ?? [], turns: l.turns ?? {}, extensions: l.extensions ?? {}, granted: l.granted ?? {} };
 };
 
 export function journalUsageStore(host: LedgerHost): UsageStore {
@@ -39,13 +40,17 @@ export function journalUsageStore(host: LedgerHost): UsageStore {
         const doc = await tx.doc(LedgerDoc);
         const ledger = plain(doc);
         const before = JSON.stringify(ledger);
+        // The turns that can still resume, read in this same commit, so tidy keeps them whole.
+        ledger.resumable = resumableTurns(await tx.doc(TurnsDoc));
         // A throw rolls the commit back.
         const out = change(ledger);
+        delete ledger.resumable;
         if (JSON.stringify(ledger) !== before) {
           doc.records = ledger.records;
           doc.open = ledger.open;
           doc.turns = ledger.turns;
           doc.extensions = ledger.extensions;
+          doc.granted = ledger.granted;
         }
         return out;
       }, BACKGROUND_CONTEXT);

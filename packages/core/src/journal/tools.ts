@@ -76,13 +76,20 @@ const ReceiptDoc = defineDoc<{ writes: any[] }>({
   checkpointWhen: () => true
 });
 
-export function toDurableTool(tool: FamiliarTool) {
+/** The consent gate, as the tool's own execute sees it: a reason not to run, or undefined. */
+export type Gate = (call: { readonly name: string; readonly arguments: unknown }, api: any, context: Context) => Promise<string | undefined>;
+
+export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
   return defineTool({
     name: tool.name,
     description: tool.description,
     parameters: tool.inputSchema as any,
     replay: replayOf(tool.kind),
     execute: async (args: unknown, api: any, context: Context) => {
+      // The gate again, inside the tool: a call pi-durable recovers after a crash (a read or a built-in
+      // write, run again) never passes `beforeTool`, so it's checked here against today's policy.
+      const refused = await gate?.({ name: tool.name, arguments: args }, api, context);
+      if (refused) return { isError: true, output: [{ type: 'text', text: refused }] };
       let writes = 0;
       const step: ToolStep = {
         id: String(api.taskId),

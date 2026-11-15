@@ -277,6 +277,7 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
   const config = { maxReplyTokens: 100, maxDayTokens: worst * 7, maxTurnTokens: worst * 4, personaDayUsd: { a: worstCost(inputBound(request), 100, price, false).usd as number * 3.5 } };
   const caps = createCaps(config, store, { now: () => 0 }, { dayOf: () => 'd' });
   const problems: string[] = [];
+  const yeses = new Set<string>();
   const check = () => {
     const tokens = [...store.all, ...store.reservations].reduce((t, x) => t + x.tokens, 0);
     if (tokens > config.maxDayTokens) problems.push(`seed ${seed}: ${tokens} tokens past the day cap`);
@@ -284,6 +285,9 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
       const used = [...store.all, ...store.reservations].filter((x) => x.turn === turn).reduce((t, x) => t + x.tokens, 0);
       // The person's Yes at a turn-tokens pause gives a turn one more allowance; nothing else does.
       const allowance = config.maxTurnTokens * (1 + (store.extensions[turn] ?? 0));
+      // One Yes grants at most one extension.
+      const total = Object.values(store.extensions).reduce((t, n) => t + n, 0);
+      if (total > yeses.size) problems.push(`seed ${seed}: ${total} extensions from ${yeses.size} yeses`);
       if (used > allowance) problems.push(`seed ${seed}: turn ${turn} at ${used}, past its allowance of ${allowance}`);
       if (used > config.maxTurnTokens) coverage.beyondBase.add(`${seed}:${turn}`);
     }
@@ -302,8 +306,12 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
       if (!r.go) {
         // Sometimes the person says yes: one more allowance for that turn, and only for a turn-tokens pause.
         if (r.pause === 'turn-tokens' && rand() < 0.7) {
-          await store.update((l) => extendTurn(l, c.turn));
+          // Each Yes has its own id, and is sometimes submitted twice: it grants once.
+          const yes = `yes-${seed}-${coverage.grants}`;
+          yeses.add(yes);
+          await store.update((l) => extendTurn(l, c.turn, yes));
           coverage.grants++;
+          if (rand() < 0.5) await store.update((l) => extendTurn(l, c.turn, yes));
           check();
         }
         return;

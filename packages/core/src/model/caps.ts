@@ -166,6 +166,13 @@ export interface Ledger {
    * have none.
    */
   extensions: Record<string, number>;
+  /** Which Yes granted an extension, and for which turn: one Yes grants at most one. */
+  granted: Record<string, string>;
+  /**
+   * Turns the store says can still resume, read in the same commit as the change (the journal's turn
+   * registry). Not stored: `tidy` keeps them whole, never folded or dropped, however old.
+   */
+  resumable?: readonly string[];
 }
 
 /**
@@ -253,13 +260,19 @@ export const FOLD_AFTER_MS = 2 * 24 * 60 * 60_000;
 /** A folded turn last used longer ago than this is dropped: no turn runs for a month. */
 export const DROP_TURN_AFTER_MS = 30 * 24 * 60 * 60_000;
 
-/** Grants a turn one more allowance of `maxTurnTokens`: the person's Yes at a turn-tokens pause. */
-export function extendTurn(ledger: Ledger, turn: string): void {
+/**
+ * Grants a turn one more allowance of `maxTurnTokens`: the person's Yes at a turn-tokens pause. `yes`
+ * names that Yes, so the same Yes given twice grants once. Returns whether it granted.
+ */
+export function extendTurn(ledger: Ledger, turn: string, yes: string): boolean {
+  if (ledger.granted[yes] !== undefined) return false;
+  ledger.granted[yes] = turn;
   ledger.extensions[turn] = (ledger.extensions[turn] ?? 0) + 1;
+  return true;
 }
 
 export function emptyLedger(): Ledger {
-  return { records: [], open: [], turns: {}, extensions: {} };
+  return { records: [], open: [], turns: {}, extensions: {}, granted: {} };
 }
 
 export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, opts: CapsOptions = {}): Caps {
@@ -286,7 +299,7 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
       ledger.records.push({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens: r.tokens, cost: { usd: r.usd } as Cost, reservation: r.id });
       pending.delete(r.id);
     }
-    const live = new Set(opts.unfinished?.() ?? []);
+    const live = new Set([...(opts.unfinished?.() ?? []), ...(ledger.resumable ?? [])]);
     if (asking !== undefined) live.add(asking);
     for (const p of pending.values()) live.add(p.turn);
     const folds = (r: UsageRecord) => r.at < now - FOLD_AFTER_MS && !live.has(r.turn);
@@ -301,6 +314,7 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
       if (t.last >= now - DROP_TURN_AFTER_MS || live.has(turn)) continue;
       delete ledger.turns[turn];
       delete ledger.extensions[turn];
+      for (const [yes, t] of Object.entries(ledger.granted)) if (t === turn) delete ledger.granted[yes];
     }
   }
 
