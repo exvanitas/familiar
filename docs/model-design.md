@@ -63,8 +63,8 @@ Settings' Test makes one small call, with one do-nothing tool, and says in plain
 | Key refused | HTTP 401 or 403, or Gemini's 400 with `API_KEY_INVALID` |
 | Not allowed yet | The address isn't saved |
 | Couldn't reach it | A network failure. For a local server it asks whether it's running |
-| No such model | HTTP 404, or a refusal and a model list without the model |
-| Can't call tools | The call with a tool was refused and the same call without one worked. It still chats, with tools off |
+| No such model | The call fails with a 404 even without the tool, or is refused and the model list lacks the model |
+| Can't call tools | The call with a tool was refused or got a 404 (OpenRouter's answer when no provider of a model takes tools), and the same call without it worked. It still chats, with tools off |
 | Limited, failed, filtered | A 429, a 5xx, a content filter |
 
 It never shows a key or an endpoint's own text.

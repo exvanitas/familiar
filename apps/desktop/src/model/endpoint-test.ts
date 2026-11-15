@@ -42,12 +42,13 @@ export async function testEndpoint(t: TestInput): Promise<TestResult> {
   if (t.preset.key === 'required' && !t.hasKey) return { ok: false, problem: 'no-key', message: `No key is saved for ${t.preset.label}. Type one in, then test again.` };
   const first = await last(t.port.stream(request(t.model, true), t.signal));
   if (first.type === 'done') return { ok: true, tools: true, message: `${t.preset.label} answered, and ${t.model} can call tools.` };
-  if (first.error.kind === 'bad-request') {
+  // A refusal or a 404 can be about the tool: OpenRouter answers 404 when no provider of a model takes
+  // tools. The same call without it tells which.
+  if (first.error.kind === 'bad-request' || first.error.kind === 'not-found') {
     const plain = await last(t.port.stream(request(t.model, false), t.signal));
     if (plain.type === 'done') return { ok: true, tools: false, message: `${t.model} answered, but it can't call tools, so it chats with tools off.` };
-    if (plain.error.kind === 'bad-request' && (await missing(t))) return notFound(t);
+    if (plain.error.kind === 'not-found' || (plain.error.kind === 'bad-request' && (await missing(t)))) return notFound(t);
   }
-  if (first.error.kind === 'not-found') return notFound(t);
   return problem(t, first.error);
 }
 

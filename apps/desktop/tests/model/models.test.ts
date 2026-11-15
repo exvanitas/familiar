@@ -123,7 +123,7 @@ describe('Test', () => {
   });
 
   it('a model the endpoint lacks: a 404, or a refusal and a list without it', async () => {
-    const notFound = fake([{ error: { kind: 'not-found', message: 'x' } }]);
+    const notFound = fake([{ error: { kind: 'not-found', message: 'x' } }, { error: { kind: 'not-found', message: 'x' } }]);
     expect(await testEndpoint({ preset: preset('openai'), model: 'gpt-9', hasKey: true, port: notFound })).toMatchObject({ ok: false, problem: 'model-not-found', message: 'OpenAI has no model called gpt-9. Pick one from its list.' });
     const refused = fake([{ error: { kind: 'bad-request', message: 'x' } }, { error: { kind: 'bad-request', message: 'x' } }]);
     const list = async () => ({ ok: true as const, models: [{ id: 'other', name: 'other', tools: 'unknown' as const }] });
@@ -134,6 +134,9 @@ describe('Test', () => {
     const port = createFakeModel((req) => (req.tools.length ? { error: { kind: 'bad-request', message: 'x' } } : { text: 'ok' }));
     const r = await testEndpoint({ preset: preset('ollama'), model: 'tiny', hasKey: false, port });
     expect(r).toEqual({ ok: true, tools: false, message: "tiny answered, but it can't call tools, so it chats with tools off." });
+    // OpenRouter answers 404 when no provider of the model takes tools.
+    const or = createFakeModel((req) => (req.tools.length ? { error: { kind: 'not-found', message: 'x' } } : { text: 'ok' }));
+    expect(await testEndpoint({ preset: preset('openrouter'), model: 'some/model', hasKey: true, port: or })).toMatchObject({ ok: true, tools: false });
   });
 
   it('never repeats a key or an endpoint\'s own words', async () => {
