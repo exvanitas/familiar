@@ -29,7 +29,7 @@ export interface LedgerHost {
 
 const plain = (value: unknown): Ledger => {
   const l = JSON.parse(JSON.stringify(value ?? emptyLedger()));
-  return { records: l.records ?? [], open: l.open ?? [], turns: l.turns ?? {} };
+  return { records: l.records ?? [], open: l.open ?? [], turns: l.turns ?? {}, extensions: l.extensions ?? {} };
 };
 
 export function journalUsageStore(host: LedgerHost): UsageStore {
@@ -45,6 +45,7 @@ export function journalUsageStore(host: LedgerHost): UsageStore {
           doc.records = ledger.records;
           doc.open = ledger.open;
           doc.turns = ledger.turns;
+          doc.extensions = ledger.extensions;
         }
         return out;
       }, BACKGROUND_CONTEXT);

@@ -82,16 +82,30 @@ The claim is about committed rows: exactly one row in the store, whenever the ki
 2. A parked interruption: a call to a tool that's waiting for Run again or skip, or that was skipped in this turn, doesn't run.
 3. The policy, from `gateFor`:
    - Only the built-in tools on `RUN_WITHOUT_ASKING` run without asking: `note_add`, `reminder_set` and `reminder_cancel`. They're visible and undoable.
-   - Everything else asks: every MCP tool (a server tool named like a listed one included), every other built-in, reads too, and a tool nobody knows.
+   - Built-in pure reads run without asking too, on `BUILT_IN_READS`: `note_search`, `note_list` and `reminder_list`. They write, open and send nothing. Only a built-in tool of kind `read` passes this way.
+   - Everything else asks:
+     - every MCP tool, whatever its `readOnlyHint` says, and a server tool named like a listed one included
+     - every other built-in, other reads included
+     - a tool nobody knows
    - Deny wins, over the list too.
    - A tool's own `asks` can only make it stricter: a listed tool, or one the person set to always allow, still asks if it says so.
    - Step 8's Settings put the person's allow, ask or deny per tool on top, through `policy().perTool`.
 
-Tests (`journal.test.ts` › "the consent gate"): the rule itself, and in the loop a read and a server tool ask, `note_add` runs without asking, and a denied tool never runs or asks. Mutations that fail them:
+Tests (`journal.test.ts` › "the consent gate"):
+
+- The rule itself.
+- In the loop:
+  - a built-in read and `note_add` run without asking
+  - a read that isn't built in, a server tool, and a server tool that says it only reads all ask
+  - a denied tool never runs or asks
+
+Mutations that fail them:
 
 - the old rule, run unless the tool asks
 - the list beating a deny
 - `asks` dropped
+- the reads list dropped
+- a read-only hint trusted
 
 ## Parked waits
 
@@ -136,7 +150,22 @@ Tests (`bounds.test.ts`):
 
 ## Caps that pause, not fail
 
-A `paused` error from `cappedPort` ends the run in pi-durable's terms, but the journal reads it back and parks the turn: a `cap` question with the cap's message, and the state `waiting`, never `error`. Yes starts a continue from the turn's last step, so nothing that had finished runs again. If the cap still has no room, it pauses again. The caps count a turn as the bound on tool calls does: from your message, across every "go on". So a Yes to a turn-tokens pause pauses again until the next message, and a day cap goes on the next day. Any other model error ends the turn as failed, and the state is `error`.
+A `paused` error from `cappedPort` ends the run in pi-durable's terms, but the journal reads it back and parks the turn: a `cap` question with the cap's message, and the state `waiting`, never `error`. Yes starts a continue from the turn's last step, so nothing that had finished runs again. If the cap still has no room, it pauses again. The caps count a turn as the bound on tool calls does: from your message, across every "go on".
+
+- **The turn cap.** The pause says how much a Yes gives: "Say yes to give it 5000 more." Your Yes at a turn-tokens pause grants the turn exactly one more allowance of `maxTurnTokens`. It's recorded in the ledger (`extensions`), in the same commit as the continue it starts, so a kill can't keep one without the other. Answering again grants nothing more. The turn's allowance is `maxTurnTokens × (1 + extensions)`, and a Yes is the only way it grows. A second pause needs a second Yes.
+- **Daily and dollar caps.** A Yes never lifts them. The pause says what it needs: "Raise the daily cap, or wait until tomorrow." A Yes there goes on only if there's room again, and otherwise it pauses again without spending anything.
+- **The call bound** (32 per turn) isn't a cap here: a Yes never lifts it.
+- **Tests:**
+  - `journal.test.ts`:
+    - a Yes goes on with exactly one more allowance, and a second pause needs a second Yes
+    - the extension survives a kill right after the answer's commit, and is granted once
+    - a Yes at a daily-cap pause spends nothing
+  - `ledger.test.ts` › "a Yes grants a turn exactly one more allowance": the same on the journal's store, with a daily cap the extension doesn't lift.
+  - The caps property test grants extensions at random turn-tokens pauses, and checks recorded plus reserved never passes `maxTurnTokens × (1 + extensions)`.
+- **Mutations that fail them:**
+  - an extension that isn't recorded
+  - a Yes that lifts a daily cap
+  - an extension worth two allowances Any other model error ends the turn as failed, and the state is `error`.
 
 ## Durable cap reservations
 

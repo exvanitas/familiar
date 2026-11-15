@@ -114,6 +114,29 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
       }
     },
     {
+      name: 'note_list',
+      description: 'Lists notes. A built-in pure read.',
+      inputSchema: object({}),
+      kind: 'read',
+      doing: () => 'listing notes',
+      async run(args: any) {
+        start('note_list', args);
+        return 'notes: none';
+      }
+    },
+    {
+      name: 'server_read',
+      description: "An MCP server's tool that says it only reads.",
+      inputSchema: object({ q: { type: 'string' } }),
+      kind: 'server',
+      readOnlyHint: true,
+      doing: (a: any) => `reading ${a.q} from the server`,
+      async run(args: any) {
+        start('server_read', args);
+        return `read: ${args.q}`;
+      }
+    },
+    {
       name: 'server_lookup',
       description: "An MCP server's tool.",
       inputSchema: object({ q: { type: 'string' } }),

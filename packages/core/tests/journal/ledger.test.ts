@@ -1,7 +1,7 @@
 // The caps ledger in the journal's store, across restarts: an open reservation survives a restart and stays
 // spent past its deadline, and the caps hold when the engine dies in the middle of concurrent calls.
 import { describe, expect, it } from 'vitest';
-import { createCaps, inputBound, worstCost, type CallInfo, type Ledger, type ModelEvent, type ModelRequest, type Price, type Usage } from '../../src/index.ts';
+import { createCaps, extendTurn, inputBound, worstCost, type CallInfo, type Ledger, type ModelEvent, type ModelRequest, type Price, type Usage } from '../../src/index.ts';
 import { nodeWorld } from './node-env.ts';
 import { openLedger } from './durable-ledger.ts';
 
@@ -91,6 +91,31 @@ describe("the caps ledger in the journal's store", () => {
     expect(ledger.records.some((x) => x.turn === 'done')).toBe(false);
     expect(ledger.turns.done).toBeUndefined();
     expect(await caps.before(call({ turn: 'waiting' }))).toMatchObject({ go: false, pause: 'turn-tokens' });
+  });
+});
+
+describe('turn extensions', () => {
+  it("a Yes grants a turn exactly one more allowance, kept in the journal's store; daily caps get none", async () => {
+    const world = nodeWorld();
+    const { usage } = await openLedger(world);
+    const worst = inputBound(request) + 100;
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst, maxDayTokens: worst * 3 }, usage, { now: () => 0 }, { dayOf: () => 'd' });
+    const spend = async (turn: string) => {
+      const r = await caps.before(call({ turn }));
+      if (r.go) await caps.settle(r.reservation, done({ inputTokens: worst - 100, outputTokens: 100 }));
+      return r;
+    };
+    expect((await spend('t')).go).toBe(true);
+    expect(await spend('t')).toMatchObject({ go: false, pause: 'turn-tokens' });
+    await usage.update((l) => extendTurn(l, 't'));
+    expect((await spend('t')).go).toBe(true);
+    // One allowance, not more: the next needs another Yes.
+    expect(await spend('t')).toMatchObject({ go: false, pause: 'turn-tokens' });
+    expect((await usage.read()).extensions).toEqual({ t: 1 });
+    // The day is full; extending the turn doesn't lift the daily cap.
+    expect((await spend('u')).go).toBe(true);
+    await usage.update((l) => extendTurn(l, 'u'));
+    expect(await spend('u')).toMatchObject({ go: false, pause: 'day-tokens', message: expect.stringMatching(/Raise the daily cap, or wait until tomorrow/) });
   });
 });
 

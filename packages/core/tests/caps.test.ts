@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cappedPort, costOf, createCaps, inputBound, localDay, memoryUsageStore, wholeUsage, withRetries, worstCost } from '../src/index.ts';
+import { cappedPort, costOf, createCaps, extendTurn, inputBound, localDay, memoryUsageStore, wholeUsage, withRetries, worstCost } from '../src/index.ts';
 import type { CallInfo, Caps, ModelError, ModelEvent, ModelRequest, Price, Usage } from '../src/index.ts';
 import { createFakeModel } from '../src/testing/index.ts';
 import { durableUsageStore } from './journal/durable-ledger.ts';
@@ -7,9 +7,12 @@ import { durableUsageStore } from './journal/durable-ledger.ts';
 // Every ledger test runs on the memory store and on the journal's store (a Harness on a strict fake
 // IndexedDB), whose updates are commits. ledger.test.ts adds restarts.
 type MakeStore = (pause?: () => Promise<void>) => ReturnType<typeof memoryUsageStore>;
-const STORES: readonly { name: string; make: MakeStore; seeds: number }[] = [
-  { name: 'memory store', make: (pause) => memoryUsageStore(pause), seeds: 200 },
-  { name: "journal's store", make: (pause) => durableUsageStore(pause), seeds: 200 }
+// `minBeyond`: turns that must go past their first allowance thanks to a Yes. The journal's store is
+// slower, so its interleavings rarely give one turn the day's room; ledger.test.ts checks the extension on
+// it directly.
+const STORES: readonly { name: string; make: MakeStore; seeds: number; minBeyond: number }[] = [
+  { name: 'memory store', make: (pause) => memoryUsageStore(pause), seeds: 200, minBeyond: 5 },
+  { name: "journal's store", make: (pause) => durableUsageStore(pause), seeds: 200, minBeyond: 0 }
 ];
 
 const request: ModelRequest = { model: 'm', system: 'You are kind.', messages: [{ role: 'user', content: 'Hello there' }], tools: [] };
@@ -263,6 +266,9 @@ function rng(seed: number) {
   return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32);
 }
 
+/** How much the extensions were exercised: Yes given, and turns that went past their first allowance. */
+const coverage = { grants: 0, beyondBase: new Set<string>() };
+
 async function interleave(seed: number, make: MakeStore): Promise<string[]> {
   const rand = rng(seed);
   const tick = () => new Promise<void>((r) => (rand() < 0.9 ? queueMicrotask(r) : setTimeout(r, 0)));
@@ -276,7 +282,10 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
     if (tokens > config.maxDayTokens) problems.push(`seed ${seed}: ${tokens} tokens past the day cap`);
     for (const turn of ['t0', 't1', 't2']) {
       const used = [...store.all, ...store.reservations].filter((x) => x.turn === turn).reduce((t, x) => t + x.tokens, 0);
-      if (used > config.maxTurnTokens) problems.push(`seed ${seed}: turn ${turn} at ${used}`);
+      // The person's Yes at a turn-tokens pause gives a turn one more allowance; nothing else does.
+      const allowance = config.maxTurnTokens * (1 + (store.extensions[turn] ?? 0));
+      if (used > allowance) problems.push(`seed ${seed}: turn ${turn} at ${used}, past its allowance of ${allowance}`);
+      if (used > config.maxTurnTokens) coverage.beyondBase.add(`${seed}:${turn}`);
     }
     const usd = [...store.all.filter((r) => r.persona === 'a').map((r) => r.cost.usd), ...store.reservations.filter((r) => r.persona === 'a').map((r) => r.usd)].reduce<number>((t, x) => t + (x as number), 0);
     if (usd > config.personaDayUsd.a + 1e-12) problems.push(`seed ${seed}: persona a at $${usd}`);
@@ -290,7 +299,15 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
       const c = call({ persona: rand() < 0.5 ? 'a' : 'b', turn: `t${Math.floor(rand() * 3)}`, conversation: 'c', request: { ...request, model } });
       const r = await caps.before(c);
       check();
-      if (!r.go) return;
+      if (!r.go) {
+        // Sometimes the person says yes: one more allowance for that turn, and only for a turn-tokens pause.
+        if (r.pause === 'turn-tokens' && rand() < 0.7) {
+          await store.update((l) => extendTurn(l, c.turn));
+          coverage.grants++;
+          check();
+        }
+        return;
+      }
       for (let n = Math.floor(rand() * 4); n > 0; n--) await tick();
       const input = model === 'big' ? inputBound(c.request) : Math.floor(inputBound(c.request) / 4), output = Math.floor(rand() * r.maxOutputTokens);
       const usage = { inputTokens: input, outputTokens: output };
@@ -329,10 +346,14 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
   return problems;
 }
 
-describe.each(STORES)('the ledger under concurrent calls, $name', ({ make, seeds }) => {
+describe.each(STORES)('the ledger under concurrent calls, $name', ({ make, seeds, minBeyond }) => {
   it(`over ${seeds} seeded interleavings, with model switches and empty or partial usage, recorded plus reserved spend never passes a cap, and nothing settles below reported or real usage`, { timeout: 120000 }, async () => {
     const problems: string[] = [];
+    coverage.grants = 0;
+    coverage.beyondBase.clear();
     for (let seed = 1; seed <= seeds; seed++) problems.push(...(await interleave(seed, make)));
+    expect(coverage.grants).toBeGreaterThan(20);
+    expect(coverage.beyondBase.size).toBeGreaterThanOrEqual(minBeyond);
     expect(problems.slice(0, 5)).toEqual([]);
   });
 });

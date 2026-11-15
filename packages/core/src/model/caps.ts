@@ -160,6 +160,12 @@ export interface Ledger {
   open: Reservation[];
   /** Settled tokens per turn, and when it was last used, of records folded out of `records`. */
   turns: Record<string, { tokens: number; last: number }>;
+  /**
+   * Extra allowances the person gave a turn, one per Yes at a turn-tokens pause: a turn may use
+   * `maxTurnTokens * (1 + extensions[turn])`. The only way a turn's allowance grows. Daily and dollar caps
+   * have none.
+   */
+  extensions: Record<string, number>;
 }
 
 /**
@@ -247,8 +253,13 @@ export const FOLD_AFTER_MS = 2 * 24 * 60 * 60_000;
 /** A folded turn last used longer ago than this is dropped: no turn runs for a month. */
 export const DROP_TURN_AFTER_MS = 30 * 24 * 60 * 60_000;
 
+/** Grants a turn one more allowance of `maxTurnTokens`: the person's Yes at a turn-tokens pause. */
+export function extendTurn(ledger: Ledger, turn: string): void {
+  ledger.extensions[turn] = (ledger.extensions[turn] ?? 0) + 1;
+}
+
 export function emptyLedger(): Ledger {
-  return { records: [], open: [], turns: {} };
+  return { records: [], open: [], turns: {}, extensions: {} };
 }
 
 export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, opts: CapsOptions = {}): Caps {
@@ -286,7 +297,11 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
       }
       ledger.records = ledger.records.filter((r) => !folds(r));
     }
-    for (const [turn, t] of Object.entries(ledger.turns)) if (t.last < now - DROP_TURN_AFTER_MS && !live.has(turn)) delete ledger.turns[turn];
+    for (const [turn, t] of Object.entries(ledger.turns)) {
+      if (t.last >= now - DROP_TURN_AFTER_MS || live.has(turn)) continue;
+      delete ledger.turns[turn];
+      delete ledger.extensions[turn];
+    }
   }
 
   function boundFor(call: CallInfo): number {
@@ -319,14 +334,19 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
         if (config.maxTurnTokens !== undefined) {
           const mine = (r: { turn: string }) => r.turn === call.turn;
           const used = (ledger.turns[call.turn]?.tokens ?? 0) + sum(ledger.records.filter(mine)) + sum(ledger.open.filter(mine));
-          if (used + tokens > config.maxTurnTokens) {
-            return { go: false, pause: 'turn-tokens', message: `This turn has used or set aside ${used} tokens. One more reply could take it past its cap of ${config.maxTurnTokens}.` };
+          const allowance = config.maxTurnTokens * (1 + (ledger.extensions[call.turn] ?? 0));
+          if (used + tokens > allowance) {
+            return {
+              go: false,
+              pause: 'turn-tokens',
+              message: `This turn has used or set aside ${used} tokens. One more reply could take it past its allowance of ${allowance}. Say yes to give it ${config.maxTurnTokens} more.`
+            };
           }
         }
         if (config.maxDayTokens !== undefined) {
           const used = sum(records) + sum(open);
           if (used + tokens > config.maxDayTokens) {
-            return { go: false, pause: 'day-tokens', message: `Today has used or set aside ${used} tokens. One more reply could take it past the daily cap of ${config.maxDayTokens}.` };
+            return { go: false, pause: 'day-tokens', message: `Today has used or set aside ${used} tokens. One more reply could take it past the daily cap of ${config.maxDayTokens}. Raise the daily cap, or wait until tomorrow.` };
           }
         }
         const cap = config.personaDayUsd?.[call.persona];
@@ -344,7 +364,7 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
             return {
               go: false,
               pause: 'persona-day-usd',
-              message: `This persona has spent or set aside ${usdText(spent)} today. One more reply could cost up to ${usdText(worst.usd)}, past its daily cap of ${usdText(cap)}.`
+              message: `This persona has spent or set aside ${usdText(spent)} today. One more reply could cost up to ${usdText(worst.usd)}, past its daily cap of ${usdText(cap)}. Raise the cap, or wait until tomorrow.`
             };
           }
         }
@@ -422,12 +442,13 @@ export function cappedPort(port: ModelPort, caps: Caps, info: (request: ModelReq
  * A usage store in memory, for tests. `pause` runs before every update and read, so a test can interleave
  * calls; the change itself runs without yielding, so an update is atomic.
  */
-export function memoryUsageStore(pause: () => Promise<void> = async () => {}): UsageStore & { readonly all: readonly UsageRecord[]; readonly reservations: readonly Reservation[] } {
+export function memoryUsageStore(pause: () => Promise<void> = async () => {}): UsageStore & { readonly all: readonly UsageRecord[]; readonly reservations: readonly Reservation[]; readonly extensions: Readonly<Record<string, number>> } {
   let ledger = emptyLedger();
   const copy = (l: Ledger): Ledger => structuredClone(l);
   return {
     get all() { return ledger.records; },
     get reservations() { return ledger.open; },
+    get extensions() { return ledger.extensions; },
     async update(change) {
       await pause();
       // On a throw nothing changes, as a store transaction would roll back.

@@ -8,7 +8,7 @@ import { isRetryableAssistantError } from '@earendil-works/pi-ai/utils/retry';
 import { registerStorageConformance } from '@earendil-works/pi-durable/testing';
 import { IDBFactory } from 'fake-indexeddb';
 import { describe, expect, it } from 'vitest';
-import { decodeModelError, encodeModelError, gateFor, NotStrict, openJournalStore, replayOf, RUN_WITHOUT_ASKING, type Decision, type FamiliarTool, type ModelRequest, type PersonaEvent } from '../../src/index.ts';
+import { BUILT_IN_READS, decodeModelError, encodeModelError, gateFor, NotStrict, openJournalStore, replayOf, RUN_WITHOUT_ASKING, type Decision, type FamiliarTool, type ModelRequest, type PersonaEvent } from '../../src/index.ts';
 import { nodeWorld } from './node-env.ts';
 import { openFor, type Env } from './scenarios.ts';
 
@@ -83,6 +83,13 @@ describe('the consent gate', () => {
 
   it('fails closed: only the listed built-ins run without asking; deny wins; asks only makes it stricter', () => {
     expect(RUN_WITHOUT_ASKING).toEqual(['note_add', 'reminder_set', 'reminder_cancel']);
+    expect(BUILT_IN_READS).toEqual(['note_search', 'note_list', 'reminder_list']);
+    // A built-in pure read runs without asking. A server tool of the same name, or one that says it only
+    // reads, still asks.
+    expect(gateFor('note_list', tool({ name: 'note_list', kind: 'read' }))).toBe('allow');
+    expect(gateFor('note_list', tool({ name: 'note_list', kind: 'server' }))).toBe('ask');
+    expect(gateFor('srv_read', tool({ name: 'srv_read', kind: 'server', readOnlyHint: true }))).toBe('ask');
+    expect(gateFor('note_list', tool({ name: 'note_list', kind: 'effect' }))).toBe('ask');
     expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write' }))).toBe('allow');
     // Not on the list: a read, an effect, a server tool named like a listed one, a tool nobody knows.
     expect(gateFor('look', tool({ name: 'look', kind: 'read' }))).toBe('ask');
@@ -97,13 +104,15 @@ describe('the consent gate', () => {
     expect(gateFor('srv', tool({ name: 'srv', kind: 'server', asks: true }), { perTool: { srv: 'allow' } })).toBe('ask');
   });
 
-  it('in the loop: a read asks, a server tool asks, note_add runs without asking, and a denied tool never runs or asks', async () => {
+  it('in the loop: a built-in read and note_add run without asking; another read, a server tool and a read-only server tool ask; a denied tool never runs or asks', async () => {
     const env = envOf();
     const calls = [
       { id: 'a', name: 'look', arguments: { what: 'x' } },
       { id: 'b', name: 'server_lookup', arguments: { q: 'y' } },
       { id: 'c', name: 'note_add', arguments: { text: 'z' } },
-      { id: 'd', name: 'send_message', arguments: { to: 'Sam', text: 'hi' } }
+      { id: 'd', name: 'send_message', arguments: { to: 'Sam', text: 'hi' } },
+      { id: 'e', name: 'note_list', arguments: {} },
+      { id: 'f', name: 'server_read', arguments: { q: 'r' } }
     ];
     const asked: string[] = [];
     const { journal } = await openFor(env, await env.world.open('gate'), {
@@ -113,10 +122,11 @@ describe('the consent gate', () => {
     });
     const sent = await journal.send('Do four things.', 'r1');
     if (sent.replied) await sent.turn.wait();
-    expect(asked).toHaveLength(2);
-    expect(['look', 'server_lookup', 'note_add', 'send_message'].map((n) => env.counters.get(`starts:${n}`))).toEqual([1, 1, 1, 0]);
+    // Asked: the read that isn't built in, the server tool, and the server tool that says it only reads.
+    expect(asked).toHaveLength(3);
+    expect(['look', 'server_lookup', 'note_add', 'send_message', 'note_list', 'server_read'].map((n) => env.counters.get(`starts:${n}`))).toEqual([1, 1, 1, 0, 1, 1]);
     const results = (await journal.transcript()).filter((e) => e.role === 'toolResult').map((e) => e.text);
-    expect(results.at(-1)).toMatch(/send_message is turned off/);
+    expect(results[3]).toMatch(/send_message is turned off/);
     await journal.close();
   });
 });
@@ -184,6 +194,75 @@ describe('caps that pause, not fail', () => {
     const end = await sent.turn.wait();
     expect(end).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'turn-tokens' } });
     expect(env.counters.get('starts:send_message')).toBe(1);
+    await journal.close();
+  });
+
+  // Each reply reports a big input, so each one after the first needs one more turn allowance.
+  const bigSteps = (steps: number) => (r: ModelRequest) =>
+    toolResults(r) < steps ? { toolCalls: [{ id: `n${toolResults(r)}`, name: 'note_add', arguments: { text: `n${toolResults(r)}` } }], usage: { inputTokens: 4500, outputTokens: 2 } } : { text: 'All noted.', usage: { inputTokens: 10, outputTokens: 2 } };
+
+  it('a Yes at a turn-tokens pause goes on with exactly one more allowance; a second pause needs a second Yes', async () => {
+    const env = envOf();
+    const { journal, model } = await openFor(env, await env.world.open('extend'), { script: bigSteps(2), caps: { maxTurnTokens: 5000 } });
+    const sent = await journal.send('Note two things.', 'r1');
+    if (!sent.replied) throw new Error('no reply');
+    const first = await sent.turn.wait();
+    expect(first).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'turn-tokens', text: expect.stringMatching(/Say yes to give it 5000 more/) } });
+    if (first.status !== 'asks') return;
+    const second = await (await journal.answer(first.question.id, true, 'yes-1'))!.wait();
+    // One more allowance took one more reply; the next pauses again.
+    expect(second).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'turn-tokens' } });
+    expect(model.requests).toHaveLength(2);
+    expect(Object.values((await journal.ledger()).extensions)).toEqual([1]);
+    if (second.status !== 'asks') return;
+    expect(await (await journal.answer(second.question.id, true, 'yes-2'))!.wait()).toMatchObject({ status: 'answered', text: 'All noted.' });
+    expect(Object.values((await journal.ledger()).extensions)).toEqual([2]);
+    // Answering the first again changes nothing.
+    await journal.answer(first.question.id, true, 'yes-1');
+    expect(Object.values((await journal.ledger()).extensions)).toEqual([2]);
+    await journal.close();
+  });
+
+  it('the extension survives a kill between the Yes and the next call, and is granted once', async () => {
+    const world = nodeWorld();
+    const one = await openFor(envOf(world), await world.open('extend-kill'), { script: bigSteps(1), caps: { maxTurnTokens: 5000 } });
+    const sent = await one.journal.send('Note one thing.', 'r1');
+    if (!sent.replied) throw new Error('no reply');
+    const end = await sent.turn.wait();
+    if (end.status !== 'asks') throw new Error(JSON.stringify(end));
+    // The kill lands right after the answer's commit, before the next call reserves anything.
+    let killed = false;
+    world.listeners.add(() => {
+      if (killed) return;
+      killed = true;
+      one.journal.kill();
+    });
+    await one.journal.answer(end.question.id, true, 'yes-1').catch(() => undefined);
+    world.listeners.clear();
+    expect(one.model.requests).toHaveLength(1);
+    const two = await openFor({ ...envOf(world), life: 2 }, await world.open('extend-kill'), { script: bigSteps(1), caps: { maxTurnTokens: 5000 } });
+    const again = await two.journal.answer(end.question.id, true, 'yes-1');
+    expect(await again!.wait()).toMatchObject({ status: 'answered', text: 'All noted.' });
+    expect(Object.values((await two.journal.ledger()).extensions)).toEqual([1]);
+    await two.journal.close();
+  });
+
+  it('a Yes at a daily-cap pause never lifts it: nothing more is spent, and it says what it needs', async () => {
+    const env = envOf();
+    const { journal, model } = await openFor(env, await env.world.open('daily-yes'), { script: bigSteps(1), caps: { maxDayTokens: 5000 } });
+    const sent = await journal.send('Note one thing.', 'r1');
+    if (!sent.replied) throw new Error('no reply');
+    const end = await sent.turn.wait();
+    expect(end).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'day-tokens', text: expect.stringMatching(/Raise the daily cap, or wait until tomorrow/) } });
+    if (end.status !== 'asks') return;
+    const before = await journal.ledger();
+    const after = await (await journal.answer(end.question.id, true, 'yes-1'))!.wait();
+    expect(after).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'day-tokens' } });
+    expect(model.requests).toHaveLength(1);
+    const ledger = await journal.ledger();
+    expect(ledger.records).toEqual(before.records);
+    expect(ledger.open).toEqual([]);
+    expect(ledger.extensions).toEqual({});
     await journal.close();
   });
 

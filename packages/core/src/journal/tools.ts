@@ -51,6 +51,11 @@ export interface FamiliarTool {
   readonly kind: ToolKind;
   /** Asks first: a consent card, with the exact call, before it runs. */
   readonly asks?: boolean;
+  /**
+   * A server's own word that its tool only reads (MCP's `readOnlyHint`). Shown to the person, never
+   * trusted: a server tool still asks, and is never run again on its own.
+   */
+  readonly readOnlyHint?: boolean;
   /** What it does, in a few plain words for the question after a restart: "saving a note". */
   doing(args: unknown): string;
   /** The text the model gets back. A throw becomes an error result. */

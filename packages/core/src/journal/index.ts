@@ -13,5 +13,5 @@ export { defineJournalDoc, replayOf } from './tools.ts';
 export type { FamiliarTool, JournalDocToken, ToolKind, ToolStep, WriteTx } from './tools.ts';
 export { admit, boundWords, emptyBudget, TOOL_CALLS_PER_REPLY, TOOL_CALLS_PER_TURN } from './bounds.ts';
 export type { Bound, Budget } from './bounds.ts';
-export { gateFor, RUN_WITHOUT_ASKING } from './gate.ts';
+export { BUILT_IN_READS, gateFor, RUN_WITHOUT_ASKING } from './gate.ts';
 export type { GatePolicy, ToolPolicy } from './gate.ts';

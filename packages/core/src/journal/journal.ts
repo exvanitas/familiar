@@ -20,7 +20,7 @@ import { cappedPort, createCaps } from '../model/caps.ts';
 import type { ModelPort } from '../model/port.ts';
 import type { RetryOptions } from '../model/retry.ts';
 import { withRetries } from '../model/retry.ts';
-import { journalUsageStore } from './ledger.ts';
+import { journalUsageStore, LedgerDoc } from './ledger.ts';
 import type { OwnerLock } from './owner.ts';
 import type { PresencePort } from './presence.ts';
 import { presenceReporter, stateOf } from './presence.ts';
@@ -332,12 +332,12 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
    * in one commit with `also`, the person's own record of what they did. Retried with the same request
    * id, it finds the same submission.
    */
-  const submitInTurn = async (draft: any, carry: boolean, also?: (tx: any, sid: string) => Promise<void>) => {
+  const submitInTurn = async (draft: any, carry: boolean, also?: (tx: any, sid: string) => Promise<void>, carryKey?: string) => {
     const id = await harness.commit(async (tx: any) => {
       const sid = draft ? String(await root.submit(tx, draft)) : '';
       if (sid) {
         const doc = await tx.doc(BudgetDoc);
-        const key = carry ? doc.current || sid : sid;
+        const key = carry ? carryKey || doc.current || sid : sid;
         if (!carry) doc.current = sid;
         if (doc.turns[sid] === undefined) {
           doc.turns[sid] = key;
@@ -684,13 +684,23 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       // again in this turn.
       const skipInterrupted = !yes && (question.kind === 'redo' || question.kind === 'rerun');
       const draft = skipInterrupted ? { type: 'continue', requestId } : !yes ? undefined : question.kind === 'steps' || question.kind === 'cap' ? { type: 'continue', requestId } : { type: 'input', content: words, requestId };
-      // The answer and what it starts are one commit, so a kill can't keep one without the other.
+      // The turn the question is about: a paused or capped run's, from its inputs.
+      const asked = turnKeyOf({ run: { inputs: (await harness.snapshot(LiveDoc, rootId, ctx) as any)?.runFailure?.inputs ?? [] } }, await harness.snapshot(BudgetDoc, ctx));
+      // The answer and what it starts are one commit, so a kill can't keep one without the other. A Yes at
+      // a turn-tokens pause gives the turn one more allowance, in the same commit; a Yes never lifts a
+      // daily or dollar cap.
       const submission = await submitInTurn(draft, true, async (tx, sid) => {
+        if (yes && question.kind === 'cap' && question.pause === 'turn-tokens') {
+          const ledger = await tx.doc(LedgerDoc);
+          const ext = { ...(ledger.extensions ?? {}) };
+          ext[asked] = (ext[asked] ?? 0) + 1;
+          ledger.extensions = ext;
+        }
         const doc = await tx.doc(QuestionsDoc);
         delete doc.open[id];
         doc.dismissed[id] = true;
         (doc.answered ??= {})[id] = { yes, ...(sid ? { submission: sid } : {}), ...(question.tool ? { tool: question.tool, turn: question.turn ?? '' } : {}) };
-      });
+      }, question.turn || asked);
       return submission ? turnFor(submission) : undefined;
     },
     async parkUntil(text, at) {
