@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 /// Lines the queue holds before new ones are dropped.
 pub const QUEUE: usize = 4096;
+/// The longest `flush` waits, all told.
+pub const FLUSH: Duration = Duration::from_secs(1);
 
 pub const CAP: u64 = 1024 * 1024;
 /// The most of one page line that's kept, in bytes.
@@ -144,12 +146,31 @@ impl Log {
         }
     }
 
-    /// Waits until every line queued before this has been written.
-    pub fn flush(&self) {
+    /// Waits until every line queued before this has been written, for at most `FLUSH` in all:
+    /// queueing the request and hearing it back share one deadline, so a stalled log thread with a
+    /// full queue can't hold anyone, an exit included. True if everything was written.
+    pub fn flush(&self) -> bool {
+        self.flush_within(FLUSH)
+    }
+
+    pub fn flush_within(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
         let (done, wait) = mpsc::channel();
-        if self.queue.send(Msg::Flushed(done)).is_ok() {
-            let _ = wait.recv_timeout(Duration::from_secs(5));
+        let mut msg = Msg::Flushed(done);
+        loop {
+            match self.queue.try_send(msg) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(m)) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    msg = m;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
         }
+        wait.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
     }
 }
 
@@ -340,6 +361,29 @@ mod tests {
         assert!(kept.windows(2).all(|w| w[0] < w[1]), "{text}");
         assert!(text.ends_with(" after\n"), "{text}");
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_flush_with_the_writer_stalled_and_the_queue_full_returns_within_its_deadline() {
+        let d = temp("stalled");
+        let l = Log::with_queue(Instant::now(), 4);
+        l.attach(&d.join("app.log"), None);
+        assert!(l.flush());
+        let held = l.gate.lock().unwrap();
+        for i in 0..50 {
+            l.line(&format!("line {i}"));
+        }
+        let t = Instant::now();
+        assert!(!l.flush_within(Duration::from_millis(300)), "nothing could be written");
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(290) && took < Duration::from_millis(600), "took {took:?}");
+        // The default deadline holds too.
+        let t = Instant::now();
+        assert!(!l.flush());
+        assert!(t.elapsed() < FLUSH + Duration::from_millis(300), "took {:?}", t.elapsed());
+        drop(held);
+        assert!(l.flush(), "once it moves again, a flush completes");
+        let _ = fs::remove_dir_all(d);
     }
 
     #[test]
