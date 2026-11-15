@@ -175,6 +175,9 @@ function Stop-NetServer {
   if ($null -ne $script:hostsBackup) { Set-Content $hostsFile $script:hostsBackup; Clear-DnsClientCache }
   if ($null -ne $script:proxyBackup) { Restore-Proxy }
   if ($script:certThumb) { Remove-Item "Cert:\CurrentUser\My\$($script:certThumb)" -ErrorAction SilentlyContinue }
+  # A fixture that died part-way would make every later check fail for the wrong reason.
+  if ($script:netServer -and $script:netServer.HasExited) { Result 'FAIL' 'check.phase' "the check's net server stopped early (exit $($script:netServer.ExitCode)); see net-server.err" }
+  if ($script:dnsServer -and $script:dnsServer.HasExited) { Result 'FAIL' 'check.phase' "the check's DNS server stopped early (exit $($script:dnsServer.ExitCode)); see dns-server.err" }
   if ($script:netServer -and -not $script:netServer.HasExited) { $script:netServer.Kill() }
   Stop-DnsServer
   if ($script:shellLocked) { & icacls $script:shellLocked /remove:d "$env:USERNAME" | Out-Null }
@@ -340,7 +343,7 @@ function Do-NetStep($action, $a) {
       return @{ lanIp = $script:lanIp }
     }
     'dns-queries' {
-      $q = @(Dns-Log | Where-Object { $_.name -eq $a.name -and $_.type -eq 1 })
+      $q = @(Dns-Log | Where-Object { $_.name -eq $a.name -and ($a.all -or $_.type -eq 1) })
       return @{ count = $q.Count; queries = @($q | ForEach-Object { @{ at = $_.at; n = $_.n; answered = ($_.answered -join ',') } }) }
     }
     'dns-canary' {

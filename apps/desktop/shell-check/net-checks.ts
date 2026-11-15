@@ -27,6 +27,18 @@ export function proxyHost(target: string): string {
 }
 /* What the logging proxy saw while it was on. */
 const proxyOff = () => step<{ targets: string[]; entries: { target: string; at: number }[] }>('proxy', { on: false });
+/* shell_info, an async command like every other, timed every 50 ms for `ms`: the longest it took. */
+async function probe(ms: number): Promise<number> {
+  const times: number[] = [];
+  for (const end = performance.now() + ms; performance.now() < end;) {
+    const t = performance.now();
+    await shell.info();
+    times.push(performance.now() - t);
+    await sleep(50);
+  }
+  return Math.round(Math.max(...times));
+}
+
 /* 128 random bits as hex: a request id of the exe's form. */
 const requestId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
 const AUTH = { authorization: `Bearer ${PLACEHOLDER}` };
@@ -268,7 +280,9 @@ export async function netChecks(ctx: Ctx) {
     const ms = Math.round(performance.now() - t0);
     await sleep(5000);
     const sent = (await proxyOff()).targets.filter(t => proxyHost(t) === slow).length;
-    ok(duringLookup === 'revoked' && ms < 1500 && sent === 0, `a removal during the lookup: ${duringLookup} in ${ms} ms, and the proxy saw ${sent} requests for the name`);
+    // The removal returns once the lookup under way has finished (its helper holds the transport's
+    // end), within the 4 s it was delayed by, and nothing is sent after it.
+    ok(duringLookup === 'revoked' && ms < 6000 && sent === 0, `a removal during the lookup: ${duringLookup} in ${ms} ms, and the proxy saw ${sent} requests for the name`);
     ok(after === 'revoked', 'a read after removal: ' + after);
     ok(next === 'not-saved', 'a fetch after removal: ' + next);
     ok(open === 0, `the server still had ${open} open`);
@@ -292,21 +306,14 @@ export async function netChecks(ctx: Ctx) {
   });
 
   await check('security.exec.responsive', async () => {
-    // shell_info, answered by the exe's main thread, timed while each kind of flood is held.
-    const probe = async (ms: number) => {
-      const times: number[] = [];
-      for (const end = performance.now() + ms; performance.now() < end;) {
-        const t = performance.now();
-        await shell.info();
-        times.push(performance.now() - t);
-        await sleep(50);
-      }
-      return Math.round(Math.max(...times));
-    };
-    // Open fetches at their limit, each waiting 5 s for its head.
+    // shell_info is async, so it's answered where every command runs; it's timed while each kind
+    // of flood is really held. A control build whose helpers block those threads must fail this
+    // (check.exec.responsive-control, in its own phase).
+    // Open fetches at their limit, each waiting 5 s for its head, all open at the server.
     const cs = Array.from({ length: 32 }, () => new AbortController());
     const open = cs.map(c => guardedFetch(A!.id)(`${base}/api/slow-head`, { signal: c.signal }).catch(() => {}));
     await sleep(500);
+    const inFlight = await openNow();
     const over = await outcome(guardedFetch(A!.id)(`${base}/api/ok`));
     const atLimit = await probe(2000);
     cs.forEach(c => c.abort());
@@ -318,6 +325,7 @@ export async function netChecks(ctx: Ctx) {
     const c2 = new AbortController();
     const stalled = guardedFetch(S.id)(`https://${n}/v1`, { signal: c2.signal }).catch(() => {});
     await sleep(500);
+    const asking = (await step<{ count: number }>('dns-queries', { name: n })).count;
     const inLookup = await probe(2000);
     c2.abort();
     await stalled;
@@ -326,7 +334,8 @@ export async function netChecks(ctx: Ctx) {
     const [held, inDialog] = await Promise.all([dialog('hold'), sleep(400).then(() => probe(1200))]);
     await dialog('approve');
     const saidYes = await within(asked, 45000, 'address_add');
-    ok(over === 'busy', 'a fetch past the limit: ' + over);
+    ok(over === 'busy' && inFlight >= 32, `a fetch past the limit: ${over}; the server held ${inFlight} open`);
+    ok(asking >= 2, `the stalled lookup had reached the DNS server ${asking} times`);
     ok(held.found && saidYes === 'saved', `the dialog: ${held.found}, ${saidYes}`);
     ok(atLimit < 100 && inLookup < 100 && inDialog < 100, `shell_info took up to ${atLimit} ms with 32 fetches open, ${inLookup} ms in a stalled lookup, ${inDialog} ms behind a dialog`);
     return `shell_info answered in at most ${atLimit} ms with 32 fetches open (the 33rd busy), ${inLookup} ms during an 8 s lookup, ${inDialog} ms behind an open dialog`;
@@ -481,6 +490,7 @@ export async function netChecks(ctx: Ctx) {
       const outcome = await within(fetched, 30000, 'net_fetch');
       await sleep(300);
       tries.push({ offset, outcome, cancelled, next: Date.now() });
+      await sleep(50);
     }
     // Five more held just before sending: their lookup answers 1.5 s late, and each is cancelled
     // while it waits. Nothing of them may reach the proxy, then or once the lookup has answered.
@@ -488,14 +498,23 @@ export async function netChecks(ctx: Ctx) {
     await plan(h, [[PUB]], [0, 1500]);
     const H = await saved({ kind: 'model', url: `https://${h}`, label: 'held before sending' });
     const heldOutcomes: string[] = [];
+    const heldWindows: [number, number][] = [];
     for (let i = 0; i < 5; i++) {
       const id = requestId();
       const fetched = shell.netFetch({ id, address: H.id, url: `https://${h}/v1`, method: 'GET', headers: [] }, new Uint8Array(0)).then(() => 'answered', e => (e as { kind?: string }).kind ?? reason(e));
       await sleep(300);
       await shell.netCancel(id);
+      const returned = Date.now();
       heldOutcomes.push(await within(fetched, 30000, 'net_fetch'));
       await sleep(1500);
+      heldWindows.push([returned, Date.now()]);
+      // A gap before the next try, so its own first query can't land in this window's last ms.
+      await sleep(50);
     }
+    // The lookup was under way when each cancel came: the cancel returns only once it's over, so
+    // the check's DNS server sees no query for the name after a cancel returned.
+    const hq = (await step<{ queries: { at: number }[] }>('dns-queries', { name: h, all: true })).queries;
+    const lateLookups = hq.filter(q => heldWindows.some(([from, to]) => q.at > from && q.at <= to)).length;
     await sleep(1000);
     const seen = await proxyOff();
     const mine = seen.entries.filter(e => proxyHost(e.target) === n);
@@ -506,7 +525,8 @@ export async function netChecks(ctx: Ctx) {
     ok(tries.filter(t => t.offset < 0).every(t => t.outcome === 'cancelled'), 'a cancel before the fetch: ' + tries.filter(t => t.offset < 0).map(t => t.outcome).join(' '));
     ok(tries.every(t => t.outcome !== 'answered'), 'a cancelled fetch answered');
     ok(heldSeen === 0 && heldOutcomes.every(o => o === 'cancelled'), `held before sending: ${heldOutcomes.join(' ')}, and the proxy saw ${heldSeen}`);
-    return `20 cancels from 5 ms before the fetch to 14 ms after: ${counts}; the proxy saw ${mine.length} requests for the name, none after its cancel returned; 5 requests held in their lookup and cancelled ended cancelled with nothing reaching the proxy, before or after the lookup answered`;
+    ok(lateLookups === 0, `the DNS server saw ${lateLookups} queries for the held name after a cancel returned`);
+    return `20 cancels from 5 ms before the fetch to 14 ms after: ${counts}; the proxy saw ${mine.length} requests for the name, none after its cancel returned; 5 requests held in their lookup and cancelled ended cancelled with nothing reaching the proxy, before or after the lookup answered, and no query at the DNS server after their cancels returned (${hq.length} in all)`;
   });
 
   /* ---------- the key goes with its address ---------- */
@@ -652,4 +672,19 @@ export async function removeRestartChecks(id: string, data: string) {
     ok(retry === 'removed' && !after, `the retry: ${retry}, still listed ${after}`);
     return `loaded as being removed with its key already gone; a keyless request to the endpoint holding the old key was ${remembered}, one with the key ${withKey}; once the folder could be written the retry finished it`;
   });
+}
+
+/* The control, run with a check build whose request helpers block the async workers on purpose:
+   the same flood and probe, which must now be slow. The driver judges the number. */
+export async function responsiveControl() {
+  const net = (await (await fetch('net.json', { cache: 'no-store' })).json()) as Net;
+  const base = `http://127.0.0.1:${net.http}`;
+  const A = await saved({ kind: 'server', url: `${base}/ctl`, label: 'the control' });
+  const cs = Array.from({ length: 32 }, () => new AbortController());
+  const open = cs.map(c => guardedFetch(A.id)(`${base}/ctl/slow-head`, { signal: c.signal }).catch(() => {}));
+  await sleep(500);
+  const ms = await probe(3000);
+  cs.forEach(c => c.abort());
+  await Promise.all(open);
+  await say(`INFO responsive-control ${ms}`);
 }

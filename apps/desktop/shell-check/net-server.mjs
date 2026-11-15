@@ -92,6 +92,8 @@ const tls = createTls({ pfx: readFileSync(pfxFile), passphrase: pfxWord }, (q, s
 // A logging proxy: it notes each CONNECT's host and port, and tunnels it.
 const proxy = createServer((req, res) => { log({ proxy: 'request', target: (req.url ?? '').slice(0, 200) }); res.writeHead(502); res.end(); });
 proxy.on('connect', (req, socket, head) => {
+  // A client that goes away mid-CONNECT (a cancelled request) resets the socket: never fatal.
+  socket.on('error', () => {});
   log({ proxy: 'connect', target: (req.url ?? '').slice(0, 200) });
   const [host, port] = (req.url ?? '').split(':');
   // The check's own names point nowhere real: logged, never tunnelled.
@@ -99,9 +101,10 @@ proxy.on('connect', (req, socket, head) => {
   const up = connect(Number(port) || 443, host, () => { socket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.write(head); up.pipe(socket); socket.pipe(up); });
   up.on('error', () => socket.destroy());
   socket.on('error', () => up.destroy());
+  socket.on('close', () => up.destroy());
 });
 // For the driver: how many requests are open right now.
-const control = createTcp(c => { c.end(JSON.stringify({ open })); });
+const control = createTcp(c => { c.on('error', () => {}); c.end(JSON.stringify({ open })); });
 
 const listen = (s, host = '127.0.0.1', port = 0) => new Promise(done => s.listen(port, host, () => done(s.address().port)));
 // Every TCP connection to the servers, with where it came in, so a check can say nothing came.
@@ -116,7 +119,7 @@ writeFileSync(logFile, '');
 const lan = createServer((q, s) => { handle(q, s).catch(() => s.destroy()); });
 lan.on('connection', c => log({ conn: 'lan', local: `${c.localAddress}:${c.localPort}` }));
 const lanPort = lanIp ? await listen(lan, lanIp) : 0;
-const forbidden = createTcp(c => { log({ conn: 'forbidden', local: `${c.localAddress}:${c.localPort}` }); c.destroy(); });
+const forbidden = createTcp(c => { c.on('error', () => {}); log({ conn: 'forbidden', local: `${c.localAddress}:${c.localPort}` }); c.destroy(); });
 if (lanPort) await listen(forbidden, '127.0.0.1', lanPort);
 const config = { http: httpPort, tls: tlsPort, proxy: proxyPort, control: controlPort, lanIp: lanIp ?? '', lan: lanPort };
 for (const d of [out, appDir]) writeFileSync(join(d, 'net.json'), JSON.stringify(config));

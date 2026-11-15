@@ -32,6 +32,7 @@
     "tls.roots",
     "key.remove-race",
     "confirm.race",
+    "exec.responsive-control",
     "system.idle",
     "wake.hidden",
     "toast.app-id",

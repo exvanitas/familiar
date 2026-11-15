@@ -291,6 +291,20 @@ describe('DNS over TCP and the check\'s DNS server', () => {
     expect(reassembleDns([syn(7, 0), fin])[0].incomplete).toMatch(/bytes missing/);
   });
 
+  it('a reused tuple whose new SYN was lost, with a lower sequence, is incomplete, never dropped', () => {
+    const benign = framed('benign.familiar-check.test'), hidden = framed('hidden.familiar-check.test');
+    const fin = { ...seg(benign, 50000, benign.length, benign.length, 2), flags: FIN | ACK };
+    // The same ports again, a new connection starting at 100; its SYN wasn't captured.
+    const got = reassembleDns([syn(50000, 0), seg(benign, 50000, 0, benign.length, 1), fin, seg(hidden, 100, 0, hidden.length, 4)]);
+    expect(got).toHaveLength(1);
+    expect(got[0].names).toEqual(['benign.familiar-check.test']);
+    expect(got[0].incomplete).toMatch(/outside the connection's window/);
+    expect(got[0].incomplete).toMatch(/traffic after the close that isn't a resend/);
+    // A resend of what came before the close is fine.
+    const resent = reassembleDns([syn(50000, 0), seg(benign, 50000, 0, benign.length, 1), fin, seg(benign, 50000, 0, benign.length, 3)]);
+    expect(resent[0].incomplete).toBeUndefined();
+  });
+
   it('two connections on one reused tuple stay apart', () => {
     const one = framed('first.familiar-check.test'), two = framed('second.familiar-check.test');
     const got = reassembleDns([syn(100, 0), seg(one, 100, 0, one.length, 1), { ...seg(one, 100, one.length, one.length, 2), flags: FIN | ACK }, syn(900000, 3), seg(two, 900000, 0, two.length, 4)]);
