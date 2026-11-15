@@ -1,14 +1,29 @@
 // The model port's contract. Every adapter runs these cases: the fake model now, the pi-ai adapter
 // (over recorded responses) from step 4. Plain async checks, so any test runner can drive them.
 
-import type { ModelEvent, ModelPort, ModelRequest } from '../model/port.ts';
+import type { ChatMessage, ModelEvent, ModelPort, ModelRequest } from '../model/port.ts';
 
 /** What the harness must prime a port to do for each case. */
 export type ContractScenario =
   | 'text' // replies with CONTRACT_TEXT and stops
   | 'tool-call' // calls CONTRACT_TOOL_CALL's tool with its arguments
   | 'auth-error' // the endpoint refuses the key
-  | 'slow'; // a reply long enough to stop part way: at least two events before its end
+  | 'slow' // a reply long enough to stop part way: at least two events before its end
+  // Signed thinking (as CONTRACT_THINKING, where the API shows it), then CONTRACT_TOOL_CALL. The signature
+  // is wherever the API puts it: Anthropic's on the thinking block, OpenRouter's in reasoning details,
+  // Gemini's on the tool call.
+  | 'thinking-tool-call'
+  // Answers CONTRACT_TEXT only if the request carries back, at messages[1], what 'thinking-tool-call'
+  // gave to replay. Without it, refuses the request as written (bad-request), as Anthropic does when
+  // signed thinking is missing.
+  | 'replay-check'
+  | 'bad-tool-arguments' // calls CONTRACT_TOOL_CALL's tool with arguments that aren't valid JSON
+  | 'cache' // CONTRACT_TEXT, with usage that has CONTRACT_CACHE's input and cache reads
+  | 'length' // some text, then it stops because it reached its length limit
+  | 'filtered' // a content filter stops it
+  | 'rate-limit' // HTTP 429 with Retry-After: 2
+  | 'overloaded' // the endpoint says it's overloaded and didn't take the request (503, or Anthropic's 529)
+  | 'server-error'; // HTTP 500: the endpoint failed, and the request might have been half done
 
 export interface ModelPortHarness {
   forScenario(scenario: ContractScenario): ModelPort;
@@ -34,6 +49,25 @@ export const CONTRACT_REQUEST: ModelRequest = {
     }
   ]
 };
+
+export const CONTRACT_THINKING = 'They want the time. Use get_time.';
+/** Usage in the 'cache' scenario: input counts every input token, cached ones included. */
+export const CONTRACT_CACHE = { inputTokens: 1300, cacheReadTokens: 1200 } as const;
+export const CONTRACT_TOOL_RESULT = '12:00 UTC';
+/** Every recorded error body holds this, so the contract can tell when an adapter repeats one. */
+export const ENDPOINT_WORDS = 'endpoint-words';
+
+/** The turn after 'thinking-tool-call': its call, and the call's result. */
+export function followUp(call: Extract<ChatMessage, { role: 'assistant' }>): ModelRequest {
+  return {
+    ...CONTRACT_REQUEST,
+    messages: [
+      CONTRACT_REQUEST.messages[0]!,
+      call,
+      { role: 'tool', toolCallId: call.toolCalls![0]!.id, toolName: CONTRACT_TOOL_CALL.name, content: CONTRACT_TOOL_RESULT }
+    ]
+  };
+}
 
 /** How long a stream may take to end after an abort before it counts as hung. */
 export const ABORT_DEADLINE_MS = 2000;
@@ -104,6 +138,113 @@ export const modelPortContract: readonly ContractCase[] = [
       check(last?.type === 'done', `ended with ${JSON.stringify(last)}`);
       for (const n of [last.usage.inputTokens, last.usage.outputTokens]) {
         check(Number.isInteger(n) && n >= 0, `usage ${JSON.stringify(last.usage)}`);
+      }
+    }
+  },
+  {
+    name: 'signed thinking comes back on the next turn: the reply gives replay state that survives JSON, and the endpoint takes it',
+    async run(h) {
+      const events = await collect(h.forScenario('thinking-tool-call').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      const thinking = events.flatMap((e) => (e.type === 'thinking' ? [e.delta] : [])).join('');
+      check(thinking === '' || thinking === CONTRACT_THINKING, `thinking was ${JSON.stringify(thinking)}`);
+      const calls = events.flatMap((e) => (e.type === 'tool-call' ? [e.call] : []));
+      check(calls.length === 1 && calls[0]!.name === CONTRACT_TOOL_CALL.name, `calls were ${JSON.stringify(calls)}`);
+      const last = events.at(-1);
+      check(last?.type === 'done' && last.stopReason === 'tool-calls', `ended with ${JSON.stringify(last)}`);
+      check(last.replay !== undefined && typeof last.replay.adapter === 'string', 'the reply gave nothing to replay');
+      // Stored as JSON, the way the journal keeps it.
+      const replay = JSON.parse(JSON.stringify(last.replay)) as typeof last.replay;
+      const assistant = { role: 'assistant', content: '', toolCalls: calls } as const;
+      const withIt = await collect(h.forScenario('replay-check').stream(followUp({ ...assistant, replay })));
+      checkOneTerminalLast(withIt);
+      const text = withIt.flatMap((e) => (e.type === 'text' ? [e.delta] : [])).join('');
+      const end = withIt.at(-1);
+      check(end?.type === 'done' && end.stopReason === 'end' && text === CONTRACT_TEXT, `with the replay it ended with ${JSON.stringify(end)}`);
+      // The control: without it the same turn is refused, so the pass above means it was carried back.
+      const without = await collect(h.forScenario('replay-check').stream(followUp(assistant)));
+      const refused = without.at(-1);
+      check(refused?.type === 'error' && refused.error.kind === 'bad-request', `without the replay it ended with ${JSON.stringify(refused)}`);
+    }
+  },
+  {
+    name: 'a tool call whose arguments are not valid JSON ends in an invalid-tool-call error, and is never passed on',
+    async run(h) {
+      const events = await collect(h.forScenario('bad-tool-arguments').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      check(!events.some((e) => e.type === 'tool-call'), 'a tool call with bad arguments was passed on');
+      const last = events.at(-1);
+      check(last?.type === 'error' && last.error.kind === 'invalid-tool-call', `ended with ${JSON.stringify(last)}`);
+      check(last.error.toolName === CONTRACT_TOOL_CALL.name, `the error names ${JSON.stringify(last.error.toolName)}`);
+    }
+  },
+  {
+    name: 'cache usage is reported as part of the input',
+    async run(h) {
+      const events = await collect(h.forScenario('cache').stream(CONTRACT_REQUEST));
+      const last = events.at(-1);
+      check(last?.type === 'done', `ended with ${JSON.stringify(last)}`);
+      const u = last.usage;
+      check(u.inputTokens === CONTRACT_CACHE.inputTokens && u.cacheReadTokens === CONTRACT_CACHE.cacheReadTokens, `usage ${JSON.stringify(u)}`);
+      const write = u.cacheWriteTokens ?? 0;
+      check(Number.isInteger(write) && write >= 0 && u.cacheReadTokens + write <= u.inputTokens, `cache writes ${JSON.stringify(u)}`);
+    }
+  },
+  {
+    name: 'a reply cut off at its length limit ends in done with stop reason length',
+    async run(h) {
+      const events = await collect(h.forScenario('length').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      check(events.some((e) => e.type === 'text'), 'no text before the stop');
+      const last = events.at(-1);
+      check(last?.type === 'done' && last.stopReason === 'length', `ended with ${JSON.stringify(last)}`);
+    }
+  },
+  {
+    name: 'a content filter ends the reply in a filtered error',
+    async run(h) {
+      const events = await collect(h.forScenario('filtered').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      const last = events.at(-1);
+      check(last?.type === 'error' && last.error.kind === 'filtered', `ended with ${JSON.stringify(last)}`);
+    }
+  },
+  {
+    name: 'HTTP 429 is a rate-limit error with its Retry-After, marked as not processed',
+    async run(h) {
+      const events = await collect(h.forScenario('rate-limit').stream(CONTRACT_REQUEST));
+      check(events.length === 1, `expected only the error, got ${JSON.stringify(events)}`);
+      const e = events[0];
+      check(e?.type === 'error' && e.error.kind === 'rate-limit', `got ${JSON.stringify(e)}`);
+      check(e.error.retryAfterMs === 2000 && e.error.notProcessed === true, `got ${JSON.stringify(e.error)}`);
+    }
+  },
+  {
+    name: 'an overloaded endpoint is a server error marked as not processed',
+    async run(h) {
+      const events = await collect(h.forScenario('overloaded').stream(CONTRACT_REQUEST));
+      check(events.length === 1, `expected only the error, got ${JSON.stringify(events)}`);
+      const e = events[0];
+      check(e?.type === 'error' && e.error.kind === 'server' && e.error.notProcessed === true, `got ${JSON.stringify(e)}`);
+    }
+  },
+  {
+    name: 'HTTP 500 is a server error that might have been half done',
+    async run(h) {
+      const events = await collect(h.forScenario('server-error').stream(CONTRACT_REQUEST));
+      check(events.length === 1, `expected only the error, got ${JSON.stringify(events)}`);
+      const e = events[0];
+      check(e?.type === 'error' && e.error.kind === 'server' && e.error.notProcessed === undefined, `got ${JSON.stringify(e)}`);
+    }
+  },
+  {
+    name: "no error repeats the endpoint's own words",
+    async run(h) {
+      for (const s of ['auth-error', 'rate-limit', 'overloaded', 'server-error', 'filtered', 'bad-tool-arguments'] as const) {
+        const last = (await collect(h.forScenario(s).stream(CONTRACT_REQUEST))).at(-1);
+        check(last?.type === 'error', `${s} ended with ${JSON.stringify(last)}`);
+        // A message that passes on an endpoint's text could pass on a key it echoed.
+        check(!JSON.stringify(last).includes(ENDPOINT_WORDS), `${s}: the error repeats the endpoint's text: ${JSON.stringify(last)}`);
       }
     }
   }

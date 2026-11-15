@@ -8,6 +8,10 @@
     "build": "node scripts/build.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json"
   },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "@familiar/core": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "22.20.5",
     "esbuild": "0.28.2",

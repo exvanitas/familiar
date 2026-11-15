@@ -222,6 +222,10 @@ const MESSAGES: Record<ModelErrorKind, string> = {
   network: 'Could not reach the endpoint.',
   'bad-request': 'The endpoint refused the request as written.',
   server: 'The endpoint failed to answer.',
+  // Added to the port in step 4; the spike never produces them.
+  'not-found': 'The endpoint has no such model.',
+  filtered: 'A content filter stopped the reply.',
+  'invalid-tool-call': 'A tool call had invalid arguments.',
   aborted: 'Stopped.',
   unknown: 'The model call failed.'
 };

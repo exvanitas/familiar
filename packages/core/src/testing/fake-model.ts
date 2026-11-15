@@ -5,6 +5,7 @@ import type {
   ModelEvent,
   ModelPort,
   ModelRequest,
+  Replay,
   StopReason,
   ToolCall,
   Usage
@@ -24,8 +25,10 @@ export interface FakeReply {
   readonly chunkSize?: number;
   /** Holds the stream after this many events until `until` settles, so a test can act mid-reply. */
   readonly pause?: { readonly afterEvents: number; readonly until: Promise<void> };
-  /** Defaults to a rough count from the request and reply sizes. */
+  /** Defaults to a rough count from the request and reply sizes. With `error`, sent on the error event. */
   readonly usage?: Usage;
+  /** Sent on the 'done' event, as an adapter sends signed thinking to carry back next turn. */
+  readonly replay?: Replay;
 }
 
 /** Either a fixed list of replies, used in order, or a function of the request. */
@@ -84,11 +87,12 @@ async function* replyEvents(reply: FakeReply, request: ModelRequest, signal?: Ab
     return;
   }
   if (reply.error) {
-    yield { type: 'error', error: reply.error };
+    yield { type: 'error', error: reply.error, ...(reply.usage ? { usage: reply.usage } : {}) };
     return;
   }
   const stopReason = reply.stopReason ?? (reply.toolCalls?.length ? 'tool-calls' : 'end');
-  yield { type: 'done', stopReason, usage: reply.usage ?? roughUsage(request, reply) };
+  const usage = reply.usage ?? roughUsage(request, reply);
+  yield { type: 'done', stopReason, usage, ...(reply.replay ? { replay: structuredClone(reply.replay) } : {}) };
 }
 
 function bodyEvents(reply: FakeReply): ModelEvent[] {

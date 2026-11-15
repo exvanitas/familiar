@@ -4,11 +4,13 @@ export { isTerminal } from './model/port.ts';
 export type {
   ChatMessage,
   JsonSchema,
+  JsonValue,
   ModelError,
   ModelErrorKind,
   ModelEvent,
   ModelPort,
   ModelRequest,
+  Replay,
   StopReason,
   ToolCall,
   ToolSpec,
@@ -30,3 +32,8 @@ export type {
   RuleEventName
 } from './decide/port.ts';
 export { BACK_AFTER_MINUTES, BUBBLE_GAP_MINUTES, SETTLE_MINUTES, decideByRules, isLateNight, rulesDecider } from './decide/rules.ts';
+
+export { costOf, createCaps, estimateInputTokens, localDay, memoryUsageStore } from './model/caps.ts';
+export type { CallInfo, CapCheck, Caps, CapsConfig, Clock, Cost, DayTotals, PauseReason, Price, UsageRecord, UsageStore } from './model/caps.ts';
+export { retryable, waitBefore, withRetries } from './model/retry.ts';
+export type { RetryOptions } from './model/retry.ts';
