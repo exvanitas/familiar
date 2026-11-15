@@ -22,7 +22,7 @@ export async function openLedger(world: NodeWorld, name = 'ledger'): Promise<Led
 }
 
 /** A UsageStore in the journal's store, opened on first use. `pause` runs before every call. */
-export function durableUsageStore(pause: () => Promise<void> = async () => {}, world: NodeWorld = nodeWorld()): UsageStore & { readonly all: Ledger['records']; readonly reservations: Ledger['open']; readonly extensions: Ledger['extensions'] } {
+export function durableUsageStore(pause: () => Promise<void> = async () => {}, world: NodeWorld = nodeWorld()): UsageStore & { readonly all: Ledger['records']; readonly reservations: Ledger['open']; readonly extensions: Ledger['extensions']; readonly folded: Ledger['turns'] } {
   let mirror = emptyLedger();
   let opened: Promise<LedgerInstance> | undefined;
   const instance = () => (opened ??= openLedger(world));
@@ -35,6 +35,9 @@ export function durableUsageStore(pause: () => Promise<void> = async () => {}, w
     },
     get extensions() {
       return mirror.extensions;
+    },
+    get folded() {
+      return mirror.turns;
     },
     async update(change) {
       await pause();

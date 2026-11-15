@@ -76,7 +76,9 @@ The claim is about committed rows: exactly one row in the store, whenever the ki
 
 ## The consent gate
 
-`gate.ts`. Every tool execution passes through one gate, pi-durable's `beforeTool` hook: a fresh call, one asked again after a restart, a "Do it now?" Yes, a Run again, and a call the model makes again on its own. Each of these is a pi-durable tool task, and every tool task runs the hook. The order:
+`gate.ts`. Every tool execution passes through one gate, pi-durable's `beforeTool` hook: a fresh call, one asked again after a restart, a "Do it now?" Yes, a Run again, and a call the model makes again on its own. Each of these is a pi-durable tool task, and every tool task runs the hook. A read or a built-in write that pi-durable recovers after a crash never passes `beforeTool`, because its intent was already recorded. So each tool's own execute runs the same gate again before it enters the tool, against today's policy. Test: `turns.test.ts` › "a built-in write allowed before the crash and denied before the reopen never runs when it is recovered". Dropping the gate from execute fails it.
+
+The order:
 
 1. The bounds on tool calls (below).
 2. A parked interruption: a call to a tool that's waiting for Run again or skip, or that was skipped in this turn, doesn't run.
@@ -110,7 +112,10 @@ Mutations that fail them:
 ## Parked waits
 
 - **Consent** (`beforeTool`): a call the gate says asks stores its card, keyed by the step's id, then asks the consent port. While a card is open the state is `waiting`. The card leaves the document when the step ends, in the hook that runs just before its result is stored. The wait observes the call's abort signal. So `close()` never hangs on an unanswered card: the card stays unanswered in the journal, and the owner lock is released whatever happens. Test: `journal.test.ts` › "close never hangs on a pending consent". Ignoring the signal makes it hang.
-- **A parked interruption.** When a cut-off effect or server tool becomes a `redo` or `rerun` question, the round's `afterTools` hook ends the run, so the model gets no further request. It can't call the tool again on its own. The turn ends as `asks`, with the question, and the state is `waiting`.
+- **A parked interruption.** When a cut-off effect or server tool becomes a `redo` or `rerun` question, the round's `afterTools` hook stops that run, so the model gets no further request. It can't call the tool again on its own. The turn ends as `asks`, with the question, and the state is `waiting`.
+  - The parked state is read from the journal (an open question for one of the round's steps), so it holds after a restart.
+  - The hook stops only the run's own task (`abortTask`), never the conversation: a conversation abort would withdraw the messages queued behind it. A message you sent while the call ran stays queued, and goes on with your answer.
+  - Test: `turns.test.ts` › "a message sent while another's effect runs is kept when that call is parked after a crash". B is still queued after the restart, never aborted, and answered once you answer A. Resending B's request id gives that answer. Aborting the conversation instead fails it, with B aborted.
   - Yes is a new step, through the gate: Run again, or "Do it now?", which asks consent again.
   - Skip continues the turn without it. The gate refuses that tool for the rest of the turn.
   - Until the person answers, the gate refuses any other call of that tool too, as a second line.
@@ -139,7 +144,7 @@ The step cap counts replies, so on its own it doesn't bound how many calls one r
 
 A call past either bound never runs. The `beforeTool` hook blocks it before anything else is asked, consent included. The model gets a tool error that says why: "Familiar stopped after 8 tool calls in one reply. This call was not run." The chat gets one line per reply, or per turn: a `familiar.notice` entry, "Familiar stopped after 8 tool calls in one reply." or "Familiar stopped after 32 tool calls in this turn."
 
-**The count is in the journal.** A tool-budget document holds the turn's admitted and refused calls by step id, changed in one commit per call. A call's place in its reply is its position among the reply's calls, which the journal keeps. A call asked again after a restart keeps its verdict: admitted stays admitted, refused stays refused, so a resume can't run a refused call. Only a message you send starts a new turn. A step-cap or cap-pause Yes, a "Do it now?" and a Run again carry on the turn they answer: their submission and its turn are written in one commit. A call that's admitted and then denied consent still counts. The count errs high.
+**The count is in the journal.** Each turn's record in the turn registry (below) holds its admitted and refused calls by step id, changed in one commit per call. Another turn running meanwhile has its own record and can't reset it. A call's place in its reply is its position among the reply's calls, which the journal keeps. A call asked again after a restart keeps its verdict: admitted stays admitted, refused stays refused, so a resume can't run a refused call. Only a message you send starts a new turn. A step-cap or cap-pause Yes, a "Do it now?" and a Run again carry on the turn they answer: their submission and its turn are written in one commit. A call that's admitted and then denied consent still counts. The count errs high.
 
 Tests (`bounds.test.ts`):
 
@@ -173,7 +178,7 @@ The caps ledger (step 4's `createCaps`) now keeps its reservations and settled s
 
 - **Atomic over the store.** `UsageStore` has one write: `update(change)` runs `change` on the whole ledger as one atomic step. In the journal's store that's one pi-durable commit. pi-durable's Session runs one commit at a time on its line, a commit's callback and its settlement, and the database has one owner. `before` and `settle` are each one update, the check and the reservation together. The in-memory lock step 4 had is gone. A lock in memory is what a second instance or a reload would bypass, and the store's own atomicity can't be bypassed.
 - **Survives a restart.** A reservation is stored before its call is sent. Only the instance that made it can settle it, so one left open by a crash or a reload stays open, still counts toward every cap, and becomes a spent record at its deadline (30 minutes), at what was reserved.
-- **Bounded.** Settled records of a finished turn older than two days fold into per-turn totals, and a folded turn unused for 30 days is dropped. A turn that can still go on is never folded or dropped, however old: the turn asking, a turn with a call in flight, and the journal's current turns. A turn can wait weeks on a consent card and then go on with its spend counted. Tests:
+- **Bounded.** Settled records of a finished turn older than two days fold into per-turn totals, and a folded turn unused for 30 days is dropped. A turn that can still resume is never folded or dropped, however old. The ledger reads which turns those are from the turn registry, in the same commit as each change, plus the turn asking and any turn with a call in flight. A turn can wait weeks on a question and then go on with its spend counted. Tests:
   - `ledger.test.ts` › "a turn that is not finished keeps its spend whole".
   - `journal.test.ts` › "a turn waiting 31 days on a consent card, then approved".
   - The rule removed fails both.
@@ -183,9 +188,39 @@ The caps ledger (step 4's `createCaps`) now keeps its reservations and settled s
   - the fold
   - 100 seeded interleavings where the engine is killed in the middle of concurrent calls, then reopened on the same store, with about a third of the calls starting after the restart. It checks that spend never passes a cap, and that no reservation the dead instance held is lost or shrinks. It also checks they're all spent records past their deadline. Two mutations fail it: dropping expired reservations, and reading the ledger outside the commit that writes it.
 
+## The turn registry
+
+`turns.ts`. Every turn's own state is keyed by its id in one journal document, and none of it is dropped or folded until the turn is finished:
+
+- **Budget:** its tool calls, admitted and refused, per turn.
+- **Ledger:** through the caps ledger, keyed by the same id, its token extensions and spend history.
+- **Questions:** its open questions, each carrying its turn's id. A pause or the step cap records its question when the run ends.
+
+A turn starts with a message you send. It goes on across every "go on", "Do it now?" and Run again, which carry its id in the commit of their submission. It's resumable while anything durable can resume it: an open question, a parked consent card, a message queued in it, or calls in flight. It's finished only explicitly:
+
+- its run ends with no question and no open card left for it
+- or you say no to going on
+
+Only the run's own turn is finished. A message queued meanwhile has its own turn, still open. The oldest finished turns are forgotten beyond 64.
+
+Tests (`turns.test.ts`):
+
+- "turn A parked at its 32nd call while turn B runs tools": when A resumes, its 33rd call is refused. Keying the budget by the current turn fails it.
+- "A's question left open 31 days while B runs and tidies": when A resumes, its spend still counts, and it pauses at its turn cap. A ledger that doesn't read the registry fails it.
+- The caps property test has a parked turn kept across a month's jump while other turns tidy around it. Every settled record of the parked turn must still count. A `tidy` that ignores resumable turns fails it.
+- The bounds property test runs two turns in each seed:
+  - A is parked across a restart, with B queued behind it, while C runs its own tools.
+  - Then Run again is given twice at once.
+  - No turn runs more than 32 calls or 8 per reply, no refused call ever runs, the two answers are one continuation, and B is answered, never lost.
+  - Keying the budget by the current turn, aborting the conversation, and dropping the in-commit answer check each fail it.
+
 ## A person's actions
 
-- **An answer is one commit.** `answer` writes the answer and what it starts (a continue, or a message asking her to do it again) in one commit, and keeps the submission's id. Answering again, after a restart too, returns the same turn and starts nothing more.
+- **An answer is one commit, checked inside it.** `answer` writes the answer and what it starts (a continue, or a message asking her to do it again) in one commit, and keeps the submission's id. It reads the answer record inside that committing transaction, before any submission or extension change. An answer already there returns its result, and changes nothing. A Yes's extension is also granted once per Yes id in the ledger.
+  - Answering again, after a restart or at the same moment, returns the same turn and starts nothing more.
+  - Test: `turns.test.ts` › "two overlapping answers to one turn-tokens pause give one turn and grant exactly one extension". Dropping the in-commit check fails it.
+  - Kill test, after the commit: `turns.test.ts` › "a kill after the answer's commit". The kill lands as the answer's own commit transaction opens (read-write over every store), which lets it finish. Before the retry, the extension and the continue submission are both stored, and the retry grants nothing more. Writing the extension in a commit of its own fails it.
+  - Kill test, before the commit (the control): a kill before the commit stores nothing, and the retry grants the extension once.
   - Test: `person.test.ts` kills at every transaction of an answer (k = 1 to 12), then answers again. Every time the turn goes on exactly once, and its notes are written once.
   - The two commits that came before fail it: the answer stored, nothing started, and the turn stuck.
 - **A message is acted on once per request id.** `send` looks up what an earlier send with the same id did before it reads the text. A resend gets the original result, kept in the journal with the submission, whatever has changed since.

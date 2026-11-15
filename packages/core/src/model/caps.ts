@@ -456,13 +456,14 @@ export function cappedPort(port: ModelPort, caps: Caps, info: (request: ModelReq
  * A usage store in memory, for tests. `pause` runs before every update and read, so a test can interleave
  * calls; the change itself runs without yielding, so an update is atomic.
  */
-export function memoryUsageStore(pause: () => Promise<void> = async () => {}): UsageStore & { readonly all: readonly UsageRecord[]; readonly reservations: readonly Reservation[]; readonly extensions: Readonly<Record<string, number>> } {
+export function memoryUsageStore(pause: () => Promise<void> = async () => {}): UsageStore & { readonly all: readonly UsageRecord[]; readonly reservations: readonly Reservation[]; readonly extensions: Readonly<Record<string, number>>; readonly folded: Ledger['turns'] } {
   let ledger = emptyLedger();
   const copy = (l: Ledger): Ledger => structuredClone(l);
   return {
     get all() { return ledger.records; },
     get reservations() { return ledger.open; },
     get extensions() { return ledger.extensions; },
+    get folded() { return ledger.turns; },
     async update(change) {
       await pause();
       // On a throw nothing changes, as a store transaction would roll back.

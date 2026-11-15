@@ -123,6 +123,8 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 | 17 | Other agent apps as buddies, through the same driver (in their own repos) | A started turn shows on that agent's buddy | 11 |
 | 18 | A release, Codex reviews and fixes | No open P1 or P2 | 3 |
 
+Every narrow review after a batch of fixes in steps 3 to 5 found a new, smaller layer. So step 14 holds one fresh review of the whole app before release, and its 8 hours assume one more layer of fixes. The reviews so far were charged to each step's own rework row.
+
 ## Shipping
 
 GitHub releases (a per-user installer, or a zip of the exe and its app folder, with SHA-256 sums), and winget once the repo is public. No Microsoft Store. Unsigned until free signing for open-source projects (SignPath) after the public flip, so the README says what Windows will show.

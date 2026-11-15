@@ -239,3 +239,118 @@ describe('the bound under random replies and restarts', () => {
     expect(kills).toBeGreaterThan(15);
   });
 });
+
+/* ---------- two turns: one parked across a restart, one running, a Yes given twice ---------- */
+
+const usersOf = (r: ModelRequest) => r.messages.flatMap((m, i) => (m.role === 'user' ? [{ i, text: m.content }] : []));
+function lastUser(r: ModelRequest) {
+  const u = usersOf(r).at(-1)!;
+  return { text: u.text, replies: r.messages.slice(u.i).filter((m) => m.role === 'assistant').length };
+}
+
+async function twoTurns(seed: number): Promise<{ problems: string[]; refused: number; parked: boolean }> {
+  const rand = rng(seed);
+  const world = nodeWorld();
+  // Heavy enough that A, before and after its park, asks for more than 32 calls.
+  const n = () => 6 + Math.floor(rand() * 7);
+  // Turn A: some replies of reads, then one whose last call is a server tool, cut off by a kill. B is sent
+  // while it runs, and queues. After the restart A is parked; C runs tools of its own; then the person
+  // says Run again, twice at once, and A goes on with more replies, the server tool first.
+  const before = Array.from({ length: 2 + Math.floor(rand() * 3) }, n);
+  // At most 7, so the server tool is within its reply's 8 and really starts.
+  const lastBatch = Math.floor(rand() * 8);
+  const after = Array.from({ length: 2 + Math.floor(rand() * 3) }, n);
+  const cReplies = Array.from({ length: 1 + Math.floor(rand() * 3) }, n);
+  const keys = (tag: string, k: number) => Array.from({ length: k }, (_, i) => ({ id: `${tag}-${i}`, name: 'look', arguments: { what: `${tag}-${i}` } }));
+  const script = (r: ModelRequest): FakeReply => {
+    const { text, replies } = lastUser(r);
+    if (text === 'Turn A') {
+      if (replies < before.length) return { toolCalls: keys(`A.${replies}`, before[replies]!) };
+      if (replies === before.length) return { toolCalls: [...keys(`A.${replies}`, lastBatch), { id: 'A-srv', name: 'server_lookup', arguments: { q: 'A.srv' } }] };
+      return { text: 'A stops.' };
+    }
+    if (text.startsWith('Run ')) {
+      if (replies < after.length) return { toolCalls: [...(replies === 0 ? [{ id: 'A-srv2', name: 'server_lookup', arguments: { q: 'A.srv2' } }] : []), ...keys(`A.r${replies}`, after[replies]!)] };
+      return { text: 'A done.' };
+    }
+    if (text === 'Turn C') return replies < cReplies.length ? { toolCalls: keys(`C.${replies}`, cReplies[replies]!) } : { text: 'C done.' };
+    return { text: `Answered: ${text}` };
+  };
+  const ran: string[] = [];
+  const requests: ModelRequest[] = [];
+  const open = async (life: number) =>
+    openFor(envOf(world, life), await world.open('two-turns'), {
+      script,
+      onRun: (name, a) => ran.push(name === 'look' ? a.what : a.q),
+      hang: (name) => life === 1 && name === 'server_lookup'
+    });
+  const one = await open(1);
+  void one.journal.send('Turn A', 'a');
+  for (let i = 0; i < 500 && world.counters.get('hung:server_lookup') < 1; i++) await sleep(5);
+  const problems: string[] = [];
+  const parkedHere = world.counters.get('hung:server_lookup') >= 1;
+  if (parkedHere) await one.journal.send('Turn B', 'b');
+  requests.push(...one.model.requests);
+  one.journal.kill();
+
+  const two = await open(2);
+  const a = await two.journal.send('Turn A', 'a');
+  const aEnd = a.replied ? await a.turn.wait() : undefined;
+  // C: its own turn, its own budget, run while A is parked.
+  if (aEnd?.status === 'asks') {
+    const c = await two.journal.send('Turn C', 'c');
+    if (c.replied) await c.turn.wait();
+    // Run again, given twice at once: one continuation.
+    const [x, y] = await Promise.all([two.journal.answer(aEnd.question.id, true, 'again-1'), two.journal.answer(aEnd.question.id, true, 'again-2')]);
+    if (x?.id !== y?.id) problems.push(`seed ${seed}: two answers gave two turns, ${x?.id} and ${y?.id}`);
+    if (x) await x.wait();
+  }
+  // No queued message is lost: B, sent while A ran, is answered, never aborted, and a resend gives that.
+  if (parkedHere) {
+    const b = await two.journal.send('Turn B', 'b');
+    const bEnd = b.replied ? await Promise.race([b.turn.wait(), sleep(3000).then(() => 'stuck' as const)]) : 'ack';
+    if (typeof bEnd === 'string' || bEnd.status !== 'answered') problems.push(`seed ${seed}: B ended ${JSON.stringify(bEnd)}`);
+  }
+  requests.push(...two.model.requests);
+  for (const q of await two.journal.questions()) await two.journal.answer(q.id, false, `no-${q.id}`);
+  await two.journal.close();
+
+  const runAgains = requests.filter((r) => lastUser(r).text.startsWith('Run ') && lastUser(r).replies === 0).length;
+  if (runAgains > 1) problems.push(`seed ${seed}: Run again reached the model ${runAgains} times`);
+  const distinct = [...new Set(ran)];
+  const inA = distinct.filter((k) => k.startsWith('A.'));
+  const inC = distinct.filter((k) => k.startsWith('C.'));
+  if (inA.length > TOOL_CALLS_PER_TURN) problems.push(`seed ${seed}: turn A ran ${inA.length} calls`);
+  if (inC.length > TOOL_CALLS_PER_TURN) problems.push(`seed ${seed}: turn C ran ${inC.length} calls`);
+  const replyOf = (k: string) => k.split('-')[0]!;
+  const perReply = new Map<string, number>();
+  for (const k of [...inA, ...inC]) perReply.set(replyOf(k), (perReply.get(replyOf(k)) ?? 0) + 1);
+  for (const [reply, count] of perReply) if (count > TOOL_CALLS_PER_REPLY) problems.push(`seed ${seed}: reply ${reply} ran ${count} calls`);
+  let refused = 0;
+  for (const [id, content] of results(requests)) {
+    if (!content.includes('Familiar stopped after')) continue;
+    refused++;
+    const key = id === 'A-srv2' ? 'A.srv2' : id.replace(/-(\d+)$/, '-$1');
+    if (ran.includes(key)) problems.push(`seed ${seed}: refused call ${key} ran`);
+  }
+  return { problems, refused, parked: parkedHere };
+}
+
+describe('the bound across two turns, a park, a restart and a Yes given twice', () => {
+  it('over 15 seeds: no turn runs more than 32 calls or 8 per reply, no refused call runs, one Yes is one continuation, and no queued message is lost', { timeout: 240_000 }, async () => {
+    const problems: string[] = [];
+    let refused = 0;
+    let parked = 0;
+    for (let seed = 1; seed <= 15; seed++) {
+      const run = await twoTurns(seed);
+      problems.push(...run.problems);
+      refused += run.refused;
+      parked += run.parked ? 1 : 0;
+    }
+    expect(problems.slice(0, 5)).toEqual([]);
+    expect(refused).toBeGreaterThan(10);
+    // Most seeds really parked A across the restart, with B queued behind it.
+    expect(parked).toBeGreaterThan(7);
+  });
+});
+

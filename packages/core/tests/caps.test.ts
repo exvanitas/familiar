@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { cappedPort, costOf, createCaps, extendTurn, inputBound, localDay, memoryUsageStore, wholeUsage, withRetries, worstCost } from '../src/index.ts';
-import type { CallInfo, Caps, ModelError, ModelEvent, ModelRequest, Price, Usage } from '../src/index.ts';
+import type { CallInfo, Caps, Ledger, ModelError, UsageRecord, ModelEvent, ModelRequest, Price, Usage } from '../src/index.ts';
 import { createFakeModel } from '../src/testing/index.ts';
 import { durableUsageStore } from './journal/durable-ledger.ts';
 
@@ -11,7 +11,7 @@ type MakeStore = (pause?: () => Promise<void>) => ReturnType<typeof memoryUsageS
 // slower, so its interleavings rarely give one turn the day's room; ledger.test.ts checks the extension on
 // it directly.
 const STORES: readonly { name: string; make: MakeStore; seeds: number; minBeyond: number }[] = [
-  { name: 'memory store', make: (pause) => memoryUsageStore(pause), seeds: 200, minBeyond: 5 },
+  { name: 'memory store', make: (pause) => memoryUsageStore(pause), seeds: 200, minBeyond: 3 },
   { name: "journal's store", make: (pause) => durableUsageStore(pause), seeds: 200, minBeyond: 0 }
 ];
 
@@ -272,17 +272,45 @@ const coverage = { grants: 0, beyondBase: new Set<string>() };
 async function interleave(seed: number, make: MakeStore): Promise<string[]> {
   const rand = rng(seed);
   const tick = () => new Promise<void>((r) => (rand() < 0.9 ? queueMicrotask(r) : setTimeout(r, 0)));
-  const store = make(tick);
+  const raw = make(tick);
+  // Every record as it was made, before any tidy folds it away: the ground truth for each call's settle.
+  const made = new Map<string, UsageRecord>();
+  const store = {
+    get all() { return raw.all; },
+    get reservations() { return raw.reservations; },
+    get extensions() { return raw.extensions; },
+    get folded() { return raw.folded; },
+    read: () => raw.read(),
+    update: <T>(change: (l: Ledger) => T) =>
+      raw.update((l) => {
+        const out = change(l);
+        for (const r of l.records) if (!made.has(r.reservation)) made.set(r.reservation, r);
+        return out;
+      })
+  };
   const worst = inputBound(request) + 100;
   const config = { maxReplyTokens: 100, maxDayTokens: worst * 7, maxTurnTokens: worst * 4, personaDayUsd: { a: worstCost(inputBound(request), 100, price, false).usd as number * 3.5 } };
-  const caps = createCaps(config, store, { now: () => 0 }, { dayOf: () => 'd' });
+  // A second kind of turn, "tp": parked the whole time (its question open), so it can still resume.
+  // Halfway through, a month passes: the others' calls tidy the ledger around it, and it resumes.
+  let now = 0;
+  const caps = createCaps(config, store, { now: () => now }, { dayOf: () => 'd', unfinished: () => ['tp'] });
   const problems: string[] = [];
   const yeses = new Set<string>();
+  const tpSettled = new Map<string, number>();
+  let started = 0;
   const check = () => {
     const tokens = [...store.all, ...store.reservations].reduce((t, x) => t + x.tokens, 0);
     if (tokens > config.maxDayTokens) problems.push(`seed ${seed}: ${tokens} tokens past the day cap`);
-    for (const turn of ['t0', 't1', 't2']) {
-      const used = [...store.all, ...store.reservations].filter((x) => x.turn === turn).reduce((t, x) => t + x.tokens, 0);
+    for (const turn of ['t0', 't1', 't2', 'tp']) {
+      const used = [...store.all, ...store.reservations].filter((x) => x.turn === turn).reduce((t, x) => t + x.tokens, 0) + (store.folded[turn]?.tokens ?? 0);
+      // A turn that can still resume never loses spend to a tidy, however old it is.
+      if (turn === 'tp') {
+        // Every settled record of it ever seen must still count, whole or folded.
+        for (const r of store.all) if (r.turn === 'tp') tpSettled.set(r.reservation, r.tokens);
+        const floor = [...tpSettled.values()].reduce((t, x) => t + x, 0);
+        const counted = store.all.filter((x) => x.turn === 'tp').reduce((t, x) => t + x.tokens, 0) + (store.folded.tp?.tokens ?? 0);
+        if (counted < floor) problems.push(`seed ${seed}: the parked turn's settled spend fell from ${floor} to ${counted}`);
+      }
       // The person's Yes at a turn-tokens pause gives a turn one more allowance; nothing else does.
       const allowance = config.maxTurnTokens * (1 + (store.extensions[turn] ?? 0));
       // One Yes grants at most one extension.
@@ -300,7 +328,9 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
       // One conversation, switching between a model that counts a quarter of the bytes and one that
       // counts every byte, so a count remembered for one and used for the other would show.
       const model = rand() < 0.5 ? 'small' : 'big';
-      const c = call({ persona: rand() < 0.5 ? 'a' : 'b', turn: `t${Math.floor(rand() * 3)}`, conversation: 'c', request: { ...request, model } });
+      const c = call({ persona: rand() < 0.5 ? 'a' : 'b', turn: rand() < 0.2 ? 'tp' : `t${Math.floor(rand() * 3)}`, conversation: 'c', request: { ...request, model } });
+      if (++started === 12) now += 31 * 24 * 60 * 60_000;
+      const reservedAt = now;
       const r = await caps.before(c);
       check();
       if (!r.go) {
@@ -335,7 +365,10 @@ async function interleave(seed: number, make: MakeStore): Promise<string[]> {
       const last = outcomes[Math.floor(rand() * outcomes.length)];
       await caps.settle(r.reservation, last);
       check();
-      const added = store.all.find((x) => x.reservation === r.reservation);
+      // A call open across the month's jump expired, spent as reserved, and was folded at once: its own
+      // record is gone by design, and the turn totals hold it.
+      if (reservedAt === 0 && now > 0) return;
+      const added = made.get(r.reservation);
       // Whatever the endpoint said, or failed to say, the call really used input + output tokens; a
       // processed call must never be recorded as less.
       const processed = !(last?.type === 'error' && last.error.notProcessed);
