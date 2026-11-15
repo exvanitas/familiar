@@ -1,87 +1,273 @@
 import { describe, expect, it } from 'vitest';
-import { costOf, createCaps, estimateInputTokens, localDay, memoryUsageStore } from '../src/index.ts';
-import type { ModelRequest, Price } from '../src/index.ts';
+import { cappedPort, costOf, createCaps, inputBound, localDay, memoryUsageStore, withRetries, worstCost } from '../src/index.ts';
+import type { CallInfo, Caps, ModelError, ModelEvent, ModelRequest, Price, Usage } from '../src/index.ts';
+import { createFakeModel } from '../src/testing/index.ts';
 
 const request: ModelRequest = { model: 'm', system: 'You are kind.', messages: [{ role: 'user', content: 'Hello there' }], tools: [] };
 const price: Price = { inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75 };
-const at = (iso: string) => ({ now: () => new Date(iso).getTime() });
 const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+const at = (iso: string) => ({ now: () => new Date(iso).getTime() });
+const call = (o: Partial<CallInfo> = {}): CallInfo => ({ request, persona: 'p', turn: 't1', price, ...o });
+type Terminal = Extract<ModelEvent, { type: 'done' | 'error' }>;
+const done = (usage: Usage, extra: object = {}): Terminal => ({ type: 'done', stopReason: 'end', usage, ...extra });
+const failed = (error: ModelError, extra: object = {}): Terminal => ({ type: 'error', error, ...extra });
+
+async function go(caps: Caps, c: CallInfo) {
+  const r = await caps.before(c);
+  if (!r.go) throw new Error(`paused: ${r.message}`);
+  return r;
+}
 
 describe('cost', () => {
   it('prices plain input, cache reads, cache writes and output each at their own rate', () => {
     const c = costOf({ inputTokens: 1_300_000, outputTokens: 100_000, cacheReadTokens: 1_000_000, cacheWriteTokens: 100_000 }, price);
-    // 200k plain at $3, 1M read at $0.30, 100k written at $3.75, 100k out at $15
     expect(c.usd).toBeCloseTo(0.6 + 0.3 + 0.375 + 1.5, 10);
   });
-  it('is unknown, never $0, when the model has no price', () => {
-    expect(costOf({ inputTokens: 10, outputTokens: 10 }, undefined)).toEqual({ usd: 'unknown' });
+  it('uses the tier for a large input', () => {
+    const tiered: Price = { inputPerMTok: 2, outputPerMTok: 12, tiers: [{ inputTokensAbove: 200_000, inputPerMTok: 4, outputPerMTok: 18 }] };
+    expect(costOf({ inputTokens: 100_000, outputTokens: 0 }, tiered).usd).toBeCloseTo(0.2, 10);
+    expect(costOf({ inputTokens: 300_000, outputTokens: 0 }, tiered).usd).toBeCloseTo(1.2, 10);
   });
-  it('is unknown when cache tokens were used and the cache price is missing', () => {
+  it('is unknown, never $0, without a price, or with cache tokens and no cache price', () => {
+    expect(costOf({ inputTokens: 10, outputTokens: 10 }, undefined)).toEqual({ usd: 'unknown' });
     expect(costOf({ inputTokens: 10, outputTokens: 1, cacheReadTokens: 5 }, { inputPerMTok: 1, outputPerMTok: 1 })).toEqual({ usd: 'unknown' });
   });
-  it('a free local model is priced at $0, which is known', () => {
-    expect(costOf({ inputTokens: 10, outputTokens: 10 }, { inputPerMTok: 0, outputPerMTok: 0 })).toEqual({ usd: 0 });
+  it('the worst case takes the highest rate that could apply: a cache write over input, and the top tier', () => {
+    expect(worstCost(1_000_000, 0, price, false).usd).toBe(3);
+    expect(worstCost(1_000_000, 0, price, true).usd).toBe(3.75);
+    const tiered: Price = { inputPerMTok: 2, outputPerMTok: 12, tiers: [{ inputTokensAbove: 200_000, inputPerMTok: 4, outputPerMTok: 18 }] };
+    expect(worstCost(1_000_000, 1_000_000, tiered, false).usd).toBe(22);
+    // With caching, a cache rate that could apply but isn't known makes it unknown.
+    expect(worstCost(10, 10, { inputPerMTok: 1, outputPerMTok: 1 }, true)).toEqual({ usd: 'unknown' });
   });
 });
 
-describe('caps', () => {
+describe('the input bound', () => {
+  const tokensAtMost = (s: string) => new TextEncoder().encode(s).length;
+  it('holds for CJK and emoji, where a third of the characters falls far short', () => {
+    for (const text of ['你好，世界。今天天气很好。'.repeat(50), '🙂🎉👍🏽🧑‍🚀'.repeat(50), 'mixed 混合 🙂 text'.repeat(40)]) {
+      const r: ModelRequest = { model: 'm', system: '', messages: [{ role: 'user', content: text }], tools: [] };
+      // A byte-level tokenizer gives at most one token per byte.
+      expect(inputBound(r)).toBeGreaterThanOrEqual(tokensAtMost(text));
+      expect(Math.ceil(text.length / 3)).toBeLessThan(tokensAtMost(text));
+    }
+  });
+
+  it("is tightened by the last final input count for the same conversation's prefix, plus the bytes added since", async () => {
+    const caps = createCaps({ maxReplyTokens: 100 }, memoryUsageStore(), at('2026-11-15T10:00:00Z'), { dayOf: day });
+    const big: ModelRequest = { ...request, messages: [{ role: 'user', content: 'x'.repeat(4000) }] };
+    const first = await go(caps, call({ request: big, conversation: 'c1' }));
+    expect(first.inputBound).toBe(inputBound(big));
+    await caps.settle(first.reservation, done({ inputTokens: 1010, outputTokens: 20 }));
+    const next: ModelRequest = { ...big, messages: [...big.messages, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'more' }] };
+    const second = await go(caps, call({ request: next, conversation: 'c1' }));
+    expect(second.inputBound).toBeLessThan(inputBound(next));
+    expect(second.inputBound).toBe(1010 + inputBound(next) - inputBound(big));
+    // A changed prefix gets no such help.
+    const edited: ModelRequest = { ...next, messages: [{ role: 'user', content: 'y'.repeat(4000) }, ...next.messages.slice(1)] };
+    expect((await go(caps, call({ request: edited, conversation: 'c1' }))).inputBound).toBe(inputBound(edited));
+  });
+});
+
+describe('the ledger', () => {
   it('caps each reply at maxReplyTokens, and keeps a smaller request', async () => {
     const caps = createCaps({ maxReplyTokens: 500 }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
-    expect(await caps.before({ request, persona: 'p', turnTokens: 0, price })).toEqual({ go: true, maxOutputTokens: 500 });
-    const small = await caps.before({ request: { ...request, maxOutputTokens: 80 }, persona: 'p', turnTokens: 0, price });
-    expect(small).toEqual({ go: true, maxOutputTokens: 80 });
+    expect((await go(caps, call())).maxOutputTokens).toBe(500);
+    expect((await go(caps, call({ request: { ...request, maxOutputTokens: 80 } }))).maxOutputTokens).toBe(80);
   });
 
-  it('pauses a turn when one more reply could pass its token cap', async () => {
-    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: 1000 }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
-    const input = estimateInputTokens(request);
-    expect((await caps.before({ request, persona: 'p', turnTokens: 1000 - 100 - input, price })).go).toBe(true);
-    const r = await caps.before({ request, persona: 'p', turnTokens: 1000 - 100 - input + 1, price });
-    expect(r).toMatchObject({ go: false, pause: 'turn-tokens' });
+  it('two calls that overlap cannot both spend the same remainder', async () => {
+    const cap = inputBound(request) + 100;
+    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: cap + 50 }, memoryUsageStore(() => new Promise((r) => setTimeout(r, 1))), at('2026-11-15T10:00:00Z'));
+    const [a, b] = await Promise.all([caps.before(call()), caps.before(call())]);
+    expect([a.go, b.go].sort()).toEqual([false, true]);
   });
 
-  it('counts tokens per day across personas, priced or not, and a new day starts again', async () => {
-    const store = memoryUsageStore();
+  it('a turn and a day count open reservations, and a new day starts again', async () => {
     let now = new Date('2026-11-15T10:00:00Z').getTime();
-    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: 5000 }, store, { now: () => now }, day);
-    await caps.after({ persona: 'a', model: 'm', usage: { inputTokens: 3000, outputTokens: 500 }, price });
-    await caps.after({ persona: 'b', model: 'local', usage: { inputTokens: 1300, outputTokens: 100 }, price: undefined });
-    const r = await caps.before({ request, persona: 'a', turnTokens: 0, price });
-    expect(r).toMatchObject({ go: false, pause: 'day-tokens' });
+    const worst = inputBound(request) + 100;
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2, maxDayTokens: worst * 3 }, memoryUsageStore(), { now: () => now }, { dayOf: day });
+    await go(caps, call());
+    await go(caps, call());
+    expect(await caps.before(call())).toMatchObject({ go: false, pause: 'turn-tokens' });
+    await go(caps, call({ turn: 't2' }));
+    expect(await caps.before(call({ turn: 't3' }))).toMatchObject({ go: false, pause: 'day-tokens' });
     now = new Date('2026-11-16T10:00:00Z').getTime();
-    expect((await caps.before({ request, persona: 'a', turnTokens: 0, price })).go).toBe(true);
+    expect((await caps.before(call({ turn: 't4' }))).go).toBe(true);
   });
 
-  it("checks a persona's daily cap against today's spend plus the reply's longest cost, and pauses", async () => {
-    const store = memoryUsageStore();
-    const caps = createCaps({ maxReplyTokens: 1000, personaDayUsd: { a: 0.05 } }, store, at('2026-11-15T10:00:00Z'), day);
-    // The longest reply here costs about 1000 * $15 / 1M = $0.015, plus a little input.
-    expect((await caps.before({ request, persona: 'a', turnTokens: 0, price })).go).toBe(true);
-    await caps.after({ persona: 'a', model: 'm', usage: { inputTokens: 1000, outputTokens: 2500 }, price }); // $0.0405
-    const r = await caps.before({ request, persona: 'a', turnTokens: 0, price });
+  it("a persona's dollar cap counts today's spend plus open reservations plus the call's worst cost", async () => {
+    const caps = createCaps({ maxReplyTokens: 1000, personaDayUsd: { a: 0.04 } }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    const first = await go(caps, call({ persona: 'a' }));
+    expect(first.reserved.usd).toBeCloseTo(worstCost(first.inputBound, 1000, price, false).usd as number, 12);
+    await go(caps, call({ persona: 'a' }));
+    const r = await caps.before(call({ persona: 'a' }));
     expect(r).toMatchObject({ go: false, pause: 'persona-day-usd' });
-    expect(r.go === false && r.message).toContain('$0.0405');
-    // Another persona's spend is its own.
-    expect((await caps.before({ request, persona: 'b', turnTokens: 0, price })).go).toBe(true);
+    expect((await caps.before(call({ persona: 'b' }))).go).toBe(true);
   });
 
-  it("pauses a capped persona when the model's price isn't known, rather than count it as free", async () => {
-    const caps = createCaps({ maxReplyTokens: 100, personaDayUsd: { a: 1 } }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
-    const r = await caps.before({ request, persona: 'a', turnTokens: 0, price: undefined });
-    expect(r).toMatchObject({ go: false, pause: 'persona-unpriced' });
-    expect((await caps.before({ request, persona: 'uncapped', turnTokens: 0, price: undefined })).go).toBe(true);
+  it('pauses a capped persona when any rate that could apply is unknown, and a token cap still works', async () => {
+    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: 100_000, personaDayUsd: { a: 1 } }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    expect(await caps.before(call({ persona: 'a', price: undefined }))).toMatchObject({ go: false, pause: 'persona-unpriced' });
+    expect(await caps.before(call({ persona: 'a', price: { inputPerMTok: 1, outputPerMTok: 1 }, caching: true }))).toMatchObject({ go: false, pause: 'persona-unpriced' });
+    expect((await caps.before(call({ persona: 'uncapped', price: undefined }))).go).toBe(true);
   });
 
-  it('records each call with its day, tokens and cost', async () => {
+  describe('settling', () => {
+    const fresh = () => {
+      const store = memoryUsageStore();
+      return { store, caps: createCaps({ maxReplyTokens: 100 }, store, at('2026-11-15T10:00:00Z')) };
+    };
+    it('drops to the actual usage when the endpoint reported its final count', async () => {
+      const { store, caps } = fresh();
+      const r = await go(caps, call());
+      await caps.settle(r.reservation, done({ inputTokens: 10, outputTokens: 5 }));
+      expect(store.all.map((x) => x.tokens)).toEqual([15]);
+      expect(store.reservations).toEqual([]);
+    });
+    it('usage the endpoint never reported is unknown, never zero: the reservation stays spent', async () => {
+      const { store, caps } = fresh();
+      const r = await go(caps, call());
+      await caps.settle(r.reservation, done({ inputTokens: 0, outputTokens: 0 }, { unreported: true }));
+      expect(store.all.map((x) => x.tokens)).toEqual([r.reserved.tokens]);
+    });
+    it('a stop, an error after sending, or a stream that ended early stays spent as reserved', async () => {
+      for (const last of [failed({ kind: 'aborted', message: 'Stopped.' }), failed({ kind: 'server', message: 'x' }), failed({ kind: 'network', message: 'x' }, { usage: { inputTokens: 1, outputTokens: 1 } }), undefined]) {
+        const { store, caps } = fresh();
+        const r = await go(caps, call());
+        await caps.settle(r.reservation, last);
+        expect(store.all[0]!.tokens).toBe(r.reserved.tokens);
+        expect(store.all[0]!.cost.usd).toBe(r.reserved.usd);
+      }
+    });
+    it('partial usage never settles below what was reported', async () => {
+      const { store, caps } = fresh();
+      const r = await go(caps, call());
+      const huge = { inputTokens: r.reserved.tokens * 2, outputTokens: 0 };
+      await caps.settle(r.reservation, failed({ kind: 'network', message: 'x' }, { usage: huge }));
+      expect(store.all[0]!.tokens).toBe(huge.inputTokens);
+    });
+    it('releases only when the endpoint said it did not take the request', async () => {
+      const { store, caps } = fresh();
+      const r = await go(caps, call());
+      expect(await caps.settle(r.reservation, failed({ kind: 'rate-limit', message: 'x', notProcessed: true }))).toEqual({ usd: 0 });
+      expect(store.all).toEqual([]);
+      expect(store.reservations).toEqual([]);
+    });
+    it('final usage on an error (a filter, a bad tool call) settles to it', async () => {
+      const { store, caps } = fresh();
+      const r = await go(caps, call());
+      await caps.settle(r.reservation, failed({ kind: 'filtered', message: 'x' }, { usage: { inputTokens: 30, outputTokens: 2 }, usageFinal: true }));
+      expect(store.all[0]!.tokens).toBe(32);
+    });
+    it('a reservation not settled within its deadline stays spent, and a late settle changes nothing', async () => {
+      let now = 0;
+      const store = memoryUsageStore();
+      const caps = createCaps({ maxReplyTokens: 100 }, store, { now: () => now }, { reservationMs: 1000, dayOf: () => 'd' });
+      const r = await go(caps, call());
+      now = 2000;
+      await go(caps, call());
+      expect(store.all.map((x) => x.tokens)).toEqual([r.reserved.tokens]);
+      expect(await caps.settle(r.reservation, done({ inputTokens: 1, outputTokens: 1 }))).toBeUndefined();
+      expect(store.all.map((x) => x.tokens)).toEqual([r.reserved.tokens]);
+    });
+  });
+
+  it('every retry takes its own reservation, and a not-processed try is released', async () => {
     const store = memoryUsageStore();
-    const caps = createCaps({ maxReplyTokens: 100 }, store, at('2026-11-15T23:30:00Z'), day);
-    const cost = await caps.after({ persona: 'a', model: 'm', usage: { inputTokens: 10, outputTokens: 5 }, price: undefined });
-    expect(cost).toEqual({ usd: 'unknown' });
-    expect(store.records).toEqual([{ at: new Date('2026-11-15T23:30:00Z').getTime(), day: '2026-11-15', persona: 'a', model: 'm', tokens: 15, cost }]);
+    const caps = createCaps({ maxReplyTokens: 100 }, store, at('2026-11-15T10:00:00Z'));
+    const busy: ModelError = { kind: 'rate-limit', message: 'x', notProcessed: true };
+    const model = createFakeModel([{ error: busy }, { error: busy }, { text: 'ok', usage: { inputTokens: 9, outputTokens: 1 } }]);
+    const reserved: string[] = [];
+    const counting: Caps = { before: async (c) => { const r = await caps.before(c); if (r.go) reserved.push(r.reservation); return r; }, settle: caps.settle };
+    const port = withRetries(cappedPort(model, counting, () => ({ persona: 'p', turn: 't', price })), { sleep: async () => {} });
+    for await (const _ of port.stream(request)) void _;
+    expect(new Set(reserved).size).toBe(3);
+    expect(store.all.map((x) => x.tokens)).toEqual([10]);
+  });
+
+  it('a capped port pauses over a cap and sends nothing; a reader that stops early leaves it spent', async () => {
+    const store = memoryUsageStore();
+    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: 10 }, store, at('2026-11-15T10:00:00Z'));
+    const model = createFakeModel([{ text: 'never' }]);
+    const events: ModelEvent[] = [];
+    for await (const e of cappedPort(model, caps, () => ({ persona: 'p', turn: 't', price })).stream(request)) events.push(e);
+    expect(events).toMatchObject([{ type: 'error', error: { kind: 'paused', pause: 'day-tokens' } }]);
+    expect(model.requests).toHaveLength(0);
+
+    const roomy = createCaps({ maxReplyTokens: 100 }, store, at('2026-11-15T10:00:00Z'));
+    const long = createFakeModel([{ text: 'a long reply', chunkSize: 1 }]);
+    for await (const e of cappedPort(long, roomy, () => ({ persona: 'p', turn: 't', price })).stream(request)) { void e; break; }
+    expect(store.all).toHaveLength(1);
+    expect(store.reservations).toEqual([]);
   });
 
   it('localDay is the local calendar date', () => {
-    const d = new Date(2026, 0, 2, 0, 30);
-    expect(localDay(d.getTime())).toBe('2026-01-02');
+    expect(localDay(new Date(2026, 0, 2, 0, 30).getTime())).toBe('2026-01-02');
+  });
+});
+
+/* ---------- the property: seeded random interleavings ---------- */
+
+function rng(seed: number) {
+  let s = seed >>> 0;
+  return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+}
+
+async function interleave(seed: number): Promise<string[]> {
+  const rand = rng(seed);
+  const tick = () => new Promise<void>((r) => (rand() < 0.9 ? queueMicrotask(r) : setTimeout(r, 0)));
+  const store = memoryUsageStore(tick);
+  const worst = inputBound(request) + 100;
+  const config = { maxReplyTokens: 100, maxDayTokens: worst * 7, maxTurnTokens: worst * 4, personaDayUsd: { a: worstCost(inputBound(request), 100, price, false).usd as number * 3.5 } };
+  const caps = createCaps(config, store, { now: () => 0 }, { dayOf: () => 'd' });
+  const problems: string[] = [];
+  const check = () => {
+    const tokens = [...store.all, ...store.reservations].reduce((t, x) => t + x.tokens, 0);
+    if (tokens > config.maxDayTokens) problems.push(`seed ${seed}: ${tokens} tokens past the day cap`);
+    for (const turn of ['t0', 't1', 't2']) {
+      const used = [...store.all, ...store.reservations].filter((x) => x.turn === turn).reduce((t, x) => t + x.tokens, 0);
+      if (used > config.maxTurnTokens) problems.push(`seed ${seed}: turn ${turn} at ${used}`);
+    }
+    const usd = [...store.all.filter((r) => r.persona === 'a').map((r) => r.cost.usd), ...store.reservations.filter((r) => r.persona === 'a').map((r) => r.usd)].reduce<number>((t, x) => t + (x as number), 0);
+    if (usd > config.personaDayUsd.a + 1e-12) problems.push(`seed ${seed}: persona a at $${usd}`);
+  };
+  await Promise.all(
+    Array.from({ length: 24 }, async () => {
+      for (let n = Math.floor(rand() * 3); n > 0; n--) await tick();
+      const c = call({ persona: rand() < 0.5 ? 'a' : 'b', turn: `t${Math.floor(rand() * 3)}` });
+      const r = await caps.before(c);
+      check();
+      if (!r.go) return;
+      for (let n = Math.floor(rand() * 4); n > 0; n--) await tick();
+      const input = Math.floor(rand() * r.inputBound), output = Math.floor(rand() * r.maxOutputTokens);
+      const usage = { inputTokens: input, outputTokens: output };
+      const outcomes: (Terminal | undefined)[] = [
+        done(usage),
+        done({ inputTokens: 0, outputTokens: 0 }, { unreported: true }),
+        failed({ kind: 'rate-limit', message: 'x', notProcessed: true }),
+        failed({ kind: 'server', message: 'x' }, { usage }),
+        failed({ kind: 'filtered', message: 'x' }, { usage, usageFinal: true }),
+        failed({ kind: 'aborted', message: 'Stopped.' }),
+        undefined
+      ];
+      const last = outcomes[Math.floor(rand() * outcomes.length)];
+      await caps.settle(r.reservation, last);
+      check();
+      const added = store.all.find((x) => x.reservation === r.reservation);
+      if (last?.usage && !(last.type === 'error' && last.error.notProcessed) && (!added || added.tokens < last.usage.inputTokens + last.usage.outputTokens)) {
+        problems.push(`seed ${seed}: settled to ${added?.tokens ?? "nothing"}, below the reported ${last.usage.inputTokens + last.usage.outputTokens}`);
+      }
+    })
+  );
+  check();
+  return problems;
+}
+
+describe('the ledger under concurrent calls', () => {
+  it('over 200 seeded interleavings, recorded plus reserved spend never passes a cap, and nothing settles below reported usage', { timeout: 60000 }, async () => {
+    const problems: string[] = [];
+    for (let seed = 1; seed <= 200; seed++) problems.push(...(await interleave(seed)));
+    expect(problems.slice(0, 5)).toEqual([]);
   });
 });

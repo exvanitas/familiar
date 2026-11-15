@@ -22,8 +22,16 @@ export type ContractScenario =
   | 'length' // some text, then it stops because it reached its length limit
   | 'filtered' // a content filter stops it
   | 'rate-limit' // HTTP 429 with Retry-After: 2
-  | 'overloaded' // the endpoint says it's overloaded and didn't take the request (503, or Anthropic's 529)
-  | 'server-error'; // HTTP 500: the endpoint failed, and the request might have been half done
+  // 529 or 503 with the provider's own sign it didn't take the request: `x-should-retry: true`, or
+  // Anthropic's `overloaded_error` body
+  | 'overloaded'
+  | 'unavailable' // a bare 503, with no such sign: it might have been half done
+  | 'server-error' // HTTP 500: the endpoint failed, and the request might have been half done
+  | 'redirected-rate-limit' // a 429, reached through a redirect, so not proof of anything
+  | 'unsafe-tool-arguments' // calls CONTRACT_TOOL_CALL's tool with the arguments {"toString": null}
+  | 'no-usage' // CONTRACT_TEXT, and the endpoint reports no usage at all
+  | 'stream-timeout' // some text, then the stream goes quiet past the transport's idle limit (timeout)
+  | 'stream-too-large'; // a reply larger than the transport's size limit (too-large)
 
 export interface ModelPortHarness {
   forScenario(scenario: ContractScenario): ModelPort;
@@ -176,6 +184,48 @@ export const modelPortContract: readonly ContractCase[] = [
       const last = events.at(-1);
       check(last?.type === 'error' && last.error.kind === 'invalid-tool-call', `ended with ${JSON.stringify(last)}`);
       check(last.error.toolName === CONTRACT_TOOL_CALL.name, `the error names ${JSON.stringify(last.error.toolName)}`);
+      check(last.usage !== undefined && last.usageFinal === true, `the spend wasn't passed on: ${JSON.stringify(last)}`);
+    }
+  },
+  {
+    name: 'arguments that name what every object has ({"toString": null}) end in an invalid-tool-call error',
+    async run(h) {
+      const events = await collect(h.forScenario('unsafe-tool-arguments').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      check(!events.some((e) => e.type === 'tool-call'), 'the call was passed on');
+      const last = events.at(-1);
+      check(last?.type === 'error' && last.error.kind === 'invalid-tool-call', `ended with ${JSON.stringify(last)}`);
+    }
+  },
+  {
+    name: 'a reply with no usage reported says so, rather than claim zero',
+    async run(h) {
+      const events = await collect(h.forScenario('no-usage').stream(CONTRACT_REQUEST));
+      const last = events.at(-1);
+      check(last?.type === 'done' && last.unreported === true, `ended with ${JSON.stringify(last)}`);
+      const text = (await collect(h.forScenario('text').stream(CONTRACT_REQUEST))).at(-1);
+      check(text?.type === 'done' && text.unreported === undefined, `a reply with usage said it had none: ${JSON.stringify(text)}`);
+    }
+  },
+  {
+    name: "a stream that goes quiet past the transport's idle limit ends in a network error with the transport's word",
+    async run(h) {
+      const events = await collect(h.forScenario('stream-timeout').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      check(events.some((e) => e.type === 'text'), 'no text before the stall');
+      const last = events.at(-1);
+      check(last?.type === 'error' && last.error.kind === 'network' && last.error.transport === 'timeout', `ended with ${JSON.stringify(last)}`);
+      check(last.error.notProcessed === undefined, 'a request that was answered part way was marked not processed');
+    }
+  },
+  {
+    name: "a reply past the transport's size limit ends in a network error with the transport's word",
+    async run(h) {
+      const events = await collect(h.forScenario('stream-too-large').stream(CONTRACT_REQUEST));
+      checkOneTerminalLast(events);
+      const last = events.at(-1);
+      check(last?.type === 'error' && last.error.kind === 'network' && last.error.transport === 'too-large', `ended with ${JSON.stringify(last)}`);
+      check(last.error.notProcessed === undefined, 'a request that was answered part way was marked not processed');
     }
   },
   {
@@ -197,7 +247,7 @@ export const modelPortContract: readonly ContractCase[] = [
       checkOneTerminalLast(events);
       check(events.some((e) => e.type === 'text'), 'no text before the stop');
       const last = events.at(-1);
-      check(last?.type === 'done' && last.stopReason === 'length', `ended with ${JSON.stringify(last)}`);
+      check(last?.type === 'done' && last.stopReason === 'length' && last.unreported === undefined, `ended with ${JSON.stringify(last)}`);
     }
   },
   {
@@ -207,6 +257,7 @@ export const modelPortContract: readonly ContractCase[] = [
       checkOneTerminalLast(events);
       const last = events.at(-1);
       check(last?.type === 'error' && last.error.kind === 'filtered', `ended with ${JSON.stringify(last)}`);
+      check(last.usage !== undefined && last.usageFinal === true, `the spend wasn't passed on: ${JSON.stringify(last)}`);
     }
   },
   {
@@ -220,7 +271,7 @@ export const modelPortContract: readonly ContractCase[] = [
     }
   },
   {
-    name: 'an overloaded endpoint is a server error marked as not processed',
+    name: "an overload with the provider's own not-processed sign is a server error marked as not processed",
     async run(h) {
       const events = await collect(h.forScenario('overloaded').stream(CONTRACT_REQUEST));
       check(events.length === 1, `expected only the error, got ${JSON.stringify(events)}`);
@@ -238,9 +289,23 @@ export const modelPortContract: readonly ContractCase[] = [
     }
   },
   {
+    name: 'a bare 503 is a server error that might have been half done',
+    async run(h) {
+      const e = (await collect(h.forScenario('unavailable').stream(CONTRACT_REQUEST)))[0];
+      check(e?.type === 'error' && e.error.kind === 'server' && e.error.notProcessed === undefined, `got ${JSON.stringify(e)}`);
+    }
+  },
+  {
+    name: 'a 429 reached through a redirect is not proof the request was not processed',
+    async run(h) {
+      const e = (await collect(h.forScenario('redirected-rate-limit').stream(CONTRACT_REQUEST)))[0];
+      check(e?.type === 'error' && e.error.kind === 'rate-limit' && e.error.notProcessed === undefined, `got ${JSON.stringify(e)}`);
+    }
+  },
+  {
     name: "no error repeats the endpoint's own words",
     async run(h) {
-      for (const s of ['auth-error', 'rate-limit', 'overloaded', 'server-error', 'filtered', 'bad-tool-arguments'] as const) {
+      for (const s of ['auth-error', 'rate-limit', 'overloaded', 'unavailable', 'server-error', 'filtered', 'bad-tool-arguments'] as const) {
         const last = (await collect(h.forScenario(s).stream(CONTRACT_REQUEST))).at(-1);
         check(last?.type === 'error', `${s} ended with ${JSON.stringify(last)}`);
         // A message that passes on an endpoint's text could pass on a key it echoed.

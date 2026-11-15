@@ -29,6 +29,10 @@ export interface FakeReply {
   readonly usage?: Usage;
   /** Sent on the 'done' event, as an adapter sends signed thinking to carry back next turn. */
   readonly replay?: Replay;
+  /** The endpoint gave no usage: 'done' says so. */
+  readonly unreported?: true;
+  /** With `error` and `usage`: the usage is the endpoint's final count. */
+  readonly usageFinal?: true;
 }
 
 /** Either a fixed list of replies, used in order, or a function of the request. */
@@ -87,12 +91,16 @@ async function* replyEvents(reply: FakeReply, request: ModelRequest, signal?: Ab
     return;
   }
   if (reply.error) {
-    yield { type: 'error', error: reply.error, ...(reply.usage ? { usage: reply.usage } : {}) };
+    yield { type: 'error', error: reply.error, ...(reply.usage ? { usage: reply.usage } : {}), ...(reply.usage && reply.usageFinal ? { usageFinal: true as const } : {}) };
     return;
   }
   const stopReason = reply.stopReason ?? (reply.toolCalls?.length ? 'tool-calls' : 'end');
   const usage = reply.usage ?? roughUsage(request, reply);
-  yield { type: 'done', stopReason, usage, ...(reply.replay ? { replay: structuredClone(reply.replay) } : {}) };
+  yield {
+    type: 'done', stopReason, usage: reply.unreported ? { inputTokens: 0, outputTokens: 0 } : usage,
+    ...(reply.replay ? { replay: structuredClone(reply.replay) } : {}),
+    ...(reply.unreported ? { unreported: true as const } : {})
+  };
 }
 
 function bodyEvents(reply: FakeReply): ModelEvent[] {

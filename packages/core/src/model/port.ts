@@ -75,7 +75,8 @@ export type ModelErrorKind =
   | 'not-found' // the endpoint has no such model, or no such path (HTTP 404)
   | 'server' // the endpoint failed
   | 'filtered' // a content filter stopped the reply, or the model refused
-  | 'invalid-tool-call' // the model called a tool with arguments that aren't a JSON object
+  | 'invalid-tool-call' // the model called a tool with a malformed name or arguments that aren't a plain JSON object
+  | 'paused' // a cap stopped the call before anything was sent (see caps.ts)
   | 'aborted' // the caller's signal fired
   | 'unknown';
 
@@ -86,14 +87,18 @@ export interface ModelError {
   readonly retryAfterMs?: number;
   /**
    * Set only when the endpoint or the transport said the request was not acted on, so sending it again
-   * can't do anything twice: HTTP 429, 503 or 529, Anthropic's `x-should-retry: true`, or a connection
-   * that was never made. Absent means it might have been half done.
+   * can't do anything twice, and nothing was billed: an HTTP 429, a 503 or 529 that carries the
+   * provider's own signal (`x-should-retry: true`, or Anthropic's `overloaded_error`), or a request
+   * the transport refused before sending. Never after a redirect. Absent means it might have been
+   * half done.
    */
   readonly notProcessed?: true;
   /** Why the transport failed, in its own word (for the guarded fetch: `no-key`, `not-saved`, `timeout`...). */
   readonly transport?: string;
-  /** For `invalid-tool-call`: which tool the model tried to call. */
+  /** For `invalid-tool-call`: which tool the model tried to call, when it named one properly. */
   readonly toolName?: string;
+  /** For `paused`: which cap. */
+  readonly pause?: string;
 }
 
 /**
@@ -104,9 +109,16 @@ export type ModelEvent =
   | { readonly type: 'text'; readonly delta: string }
   | { readonly type: 'thinking'; readonly delta: string }
   | { readonly type: 'tool-call'; readonly call: ToolCall }
-  | { readonly type: 'done'; readonly stopReason: StopReason; readonly usage: Usage; readonly replay?: Replay }
-  /** `usage` is there when the endpoint reported it before failing, so the spend can still be counted. */
-  | { readonly type: 'error'; readonly error: ModelError; readonly usage?: Usage };
+  /**
+   * `unreported`: the endpoint gave no usage for the call, so `usage` holds zeros that mean nothing.
+   * Spend is then unknown, never zero.
+   */
+  | { readonly type: 'done'; readonly stopReason: StopReason; readonly usage: Usage; readonly replay?: Replay; readonly unreported?: true }
+  /**
+   * `usage` is what the endpoint had reported when the reply ended, so spend can still be counted.
+   * `usageFinal` says it is the endpoint's final count for the call; without it, it may be partial.
+   */
+  | { readonly type: 'error'; readonly error: ModelError; readonly usage?: Usage; readonly usageFinal?: true };
 
 export interface ModelPort {
   /**
