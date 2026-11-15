@@ -64,10 +64,16 @@ This keeps the spike's condition (every tool unsafe except pure reads) with the 
 
 **Built-in writes.** `step.write(change)` runs the write in one pi-durable commit together with the step's receipt, so a note or a reminder is all made or not made. A rerun of the step finds the receipt and gets the first run's value back without writing again. Writes are matched by their order within the step. pi-durable commits the step's result in its own commit right after, and that's the one gap: a kill between the two reruns the step, which then finds its receipt. `write-started` kills exactly there. Only outside effects can be cut off mid-call.
 
+The claim is about committed rows: exactly one row in the store, whenever the kill lands. The fake note store appends rows, so a second write would show. Each row carries the life that made it, and the step's result must carry the same token, so the receipt matches the row. A write's change can run twice, once in a life a kill cut off before its commit landed, and that's fine: nothing of that run was stored. The tests count rows, not calls:
+
+- `write-started`: the kill comes after the write's commit. One row, from life 1. The rerun's change never runs.
+- The every-point test (`kill.test.ts` and `browser.test.ts`): the connection is dropped right after each transaction from the tool's start to past the turn's end (k = 1 to 14). In Chromium the page is also closed at 16 seeded delays, 0 to 39 ms after the tool starts. Every run gives exactly one row, matching the result. Runs take both paths: the row made again in life 2 (the kill came before the commit), and the row from life 1 found by its receipt.
+- Splitting the write and its receipt into two commits fails the every-point test in Node and in Chromium, with two rows.
+
 ## Parked waits
 
 - **Consent** (`beforeTool`): a tool marked `asks` stores its card, keyed by the step's id, then asks the consent port. While a card is open the state is `waiting`. The card leaves the document when the step ends, in the hook that runs just before its result is stored.
-- **Wake times** (`parkUntil`, for step 8's reminders): a task that sleeps until its time. The journal gives pi-durable `onWake`, so pi-durable arms no timer of its own. Each time the earliest wake changes, the journal tells the wake port (in the app, the exe's `wake_at`, so a reminder fires though the window sleeps or the app is closed), and arms its own timer while the page lives. `journal.wake()` is what the wake port calls. A wake due while the app was closed fires once, on the next open.
+- **Wake times** (`parkUntil`, for step 8's reminders): a task that sleeps until its time. The journal gives pi-durable `onWake`, so pi-durable arms no timer of its own. Each time the earliest wake changes, the journal tells the wake port (in the app, the exe's `wake_at`, so a reminder fires though the window sleeps or the app is closed), and arms its own timer while the page lives. `journal.wake()` is what the wake port calls. pi-durable offers a wake time once, when it changes, so the page's timer checks the clock when it fires and arms again if it came early (timers can fire a millisecond early). Without that, a sleep whose timer fired early was never run: `journal.test.ts` › "a wake timer that fires early arms again" checks it with timers 20 ms early. A wake due while the app was closed fires once, on the next open.
 
 ## The step cap
 

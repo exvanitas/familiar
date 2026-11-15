@@ -12,6 +12,7 @@ import { build } from 'esbuild';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CHECKS } from './checks.ts';
+import { writeWindowPath, writeWindowProblems } from './scenarios.ts';
 
 const chrome = process.env.FAMILIAR_CHROME;
 const required = process.env.FAMILIAR_REQUIRE_BROWSER === '1';
@@ -89,6 +90,44 @@ describe.runIf(chrome || required)('the journal in headless Chromium (real Index
     expect(await first.evaluate(() => (window as any).__familiar?.owned ?? false)).toBe(false);
     await context.close();
   }, 30_000);
+
+  /** One write-window run: life 1 killed as `killAfter` says, or closed `delayMs` after the tool starts. */
+  const writeWindow = async (opts: { killAfter: number } | { delayMs: number }) => {
+    const context = await browser.newContext();
+    const tag = 'killAfter' in opts ? `k${opts.killAfter}` : `d${opts.delayMs}`;
+    const url = `${base}?scenario=write-window&run=ww-${tag}-${Date.now()}&killAfter=${'killAfter' in opts ? opts.killAfter : 0}`;
+    const first = await context.newPage();
+    await first.goto(url);
+    await result(first, 'ready');
+    if ('delayMs' in opts) await first.waitForTimeout(opts.delayMs);
+    await first.close();
+    const second = await context.newPage();
+    await second.goto(url);
+    const { summary } = await result(second, 'done');
+    await context.close();
+    return summary;
+  };
+
+  it('a built-in write killed at every point through its write commits exactly one row, matching its receipt', async () => {
+    const problems: string[] = [];
+    const paths = new Set<string>();
+    // The connection dropped inside the page right after each transaction from the tool's start, then the page closed.
+    for (let k = 1; k <= 14; k++) {
+      const s = await writeWindow({ killAfter: k });
+      problems.push(...writeWindowProblems(s).map((p) => `kill after transaction ${k}: ${p}`));
+      paths.add(writeWindowPath(s));
+    }
+    // The page closed at seeded delays after the tool starts, across the write's whole window.
+    for (let seed = 1, x = 7; seed <= 16; seed++) {
+      x = (x * 1103515245 + 12345) % 2 ** 31;
+      const s = await writeWindow({ delayMs: x % 40 });
+      problems.push(...writeWindowProblems(s).map((p) => `page closed ${x % 40} ms in: ${p}`));
+      paths.add(writeWindowPath(s));
+    }
+    expect(problems).toEqual([]);
+    expect(paths).toContain('receipt');
+    expect(paths).toContain('made-again');
+  }, 120_000);
 
   for (const [name, check] of Object.entries(CHECKS)) {
     it(`${name}: ${check.title}`, async () => {

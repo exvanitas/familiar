@@ -30,13 +30,15 @@ export const CHECKS: Record<string, Check> = {
     }
   },
   'write-started': {
-    title: 'a built-in write that had started is run again, and its write, keyed by its step, is made once',
+    title: 'a built-in write that had started is run again, and its write, keyed by its step, is committed once',
     verify(s) {
       expect(s.end).toMatchObject({ status: 'answered' });
       expect(s.starts).toBe(2);
-      expect(s.writes).toBe(1);
-      expect(s.notes).toEqual(['buy milk']);
-      expect(toolResult(s).text).toBe('saved: buy milk');
+      // Counted in the store: one committed row, made in life 1 (the kill came after its commit).
+      expect(s.rows).toEqual([expect.objectContaining({ text: 'buy milk', token: 'buy milk#life1' })]);
+      // The rerun found its receipt: it got life 1's token back, and its change never ran.
+      expect(toolResult(s).text).toBe('saved: buy milk (buy milk#life1)');
+      expect(s.writeCalls).toEqual([1, 0]);
     }
   },
   'effect-started': {

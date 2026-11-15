@@ -25,6 +25,8 @@ export interface Env {
   readonly owner: OwnerLock;
   /** Life 1: the step is under way. The driver kills the engine (Node) or closes the page (Chromium). */
   ready(kill: () => void): void;
+  /** Called on every IndexedDB transaction the journal's store opens. Returns a stop. */
+  onTransaction(listener: () => void): () => void;
 }
 
 export type Summary = Record<string, unknown>;
@@ -49,7 +51,8 @@ export function offsetClock(counters: Counters): JournalClock & { advance(ms: nu
   };
 }
 
-export const NotesDoc = defineJournalDoc<{ notes: Record<string, string> }>('familiar.test-notes', () => ({ notes: {} }));
+/** The fake note store: rows appended, so a write made twice would show as two rows. */
+export const NotesDoc = defineJournalDoc<{ notes: { step: string; text: string; token: string }[] }>('familiar.test-notes', () => ({ notes: [] }));
 
 /** The fake tools: one of each kind. Each counts its starts; a hang holds it in flight for the kill. */
 export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (name: string, args: any) => void): FamiliarTool[] {
@@ -85,13 +88,16 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
       doing: (a: any) => `saving a note "${a.text}"`,
       async run(args: any, step) {
         start('save_note', args);
-        await step.write(async (tx) => {
-          env.counters.bump('writes:save_note');
-          (await tx.doc(NotesDoc)).notes[step.id] = args.text;
-          return null;
+        // The token says which life made the row. A rerun that finds its receipt gets the first token back.
+        const token = `${args.text}#life${env.life}`;
+        const got = await step.write(async (tx) => {
+          // Calls of the write's change, which a kill can cut off before its commit lands.
+          env.counters.bump(`write-calls:life${env.life}`);
+          (await tx.doc(NotesDoc)).notes.push({ step: step.id, text: args.text, token });
+          return token;
         });
         await maybeHang('save_note');
-        return `saved: ${args.text}`;
+        return `saved: ${args.text} (${got})`;
       }
     },
     {
@@ -138,11 +144,15 @@ export interface OpenOptions {
   readonly onReaction?: (decision: Decision, event: PersonaEvent) => void;
   readonly newGen?: () => string;
   readonly onRun?: (name: string, args: any) => void;
+  /** Timers that fire this many milliseconds early, as real timers can. */
+  readonly earlyTimersMs?: number;
 }
 
 /** Opens the scenario's journal over the shared store, with the fake model, tools and ports. */
 export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
-  const clock = offsetClock(env.counters);
+  const base = offsetClock(env.counters);
+  const early = o.earlyTimersMs ?? 0;
+  const clock = early ? { ...base, setTimer: (cb: () => void, ms: number, opts: { background: boolean }) => base.setTimer(cb, Math.max(0, ms - early), opts) } : base;
   const presence: PresenceSnapshot[] = [];
   const wakes: (number | undefined)[] = [];
   const model = createFakeModel((request) => {
@@ -236,8 +246,8 @@ export const SCENARIOS: readonly Scenario[] = [
 
   // A built-in write that wrote, then hung before its step was done: run again, written once.
   toolKill('write-started', 'write-started', 'save_note', { text: 'buy milk' }, async (env, j) => ({
-    writes: env.counters.get('writes:save_note'),
-    notes: Object.values((await j.read(NotesDoc))?.notes ?? {})
+    rows: (await j.read(NotesDoc))?.notes ?? [],
+    writeCalls: [env.counters.get('write-calls:life1'), env.counters.get('write-calls:life2')]
   })),
 
   // A built-in effect, started (consent given in life 1): not run again; a question instead.
@@ -382,7 +392,79 @@ export const SCENARIOS: readonly Scenario[] = [
   }
 ];
 
+/**
+ * A built-in write killed at a point through its whole window. With `kill-after` k set in the counters,
+ * life 1 drops the store's connection right after the k-th transaction since the tool started, from
+ * inside the store, so the point is exact; k runs past the turn's end too. Without it, life 1 calls
+ * `ready` as the tool starts, and the driver closes the page after a delay of its own.
+ */
+export const WRITE_WINDOW: Scenario = {
+  name: 'write-window',
+  async run(env) {
+    const store = await env.openStore('write-window');
+    const k = env.counters.get('kill-after');
+    let killed = false;
+    let stop: (() => void) | undefined;
+    const opened = await openFor(env, store, {
+      script: (r) => (lastIsTool(r) ? answerTool(r) : callOnce('save_note', { text: 'buy milk' })),
+      onRun: () => {
+        env.counters.bump(`tool-runs:life${env.life}`);
+        if (env.life !== 1 || stop) return;
+        if (k === 0) return env.ready(() => opened.journal.kill());
+        let n = 0;
+        stop = env.onTransaction(() => {
+          if (killed || ++n < k) return;
+          killed = true;
+          opened.journal.kill();
+          env.ready(() => {});
+        });
+      }
+    });
+    const { journal } = opened;
+    if (env.life === 1) {
+      const sent = await journal.send('Note: buy milk.', 'turn-1');
+      if (sent.replied) await sent.turn.wait().catch(() => undefined);
+      // k past the turn's end: the kill comes after it.
+      if (!killed) {
+        killed = true;
+        journal.kill();
+        env.ready(() => {});
+      }
+      return undefined;
+    }
+    const end = await journal.turn(await turnId(journal)).wait();
+    const summary = {
+      end,
+      rows: (await journal.read(NotesDoc))?.notes ?? [],
+      result: (await journal.transcript()).find((e) => e.role === 'toolResult')?.text,
+      writeCalls: [env.counters.get('write-calls:life1'), env.counters.get('write-calls:life2')],
+      toolRuns: [env.counters.get('tool-runs:life1'), env.counters.get('tool-runs:life2')]
+    };
+    await journal.close();
+    return summary;
+  }
+};
+
+/** Exactly one committed row, whatever the kill point, and the step's result carries that row's token. */
+export function writeWindowProblems(s: any): string[] {
+  const p: string[] = [];
+  if (s.end?.status !== 'answered') p.push(`turn ended ${JSON.stringify(s.end)}`);
+  if (s.rows.length !== 1) p.push(`${s.rows.length} committed rows: ${JSON.stringify(s.rows)}`);
+  else if (!String(s.result).includes(`(${s.rows[0].token})`)) p.push(`result ${s.result} does not match the committed row ${s.rows[0].token}`);
+  return p;
+}
+
+/** Which way a run went: the row from life 1 found by its receipt, or made in life 2. */
+export function writeWindowPath(s: any): 'receipt' | 'made-again' | 'before-tool' | 'other' {
+  const token = s.rows[0]?.token ?? '';
+  if (token.endsWith('#life1') && s.toolRuns[1] > 0 && s.writeCalls[1] === 0) return 'receipt';
+  if (token.endsWith('#life2') && s.writeCalls[0] > 0) return 'made-again';
+  if (token.endsWith('#life2')) return 'before-tool';
+  return 'other';
+}
+
 export function scenario(name: string): Scenario {
+  if (name === WRITE_WINDOW.name) return WRITE_WINDOW;
   const s = SCENARIOS.find((x) => x.name === name);
   if (!s) throw new Error(`no scenario ${name}`);
   return s;

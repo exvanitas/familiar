@@ -28,7 +28,11 @@ const counters: Counters = {
 
 /** Every transaction a journal store opened, with the durability it reported. */
 const durabilities: string[] = [];
-const track = (t: IDBTransaction) => durabilities.push(String((t as any).durability));
+const listeners = new Set<() => void>();
+const track = (t: IDBTransaction) => {
+  durabilities.push(String((t as any).durability));
+  for (const l of [...listeners]) l();
+};
 
 async function conformance() {
   let n = 0;
@@ -68,11 +72,16 @@ async function main() {
     return out({ done: true, summary: { conformance: result, durabilities: [...new Set(durabilities)], transactions: durabilities.length } });
   }
   const life = counters.bump('life');
+  if (life === 1 && params.has('killAfter')) counters.set('kill-after', Number(params.get('killAfter')));
   const summary = await scenario(params.get('scenario')!).run({
     life,
     counters,
     owner: webLockOwner(navigator.locks as any),
     openStore: (name) => openJournalStore(`${run}-${name}`, { indexedDB, onTransaction: track }),
+    onTransaction: (l) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
     // The driver closes the page here: no shutdown path runs.
     ready: () => out({ ready: true, life })
   });

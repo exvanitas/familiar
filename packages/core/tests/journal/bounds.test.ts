@@ -39,7 +39,7 @@ function planned(plan: number[][], tool = (_t: number, _r: number, _i: number) =
   };
 }
 
-const envOf = (world: NodeWorld, life = 1): Env => ({ life, counters: world.counters, owner: world.owner, openStore: world.open, ready: () => {} });
+const envOf = (world: NodeWorld, life = 1): Env => ({ life, counters: world.counters, owner: world.owner, openStore: world.open, onTransaction: () => () => {}, ready: () => {} });
 
 /** Every tool result the model was sent, by call id. */
 function results(requests: readonly ModelRequest[]): Map<string, string> {

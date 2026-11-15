@@ -45,19 +45,30 @@ export interface NodeWorld {
   readonly owner: OwnerLock;
   readonly counters: Counters;
   readonly transactions: IDBTransaction[];
+  readonly listeners: Set<() => void>;
   open(name: string): Promise<JournalStore>;
 }
 
 export function nodeWorld(): NodeWorld {
   const factory = new IDBFactory();
   const transactions: IDBTransaction[] = [];
+  const listeners = new Set<() => void>();
   return {
+    listeners,
     factory,
     owner: memoryOwner(),
     counters: memoryCounters(),
     transactions,
-    open: (name) => openJournalStore(name, { indexedDB: factory as unknown as globalThis.IDBFactory, onTransaction: (t) => transactions.push(t) })
+    open: (name) => openJournalStore(name, { indexedDB: factory as unknown as globalThis.IDBFactory, onTransaction: (t) => {
+        transactions.push(t);
+        for (const l of [...listeners]) l();
+      } })
   };
+}
+
+function listen(world: NodeWorld, listener: () => void): () => void {
+  world.listeners.add(listener);
+  return () => world.listeners.delete(listener);
 }
 
 /** Life 1 until it's ready, a kill, then life 2 on the same store. */
@@ -69,6 +80,7 @@ export async function killAndResume(s: Scenario, world: NodeWorld = nodeWorld())
       counters: world.counters,
       owner: world.owner,
       openStore: world.open,
+      onTransaction: (l) => listen(world, l),
       ready: (k) => {
         kill = k;
         resolve();
@@ -79,7 +91,7 @@ export async function killAndResume(s: Scenario, world: NodeWorld = nodeWorld())
   await ready;
   if (!kill) throw new Error(`${s.name}: life 1 ended without reaching its kill point`);
   kill();
-  const summary = await s.run({ life: 2, counters: world.counters, owner: world.owner, openStore: world.open, ready: () => {} });
+  const summary = await s.run({ life: 2, counters: world.counters, owner: world.owner, openStore: world.open, onTransaction: (l) => listen(world, l), ready: () => {} });
   if (!summary) throw new Error(`${s.name}: life 2 gave no summary`);
   return summary;
 }

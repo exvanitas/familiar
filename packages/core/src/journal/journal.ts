@@ -199,6 +199,8 @@ export interface Journal {
   notice(event: PersonaEvent): Promise<Decision>;
   /** The wake port fired: run what's due. */
   wake(): void;
+  /** What's live in the engine: unfinished tasks and submissions, and what each waits on. For diagnostics. */
+  inspect(): Promise<unknown>;
   /** The caps ledger as stored: settled spend and open reservations. */
   ledger(): Promise<Ledger>;
   /** One of Familiar's own documents, as committed. */
@@ -347,7 +349,21 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
     cancelWake?.();
     cancelWake = undefined;
     // While the page lives, its own timer wakes it too.
-    if (w.at !== undefined) cancelWake = clock.setTimer(() => !dead && harness?.resume(), Math.max(0, w.at - clock.now()), { background: false });
+    if (w.at !== undefined) armWake(w.at);
+  };
+  // pi-durable offers a wake time once, when it changes, so a timer that fires before it's due (timers
+  // may fire a millisecond early) must arm again, or the sleep is never run. One that fires while the
+  // Harness is still opening is covered by the resume at the end of the open.
+  const armWake = (at: number) => {
+    cancelWake = clock.setTimer(
+      () => {
+        if (dead) return;
+        if (clock.now() < at) return armWake(at);
+        harness?.resume();
+      },
+      Math.max(0, at - clock.now()) + 1,
+      { background: false }
+    );
   };
 
   try {
@@ -560,6 +576,7 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
       if (!dead) harness.resume();
     },
     ledger: () => usage.read(),
+    inspect: () => harness.inspect(ctx),
     read: (token) => harness.snapshot(token, ctx),
     async transcript() {
       const page = await root.entries({ order: 'ascending' }, 500, undefined, ctx);

@@ -16,7 +16,7 @@ const lastIsTool = (r: ModelRequest) => r.messages.at(-1)?.role === 'tool';
 const toolResults = (r: ModelRequest) => r.messages.filter((m) => m.role === 'tool').length;
 
 function envOf(world = nodeWorld()): Env & { world: typeof world } {
-  return { life: 1, counters: world.counters, owner: world.owner, openStore: world.open, ready: () => {}, world };
+  return { life: 1, counters: world.counters, owner: world.owner, openStore: world.open, onTransaction: () => () => {}, ready: () => {}, world };
 }
 
 describe('the store', () => {
@@ -242,6 +242,17 @@ describe('the state it reports', () => {
     const again = await openFor(env, await world.open('presence'), { script: () => ({ text: 'x' }), newGen: () => `g${++gens}` });
     expect(again.presence[0]).toMatchObject({ gen: 'g2', seq: 1, state: 'idle' });
     await again.journal.close();
+  });
+});
+
+describe('waking', () => {
+  it('a wake timer that fires early arms again, so the parked wait still runs once it is due', async () => {
+    const env = envOf();
+    const { journal, clock } = await openFor(env, await env.world.open('early'), { script: () => ({ text: 'x' }), earlyTimersMs: 20 });
+    await journal.parkUntil('stretch', clock.now() + 60);
+    for (let i = 0; i < 100 && env.counters.get('delivered') === 0; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(env.counters.get('delivered')).toBe(1);
+    await journal.close();
   });
 });
 
