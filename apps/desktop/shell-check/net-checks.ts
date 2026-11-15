@@ -28,7 +28,7 @@ export function proxyHost(target: string): string {
 /* What the logging proxy saw while it was on. */
 const proxyOff = () => step<{ targets: string[]; entries: { target: string; at: number }[] }>('proxy', { on: false });
 /* shell_info, an async command like every other, timed every 50 ms for `ms`: the longest it took. */
-async function probe(ms: number): Promise<number> {
+export async function probe(ms: number): Promise<number> {
   const times: number[] = [];
   for (const end = performance.now() + ms; performance.now() < end;) {
     const t = performance.now();

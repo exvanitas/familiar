@@ -4,6 +4,7 @@
 import type { CoreMessage, Info, ServerEvent, Setup } from '../src/shell.ts';
 import { reason } from '../src/shell.ts';
 import { check, fail, ok, raw, rand, say, shell, skip, sleep, step, until } from './common.ts';
+import { probe } from './net-checks.ts';
 
 /* The spike's ENV_ALLOWLIST, which is all a server inherits. */
 const ALLOWLIST = ['SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT', 'Path', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'CommonProgramFiles', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'USERNAME'];
@@ -349,15 +350,12 @@ async function main(info: Info, ctx: Ctx) {
     let settled = 0;
     const writes = Array.from({ length: 60 }, () => shell.serverWrite(m.run, chunk).then(() => 'written', e => errKind(e)).finally(() => { settled++; }));
     await sleep(1000);
-    // While the flood is held (the writes in flight still unanswered), shell_info five times,
-    // each timed alone: every one must answer in under 100 ms.
-    const infoMs: number[] = [];
-    for (let i = 0; i < 5; i++) {
-      const t = Date.now();
-      const r = await Promise.race([shell.info().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
-      infoMs.push(r === 'answered' ? Date.now() - t : Infinity);
-    }
-    const heldDuring = 60 - settled;
+    // While the flood is held (the 8 writes in flight still unanswered), the async probe of
+    // security.exec.responsive: shell_info every 50 ms for 1 s, on the async workers where
+    // commands run. Its longest answer must be under 100 ms.
+    const heldBefore = 60 - settled;
+    const longest = await Promise.race([probe(1000), sleep(5000).then(() => Infinity)]);
+    const heldDuring = Math.min(heldBefore, 60 - settled);
     const t1 = Date.now();
     const sys = await Promise.race([shell.system().then(() => 'answered'), sleep(3000).then(() => 'hung')]);
     const others = Date.now() - t1;
@@ -368,12 +366,56 @@ async function main(info: Info, ctx: Ctx) {
     const outcomes = await Promise.race([Promise.all(writes), sleep(5000).then(() => ['hung'])]);
     const count = (k: string) => outcomes.filter(o => o === k).length;
     ok(heldDuring > 0, `the flood wasn't held while shell_info was timed: all 60 writes had answered`);
-    ok(Math.max(...infoMs) < 100, `shell_info during the flood: ${infoMs.join(', ')} ms, not all under 100`);
+    ok(longest < 100, `the probe during the flood: shell_info's longest answer ${longest} ms, not under 100`);
     ok(sys === 'answered', `system during the flood: ${sys}`);
     ok(stopped === 'stopped' && ms < 3000, `stop during the flood: ${stopped} after ${ms} ms`);
     ok(!outcomes.includes('hung'), 'some writes never answered');
     ok(count('busy') >= 40, `only ${count('busy')} of 60 writes were refused busy`);
-    return `60 writes of 1 MiB to a server that never reads: ${count('busy')} busy, ${count('failed')} failed when it stopped, ${count('written')} written; with ${heldDuring} still held, shell_info answered in ${infoMs.join(', ')} ms (each under 100) and system in ${others} ms; stop took ${ms} ms`;
+    return `60 writes of 1 MiB to a server that never reads: ${count('busy')} busy, ${count('failed')} failed when it stopped, ${count('written')} written; with ${heldDuring} still held, the probe's longest shell_info was ${longest} ms (under 100) and system in ${others} ms; stop took ${ms} ms`;
+  });
+
+  await check('security.server.forget-failed', async () => {
+    // An approved setup, then a changed start of it, whose ask is held at its dialog. With the
+    // shell folder unwritable, a forget can't remove the approval: it fails, and so must a second.
+    // The held ask, approved, is revoked, and an unchanged start is refused before any dialog.
+    // Once the folder is writable again, the next start retries the removal, and asks. It's
+    // approved, not refused: three refusals in a run stop asking, and later checks still ask.
+    const a = fakeSetup(p, 'forget-f-' + rand(4));
+    const m = new Mcp();
+    const r = await startWith(m, a, 'yes');
+    ok(r.started === 'started', 'the first start: ' + r.started);
+    await shell.serverStop(m.run);
+    await m.exited(5000);
+    const heldP = new Mcp().start({ ...a, args: [p.mainTs, '--variant', 'b'] }).then(() => 'started', e => errKind(e));
+    const up = await step<{ found: boolean }>('confirm-wait', { ms: 15000 });
+    ok(up.found, 'no dialog for the changed start');
+    let first = '', second = '', held = '', plain = { dialog: { shown: false, text: '' }, started: '' };
+    await step('shell-lock', { data: info.dataDir, on: true });
+    try {
+      first = await shell.serverForget(a.id).then(() => 'forgot', e => errKind(e));
+      second = await shell.serverForget(a.id).then(() => 'forgot', e => errKind(e));
+      await dialog('approve', START);
+      held = await heldP;
+      plain = await startWith(new Mcp(), a, 'none');
+    } finally {
+      await step('shell-lock', { data: info.dataDir, on: false });
+    }
+    const ma = new Mcp();
+    const after = await startWith(ma, a, 'yes');
+    if (after.started === 'started') {
+      await shell.serverStop(ma.run);
+      await ma.exited(5000);
+    }
+    const cleared = await shell.serverForget(a.id).then(() => 'forgot', e => errKind(e));
+    const kids = await step<{ count: number }>('node-children', {});
+    ok(first === 'failed', `the forget with the folder locked: ${first}, not failed`);
+    ok(second === 'failed', `a second forget with the folder locked: ${second}, not failed`);
+    ok(held === 'revoked', `the ask held over the failed forget, approved: ${held}, not revoked`);
+    ok(!plain.dialog.shown && plain.started === 'revoked', `an unchanged start while locked: dialog ${plain.dialog.shown}, ${plain.started}, not revoked before any dialog`);
+    ok(after.dialog.shown && after.started === 'started', `the start once unlocked: dialog ${after.dialog.shown}, ${after.started}; it must ask`);
+    ok(cleared === 'forgot', `the forget once unlocked: ${cleared}`);
+    ok(kids.count === 0, `${kids.count} node children left`);
+    return `with servers.json unwritable both forgets were ${first}, the held ask approved was ${held}, an unchanged start ${plain.started} with no dialog; unlocked, the next start asked and was approved (${after.started}), and a forget succeeded; ${kids.count} node children`;
   });
 
   await check('security.server.exit-drains', async () => {

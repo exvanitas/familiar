@@ -65,6 +65,7 @@
     "server.store-recovery",
     "server.forget-pending",
     "server.forget-race",
+    "server.forget-failed",
     "server.stopped-asks",
     "server.kill",
     "link.confirm",

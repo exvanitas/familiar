@@ -12,11 +12,18 @@
 //!   so nothing meant for run A ever touches run B. A stale `Spawned` is answered `Abort`, so the
 //!   child it names is ended rather than left waiting.
 //!
+//! - **A forget succeeds only once the approval's removal is durable.** A removal that fails is
+//!   kept: the setup stays `Forgetting`, its forgets answer the failure or retry the removal, and
+//!   no start is admitted (`revoked`) until a removal succeeds. A start then retries the removal
+//!   itself, and asks only if it succeeded, so an approval the person asked to forget is never
+//!   used again.
+//!
 //! States: `Idle` (nothing runs); `Asking` (the walk, the approval check, maybe the dialog);
 //! `Starting` (the approval stored, the child being made in its job); `Running`; `Stopping` (input
-//! closed, the job ended at the deadline); `Forgetting` (the approval being removed, or an old
-//! attempt still in flight: starts are refused `revoked`). No state lasts without an event pending
-//! that leaves it, except `Idle` and `Running`.
+//! closed, the job ended at the deadline); `Forgetting` (the approval being removed, an old
+//! attempt still in flight, or a removal that failed: starts are refused `revoked`). No state
+//! lasts without an event pending that leaves it, except `Idle`, `Running` and `Forgetting` after
+//! a failed removal, which a forget or a start leaves by retrying it.
 //!
 //! The approval store is synchronous to the actor: `StoreApproval(g)` is answered by `Stored(g, _)`
 //! before any other message, so a forget can't fall between a store and its answer.
@@ -86,6 +93,9 @@ pub struct Machine {
     forgets: Vec<Token>,
     forget_after_stop: bool,
     removing: bool,
+    /// The last removal failed: the approval may still be on disk, so the revocation isn't
+    /// durable. Kept until a removal succeeds.
+    unrevoked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +115,16 @@ impl Machine {
     /// The run's id while there's a run.
     pub fn run(&self) -> Option<Gen> {
         matches!(self.state(), Running | Stopping).then_some(self.current).flatten()
+    }
+
+    /// Whether a start would begin an attempt now (so the exe takes a slot for it): from `Idle`,
+    /// or from a failed removal with nothing in flight, which the start retries first.
+    pub fn admits_start(&self) -> bool {
+        self.state() == Idle || self.retry_ready()
+    }
+
+    fn retry_ready(&self) -> bool {
+        self.state() == Forgetting && self.unrevoked && !self.removing && self.current.is_none()
     }
 
     /// Whether this holds a slot: anything with an attempt or a run in flight.
@@ -138,10 +158,19 @@ impl Machine {
         }
         if std::mem::take(&mut self.forget_after_stop) {
             fx.extend(self.begin_forgetting());
-        } else if !(self.state() == Forgetting && self.removing) {
+        } else if !(self.state() == Forgetting && (self.removing || self.unrevoked)) {
             self.set(Idle);
         }
         fx
+    }
+
+    fn begin_attempt(&mut self, t: Token) -> Vec<Effect> {
+        let g = self.next;
+        self.next += 1;
+        self.current = Some(g);
+        self.start = Some(t);
+        self.set(Asking);
+        vec![BeginAsk(g)]
     }
 
     pub fn handle(&mut self, msg: Msg) -> Vec<Effect> {
@@ -149,13 +178,12 @@ impl Machine {
         match msg {
             // ---------- commands ----------
             Msg::Start(t) => match s {
-                Idle => {
-                    let g = self.next;
-                    self.next += 1;
-                    self.current = Some(g);
+                Idle => self.begin_attempt(t),
+                // A failed removal, nothing in flight: the start retries it, and goes on only if
+                // it's durable.
+                Forgetting if self.retry_ready() => {
                     self.start = Some(t);
-                    self.set(Asking);
-                    vec![BeginAsk(g)]
+                    self.begin_forgetting()
                 }
                 Forgetting => vec![Reply(t, Err("revoked"))],
                 _ => vec![Reply(t, Err("busy"))],
@@ -199,6 +227,11 @@ impl Machine {
                     self.forgets.push(t);
                     vec![]
                 }
+                // The last removal failed: this forget retries it, and answers its result.
+                Forgetting if self.unrevoked => {
+                    self.forgets.push(t);
+                    self.begin_forgetting()
+                }
                 Forgetting => vec![Reply(t, Ok(None))],
             },
 
@@ -208,10 +241,20 @@ impl Machine {
                     return vec![];
                 }
                 self.removing = false;
+                // Kept, so no later forget can report success over it and no start can use the
+                // approval it left.
+                self.unrevoked = !ok;
                 let r = if ok { Ok(None) } else { Err("failed") };
-                let fx: Vec<Effect> = self.forgets.drain(..).map(|t| Reply(t, r)).collect();
+                let mut fx: Vec<Effect> = self.forgets.drain(..).map(|t| Reply(t, r)).collect();
                 if self.current.is_none() {
-                    self.set(Idle);
+                    // A start that retried the removal: it asks now, or it's refused.
+                    let waiting = self.start.take();
+                    match (ok, waiting) {
+                        (true, Some(t)) => fx.extend(self.begin_attempt(t)),
+                        (true, None) => self.set(Idle),
+                        (false, Some(t)) => fx.push(Reply(t, Err("revoked"))),
+                        (false, None) => {}
+                    }
                 }
                 fx
             }
@@ -330,6 +373,38 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_removal_never_becomes_a_successful_forget() {
+        // An approved setup's ask is out (it will say "approved before"); the removal fails, and a
+        // second forget comes before the ask's answer.
+        let mut m = at(Asking);
+        assert_eq!(m.handle(Msg::Forget(5)), vec![RemoveApproval]);
+        assert_eq!(m.handle(Msg::Removed(false)), vec![Reply(5, Err("failed"))]);
+        assert_eq!(m.handle(Msg::Forget(6)), vec![RemoveApproval], "the second forget retries the removal");
+        assert_eq!(m.handle(Msg::Removed(false)), vec![Reply(6, Err("failed"))], "and reports its failure, never success");
+        assert_eq!(m.handle(Msg::Start(7)), vec![Reply(7, Err("revoked"))], "no start while the old ask is out");
+        assert_eq!(m.handle(Msg::AskDone(0, Ok(false))), vec![Reply(1, Err("revoked"))]);
+        assert_eq!(m.state(), Forgetting, "the old attempt settled, the revocation still not durable");
+        assert!(!m.holds_slot());
+        // A start retries the removal; while it fails, the start is refused, never admitted.
+        assert!(m.admits_start());
+        assert_eq!(m.handle(Msg::Start(8)), vec![RemoveApproval]);
+        assert_eq!(m.handle(Msg::Removed(false)), vec![Reply(8, Err("revoked"))]);
+        assert_eq!(m.state(), Forgetting);
+        // Once a removal is durable, the start asks: a new attempt, which can't find the approval.
+        assert_eq!(m.handle(Msg::Start(9)), vec![RemoveApproval]);
+        assert_eq!(m.handle(Msg::Removed(true)), vec![BeginAsk(1)]);
+        assert_eq!(m.state(), Asking);
+        // A forget retried after a failure, with nothing in flight, ends idle once durable.
+        let mut m = at(Idle);
+        m.handle(Msg::Forget(1));
+        assert_eq!(m.handle(Msg::Removed(false)), vec![Reply(1, Err("failed"))]);
+        assert_eq!(m.state(), Forgetting);
+        assert_eq!(m.handle(Msg::Forget(2)), vec![RemoveApproval]);
+        assert_eq!(m.handle(Msg::Removed(true)), vec![Reply(2, Ok(None))]);
+        assert_eq!(m.state(), Idle);
+    }
+
+    #[test]
     fn commands_and_reports_for_another_run_never_touch_this_one() {
         let mut m = at(Running);
         // Run 0 ends; run 1 starts.
@@ -358,6 +433,13 @@ mod tests {
         alive: BTreeSet<Gen>,
         /// Every report ever delivered, to deliver again later as a stale duplicate.
         old: Vec<Msg>,
+        /// Whether the approval is on disk.
+        disk: bool,
+        /// A forget was asked since the last approval stored from a dialog.
+        forgot: bool,
+        /// Removals succeed from now on (the final settling).
+        removals_succeed: bool,
+        forget_tokens: BTreeSet<Token>,
     }
 
     struct Rng(u64);
@@ -374,7 +456,7 @@ mod tests {
     fn trial(seed: u64, steps: usize) -> (Machine, BTreeMap<Token, usize>, BTreeSet<Token>) {
         let mut rng = Rng(seed | 1);
         let mut m = Machine::default();
-        let mut w = World::default();
+        let mut w = World { disk: rng.next(2) == 0, ..World::default() };
         let mut asked: BTreeSet<Token> = BTreeSet::new();
         let mut answers: BTreeMap<Token, usize> = BTreeMap::new();
         let mut token: Token = 0;
@@ -383,7 +465,21 @@ mod tests {
             let mut queue = vec![msg];
             while let Some(msg) = queue.pop() {
                 let run_before = m.run();
+                // The store's side: what's on disk once each report is true.
+                match msg {
+                    Msg::Removed(true) => w.disk = false,
+                    Msg::Forget(_) => w.forgot = true,
+                    _ => {}
+                }
                 for e in m.handle(msg.clone()) {
+                    // A forget succeeds only once the removal is durable; nothing starts from an
+                    // approval the person asked to forget, and no dialog-less spawn follows one.
+                    match (&e, &msg) {
+                        (Reply(t, Ok(None)), _) if w.forget_tokens.contains(t) => assert!(!w.disk, "seed {seed}: forget {t} succeeded with the approval on disk"),
+                        (BeginAsk(_), _) => assert!(!(w.disk && w.forgot), "seed {seed}: a start admitted with a forgotten approval on disk"),
+                        (BeginSpawn(_), Msg::AskDone(_, Ok(false))) => assert!(!w.forgot, "seed {seed}: a spawn without a dialog after a forget"),
+                        _ => {}
+                    }
                     // Each effect is for the generation its message named, never another run's.
                     match (&e, &msg) {
                         (Terminate(g), Msg::Deadline(d)) => assert_eq!(g, d, "seed {seed}: a deadline ended another run"),
@@ -396,13 +492,21 @@ mod tests {
                     }
                     match e {
                         Reply(t, _) | Forward(t) => *answers.entry(t).or_insert(0) += 1,
+                        // "Approved before" only if the approval is on disk when the ask reads it.
                         BeginAsk(g) => w.pending.push(Msg::AskDone(g, match rng.next(4) {
-                            0 => Ok(true),
-                            1 => Ok(false),
+                            0 | 1 if w.disk => Ok(rng.next(2) == 0),
+                            0 | 1 => Ok(true),
                             _ => Err(kinds[rng.next(3) as usize]),
                         })),
                         // Synchronous: answered before any other message.
-                        StoreApproval(g) => queue.push(Msg::Stored(g, rng.next(5) != 0)),
+                        StoreApproval(g) => {
+                            let ok = rng.next(5) != 0;
+                            if ok {
+                                w.disk = true;
+                                w.forgot = false;
+                            }
+                            queue.push(Msg::Stored(g, ok))
+                        }
                         BeginSpawn(g) => w.pending.push(if rng.next(5) == 0 { Msg::SpawnFailed(g, "start-failed") } else { Msg::Spawned(g) }),
                         Go(g) => {
                             if rng.next(6) == 0 {
@@ -420,7 +524,8 @@ mod tests {
                                 w.pending.push(Msg::Exited(g));
                             }
                         }
-                        RemoveApproval => w.pending.push(Msg::Removed(rng.next(6) != 0)),
+                        // One removal in three fails.
+                        RemoveApproval => w.pending.push(Msg::Removed(w.removals_succeed || rng.next(3) != 0)),
                     }
                 }
             }
@@ -441,6 +546,7 @@ mod tests {
                 3 => {
                     token += 1;
                     asked.insert(token);
+                    w.forget_tokens.insert(token);
                     Msg::Forget(token)
                 }
                 4 => {
@@ -459,7 +565,9 @@ mod tests {
                 _ if !w.pending.is_empty() => {
                     let i = rng.next(w.pending.len() as u64) as usize;
                     let msg = w.pending.swap_remove(i);
-                    if !matches!(msg, Msg::Spawned(_)) {
+                    // A removal's report has no generation: the exe's store answers it at once,
+                    // so it's never late or repeated.
+                    if !matches!(msg, Msg::Spawned(_) | Msg::Removed(_)) {
                         w.old.push(msg.clone());
                     }
                     msg
@@ -476,6 +584,20 @@ mod tests {
             assert!(guard < 10_000, "seed {seed}: the world never settles");
             let msg = w.pending.remove(0);
             feed(&mut m, &mut w, &mut rng, &mut answers, msg);
+        }
+        // A failed removal rests in Forgetting; once removals succeed, one forget leaves it.
+        let rested = m.state();
+        if rested == Forgetting {
+            assert!(m.admits_start() && !m.holds_slot(), "seed {seed}: Forgetting with something in flight");
+            w.removals_succeed = true;
+            token += 1;
+            asked.insert(token);
+            w.forget_tokens.insert(token);
+            feed(&mut m, &mut w, &mut rng, &mut answers, Msg::Forget(token));
+            while !w.pending.is_empty() {
+                let msg = w.pending.remove(0);
+                feed(&mut m, &mut w, &mut rng, &mut answers, msg);
+            }
         }
         (m, answers, asked)
     }
