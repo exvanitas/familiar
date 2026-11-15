@@ -9,6 +9,8 @@ import { describe, expect, it } from 'vitest';
 const ROOT = join(__dirname, '..', '..', '..');
 const WORKFLOWS = join(ROOT, '.github', 'workflows');
 const SRC = join(__dirname, '..', 'src-tauri', 'src');
+/* A file's text with Windows line ends made plain, as a checkout on the runner has them. */
+const read = (p: string) => readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
 
 /* A workflow's steps, as their text: each starts at a `- ` item under `steps:`. */
 function steps(yml: string): string[] {
@@ -67,17 +69,17 @@ export function featureProblems(sources: Record<string, string>, cargo: string):
 describe('the check-blocking control build', () => {
   it('no workflow ships, uploads or releases it', () => {
     for (const f of readdirSync(WORKFLOWS).filter(f => /\.ya?ml$/.test(f))) {
-      expect(workflowProblems(f, readFileSync(join(WORKFLOWS, f), 'utf8'))).toEqual([]);
+      expect(workflowProblems(f, read(join(WORKFLOWS, f)))).toEqual([]);
     }
   });
 
   it('the feature does nothing but its one sleep', () => {
-    const sources = Object.fromEntries(readdirSync(SRC).filter(f => f.endsWith('.rs')).map(f => [f, readFileSync(join(SRC, f), 'utf8')]));
-    expect(featureProblems(sources, readFileSync(join(__dirname, '..', 'src-tauri', 'Cargo.toml'), 'utf8'))).toEqual([]);
+    const sources = Object.fromEntries(readdirSync(SRC).filter(f => f.endsWith('.rs')).map(f => [f, read(join(SRC, f))]));
+    expect(featureProblems(sources, read(join(__dirname, '..', 'src-tauri', 'Cargo.toml')))).toEqual([]);
   });
 
   it('catches each way it could ship', () => {
-    const base = readFileSync(join(WORKFLOWS, 'shell.yml'), 'utf8');
+    const base = read(join(WORKFLOWS, 'shell.yml'));
     const shipped = base.replace('run: cargo build --release --locked\n', 'run: cargo build --release --locked --features check-blocking\n');
     expect(shipped).not.toBe(base);
     expect(workflowProblems('x', shipped).join(' ')).toMatch(/doesn't keep it apart|before the shipped exe/);
@@ -85,7 +87,7 @@ describe('the check-blocking control build', () => {
     expect(workflowProblems('x', uploaded).join(' ')).toMatch(/the control exe is uploaded/);
     const folder = base.replace('path: exe/familiar.exe', 'path: exe/');
     expect(workflowProblems('x', folder).join(' ')).toMatch(/whole exe folder/);
-    const net = readFileSync(join(SRC, 'net.rs'), 'utf8');
+    const net = read(join(SRC, 'net.rs'));
     const more = net.replace('Ok(f())\n    }', 'std::fs::write("x", "y").ok();\n        Ok(f())\n    }');
     expect(more).not.toBe(net);
     expect(featureProblems({ 'net.rs': more }, 'check-blocking = []').join(' ')).toMatch(/more than its one sleep/);
