@@ -84,7 +84,9 @@ function frame(b, linktype) {
    and the judges count it as a failed observation. So is a connection whose end is known to lie
    past what was captured: each direction's end is taken from its FIN, its RST, and the other
    side's ACKs, and any byte missing before it marks the connection incomplete, even when what
-   was captured ends on a message boundary. */
+   was captured ends on a message boundary. No payload is dropped silently: bytes outside the
+   connection's window, or traffic after its close that isn't a resend of what came before, make
+   it incomplete too (a reused tuple whose new SYN was lost looks just like that). */
 export function reassembleDns(packets) {
   const SYN = 0x02, FIN = 0x01, RST = 0x04, ACK = 0x10;
   const conns = [];
@@ -96,15 +98,18 @@ export function reassembleDns(packets) {
     let c = current.get(key);
     if (flags & SYN) {
       if (!c || c.isn !== p.seq || c.closed) {
-        c = { key, first: p, isn: p.seq, segments: new Map(), closed: false, conflict: false, fins: [], rsts: [], acks: [] };
+        c = { key, first: p, isn: p.seq, segments: new Map(), closed: false, conflict: false, fins: [], rsts: [], acks: [], late: [] };
         conns.push(c);
         current.set(key, c);
       }
     } else if (!c) {
-      c = { key, first: p, isn: null, segments: new Map(), closed: false, conflict: false, fins: [], rsts: [], acks: [] };
+      c = { key, first: p, isn: null, segments: new Map(), closed: false, conflict: false, fins: [], rsts: [], acks: [], late: [] };
       conns.push(c);
       current.set(key, c);
     }
+    // Bytes after a FIN or RST, kept to be judged: a resend of what came before is fine, anything
+    // else is traffic the connection can't explain.
+    if (c.closed && p.payload.length && !(flags & SYN)) c.late.push([p.seq, p.payload.length]);
     if (p.payload.length) {
       const had = c.segments.get(p.seq);
       if (!had || p.payload.length > had.length) {
@@ -128,7 +133,9 @@ export function reassembleDns(packets) {
     // Offsets from the first byte after the SYN, or with no SYN from the earliest segment.
     const seqs = [...c.segments.keys()];
     const base = c.isn !== null ? (c.isn + 1) >>> 0 : seqs.reduce((m, q) => (((q - m) | 0) < 0 ? q : m), seqs[0]);
-    const ordered = [...c.segments.entries()].map(([q, d]) => [(q - base) >>> 0, d]).filter(([off]) => off < 2 ** 31).sort((x, y) => x[0] - y[0]);
+    const all = [...c.segments.entries()].map(([q, d]) => [(q - base) >>> 0, d]);
+    if (all.some(([off]) => off >= 2 ** 31)) problems.push('bytes outside the connection\'s window');
+    const ordered = all.filter(([off]) => off < 2 ** 31).sort((x, y) => x[0] - y[0]);
     const parts = [];
     let next = 0;
     for (const [off, data] of ordered) {
@@ -149,6 +156,9 @@ export function reassembleDns(packets) {
     const finEnd = c.fins.length ? Math.max(...c.fins.map(offOf).filter(o => o < 2 ** 31), 0) : null;
     for (const a of c.acks.map(offOf).filter(o => o < 2 ** 31)) ends.push(finEnd !== null && a === finEnd + 1 ? finEnd : a);
     const end = ends.length ? Math.max(...ends) : 0;
+    const closedAt = [...c.fins, ...c.rsts].map(offOf).filter(o => o < 2 ** 31);
+    const closeEnd = closedAt.length ? Math.min(...closedAt) : null;
+    if (c.late.some(([q, len]) => { const off = offOf(q); return off >= 2 ** 31 || closeEnd === null || off + len > closeEnd; })) problems.push('traffic after the close that isn\'t a resend');
     if (end > next && !problems.some(x => x.startsWith('a gap'))) problems.push(`bytes missing before the end at byte ${end}, ${end - next} of them`);
     const stream = Buffer.concat(parts);
     const names = [];
