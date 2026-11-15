@@ -301,13 +301,18 @@ impl Actor {
     }
 
     fn handle(&mut self, cmd: Cmd) {
-        let held = self.machine.holds_slot();
+        let mut held = self.machine.holds_slot();
         let before = self.machine.state();
         let msg = match cmd {
             Cmd::Start { setup, owner, channel, reply } => {
-                if before == State::Idle && !self.servers().take_slot() {
-                    let _ = reply.send(Err(fail("busy", "16 servers are running or starting")));
-                    return;
+                // A start that would begin an attempt takes its slot first; one that retries a
+                // failed removal and is refused gives it back below.
+                if self.machine.admits_start() {
+                    if !self.servers().take_slot() {
+                        let _ = reply.send(Err(fail("busy", "16 servers are running or starting")));
+                        return;
+                    }
+                    held = true;
                 }
                 self.incoming = Some((setup, owner, channel));
                 Msg::Start(self.token(Pending::Start(reply)))
