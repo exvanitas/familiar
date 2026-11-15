@@ -673,23 +673,36 @@ The exe settles just before the first release, not at step 3 ([Decisions](#decis
 | `system()` (full screen, presentation, quiet time, idle) and resume, `wake_at`, notifications, hotkey, toast app id | 1 | 0.5 | |
 | Egress harness (listeners, STUN, `pktmon`, positive controls), the two-namespace gate, the workflow | | 3 | |
 | Runs on the runner until green, and what the measurements overturn (WebRTC, the sink proxy, clipboard, toasts) | | | 4 |
-| **Total** | **17.75** | **12** | **4** |
+| Code reviews 3 to 9: the two restructures (one actor per setup, one owner for network state), each round's fixes, and the last batch of six | | | 4.5 |
+| **Total** | **17.75** | **12** | **8.5** |
 
-**Step 3 is about 33.75 hours.** That replaces its 8, it doesn't add to them. It was 32.5 when the owner accepted it. The 1.25 more is the safeguards that came with typing keys in Settings.
+**Step 3 took about 38.25 hours.** That replaces its 8, it doesn't add to them. It was 32.5 when the owner accepted it. The safeguards that came with typing keys in Settings added 1.25. The rework row ran out during the code reviews, and the lead approved 3 more hours on 2026-11-15, then 1.5 for the last batch of six fixes ([Closing step 3](#closing-step-3)).
 
 **What moved where, and the part 1 total**, starting from the current 93:
 
 | Step | Was | Now | Why |
 | --- | --- | --- | --- |
-| 3, the shell | 8 | 33.75 | This note |
+| 3, the shell | 8 | 38.25 | This note |
 | 4, the model layer | 5 | 5.25 | Gains the recorded-provider contract run over `guardedFetch` in the real webview (0.75), saves on a fetch already proven (0.5) |
 | 7, the MCP client | 12 | 10.5 | The server start, its approval and blanking are built in step 3 |
 | 10, memory and export | 5 | 6 | Gains the native backup commands and their budget check |
 | 11, chat and settings | 10 | 10.25 | Gains the Trusted Types `<meta>` on every page and its test |
 | New: a pre-release native pass, before step 12 | 0 | 1.25 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks |
-| **Part 1** | **93** | **120** | |
+| 4, 5 and 7, rework (2026-11-15) | 0 | 8 | A rework row of a third of build (1.75, 2.75 and 3.5), from what step 3's reviews cost. See [design.md](design.md#build-order) |
+| **Part 1** | **93** | **132.5** | |
 
-This is still an estimate before anything is built. It should be redone once the riskiest pieces (the egress closure with the sink proxy, and the reparse walk) have run on the runner, which should be the first thing step 3 does.
+The riskiest pieces (the egress closure with the sink proxy, and the reparse walk) ran on the runner first, and neither moved the estimate. The code reviews did.
+
+
+## Closing step 3
+
+Nine code reviews in all, each by Codex in a sandbox that reads only a copy of the code. From the third on, the lead's rule applied: when a third round still finds races, change the design rather than patch again. So the process side became one actor per setup ([5b](#5b-starting-a-local-mcp-server)), and the network side one owner for addresses and requests ([5c](#5c-the-guarded-fetch)). Each later round was a narrow check of the fixes, with a stop rule: new P1s go to the lead, not into another silent round.
+
+Round 9 found six. Three were real but needed a failing disk or a queued lookup: a forget that failed on disk could be reported as a success, a stalled log could hang quit, and a queued lookup could still go out after a cancel. Three were edges in how a check proved its claim. None leaked a key, and none let page script alone start a program or send data somewhere unapproved.
+
+Decided 2026-11-15 by the lead, in their words: "Go with A: fix all six as one batch, run no further Codex round, close step 3, and put the whole exe through one fresh Codex review in the pre-release native pass. Fix #1 (a failed forget reported as success) first and give it its own regression test, since it's a consent bug." The owner can still overrule it.
+
+So all six are fixed, each with a test or a runner check that fails without it, and the failed forget has its own (`security.server.forget-failed`). A failed forget is remembered only while the exe runs: after a restart with the removal still undone, the approval on disk counts again. The person was told the forget failed, and a mark saying so would go to the same disk that just failed, so there is none. The fresh review of the whole exe is part of the pre-release native pass, before the exe settles.
 
 ---
 
@@ -699,7 +712,7 @@ Decided 2026-11-14 by the maintainer, in their words: "so we do option 1, the re
 
 1. **When the exe settles: just before the first release (step 12)**, not at step 3. The rule: no exe reaches a person's PC until it's settled. The three moved pieces (backups in step 10, the recorded-provider run in step 4, the peer WebSocket in a pre-release pass) are built before release.
 2. **Key entry: typed in Familiar's own Settings window** ("option 1"), not a native prompt. Settings calls `secret_set` itself, write-only, so a key never crosses a channel. It comes with four safeguards: a separate Settings window that never draws model or tool text and has its own narrow capability set, write-only storage with only "set" and a masked hint shown, core making every request with the key, and a changed address needing the key typed again ([5a](#5a-credentials)). The reason for those safeguards: in open-source chat apps the failure seen again and again is script in model output reaching a key, including one case where swapping a base URL sent the stored key to the new address.
-3. **The estimate: accepted**, step 3 at about 32.5 hours and part 1 at about 118.75, to be redone after the egress closure and Trusted Types have been measured on the runner. The safeguards in 2 then added 1.25, so this note now says 33.75 and 120 ([9](#9-hours)).
+3. **The estimate: accepted**, step 3 at about 32.5 hours and part 1 at about 118.75, to be redone after the egress closure and Trusted Types have been measured on the runner. The safeguards in 2 then added 1.25, for 33.75 and 120. Step 3 closed at 38.25, and part 1 is now 132.5 ([9](#9-hours)).
 
 Decided in this note, after review: untrusted content is never HTML, with Trusted Types in the app's own CSP and no sandboxed frame. Consent to MCP writes and sends stays in the app. Links ask natively with no allowlist. No OAuth in v1. No loopback fetch mode. With Desktop Buddies, on 2026-11-14: its socket only, no discovery file ([5d](#5d-the-rest)).
 

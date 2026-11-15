@@ -93,16 +93,18 @@ When you send only an acknowledgement, such as "thanks", "ok", "got it" or a thu
 
 Hours are a working estimate, not calendar time. Part 1 is re-estimated once the first real server works end to end in the installed app.
 
+**Re-estimated 2026-11-15, after step 3.** Step 3 took 38.25: the accepted 33.75, 3 more rework hours the lead approved, and 1.5 for the last batch of six review fixes. Its review rounds on security code took about as much work as the build itself, and they found races in concurrent code more than in rules. Steps 4, 5 and 7 build the same kind of code: the model layer streams over the guarded fetch, the turn loop resumes a durable journal after a kill, and the MCP client restarts servers under time limits. So each gets a rework row of a third of its build: 1.75, 2.75 and 3.5. Less than step 3's, because the hard parts they stand on (the fetch's single owner, the actor per setup, the gate) now exist and are proven. The other steps are app logic with ordinary tests, and step 14's review hours cover them. Part 1 goes from 120 to 132.5.
+
 | # | Step | Done when | Hours |
 | --- | --- | --- | --- |
-| | **Part 1: Familiar on its own** | | **120** |
+| | **Part 1: Familiar on its own** | | **132.5** |
 | 1 | Repo, workspace, CI, fake model, fake MCP server | Typecheck and tests green on CI | 3 |
 | 2 | Spikes: pi-durable in a Tauri webview, pi-ai bundling, the installed exe starting a local MCP server | A yes or no on each, written down | 5 |
-| 3 | Tauri shell ([shell-design.md](shell-design.md)): the app loaded from a folder beside the exe, its origin and WebView2 data folder pinned, persistent storage asked for, windows and capabilities, the egress closure, the native confirms, tray, keys typed in Settings, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch | Every security check passes on the Windows runner | 33.75 |
-| 4 | Model layer: port, pi-ai adapter, presets, model list, Test, caps | Recorded responses pass for all three APIs, also over the guarded fetch in the real webview | 5.25 |
-| 5 | Turn loop and journal in core, on pi-durable with its IndexedDB store and strict durability: resume rules, recorded calls, parked waits, the state it reports, the decision slot with the rules decider | Kill-mid-tool tests for every step kind. pi-durable's storage suite passes in CI | 8 |
+| 3 | Tauri shell ([shell-design.md](shell-design.md)): the app loaded from a folder beside the exe, its origin and WebView2 data folder pinned, persistent storage asked for, windows and capabilities, the egress closure, the native confirms, tray, keys typed in Settings, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch | Every security check passes on the Windows runner | 38.25 |
+| 4 | Model layer: port, pi-ai adapter, presets, model list, Test, caps | Recorded responses pass for all three APIs, also over the guarded fetch in the real webview | 7 (5.25 and 1.75 rework) |
+| 5 | Turn loop and journal in core, on pi-durable with its IndexedDB store and strict durability: resume rules, recorded calls, parked waits, the state it reports, the decision slot with the rules decider | Kill-mid-tool tests for every step kind. pi-durable's storage suite passes in CI | 10.75 (8 and 2.75 rework) |
 | 6 | Cards: V2/V3, lorebook, prompt building, plain helper | Sample cards round-trip, lorebook budget tests | 5 |
-| 7 | MCP client: local and remote servers, add by paste or form, Test, prerequisites, saved setups, secrets, the unpinned flag, changed-tool re-ask, time limits and Stop, restarts (starting, approval and blanking are in the exe from step 3) | Against the fake server: add, crash mid-call (never sent again), change a tool, print a secret (blanked), remove | 10.5 |
+| 7 | MCP client: local and remote servers, add by paste or form, Test, prerequisites, saved setups, secrets, the unpinned flag, changed-tool re-ask, time limits and Stop, restarts (starting, approval and blanking are in the exe from step 3) | Against the fake server: add, crash mid-call (never sent again), change a tool, print a secret (blanked), remove | 14 (10.5 and 3.5 rework) |
 | 8 | Tools, reminders, consent cards, activity list, the outside-content rule | Missed-reminder, exact-call consent, revoke and steering tests | 7 |
 | 9 | Capability matrix: the list, the Settings tab, the docs page, the setup guide | Settings and docs agree, checked in CI | 5 |
 | 10 | Memory: notes, summaries, the Memory tab, deletion. Export and import, and the fallback backup with its native commands | Notes survive restart and delete cleanly. Export then import gives back the same data | 6 |
