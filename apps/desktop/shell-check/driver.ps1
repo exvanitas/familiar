@@ -387,6 +387,19 @@ try {
   if ($p.ExitCode -ne 0 -or -not (Select-String -Path $log -Pattern '\] DONE$' -Quiet)) { Result 'FAIL' 'check.phase' "proxy-start didn't complete: exit $($p.ExitCode)" }
   [void](No-Strays 'proxy-start')
 
+  # ---------- the responsiveness probe against a build that blocks on purpose ----------
+  $blockingExe = Join-Path (Split-Path $Exe) 'familiar-blocking.exe'
+  if (Test-Path $blockingExe) {
+    $log = Join-Path $Out 'responsive-control.log'
+    $p = Run-Phase 'responsive-control' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'control-data'), '--log', $log, '--seconds', '120', '--phase', 'responsive-control') 150 $blockingExe
+    $m = Select-String -Path $log -Pattern 'INFO responsive-control (\d+)' | Select-Object -Last 1
+    $ms = if ($m) { [int]$m.Matches[0].Groups[1].Value } else { -1 }
+    if ($ms -ge 100) { Result 'PASS' 'check.exec.responsive-control' "a check build whose request helpers block the async workers made shell_info take $ms ms, so the probe catches it" }
+    else { Result 'FAIL' 'security.exec.responsive' "the probe didn't catch a build that blocks on purpose: $ms ms" }
+    [void](No-Strays 'responsive-control')
+  } elseif ($env:REUSE -eq 'true') { Result 'SKIP' 'check.exec.responsive-control' 'a reused exe has no control build' }
+  else { Result 'FAIL' 'security.exec.responsive' 'no control build beside the exe' }
+
   # ---------- server starts, links, saving, system state, wake: procs.ps1 ----------
   Run-ProcChecks
 

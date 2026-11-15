@@ -64,3 +64,8 @@ opt-level = "s"
 lto = "thin"
 codegen-units = 16
 strip = true
+
+[features]
+# A check build only, never shipped: a request's helper blocks the async worker it runs on, so the
+# runner can show security.exec.responsive catches that.
+check-blocking = []

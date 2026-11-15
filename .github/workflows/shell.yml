@@ -111,6 +111,15 @@ jobs:
           New-Item -ItemType Directory -Force exe | Out-Null
           Copy-Item apps/desktop/src-tauri/target/release/familiar.exe exe/
 
+      # A check build, never uploaded or shipped: its request helpers block the async workers on
+      # purpose, and the contract check shows security.exec.responsive's probe catches that.
+      - name: Control build that blocks on purpose
+        if: env.REUSE != 'true'
+        working-directory: apps/desktop/src-tauri
+        run: |
+          cargo build --release --locked --features check-blocking
+          Copy-Item target/release/familiar.exe ../../../exe/familiar-blocking.exe
+
       - name: Exe from the latest build
         if: env.REUSE == 'true'
         env:

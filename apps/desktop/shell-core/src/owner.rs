@@ -19,12 +19,17 @@
 //!   connection dropped, nothing more can be sent). Ending a request is a transition; its
 //!   termination is another, and a cancel or a removal waits for it (`running`, `settled`) before
 //!   it returns or goes on.
+//! - A request's helper work (its key read and every lookup, run on blocking threads) belongs to
+//!   its transport's lifetime (`Helpers`): a helper starts only while the request runs, and the
+//!   transport says it has terminated only once every helper that started has finished. A helper
+//!   still queued when the request ends never starts.
 //! - A removal is made durable before anything irreversible: the address is written to the list
 //!   as removing, then its key is deleted, then the list is written without it (`run_removal`). An
 //!   entry loaded as removing starts `Removing`, refusing everything, and the removal is finished.
 
 use crate::fetch::FetchError;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// How long a request may spend reading its key and looking its name up before it's sent.
@@ -270,6 +275,46 @@ impl Ledger {
         if let Some(a) = self.addrs.get_mut(address) {
             a.writes = a.writes.saturating_sub(1);
         }
+    }
+}
+
+/// A request's helpers: the blocking work it hands to other threads.
+#[derive(Default)]
+pub struct Helpers {
+    /// (stopped, how many are running)
+    state: Mutex<(bool, u32)>,
+}
+
+/// One helper running. It counts until it's dropped.
+pub struct Helping(Arc<Helpers>);
+
+impl Helpers {
+    /// Called by a helper as it starts, on its own thread: `None` once the request has ended, so
+    /// a helper still queued then does nothing.
+    pub fn start(self: &Arc<Self>) -> Option<Helping> {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if s.0 {
+            return None;
+        }
+        s.1 += 1;
+        Some(Helping(self.clone()))
+    }
+
+    /// The request has ended: no helper starts from now on.
+    pub fn stop(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).0 = true;
+    }
+
+    /// No helper is running. Once stopped and idle, none ever will again.
+    pub fn idle(&self) -> bool {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 == 0
+    }
+}
+
+impl Drop for Helping {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.1 = s.1.saturating_sub(1);
     }
 }
 
@@ -559,6 +604,39 @@ mod tests {
             // Only a failure before anything durable leaves it saved.
             assert_eq!(d.restart().address(A).is_some_and(|s| s == AddrState::Saved), fail_at == Some(1), "{fail_at:?}");
         }
+    }
+
+    #[test]
+    fn a_helper_queued_until_after_the_end_never_runs_and_a_running_one_holds_the_end() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Barrier;
+        let helpers = Arc::new(Helpers::default());
+        let lookups = Arc::new(AtomicU32::new(0));
+        // A lookup handed to a blocking thread, held in its queue.
+        let release = Arc::new(Barrier::new(2));
+        let (h, n, r) = (helpers.clone(), lookups.clone(), release.clone());
+        let queued = std::thread::spawn(move || {
+            r.wait();
+            if let Some(_running) = h.start() {
+                n.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // The request ends: stopped, and nothing is running, so its cancel may return now.
+        helpers.stop();
+        assert!(helpers.idle(), "the queued helper hasn't started, so nothing holds the end");
+        // Released after the cancel would have returned: it does nothing.
+        release.wait();
+        queued.join().unwrap();
+        assert_eq!(lookups.load(Ordering::SeqCst), 0, "a lookup ran after the end");
+        assert!(helpers.start().is_none());
+
+        // A helper already running when the request ends holds the end until it's done.
+        let helpers = Arc::new(Helpers::default());
+        let running = helpers.start().expect("started while the request runs");
+        helpers.stop();
+        assert!(!helpers.idle(), "the end must wait for it");
+        drop(running);
+        assert!(helpers.idle());
     }
 
     #[test]

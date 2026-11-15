@@ -27,14 +27,14 @@ use serde::{Deserialize, Serialize};
 use shell_core::{
     address::{self, Kind, Normalized, Reach},
     fetch::{self, FetchError, Limits},
-    owner::{ReqState, RESOLVE_DEADLINE},
+    owner::{Helpers, ReqState, RESOLVE_DEADLINE},
     redact::{self, Redactor, KEY_MARK},
     secret,
 };
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::OnceLock,
+    sync::Arc,
     time::Duration,
 };
 use tauri::{ipc::Response, AppHandle, Manager};
@@ -65,17 +65,16 @@ pub type Read = oneshot::Sender<Result<Vec<u8>, FetchError>>;
 
 pub type Owner = crate::owner::Owner<Read>;
 
-/// The kept clients. Every request's state is the owner's, in `Addresses`.
+/// Nothing kept: every request gets its own client, so its resolver's lookups belong to that
+/// request's transport. Every request's state is the owner's, in `Addresses`.
 #[derive(Default)]
-pub struct Net {
-    /// Lan and loopback, which never use a proxy, so they can be kept.
-    local: OnceLock<[Client; 2]>,
-}
+pub struct Net {}
 
 /// A resolver that uses a lookup only if every answer is of the address's reach, so a name that
 /// later resolves somewhere else (DNS rebinding) reaches nothing. TLS still checks the certificate
-/// against the name.
-struct KeepReach(Reach);
+/// against the name. Its lookups are its request's helpers: one still queued when the request
+/// ends never runs, and the transport doesn't terminate while one is running.
+struct KeepReach(Reach, Arc<Helpers>);
 
 #[derive(Debug)]
 struct Blocked;
@@ -92,10 +91,10 @@ fn look_up(host: &str) -> std::io::Result<Vec<IpAddr>> {
 
 impl Resolve for KeepReach {
     fn resolve(&self, name: Name) -> Resolving {
-        let (reach, host) = (self.0, name.as_str().to_string());
+        let (reach, host, helpers) = (self.0, name.as_str().to_string(), self.1.clone());
         Box::pin(async move {
             type BoxError = Box<dyn std::error::Error + Send + Sync>;
-            let answers = tokio::task::spawn_blocking(move || look_up(&host)).await.map_err(|e| Box::new(e) as BoxError)?.map_err(|e| Box::new(e) as BoxError)?;
+            let answers = helper(&helpers, move || look_up(&host)).await.map_err(|_| Box::new(Blocked) as BoxError).and_then(|r| r.map_err(|e| Box::new(e) as BoxError))?;
             // Every answer of the address's reach, or none used at all: one answer elsewhere among
             // good ones is a rebinding attempt, not noise to filter out.
             let kept = shell_core::reach::all_of(reach, &answers).ok_or_else(|| Box::new(Blocked) as BoxError)?;
@@ -104,9 +103,9 @@ impl Resolve for KeepReach {
     }
 }
 
-fn client(reach: Reach) -> Client {
+fn client(reach: Reach, helpers: Arc<Helpers>) -> Client {
     let b = Client::builder()
-        .dns_resolver(KeepReach(reach))
+        .dns_resolver(KeepReach(reach, helpers))
         .redirect(Policy::none())
         .connect_timeout(fetch::CONNECT_TIMEOUT)
         .user_agent("Familiar");
@@ -115,18 +114,6 @@ fn client(reach: Reach) -> Client {
     b.build().expect("the fetch's client")
 }
 
-impl Net {
-    /// A public address gets a client made for this request, so it uses the system proxy as it is
-    /// now, not as it was when Familiar started.
-    fn client(&self, reach: Reach) -> Client {
-        let local = self.local.get_or_init(|| [client(Reach::Lan), client(Reach::Loopback)]);
-        match reach {
-            Reach::Public => client(Reach::Public),
-            Reach::Lan => local[0].clone(),
-            Reach::Loopback => local[1].clone(),
-        }
-    }
-}
 
 /// The request's spec, from the `x-spec` header, percent-encoded JSON.
 #[derive(Deserialize)]
@@ -205,6 +192,28 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|_| FetchError::Network)
 }
 
+/// A request's blocking work, as one of its helpers: it runs only if the request is still running
+/// when a blocking thread picks it up, and holds the transport's termination while it runs.
+async fn helper<T: Send + 'static>(helpers: &Arc<Helpers>, f: impl FnOnce() -> T + Send + 'static) -> Result<T, FetchError> {
+    let h = helpers.clone();
+    // A check build only: the helper blocks the async worker it was called on, the regression
+    // security.exec.responsive must catch.
+    #[cfg(feature = "check-blocking")]
+    {
+        std::thread::sleep(Duration::from_secs(3));
+        let _running = h.start().ok_or(FetchError::Cancelled)?;
+        Ok(f())
+    }
+    #[cfg(not(feature = "check-blocking"))]
+    tokio::task::spawn_blocking(move || {
+        let _running = h.start()?;
+        Some(f())
+    })
+    .await
+    .map_err(|_| FetchError::Network)?
+    .ok_or(FetchError::Cancelled)
+}
+
 #[tauri::command]
 pub async fn net_fetch(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<Head, Fail> {
     let spec = request.headers().get("x-spec").and_then(|v| v.to_str().ok()).map(|v| percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned());
@@ -237,22 +246,33 @@ async fn start(app: &AppHandle, spec: Spec, body: Vec<u8>) -> Result<Head, Fetch
 struct Terminated {
     app: AppHandle,
     id: String,
+    helpers: Arc<Helpers>,
 }
 
 impl Drop for Terminated {
+    /// No helper starts from now on, and the owner hears of the termination only once every
+    /// helper that had started has finished.
     fn drop(&mut self) {
-        self.app.state::<Addresses>().owner.terminated(&self.id);
+        self.helpers.stop();
+        let (app, id, helpers) = (self.app.clone(), std::mem::take(&mut self.id), self.helpers.clone());
+        tauri::async_runtime::spawn(async move {
+            while !helpers.idle() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            app.state::<Addresses>().owner.terminated(&id);
+        });
     }
 }
 
 /// One request's transport, from its lookup to its last byte: it owns the connection, answers
 /// reads, and ends when the body does, on an error, or when the owner ends the request.
 async fn transport(app: AppHandle, spec: Spec, found: (Saved, Normalized), body: Vec<u8>, mut stop: watch::Receiver<Stop>, mut reads: mpsc::Receiver<Read>, head: oneshot::Sender<Result<Head, FetchError>>) {
-    let _terminated = Terminated { app: app.clone(), id: spec.id.clone() };
+    let helpers = Arc::new(Helpers::default());
+    let _terminated = Terminated { app: app.clone(), id: spec.id.clone(), helpers: helpers.clone() };
     let id = spec.id.clone();
     let addresses = app.state::<Addresses>();
     let owner = &addresses.owner;
-    let mut b = match go(&app, owner, &mut stop, found, spec, body).await {
+    let mut b = match go(owner, &helpers, &mut stop, found, spec, body).await {
         Ok((h, b)) => {
             if head.send(Ok(h)).is_err() {
                 owner.end(&id, Some(FetchError::Cancelled));
@@ -289,7 +309,7 @@ async fn transport(app: AppHandle, spec: Spec, found: (Saved, Normalized), body:
     }
 }
 
-async fn go(app: &AppHandle, owner: &Owner, stop: &mut watch::Receiver<Stop>, (saved, norm): (Saved, Normalized), spec: Spec, body: Vec<u8>) -> Result<(Head, Body), FetchError> {
+async fn go(owner: &Owner, helpers: &Arc<Helpers>, stop: &mut watch::Receiver<Stop>, (saved, norm): (Saved, Normalized), spec: Spec, body: Vec<u8>) -> Result<(Head, Body), FetchError> {
     let id = spec.id.as_str();
     let reach = crate::addresses::reach(&saved).ok_or(FetchError::NotSaved)?;
     let mut url = address::under(&norm, spec.url.as_str())?;
@@ -301,10 +321,11 @@ async fn go(app: &AppHandle, owner: &Owner, stop: &mut watch::Receiver<Stop>, (s
     // proxy will resolve it, together under one deadline.
     owner.advance(id, ReqState::Resolving)?;
     let (address_id, host, public_name) = (saved.id.clone(), norm.host.clone(), reach == Reach::Public && norm.reach.is_none());
+    let h = helpers.clone();
     let key = wait(owner, id, stop, RESOLVE_DEADLINE, async move {
-        let key = blocking(move || secrets::address_key(&address_id)).await?;
+        let key = helper(&h, move || secrets::address_key(&address_id)).await?;
         if public_name {
-            let answers = blocking(move || look_up(&host)).await?.map_err(|_| FetchError::Network)?;
+            let answers = helper(&h, move || look_up(&host)).await?.map_err(|_| FetchError::Network)?;
             shell_core::reach::all_of(Reach::Public, &answers).ok_or(FetchError::BlockedAddress)?;
         }
         Ok(key)
@@ -315,7 +336,7 @@ async fn go(app: &AppHandle, owner: &Owner, stop: &mut watch::Receiver<Stop>, (s
     // or not this request carried it: an endpoint can hold it from earlier requests.
     let secrets: Vec<String> = key.into_iter().collect();
     owner.advance(id, ReqState::Sending)?;
-    let (response, redirected) = send(owner, id, stop, &app.state::<Net>().client(reach), method, &mut url, &swapped.headers, body, &norm, &secrets, &limits).await?;
+    let (response, redirected) = send(owner, id, stop, &client(reach, helpers.clone()), method, &mut url, &swapped.headers, body, &norm, &secrets, &limits).await?;
     let head = redact::redact_head(
         redact::Head {
             status_text: response.status().canonical_reason().unwrap_or("").to_string(),
