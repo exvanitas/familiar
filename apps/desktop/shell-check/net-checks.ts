@@ -53,7 +53,7 @@ async function added(spec: Parameters<typeof shell.addressAdd>[0], act: 'approve
   if (act !== 'none' && !d.found) fail('no dialog for ' + spec.url);
   return r;
 }
-async function saved(spec: Parameters<typeof shell.addressAdd>[0]): Promise<Address> {
+export async function saved(spec: Parameters<typeof shell.addressAdd>[0]): Promise<Address> {
   const r = await added(spec);
   if (typeof r === 'string') fail(`${spec.url} wasn't saved: ${r}`);
   return r as Address;

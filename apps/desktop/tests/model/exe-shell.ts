@@ -25,7 +25,7 @@ export function exeShell(saved: { id: string; url: string; key?: string }): Shel
       const abort = new AbortController();
       let r: Response;
       try {
-        r = await fetch(spec.url, { method: spec.method, headers, body: body.length ? body : undefined, signal: abort.signal });
+        r = await fetch(spec.url, { method: spec.method, headers, ...(body.length ? { body: body as Uint8Array<ArrayBuffer> } : {}), signal: abort.signal });
       } catch {
         throw { kind: 'network', message: 'connect failed' };
       }

@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import { join } from 'node:path';
+import { answer, keyOf as modelKeyOf } from './model-recordings.ts';
 
 const [out, appDir, pfxFile, pfxWord, lanIp] = process.argv.slice(2);
 /* The last key a request carried, so a later request without one can be answered with it. */
@@ -35,6 +36,8 @@ async function handle(req, res) {
   const route = path.replace(/^\/[^/]+/, '');
   open++;
   res.on('close', () => { open--; });
+  // The recorded model endpoints, for model-checks.ts: /model/<wire>/<scenario>/<what the SDK adds>.
+  if (/^\/model0?\//.test(path)) return modelRoute(req, res, route);
   switch (route) {
     case '/ok': return res.end('ok');
     // The address's key, though this request didn't carry it.
@@ -85,6 +88,24 @@ async function handle(req, res) {
     case '/redir-https': res.writeHead(302, { location: `https://127.0.0.1:${tlsPort}${path.match(/^\/[^/]+/)[0]}/ok` }); return res.end();
     default: res.writeHead(404); return res.end('no such route');
   }
+}
+
+/* Replays a recording from model-recordings.ts. It answers with a SHA-256 of `Bearer <the key it
+   got>`, from either key header, so the page can check the stored key arrived without seeing it, and
+   puts that key where an endpoint would echo it. */
+async function modelRoute(req, res, route) {
+  const parts = [];
+  for await (const c of req) parts.push(c);
+  const key = modelKeyOf(req.headers);
+  const r = answer(route, Buffer.concat(parts).toString('utf8'), key);
+  if (!r) { res.writeHead(404); return res.end('no recording'); }
+  res.writeHead(r.status, { ...r.headers, 'x-auth-sha256': sha(`Bearer ${key}`) });
+  for (const chunk of r.chunks) {
+    if (res.destroyed) return;
+    res.write(chunk);
+    if (r.delayMs) await sleep(r.delayMs);
+  }
+  res.end();
 }
 
 const http = createServer((q, s) => { handle(q, s).catch(() => s.destroy()); });

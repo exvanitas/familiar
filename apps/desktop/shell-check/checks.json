@@ -37,6 +37,7 @@
     "wake.hidden",
     "toast.app-id",
     "persist.notified",
-    "autostart"
+    "autostart",
+    "model.contract"
   ]
 }

@@ -528,7 +528,7 @@ guardedFetch(address: string): typeof fetch
 - **Literal addresses**: `http://[::ffff:127.0.0.1]:<port>` saves as loopback. `http://` to a public address is `insecure`. `http://169.254.169.254` can't be saved.
 - **Proxy**: the driver sets the per-user system proxy to its logging proxy. A public address goes through it, a lan and a loopback address don't, and a literal private IP is still refused.
 - The key swap and every echo route ([5a](#5a-credentials)).
-- In step 4, not step 3: the model-port contract runs over `guardedFetch` in the real webview against the same server, with recorded OpenAI and Anthropic streams, all six cases. Step 3 keeps the broker's own security, streaming, redaction and cancellation tests.
+- In step 4, not step 3: the model-port contract runs over `guardedFetch` in the real webview against the same server, with recorded OpenAI, Anthropic and Gemini streams, every case (`check.model.contract`, and `security.model.key-swap` for the key). Step 3 keeps the broker's own security, streaming, redaction and cancellation tests.
 
 ### 5d. The rest
 
@@ -615,6 +615,7 @@ Modelled on Desktop Buddies' `shell.yml`: `.github/workflows/shell.yml` on `wind
    - `fetch.saved-only`, `fetch.no-lookup-before-allow`, `fetch.stream-stop`, `fetch.live-stream`, `fetch.limits`, `fetch.redirects`, `fetch.rebinding`, `fetch.literal`, `fetch.proxy`, `fetch.revoke`
    - `server.approve`, `server.reask`, `server.paths`, `server.remote-drive`, `server.links`, `server.retarget`, `server.forget-failed`, `server.settings`, `server.blank`, `server.env`, `server.start-failed`, `server.store-recovery`, `server.kill`
    - `link.confirm`, `files.save-refused`, `quit.clean`
+   - `model.key-swap` (step 4): the model adapter's requests carry only the placeholder, the endpoint gets the stored key, and its echo comes back blanked. See [model-design.md](model-design.md#recorded-replies).
    - Added with the pieces built later: `files.backup-budget` (step 10), `ws.saved-only`, `ws.host-origin`, `ws.owner-process` (the pre-release pass). The release gate requires them all.
 
    Declared `check.` ids include the measurements below, `system.idle`, `wake.hidden`, the smoke run's steps and anything the runner may not allow.

@@ -9,6 +9,7 @@ import { CORE_EVENT_NAMES, CORE_ONLY, EVENTS, NOT_YET, PLUGINS } from './lists.t
 import { allowed, trySinks } from './tt.ts';
 import { confirmChecks } from './confirm-checks.ts';
 import { netChecks, proxyStartChecks, removeRestartChecks, responsiveControl } from './net-checks.ts';
+import { modelChecks } from './model-checks.ts';
 import { procPhase } from './procs.ts';
 
 const messages: CoreMessage[] = [];
@@ -317,6 +318,7 @@ async function main(info: Info) {
 
   await confirmChecks({ ask, up });
   await netChecks({ ask, up });
+  await modelChecks({ ask });
 
   // Egress: core, a view, and a view without Trusted Types, one after another.
   const fx = await fixtures();

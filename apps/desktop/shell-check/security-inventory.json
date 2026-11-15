@@ -70,6 +70,7 @@
     "server.kill",
     "link.confirm",
     "files.modal",
-    "files.save-refused"
+    "files.save-refused",
+    "model.key-swap"
   ]
 }
