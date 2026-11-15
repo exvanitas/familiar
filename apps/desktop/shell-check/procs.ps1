@@ -305,6 +305,11 @@ $procSteps = @{
     $why = [P]::LimitJob([uint32]$script:proc.Id)
     @{ done = ($why -eq ''); why = $why }
   }
+  'confirm-wait' = {
+    param($a)
+    # A confirm of the exe's, waited for and left up.
+    @{ found = [bool](Wait-Dialog $a.ms) }
+  }
   'retarget-setup' = {
     param($a)
     # Two copies of node, in folders a and b, and a junction j leading to a.

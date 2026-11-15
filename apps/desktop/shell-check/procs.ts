@@ -376,6 +376,42 @@ async function main(info: Info, ctx: Ctx) {
     return `60 writes of 1 MiB to a server that never reads: ${count('busy')} busy, ${count('failed')} failed when it stopped, ${count('written')} written; with ${heldDuring} still held, shell_info answered in ${infoMs.join(', ')} ms (each under 100) and system in ${others} ms; stop took ${ms} ms`;
   });
 
+  await check('security.server.forget-failed', async () => {
+    // An approved setup, then a changed start of it, whose ask is held at its dialog. With the
+    // shell folder unwritable, a forget can't remove the approval: it fails, and so must a second.
+    // The held ask, approved, is revoked, and an unchanged start is refused before any dialog.
+    // Once the folder is writable again, the next start retries the removal, and asks.
+    const a = fakeSetup(p, 'forget-f-' + rand(4));
+    const m = new Mcp();
+    const r = await startWith(m, a, 'yes');
+    ok(r.started === 'started', 'the first start: ' + r.started);
+    await shell.serverStop(m.run);
+    await m.exited(5000);
+    const heldP = new Mcp().start({ ...a, args: [p.mainTs, '--variant', 'b'] }).then(() => 'started', e => errKind(e));
+    const up = await step<{ found: boolean }>('confirm-wait', { ms: 15000 });
+    ok(up.found, 'no dialog for the changed start');
+    let first = '', second = '', held = '', plain = { dialog: { shown: false, text: '' }, started: '' };
+    await step('shell-lock', { data: info.dataDir, on: true });
+    try {
+      first = await shell.serverForget(a.id).then(() => 'forgot', e => errKind(e));
+      second = await shell.serverForget(a.id).then(() => 'forgot', e => errKind(e));
+      await dialog('approve', START);
+      held = await heldP;
+      plain = await startWith(new Mcp(), a, 'none');
+    } finally {
+      await step('shell-lock', { data: info.dataDir, on: false });
+    }
+    const after = await startWith(new Mcp(), a, 'no');
+    const kids = await step<{ count: number }>('node-children', {});
+    ok(first === 'failed', `the forget with the folder locked: ${first}, not failed`);
+    ok(second === 'failed', `a second forget with the folder locked: ${second}, not failed`);
+    ok(held === 'revoked', `the ask held over the failed forget, approved: ${held}, not revoked`);
+    ok(!plain.dialog.shown && plain.started === 'revoked', `an unchanged start while locked: dialog ${plain.dialog.shown}, ${plain.started}, not revoked before any dialog`);
+    ok(after.dialog.shown && after.started === 'declined', `the start once unlocked: dialog ${after.dialog.shown}, ${after.started}; it must ask`);
+    ok(kids.count === 0, `${kids.count} node children left`);
+    return `with servers.json unwritable both forgets were ${first}, the held ask approved was ${held}, an unchanged start ${plain.started} with no dialog; unlocked, the next start asked (${after.started}); ${kids.count} node children`;
+  });
+
   await check('security.server.exit-drains', async () => {
     // The program exits, but a grandchild it started holds its stdout open. The exit must still
     // come, and the grandchild go with the job.
