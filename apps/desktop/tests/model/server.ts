@@ -44,7 +44,9 @@ export async function startModelServer(extra?: (path: string) => { status: numbe
       res.writeHead(r.status, r.headers);
       let closed = false;
       res.on('close', () => { closed = true; });
-      for (const chunk of r.chunks) {
+      for (const [i, chunk] of r.chunks.entries()) {
+        if (closed) return;
+        if (r.stall && i === r.stall.after) await new Promise(done => setTimeout(done, r.stall!.ms));
         if (closed) return;
         res.write(chunk);
         if (r.delayMs > 0) await new Promise(done => setTimeout(done, r.delayMs));

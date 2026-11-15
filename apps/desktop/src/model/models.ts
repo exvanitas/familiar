@@ -4,12 +4,14 @@
 import type { Price } from '@familiar/core';
 import { PLACEHOLDER } from '../net.ts';
 import type { EndpointSetup, Preset } from './presets.ts';
-import { preset as presetOf, priceFor } from './presets.ts';
+import { CATALOG_LABEL, preset as presetOf, priceFor } from './presets.ts';
 
 export interface ListedModel {
   readonly id: string;
   readonly name: string;
   readonly price?: Price;
+  /** Said beside the price when it isn't the endpoint's own. */
+  readonly priceNote?: string;
   readonly tools: 'yes' | 'no' | 'unknown';
   /** Why tools are off, when they are. */
   readonly note?: string;
@@ -75,13 +77,13 @@ function toListed(p: Preset, raw: unknown): ListedModel[] {
   const name = typeof m.name === 'string' ? m.name : typeof m.display_name === 'string' ? m.display_name : id;
   const params = Array.isArray(m.supported_parameters) ? m.supported_parameters : undefined;
   const tools = params ? (params.includes('tools') ? 'yes' : 'no') : 'unknown';
-  const price = priceFor(p, openRouterPrice(m.pricing));
+  const price = priceFor(p, openRouterPrice(m.pricing), id);
   return [{
     id,
     name,
     tools,
     ...(tools === 'no' ? { note: NO_TOOLS_NOTE } : {}),
-    ...(price ? { price } : {}),
+    ...(price ? { price, ...(price.source === 'catalog' ? { priceNote: CATALOG_LABEL } : {}) } : {}),
     ...(typeof m.context_length === 'number' ? { contextLength: m.context_length } : {})
   }];
 }

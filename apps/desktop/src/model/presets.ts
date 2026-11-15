@@ -5,6 +5,7 @@ import type { AnthropicMessagesCompat, OpenAICompletionsCompat } from '@earendil
 import type { Price } from '@familiar/core';
 import { PLACEHOLDER } from '../net.ts';
 import type { AdapterOptions, WireApi } from './pi-ai.ts';
+import { CATALOG_PRICES } from './catalog-prices.ts';
 
 export type PresetId = 'openrouter' | 'openai' | 'anthropic' | 'gemini' | 'ollama' | 'lmstudio' | 'custom';
 
@@ -113,7 +114,19 @@ export function adapterOptions(s: EndpointSetup): AdapterOptions {
   };
 }
 
-/** The price to use for a model: a local server's is $0, else what the model list said, if anything. */
-export function priceFor(p: Preset, listed: Price | undefined): Price | undefined {
-  return p.free ? { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 } : listed;
+/** How a price from the catalog is labelled wherever it's shown, so it's never taken for a live one. */
+export const CATALOG_LABEL = "listed price in Familiar's model catalog";
+
+/**
+ * The price to use for a model, best first: one the person typed; a local server's $0; the endpoint's
+ * own list (OpenRouter); for OpenAI, Anthropic and Gemini, which publish none, the listed price in
+ * Familiar's model catalog for a model id it knows. Otherwise unknown, and a dollar cap pauses.
+ */
+export function priceFor(p: Preset, listed: Price | undefined, modelId?: string, typed?: Price): Price | undefined {
+  if (typed) return { ...typed, source: 'typed' };
+  if (p.free) return { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0, source: 'local' };
+  if (listed) return { ...listed, source: 'endpoint' };
+  const book = p.id === 'openai' || p.id === 'anthropic' || p.id === 'gemini' ? CATALOG_PRICES[p.id] : undefined;
+  const found = modelId !== undefined && book && Object.hasOwn(book, modelId) ? book[modelId] : undefined;
+  return found ? { ...found, source: 'catalog' } : undefined;
 }

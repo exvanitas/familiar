@@ -33,8 +33,13 @@ export interface Recording {
   /** Written one by one, `delayMs` apart. For SSE each is one whole event block. */
   readonly chunks: readonly string[];
   readonly delayMs: number;
-  /** The request body must hold this, or the wire's bad-request recording answers instead. */
-  readonly requires?: string;
+  /** The request must carry back this wire's replay, in its proper place (`carriesReplay`), or the
+      wire's bad-request recording answers instead. */
+  readonly replay?: true;
+  /** Goes quiet for `ms` after writing `after` chunks. */
+  readonly stall?: { readonly after: number; readonly ms: number };
+  /** For a redirect: where to, relative to the scenario (see `answer`). */
+  readonly redirectTo?: Scenario;
 }
 
 const sse = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' };
@@ -59,7 +64,13 @@ export const SIGNATURES: Record<Wire, string> = {
 
 export type Scenario =
   | 'text' | 'tool-call' | 'auth-error' | 'slow' | 'thinking-tool-call' | 'replay-check' | 'bad-tool-arguments'
-  | 'cache' | 'length' | 'filtered' | 'rate-limit' | 'overloaded' | 'server-error' | 'bad-request';
+  | 'cache' | 'length' | 'filtered' | 'rate-limit' | 'overloaded' | 'server-error' | 'bad-request'
+  | 'unavailable' | 'redirected-rate-limit' | 'unsafe-tool-arguments' | 'no-usage' | 'stream-timeout' | 'stream-too-large';
+
+/** The tool call ids the thinking recordings use, which a replayed signature must ride on. */
+export const REPLAY_CALL_IDS: Record<Wire, string> = { openai: 'call_rec_1', anthropic: 'toolu_rec_2', gemini: 'function-call-15409270000000000000' };
+const BIG_PIECES = Array.from({ length: 80 }, (_, i) => `chunk ${i} `.padEnd(100, 'x'));
+const redirect = (to: Scenario): Recording => ({ status: 302, headers: { 'content-length': '0' }, chunks: [], delayMs: 0, redirectTo: to });
 
 /* ---------- OpenAI chat completions (and the OpenAI-compatible endpoints) ---------- */
 
@@ -108,7 +119,16 @@ function openaiShaped(wire: 'openai' | 'gemini'): Record<Scenario, Recording> {
       : failure(400, [{ error: { code: 400, message: `API key not valid. Please pass a valid API key. {{key}} ${ENDPOINT_WORDS}`, status: 'INVALID_ARGUMENT', details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }] } }]),
     slow: reply([chunk({ role: 'assistant', content: '' }), ...SLOW_PIECES.map(t => chunk({ content: t })), chunk({}, 'stop'), done], sse, 100),
     'thinking-tool-call': reply(thinkingCall),
-    'replay-check': { ...reply(text()), requires: SIGNATURES[wire] },
+    'replay-check': { ...reply(text()), replay: true },
+    'unsafe-tool-arguments': reply([
+      chunk({ role: 'assistant', content: null, tool_calls: [{ index: 0, id: callId, type: 'function', function: { name: 'get_time', arguments: '{"toString": null}' } }] }),
+      chunk({}, 'tool_calls'), usage(48, 7), done
+    ]),
+    // A server that doesn't send stream usage: no usage chunk at all.
+    'no-usage': reply([chunk({ role: 'assistant', content: '' }), ...TEXT_PIECES.map(t => chunk({ content: t })), chunk({}, 'stop'), done]),
+    'stream-timeout': { ...reply(text()), stall: { after: 2, ms: 4000 } },
+    'stream-too-large': reply([chunk({ role: 'assistant', content: '' }), ...BIG_PIECES.map(t => chunk({ content: t })), chunk({}, 'stop'), usage(31, 900), done], sse, 2),
+    'redirected-rate-limit': redirect('rate-limit'),
     'bad-request': badRequest,
     'bad-tool-arguments': reply([
       chunk({ role: 'assistant', content: null, tool_calls: [{ index: 0, id: callId, type: 'function', function: { name: 'get_time', arguments: BAD_ARGS } }] }),
@@ -120,7 +140,13 @@ function openaiShaped(wire: 'openai' | 'gemini'): Record<Scenario, Recording> {
     'rate-limit': err(429,
       { error: { message: `Rate limit reached for requests. ${ENDPOINT_WORDS}`, type: 'requests', param: null, code: 'rate_limit_exceeded' } },
       { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted (e.g. check quota).' }, { 'retry-after': '2' }),
+    // OpenAI's and Google's documented 503s carry no sign the request wasn't taken. This one adds
+    // `x-should-retry: true`, which OpenAI's own SDK honours, to test the adapter's rule; whether either
+    // sends it isn't documented.
     overloaded: err(503,
+      { error: { message: `The engine is currently overloaded, please try again later. ${ENDPOINT_WORDS}`, type: 'server_error', param: null, code: null } },
+      { code: 503, status: 'UNAVAILABLE', message: 'The model is overloaded. Please try again later.' }, { 'x-should-retry': 'true' }),
+    unavailable: err(503,
       { error: { message: `The engine is currently overloaded, please try again later. ${ENDPOINT_WORDS}`, type: 'server_error', param: null, code: null } },
       { code: 503, status: 'UNAVAILABLE', message: 'The model is overloaded. Please try again later.' }),
     'server-error': err(500,
@@ -170,7 +196,15 @@ function anthropicWire(): Record<Scenario, Recording> {
       ...toolUse(1, 'toolu_rec_2', ['{"zone": "UTC"}']),
       ...end('tool_use', 30)
     ], head(5)),
-    'replay-check': { ...reply(text(), head(6)), requires: SIGNATURES.anthropic },
+    'replay-check': { ...reply(text(), head(6)), replay: true },
+    'unsafe-tool-arguments': reply([start(48), ...toolUse(0, 'toolu_rec_4', ['{"toString": null}']), ...end('tool_use', 7)], head(11)),
+    // message_delta without its usage, as a proxy might send it.
+    'no-usage': reply([start(31), textStart(), ...TEXT_PIECES.map(t => textDelta(t)), blockStop(),
+      event('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null } }), event('message_stop', { type: 'message_stop' })], head(12)),
+    'stream-timeout': { ...reply(text(), head(13)), stall: { after: 4, ms: 4000 } },
+    'stream-too-large': reply([start(31), textStart(), ...BIG_PIECES.map(t => textDelta(t)), blockStop(), ...end('end_turn', 900)], head(14), 2),
+    'redirected-rate-limit': redirect('rate-limit'),
+    unavailable: err(503, 'api_error', 'Service unavailable', {}),
     // What Anthropic says when a turn mixing thinking and tools comes back without its signed thinking.
     'bad-request': err(400, 'invalid_request_error', 'messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `tool_use`.', { 'x-should-retry': 'false' }),
     'bad-tool-arguments': reply([start(48), ...toolUse(0, 'toolu_rec_3', [BAD_ARGS]), ...end('tool_use', 7)], head(7)),
@@ -201,9 +235,55 @@ export function keyOf(headers: Readonly<Record<string, string | string[] | undef
  * of the path the server itself owns. `body` is the request's body as text.
  */
 export function answer(path: string, body: string, key: string): Recording | undefined {
-  const [, wire, scenario] = path.split('/');
+  const [, wire, scenario, ...rest] = path.split('/');
   const r = recordings[wire as Wire]?.[scenario as Scenario];
   if (!r) return undefined;
-  const chosen = r.requires !== undefined && !body.includes(r.requires) ? recordings[wire as Wire]['bad-request'] : r;
+  if (r.redirectTo) {
+    // Relative, so it stays under whatever prefix the server put in front: up past what the SDK added.
+    const location = '../'.repeat(rest.length) + [r.redirectTo, ...rest].join('/');
+    return { ...r, headers: { ...r.headers, location } };
+  }
+  const chosen = r.replay && !carriesReplay(wire as Wire, body) ? recordings[wire as Wire]['bad-request'] : r;
   return { ...chosen, chunks: chosen.chunks.map(c => c.replaceAll('{{key}}', key)) };
 }
+
+type Json = Record<string, unknown>;
+const obj = (v: unknown): Json | undefined => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : undefined);
+const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+/**
+ * Whether a request carries back the thinking-tool-call reply's replay in the place each API reads it:
+ * - Anthropic: in the assistant turn, a thinking block with the signature, before the tool_use block of
+ *   the recorded call.
+ * - OpenRouter's wire: on the assistant message, `reasoning_details` holding an entry with the signature.
+ * - Gemini: on the recorded tool call, `extra_content.google.thought_signature`, and on no other call.
+ * The signature anywhere else, as text or on the wrong call, doesn't count.
+ */
+export function carriesReplay(wire: Wire, body: string): boolean {
+  let j: unknown;
+  try {
+    j = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  const sig = SIGNATURES[wire], id = REPLAY_CALL_IDS[wire];
+  const turns = arr(obj(j)?.messages).map(obj).filter((m): m is Json => m?.role === 'assistant');
+  return turns.some(m => {
+    if (wire === 'anthropic') {
+      const blocks = arr(m.content).map(obj);
+      const thinking = blocks.findIndex(b => b?.type === 'thinking' && b.signature === sig);
+      const call = blocks.findIndex(b => b?.type === 'tool_use' && b.id === id);
+      return thinking >= 0 && call > thinking;
+    }
+    if (wire === 'openai') return arr(m.reasoning_details).some(d => obj(d)?.signature === sig);
+    const calls = arr(m.tool_calls).map(obj);
+    const signed = calls.filter(c => obj(obj(c?.extra_content)?.google)?.thought_signature === sig);
+    return signed.length === 1 && signed[0]!.id === id;
+  });
+}
+
+/** The guarded fetch's limits a harness sets for the scenarios that test them. */
+export const TRANSPORT_LIMITS: Partial<Record<Scenario, { readonly idleMs?: number; readonly maxBytes?: number }>> = {
+  'stream-timeout': { idleMs: 1000 },
+  'stream-too-large': { maxBytes: 4096 }
+};

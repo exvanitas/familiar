@@ -2,7 +2,8 @@
    the first-run screens (step 11) and the turn loop (step 5) build on these. */
 export { createPiAiPort, loaders, retryAfterMs } from './pi-ai.ts';
 export type { AdapterOptions, PiAiModule, WireApi } from './pi-ai.ts';
-export { adapterOptions, NO_KEY, preset, PRESETS, priceFor } from './presets.ts';
+export { adapterOptions, CATALOG_LABEL, NO_KEY, preset, PRESETS, priceFor } from './presets.ts';
+export { CATALOG_PRICES } from './catalog-prices.ts';
 export type { EndpointSetup, Preset, PresetId } from './presets.ts';
 export { authHeaders, listModels, NO_TOOLS_NOTE } from './models.ts';
 export type { ListedModel, ListProblem, ModelList } from './models.ts';

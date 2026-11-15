@@ -7,6 +7,8 @@ import type { ModelEvent, ModelPort } from '@familiar/core';
 import { createFakeModel, type FakeReply } from '@familiar/core/testing';
 import { PLACEHOLDER } from '../../src/net.ts';
 import { listModels, NO_TOOLS_NOTE } from '../../src/model/models.ts';
+import { CATALOG_PRICES } from '../../src/model/catalog-prices.ts';
+import { CATALOG_LABEL } from '../../src/model/presets.ts';
 import { testEndpoint } from '../../src/model/endpoint-test.ts';
 import { createPiAiPort } from '../../src/model/pi-ai.ts';
 import { adapterOptions, preset, type PresetId } from '../../src/model/presets.ts';
@@ -49,7 +51,7 @@ describe('model list', () => {
     const [sonnet, auto, story] = r.ok ? r.models : [];
     expect(sonnet).toEqual({
       id: 'anthropic/claude-sonnet-4', name: 'Anthropic: Claude Sonnet 4', tools: 'yes', contextLength: 200000,
-      price: { inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75 }
+      price: { inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75, source: 'endpoint' }
     });
     expect(story).toMatchObject({ tools: 'no', note: NO_TOOLS_NOTE, price: { inputPerMTok: 0, outputPerMTok: 0 } });
     // A price that varies is unknown, not free.
@@ -58,7 +60,8 @@ describe('model list', () => {
 
   it('elsewhere price and tools are unknown; a local server is free', async () => {
     const oa = await listModels(setup('openai', '/oa'));
-    expect(oa.ok && oa.models).toEqual([{ id: 'gpt-4.1-mini', name: 'gpt-4.1-mini', tools: 'unknown' }]);
+    // OpenAI publishes no prices: a model the catalog knows gets its listed price, labelled.
+    expect(oa.ok && oa.models).toEqual([{ id: 'gpt-4.1-mini', name: 'gpt-4.1-mini', tools: 'unknown', price: { ...CATALOG_PRICES.openai['gpt-4.1-mini'], source: 'catalog' }, priceNote: CATALOG_LABEL }]);
     const ol = await listModels(setup('ollama', '/ol', false));
     expect(ol.ok && ol.models[0]).toMatchObject({ id: 'llama3.2:latest', tools: 'unknown', price: { inputPerMTok: 0, outputPerMTok: 0 } });
   });
@@ -96,7 +99,16 @@ describe('Test', () => {
   const fake = (replies: FakeReply[]): ModelPort => createFakeModel(replies);
 
   it('a working endpoint says so', async () => {
-    expect(await testEndpoint({ preset: preset('openai'), model: 'm', hasKey: true, port: real('openai', 'text') })).toEqual({ ok: true, tools: true, message: 'OpenAI answered, and m can call tools.' });
+    const port = fake([{ toolCalls: [{ id: 'c1', name: 'familiar_test', arguments: {} }] }]);
+    expect(await testEndpoint({ preset: preset('openai'), model: 'm', hasKey: true, port })).toEqual({ ok: true, tools: 'yes', message: 'OpenAI answered, and m called the test tool, so it can call tools.' });
+  });
+
+  it('a plain answer, or a call to another tool, leaves tool use unproven, never passed', async () => {
+    expect(await testEndpoint({ preset: preset('openai'), model: 'm', hasKey: true, port: real('openai', 'text') })).toEqual({ ok: true, tools: 'unproven', message: 'm answered without calling the tool, so tool use is unproven.' });
+    const other = fake([{ toolCalls: [{ id: 'c1', name: 'get_time', arguments: {} }] }]);
+    expect(await testEndpoint({ preset: preset('openai'), model: 'm', hasKey: true, port: other })).toMatchObject({ tools: 'unproven' });
+    // Over the real adapter: a call to a tool the test didn't offer is refused, and proves nothing.
+    expect(await testEndpoint({ preset: preset('openai'), model: 'm', hasKey: true, port: real('openai', 'tool-call') })).toMatchObject({ ok: true, tools: 'unproven' });
   });
 
   it('no key saved, before any call', async () => {
@@ -133,10 +145,10 @@ describe('Test', () => {
   it("a model that can't call tools still chats, and the result says so", async () => {
     const port = createFakeModel((req) => (req.tools.length ? { error: { kind: 'bad-request', message: 'x' } } : { text: 'ok' }));
     const r = await testEndpoint({ preset: preset('ollama'), model: 'tiny', hasKey: false, port });
-    expect(r).toEqual({ ok: true, tools: false, message: "tiny answered, but it can't call tools, so it chats with tools off." });
+    expect(r).toEqual({ ok: true, tools: 'no', message: "tiny answered, but it can't call tools, so it chats with tools off." });
     // OpenRouter answers 404 when no provider of the model takes tools.
     const or = createFakeModel((req) => (req.tools.length ? { error: { kind: 'not-found', message: 'x' } } : { text: 'ok' }));
-    expect(await testEndpoint({ preset: preset('openrouter'), model: 'some/model', hasKey: true, port: or })).toMatchObject({ ok: true, tools: false });
+    expect(await testEndpoint({ preset: preset('openrouter'), model: 'some/model', hasKey: true, port: or })).toMatchObject({ ok: true, tools: 'no' });
   });
 
   it('never repeats a key or an endpoint\'s own words', async () => {

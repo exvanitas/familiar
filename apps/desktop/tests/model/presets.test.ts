@@ -73,7 +73,7 @@ describe('presets', () => {
   });
 
   it("a local server's price is a known $0; elsewhere it's what the list said, or unknown", () => {
-    expect(priceFor(preset('ollama'), undefined)).toEqual({ inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 });
+    expect(priceFor(preset('ollama'), undefined)).toEqual({ inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0, source: 'local' });
     expect(priceFor(preset('openai'), undefined)).toBeUndefined();
   });
 });

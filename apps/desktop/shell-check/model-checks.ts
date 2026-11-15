@@ -18,7 +18,7 @@ import { createPiAiPort } from '../src/model/pi-ai.ts';
 import { adapterOptions, type PresetId } from '../src/model/presets.ts';
 import { check, fail, ok, rand, step } from './common.ts';
 import { saved } from './net-checks.ts';
-import { WIRES, type Wire } from './model-recordings.ts';
+import { TRANSPORT_LIMITS, WIRES, type Scenario, type Wire } from './model-recordings.ts';
 
 type Ctx = { ask: <T>(to: string, cmd: string, args?: unknown) => Promise<T> };
 interface Typed { sha: string; head: string; tail: string; length: number }
@@ -62,8 +62,10 @@ export async function modelChecks(ctx: Ctx): Promise<void> {
   if (savedKey !== 'ok') fail('Settings could not save the key: ' + savedKey);
   const holds = (texts: string[], k: { head: string; tail: string }) => texts.some(t => t.includes(k.head) || t.includes(k.tail));
 
-  const harness = (wire: Wire, fetchImpl: typeof fetch, only?: ContractScenario): ModelPortHarness => ({
-    forScenario: s => createPiAiPort(adapterOptions({ preset: PRESET[wire], baseUrl: `${base}/model/${wire}/${only ?? s}`, hasKey: true, fetch: fetchImpl, userAgent: UA }))
+  // The exe's own idle and size limits are set for the scenarios that test them.
+  const fetchFor = (s: string) => guardedFetch(M.id, TRANSPORT_LIMITS[s as Scenario] ?? {});
+  const harness = (wire: Wire, fetchImpl: (s: string) => typeof fetch, only?: ContractScenario): ModelPortHarness => ({
+    forScenario: s => createPiAiPort(adapterOptions({ preset: PRESET[wire], baseUrl: `${base}/model/${wire}/${only ?? s}`, hasKey: true, fetch: fetchImpl(only ?? s), userAgent: UA }))
   });
 
   await check('check.model.contract', async () => {
@@ -72,7 +74,7 @@ export async function modelChecks(ctx: Ctx): Promise<void> {
     for (const wire of WIRES) {
       for (const c of modelPortContract) {
         try {
-          await c.run(harness(wire, guardedFetch(M.id)));
+          await c.run(harness(wire, fetchFor));
           passed++;
         } catch (e) {
           failed.push(`${wire}: ${c.name}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 300));
@@ -81,7 +83,7 @@ export async function modelChecks(ctx: Ctx): Promise<void> {
     }
     // The control: the tool-call case against the text recording must fail.
     const toolCase = modelPortContract.find(c => c.name.startsWith('a tool call arrives'))!;
-    const control = await toolCase.run(harness('openai', guardedFetch(M.id), 'text')).then(() => 'passed', () => 'failed');
+    const control = await toolCase.run(harness('openai', fetchFor, 'text')).then(() => 'passed', () => 'failed');
     ok(failed.length === 0, `${failed.length} failed: ${failed.join(' | ')}`);
     ok(control === 'failed', 'the control, a tool-call case against a text reply, passed');
     return `${passed} of ${WIRES.length * modelPortContract.length} contract cases passed over guardedFetch, ${modelPortContract.length} for each of ${WIRES.join(', ')}; the control (a case against the wrong recording) failed`;
@@ -92,8 +94,8 @@ export async function modelChecks(ctx: Ctx): Promise<void> {
     for (const wire of WIRES) {
       const log: Exchange[] = [];
       const f = watching(guardedFetch(M.id), log);
-      const text = await drain(harness(wire, f).forScenario('text').stream(CONTRACT_REQUEST));
-      const refused = await drain(harness(wire, f).forScenario('auth-error').stream(CONTRACT_REQUEST));
+      const text = await drain(harness(wire, () => f).forScenario('text').stream(CONTRACT_REQUEST));
+      const refused = await drain(harness(wire, () => f).forScenario('auth-error').stream(CONTRACT_REQUEST));
       const keyHeader = KEY_HEADER[wire];
       const seen = log.flatMap(x => [...x.sent.flat(), ...x.headers.flat(), x.body]);
       ok(log.length === 2, `${wire}: ${log.length} requests`);

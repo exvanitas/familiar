@@ -226,6 +226,7 @@ const MESSAGES: Record<ModelErrorKind, string> = {
   'not-found': 'The endpoint has no such model.',
   filtered: 'A content filter stopped the reply.',
   'invalid-tool-call': 'A tool call had invalid arguments.',
+  paused: 'A cap paused the call.',
   aborted: 'Stopped.',
   unknown: 'The model call failed.'
 };

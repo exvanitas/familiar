@@ -100,7 +100,8 @@ async function modelRoute(req, res, route) {
   const r = answer(route, Buffer.concat(parts).toString('utf8'), key);
   if (!r) { res.writeHead(404); return res.end('no recording'); }
   res.writeHead(r.status, { ...r.headers, 'x-auth-sha256': sha(`Bearer ${key}`) });
-  for (const chunk of r.chunks) {
+  for (const [i, chunk] of r.chunks.entries()) {
+    if (r.stall && i === r.stall.after) await sleep(r.stall.ms);
     if (res.destroyed) return;
     res.write(chunk);
     if (r.delayMs) await sleep(r.delayMs);

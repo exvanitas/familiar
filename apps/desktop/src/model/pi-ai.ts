@@ -9,7 +9,7 @@
    - Error kinds come from what the injected fetch saw: the HTTP status, Retry-After, and Anthropic's
      x-should-retry. pi-ai flattens errors to text, and an endpoint's text can echo a key, so messages
      here are Familiar's own and never repeat it. */
-import type { ChatMessage, JsonValue, ModelError, ModelErrorKind, ModelEvent, ModelPort, ModelRequest, Replay, StopReason, Usage } from '@familiar/core';
+import type { ChatMessage, JsonValue, ModelError, ModelErrorKind, ModelEvent, ModelPort, ModelRequest, Replay, StopReason, ToolCall, Usage } from '@familiar/core';
 import type {
   AnthropicMessagesCompat,
   Api,
@@ -80,26 +80,53 @@ interface ReplayData {
 }
 
 interface Seen {
+  /** Whether the fetch was called: before that, nothing reached the endpoint. */
+  sent?: boolean;
+  url?: string;
   status?: number;
+  redirected?: boolean;
   retryAfter?: string | null;
   shouldRetry?: string | null;
   body?: string;
   transport?: string;
 }
 
+/* What one call has seen so far, beside pi-ai's own events. */
+interface CallState {
+  seen: Seen;
+  google: Record<string, string>;
+  ids: Map<number, string>;
+  /** The endpoint sent its final usage count (OpenAI's usage chunk, Anthropic's message_delta). */
+  finalUsage: boolean;
+  /** The latest usage pi-ai had, partial or not. */
+  usage?: PiUsage;
+  /** A tool call that can't be passed on. The reply is read to its end for its usage, then this ends it. */
+  badCall?: ModelError;
+}
+
 export function createPiAiPort(options: AdapterOptions): ModelPort {
   return { stream: (request, signal) => run(options, request, signal) };
 }
 
+const isUsage = (u: Usage) => u.inputTokens > 0 || u.outputTokens > 0;
+
+/* One terminal error, with whatever usage is known, and whether it's the endpoint's final count. */
+function failure(error: ModelError, st: CallState, usage?: PiUsage): Extract<ModelEvent, { type: 'error' }> {
+  const u = toUsage(usage ?? st.usage ?? zeroUsage());
+  return { type: 'error', error, ...(isUsage(u) ? { usage: u, ...(st.finalUsage ? { usageFinal: true as const } : {}) } : {}) };
+}
+
+/* Never throws: every step, from building the request to the last event, is inside one catch, which
+   ends the reply with exactly one plain error. */
 async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSignal): AsyncGenerator<ModelEvent> {
   if (signal?.aborted) {
     yield aborted();
     return;
   }
-  const seen: Seen = {};
-  const google: Record<string, string> = {};
-  const indexIds = new Map<number, string>();
-  let source: AsyncIterator<AssistantMessageEvent>;
+  const st: CallState = { seen: {}, google: {}, ids: new Map(), finalUsage: false };
+  let source: AsyncIterator<AssistantMessageEvent> | undefined;
+  let stopped: ReturnType<typeof stopPromise> | undefined;
+  let ended = false;
   try {
     const mod = await (o.load ?? loaders[o.api])();
     const model = toModel(o, request);
@@ -109,7 +136,7 @@ async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSign
       apiKey: o.apiKey,
       signal,
       maxRetries: 0,
-      fetch: observing(o.fetch, seen),
+      fetch: observing(o.fetch, st.seen, signal),
       headers: { ...QUIET, ...o.headers },
       identity: { userAgent: { custom: o.userAgent } },
       ...(o.cacheRetention ? { cacheRetention: o.cacheRetention } : {}),
@@ -117,63 +144,110 @@ async function* run(o: AdapterOptions, request: ModelRequest, signal?: AbortSign
       ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
       ...thinkingOptions(o.api, request),
       // Gemini's signatures ride on tool calls as `extra_content`, which pi-ai neither reads nor writes.
-      onProviderStreamEvent: (chunk: unknown) => noteGoogle(chunk, google, indexIds),
+      onProviderStreamEvent: (chunk: unknown) => noteChunk(chunk, st),
       ...(outgoing.size ? { onPayload: (payload: unknown) => addGoogle(payload, outgoing) } : {})
     };
     source = mod.stream(model, context, stream)[Symbol.asyncIterator]();
-  } catch (e) {
-    yield { type: 'error', error: toError(undefined, seen, signal, e) };
-    return;
-  }
-
-  // Every read is raced against the signal, so a stop ends the stream even if an SDK is slow to.
-  const stopped = signal ? stopPromise(signal) : undefined;
-  try {
+    // Every read is raced against the signal, so a stop ends the stream even if an SDK is slow to.
+    stopped = signal ? stopPromise(signal) : undefined;
+    const tools = new Set(request.tools.map(t => t.name));
     for (;;) {
       const next = source.next();
       const result = stopped ? await Promise.race([next, stopped.promise]) : await next;
       if (result === STOPPED) {
-        yield aborted();
+        ended = true;
+        yield failure(aborted().error, { ...st, finalUsage: false });
         return;
       }
       if (result.done) {
-        yield { type: 'error', error: { kind: 'unknown', message: 'The reply ended without finishing.' } };
+        ended = true;
+        yield failure({ kind: 'unknown', message: 'The reply ended without finishing.' }, st);
         return;
       }
       const event = result.value;
+      if ('partial' in event && event.partial?.usage) st.usage = event.partial.usage;
       switch (event.type) {
         case 'text_delta':
-          if (event.delta) yield { type: 'text', delta: event.delta };
+          if (event.delta && !st.badCall) yield { type: 'text', delta: event.delta };
           break;
         case 'thinking_delta':
-          if (event.delta) yield { type: 'thinking', delta: event.delta };
+          if (event.delta && !st.badCall) yield { type: 'thinking', delta: event.delta };
           break;
-        case 'toolcall_end':
-          if (event.toolCall.argumentsError !== undefined) {
-            const name = event.toolCall.name;
-            yield { type: 'error', error: { kind: 'invalid-tool-call', message: `The model called ${name} with arguments that aren't valid.`, toolName: name } };
+        case 'toolcall_end': {
+          if (st.badCall) break;
+          const checked = checkCall(event.toolCall, tools);
+          if ('error' in checked) st.badCall = checked.error;
+          else yield { type: 'tool-call', call: checked.call };
+          break;
+        }
+        case 'done': {
+          ended = true;
+          if (st.badCall) {
+            yield failure(st.badCall, st, event.message.usage);
             return;
           }
-          yield { type: 'tool-call', call: { id: event.toolCall.id, name: event.toolCall.name, arguments: event.toolCall.arguments } };
-          break;
-        case 'done': {
-          const replay = toReplay(o, request, event.message, google);
-          yield { type: 'done', stopReason: toStopReason(event.reason), usage: toUsage(event.message.usage), ...(replay ? { replay } : {}) };
+          const replay = toReplay(o, request, event.message, st.google);
+          yield {
+            type: 'done', stopReason: toStopReason(event.reason), usage: toUsage(event.message.usage),
+            ...(replay ? { replay } : {}), ...(st.finalUsage ? {} : { unreported: true as const })
+          };
           return;
         }
-        case 'error': {
-          const usage = toUsage(event.error.usage);
-          yield { type: 'error', error: toError(event.error, seen, signal), ...(usage.inputTokens || usage.outputTokens ? { usage } : {}) };
+        case 'error':
+          ended = true;
+          yield failure(st.badCall ?? toError(event.error, st.seen, signal), st, event.error.usage);
           return;
-        }
         default:
           break;
       }
     }
+  } catch {
+    if (!ended) {
+      ended = true;
+      const error: ModelError = signal?.aborted
+        ? aborted().error
+        : !st.seen.sent
+          ? { kind: 'bad-request', message: "Familiar couldn't build the request.", notProcessed: true }
+          : toError(undefined, st.seen, signal);
+      yield failure(error, { ...st, finalUsage: false });
+    }
   } finally {
     stopped?.dispose();
-    void source.return?.();
+    try {
+      void Promise.resolve(source?.return?.()).catch(() => {});
+    } catch {
+      // An iterator whose return throws has nothing left to close.
+    }
   }
+}
+
+/* Every name an object has before anything is put in it: arguments that use one can turn a later
+   `args.toString()` or `args.constructor` into the model's own value. */
+const OBJECT_NAMES = new Set([...Object.getOwnPropertyNames(Object.prototype), 'prototype']);
+const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+function plainJson(v: unknown, depth = 0): boolean {
+  if (depth > 64) return false;
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (Array.isArray(v)) return v.every(x => plainJson(x, depth + 1));
+  if (typeof v !== 'object') return false;
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return false;
+  return Object.keys(v).every(k => !OBJECT_NAMES.has(k) && plainJson((v as Record<string, unknown>)[k], depth + 1));
+}
+
+/* A call is passed on only with a well-formed name of a tool the request offered, an id, and arguments
+   that are a plain JSON object, copied so nothing of pi-ai's object remains. */
+export function checkCall(tc: { id?: unknown; name?: unknown; arguments?: unknown; argumentsError?: unknown }, tools: ReadonlySet<string>): { call: ToolCall } | { error: ModelError } {
+  const name = typeof tc.name === 'string' && TOOL_NAME.test(tc.name) ? tc.name : undefined;
+  const bad = (why: string): { error: ModelError } => ({ error: { kind: 'invalid-tool-call', message: `The model called ${name ?? 'a tool'} ${why}.`, ...(name ? { toolName: name } : {}) } });
+  if (!name) return bad('with a malformed name');
+  if (!tools.has(name)) return bad("that the request didn't offer");
+  if (typeof tc.id !== 'string' || !tc.id) return bad('without an id');
+  const args = tc.arguments;
+  if (tc.argumentsError !== undefined || !args || typeof args !== 'object' || Array.isArray(args) || !plainJson(args)) return bad("with arguments that aren't a plain JSON object");
+  return { call: { id: tc.id, name, arguments: JSON.parse(JSON.stringify(args)) } };
 }
 
 /* ---------- requests ---------- */
@@ -280,14 +354,19 @@ function addGoogle(payload: unknown, sigs: Map<string, string>): unknown {
 }
 
 /* Notes a tool call's Gemini signature from a raw chunk. Ids come once, on the call's first chunk. */
-function noteGoogle(chunk: unknown, out: Record<string, string>, ids: Map<number, string>): void {
-  const calls = (chunk as { choices?: { delta?: { tool_calls?: { index?: number; id?: string; extra_content?: { google?: { thought_signature?: unknown } } }[] } }[] })?.choices?.[0]?.delta?.tool_calls;
-  for (const call of calls ?? []) {
+/* Reads what pi-ai doesn't keep from a raw chunk: a Gemini signature on a tool call (ids come once, on
+   the call's first chunk), and whether the endpoint has sent its final usage count. */
+function noteChunk(chunk: unknown, st: CallState): void {
+  const c = chunk as { type?: unknown; usage?: unknown; choices?: { delta?: { tool_calls?: { index?: number; id?: string; extra_content?: { google?: { thought_signature?: unknown } } }[] } }[] } | null;
+  if (!c || typeof c !== 'object') return;
+  // OpenAI-compatible: the usage chunk. Anthropic: message_delta's usage, which ends the message.
+  if (c.usage && typeof c.usage === 'object' && (c.type === undefined || c.type === 'message_delta')) st.finalUsage = true;
+  for (const call of c.choices?.[0]?.delta?.tool_calls ?? []) {
     const index = call.index ?? 0;
-    if (call.id) ids.set(index, call.id);
+    if (call.id) st.ids.set(index, call.id);
     const sig = call.extra_content?.google?.thought_signature;
-    const id = ids.get(index);
-    if (typeof sig === 'string' && id) out[id] = sig;
+    const id = st.ids.get(index);
+    if (typeof sig === 'string' && id) st.google[id] = sig;
   }
 }
 
@@ -337,6 +416,7 @@ const MESSAGES: Record<ModelErrorKind, string> = {
   server: 'The endpoint failed to answer.',
   filtered: "The endpoint's content filter stopped the reply.",
   'invalid-tool-call': 'The model called a tool with arguments that aren\'t valid.',
+  paused: 'A cap paused the call.',
   aborted: 'Stopped.',
   unknown: 'The model call failed.'
 };
@@ -384,8 +464,11 @@ function toError(message: AssistantMessage | undefined, seen: Seen, signal?: Abo
   else if (status === 429) kind = 'rate-limit';
   else if (status >= 500) kind = 'server';
   else kind = 'bad-request';
+  // A status alone isn't proof nothing was done. Not processed: a 429 (unless the endpoint says not to
+  // retry), or a 529 or 503 with the provider's own sign. Never after a redirect, since some request
+  // before this answer was acted on.
   const said = seen.shouldRetry?.trim().toLowerCase();
-  const notProcessed = said === 'false' ? false : said === 'true' || status === 429 || status === 503 || status === 529;
+  const notProcessed = !seen.redirected && (status === 429 ? said !== 'false' : (status === 529 || status === 503) && (said === 'true' || /overloaded_error/.test(body)));
   const wait = kind === 'rate-limit' || kind === 'server' ? retryAfterMs(seen.retryAfter) : undefined;
   return {
     kind,
@@ -412,21 +495,57 @@ function aborted(): Extract<ModelEvent, { type: 'error' }> {
 
 /* Keeps what pi-ai flattens away: the status, Retry-After, x-should-retry, an error body (only to
    classify it, never shown), and why the transport failed. */
-function observing(inner: typeof globalThis.fetch, seen: Seen): typeof globalThis.fetch {
+function observing(inner: typeof globalThis.fetch, seen: Seen, signal?: AbortSignal): typeof globalThis.fetch {
   return async (input, init) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.sent = true;
     let response: Response;
     try {
       response = await inner(input, init);
     } catch (e) {
-      if (!init?.signal?.aborted) seen.transport = transportKind(e);
+      if (!init?.signal?.aborted && !signal?.aborted) seen.transport = transportKind(e);
       throw e;
     }
     seen.status = response.status;
+    seen.redirected = response.redirected || (!!response.url && sameUrl(response.url, url) === false);
     seen.retryAfter = response.headers.get('retry-after');
     seen.shouldRetry = response.headers.get('x-should-retry');
     if (!response.ok) seen.body = await response.clone().text().catch(() => '');
-    return response;
+    return watchBody(response, seen, signal);
   };
+}
+
+function sameUrl(a: string, b: string): boolean {
+  try {
+    return new URL(a).href === new URL(b).href;
+  } catch {
+    return a === b;
+  }
+}
+
+/* The body, read through, so an error part way keeps the transport's word (the guarded fetch's
+   `cause.kind`), which pi-ai would flatten to text. */
+function watchBody(r: Response, seen: Seen, signal?: AbortSignal): Response {
+  if (!r.body || [101, 204, 205, 304].includes(r.status)) return r;
+  const reader = r.body.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(c) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) c.close();
+        else c.enqueue(value);
+      } catch (e) {
+        const cause = e instanceof Error ? (e.cause as { kind?: unknown } | undefined) : undefined;
+        if (typeof cause?.kind === 'string' && !signal?.aborted) seen.transport = cause.kind;
+        c.error(e);
+      }
+    },
+    cancel: reason => reader.cancel(reason)
+  }, { highWaterMark: 0 });
+  const out = new Response(body, { status: r.status, statusText: r.statusText, headers: r.headers });
+  Object.defineProperty(out, 'url', { value: r.url });
+  Object.defineProperty(out, 'redirected', { value: r.redirected });
+  return out;
 }
 
 /* The guarded fetch puts its kind in `cause.kind`; Node's fetch puts a code in `cause.code`. */

@@ -8,7 +8,9 @@ import type { ModelEvent } from '@familiar/core';
 import { guardedFetch } from '../../src/net.ts';
 import { createPiAiPort } from '../../src/model/pi-ai.ts';
 import { adapterOptions, PRESETS, type PresetId } from '../../src/model/presets.ts';
-import type { Wire } from '../../shell-check/model-recordings.ts';
+import { TRANSPORT_LIMITS, type Scenario, type Wire } from '../../shell-check/model-recordings.ts';
+import type { GuardedOptions } from '../../src/net.ts';
+import { limited } from './limits.ts';
 import { exeShell } from './exe-shell.ts';
 import { startModelServer, type ModelServer } from './server.ts';
 
@@ -25,25 +27,26 @@ let server: ModelServer;
 beforeAll(async () => { server = await startModelServer(); });
 afterAll(async () => { await server.close(); globalThis.fetch = realFetch; });
 
-function harness(id: PresetId, fetchFor: (base: string) => typeof fetch): ModelPortHarness {
+function harness(id: PresetId, fetchFor: (base: string, limits: GuardedOptions) => typeof fetch): ModelPortHarness {
   return {
     forScenario(s: ContractScenario) {
       const base = `${server.url}/${WIRE[id]}/${s}`;
-      return createPiAiPort(adapterOptions({ preset: id, baseUrl: base, hasKey: true, fetch: fetchFor(base), userAgent: 'Familiar/test' }));
+      return createPiAiPort(adapterOptions({ preset: id, baseUrl: base, hasKey: true, fetch: fetchFor(base, TRANSPORT_LIMITS[s as Scenario] ?? {}), userAgent: 'Familiar/test' }));
     }
   };
 }
 
 for (const p of PRESETS) {
   describe(`${p.label}, recorded ${WIRE[p.id]} wire, injected fetch`, () => {
-    for (const c of modelPortContract) it(c.name, () => c.run(harness(p.id, () => injected)));
+    for (const c of modelPortContract) it(c.name, () => c.run(harness(p.id, (_, l) => limited(injected, l))));
   });
 }
 
 const KEY = 'fk-node-stand-in-key-0123456789';
 for (const id of ['openai', 'anthropic', 'gemini'] as const) {
   describe(`${id} over guardedFetch and a stand-in exe`, () => {
-    const viaExe = (base: string) => guardedFetch('addr-1', {}, exeShell({ id: 'addr-1', url: base, key: KEY }));
+    // Saved at the wire's root, so a redirect between scenarios stays under it.
+    const viaExe = (base: string, l: GuardedOptions) => guardedFetch('addr-1', l, exeShell({ id: 'addr-1', url: base.replace(/\/[^/]+$/, ''), key: KEY }));
     for (const c of modelPortContract) it(c.name, () => c.run(harness(id, viaExe)));
 
     it('the endpoint got the stored key, the page sent only the placeholder, and the echo came back blanked', async () => {

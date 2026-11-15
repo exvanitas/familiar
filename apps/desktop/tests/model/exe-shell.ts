@@ -9,7 +9,7 @@ import type { NetHead, NetSpec, Shell } from '../../src/shell.ts';
 const KEY_HEADERS = new Set(['authorization', 'x-api-key', 'api-key', 'x-goog-api-key']);
 
 export function exeShell(saved: { id: string; url: string; key?: string }): Shell & { readonly sent: { url: string; headers: [string, string][] }[] } {
-  const open = new Map<string, { reader: ReadableStreamDefaultReader<Uint8Array>; abort: AbortController }>();
+  const open = new Map<string, { reader: ReadableStreamDefaultReader<Uint8Array>; abort: AbortController; spec: NetSpec; total: number }>();
   const sent: { url: string; headers: [string, string][] }[] = [];
   const blank = (s: string) => (saved.key ? s.replaceAll(saved.key, '[key]') : s);
   const shell = {
@@ -29,15 +29,22 @@ export function exeShell(saved: { id: string; url: string; key?: string }): Shel
       } catch {
         throw { kind: 'network', message: 'connect failed' };
       }
-      open.set(spec.id, { reader: r.body!.getReader(), abort });
-      return { status: r.status, statusText: r.statusText, headers: [...r.headers.entries()].map(([k, v]) => [k, blank(v)]), url: r.url, redirected: false };
+      open.set(spec.id, { reader: r.body!.getReader(), abort, spec, total: 0 });
+      return { status: r.status, statusText: r.statusText, headers: [...r.headers.entries()].map(([k, v]) => [k, blank(v)]), url: r.url, redirected: r.redirected };
     },
     async netRead(id: string): Promise<Uint8Array> {
       const o = open.get(id);
       if (!o) throw { kind: 'cancelled', message: 'no such request' };
-      const { done, value } = await o.reader.read();
-      if (done) { open.delete(id); return new Uint8Array(0); }
-      return new TextEncoder().encode(blank(new TextDecoder().decode(value)));
+      // The exe's own limits: quiet past idleMs is `timeout`, a body past maxBytes is `too-large`.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const idle = o.spec.idleMs === undefined ? undefined : new Promise<'idle'>(done => { timer = setTimeout(() => done('idle'), o.spec.idleMs); });
+      const next = await (idle ? Promise.race([o.reader.read(), idle]) : o.reader.read());
+      clearTimeout(timer);
+      if (next === 'idle') { o.abort.abort(); open.delete(id); throw { kind: 'timeout', message: 'idle' }; }
+      if (next.done) { open.delete(id); return new Uint8Array(0); }
+      o.total += next.value.length;
+      if (o.spec.maxBytes !== undefined && o.total > o.spec.maxBytes) { o.abort.abort(); open.delete(id); throw { kind: 'too-large', message: 'too large' }; }
+      return new TextEncoder().encode(blank(new TextDecoder().decode(next.value)));
     },
     async netCancel(id: string): Promise<void> {
       open.get(id)?.abort.abort();
