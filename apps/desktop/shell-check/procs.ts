@@ -380,7 +380,8 @@ async function main(info: Info, ctx: Ctx) {
     // An approved setup, then a changed start of it, whose ask is held at its dialog. With the
     // shell folder unwritable, a forget can't remove the approval: it fails, and so must a second.
     // The held ask, approved, is revoked, and an unchanged start is refused before any dialog.
-    // Once the folder is writable again, the next start retries the removal, and asks.
+    // Once the folder is writable again, the next start retries the removal, and asks. It's
+    // approved, not refused: three refusals in a run stop asking, and later checks still ask.
     const a = fakeSetup(p, 'forget-f-' + rand(4));
     const m = new Mcp();
     const r = await startWith(m, a, 'yes');
@@ -401,15 +402,22 @@ async function main(info: Info, ctx: Ctx) {
     } finally {
       await step('shell-lock', { data: info.dataDir, on: false });
     }
-    const after = await startWith(new Mcp(), a, 'no');
+    const ma = new Mcp();
+    const after = await startWith(ma, a, 'yes');
+    if (after.started === 'started') {
+      await shell.serverStop(ma.run);
+      await ma.exited(5000);
+    }
+    const cleared = await shell.serverForget(a.id).then(() => 'forgot', e => errKind(e));
     const kids = await step<{ count: number }>('node-children', {});
     ok(first === 'failed', `the forget with the folder locked: ${first}, not failed`);
     ok(second === 'failed', `a second forget with the folder locked: ${second}, not failed`);
     ok(held === 'revoked', `the ask held over the failed forget, approved: ${held}, not revoked`);
     ok(!plain.dialog.shown && plain.started === 'revoked', `an unchanged start while locked: dialog ${plain.dialog.shown}, ${plain.started}, not revoked before any dialog`);
-    ok(after.dialog.shown && after.started === 'declined', `the start once unlocked: dialog ${after.dialog.shown}, ${after.started}; it must ask`);
+    ok(after.dialog.shown && after.started === 'started', `the start once unlocked: dialog ${after.dialog.shown}, ${after.started}; it must ask`);
+    ok(cleared === 'forgot', `the forget once unlocked: ${cleared}`);
     ok(kids.count === 0, `${kids.count} node children left`);
-    return `with servers.json unwritable both forgets were ${first}, the held ask approved was ${held}, an unchanged start ${plain.started} with no dialog; unlocked, the next start asked (${after.started}); ${kids.count} node children`;
+    return `with servers.json unwritable both forgets were ${first}, the held ask approved was ${held}, an unchanged start ${plain.started} with no dialog; unlocked, the next start asked and was approved (${after.started}), and a forget succeeded; ${kids.count} node children`;
   });
 
   await check('security.server.exit-drains', async () => {
