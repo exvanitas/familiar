@@ -72,6 +72,24 @@ describe.runIf(chrome || required)('the journal in headless Chromium (real Index
     expect(summary.durabilities).toEqual(['strict']);
   }, 150_000);
 
+  it('one owner: a second page waits for the Web Lock, and a reload of the first releases it', async () => {
+    const context = await browser.newContext();
+    const url = `${base}?mode=owner&run=owner-${Date.now()}`;
+    const first = await context.newPage();
+    await first.goto(url);
+    await first.waitForFunction(() => (window as any).__familiar?.owned === true, undefined, { timeout: 10_000 });
+    const second = await context.newPage();
+    await second.goto(url);
+    await second.waitForTimeout(500);
+    expect(await second.evaluate(() => (window as any).__familiar?.owned ?? false)).toBe(false);
+    // A reload is a kill of the page: its lock goes with it, and the waiting page gets it.
+    await first.reload();
+    await second.waitForFunction(() => (window as any).__familiar?.owned === true, undefined, { timeout: 10_000 });
+    await first.waitForTimeout(300);
+    expect(await first.evaluate(() => (window as any).__familiar?.owned ?? false)).toBe(false);
+    await context.close();
+  }, 30_000);
+
   for (const [name, check] of Object.entries(CHECKS)) {
     it(`${name}: ${check.title}`, async () => {
       const context = await browser.newContext();

@@ -142,11 +142,19 @@ async function withRestart(seed: number): Promise<{ problems: string[]; cutOff: 
       if (granted.size >= restartAt) restart();
       for (let n = Math.floor(rand() * 4); n > 0; n--) await tick();
       const input = model === 'big' ? inputBound(c.request) : Math.floor(inputBound(c.request) / 4);
+      const usage = { inputTokens: input, outputTokens: Math.floor(rand() * r.maxOutputTokens) };
+      // The same outcomes as the step 4 property test.
       const outcomes: (Terminal | undefined)[] = [
-        done({ inputTokens: input, outputTokens: Math.floor(rand() * r.maxOutputTokens) }),
+        done(usage),
         done({} as Usage),
+        done({ inputTokens: input } as Usage),
+        done({ inputTokens: String(input), outputTokens: -1 } as unknown as Usage),
+        { type: 'error', error: { kind: 'filtered', message: 'x' }, usage: {} as Usage, usageFinal: true },
+        { type: 'done', stopReason: 'end', usage: { inputTokens: 0, outputTokens: 0 }, unreported: true },
         { type: 'error', error: { kind: 'rate-limit', message: 'x', notProcessed: true } },
-        { type: 'error', error: { kind: 'server', message: 'x' } },
+        { type: 'error', error: { kind: 'server', message: 'x' }, usage },
+        { type: 'error', error: { kind: 'filtered', message: 'x' }, usage, usageFinal: true },
+        { type: 'error', error: { kind: 'aborted', message: 'Stopped.' } },
         undefined
       ];
       try {

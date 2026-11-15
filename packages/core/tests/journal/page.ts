@@ -58,6 +58,11 @@ async function conformance() {
 }
 
 async function main() {
+  if (params.get('mode') === 'owner') {
+    // Holds the journal's owner lock for as long as the page lives.
+    await webLockOwner(navigator.locks as any).acquire(run);
+    return out({ owned: true });
+  }
   if (params.get('mode') === 'conformance') {
     const result = await conformance();
     return out({ done: true, summary: { conformance: result, durabilities: [...new Set(durabilities)], transactions: durabilities.length } });
