@@ -183,10 +183,14 @@ pub fn creation_time(pid: u32) -> Option<u64> {
     t
 }
 
+/// How long the sweep waits, after terminating a recorded child, for its handle to signal that
+/// it's gone. Past it the record is kept for the next start.
+pub const SWEEP_WAIT_MS: u32 = 5000;
+
 /// What one record's process came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Swept {
-    /// It was still the recorded child, and it's ended.
+    /// It was still the recorded child, it was terminated, and its handle has signalled: it's gone.
     Ended,
     /// Proven gone: no process has its id (`OpenProcess` says `ERROR_INVALID_PARAMETER`), or the
     /// id now belongs to a process made at another time, which is left alone.
@@ -210,7 +214,13 @@ pub fn sweep_one(pid: u32, created: u64) -> Swept {
     let r = match times(h) {
         Some(t) if t == created => {
             if unsafe { TerminateProcess(h, 1) }.is_ok() {
-                Swept::Ended
+                // Termination is asynchronous: ended only once the handle has signalled, within a
+                // bounded wait. A timeout or a failed wait keeps the record.
+                if unsafe { WaitForSingleObject(h, SWEEP_WAIT_MS) } == WAIT_OBJECT_0 {
+                    Swept::Ended
+                } else {
+                    Swept::Failed
+                }
             } else if unsafe { WaitForSingleObject(h, 0) } == WAIT_OBJECT_0 {
                 // It had already ended: only a handle still held it.
                 Swept::Gone

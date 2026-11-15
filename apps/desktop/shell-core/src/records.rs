@@ -2,7 +2,8 @@
 //! kill left outside any job can be ended at the next start. This is the sweep's rule, with the OS
 //! call passed in. See "5b. Starting a local MCP server" in docs/shell-design.md.
 //!
-//! A record is deleted only after it's been read and its process is ended or proven gone. Any
+//! A record is deleted only after it's been read and its process is ended (terminated, and its
+//! handle signalled within a bounded wait) or proven gone. Any
 //! other failure keeps it for the next start. One that can't be parsed names nothing that can be
 //! ended, but might still be the only trace of a child, so it's renamed aside, never deleted.
 
@@ -18,6 +19,7 @@ pub const ASIDE: &str = ".unreadable";
 /// What the OS side came to for one record's process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Swept {
+    /// Terminated, and its handle has signalled.
     Ended,
     Gone,
     Failed,

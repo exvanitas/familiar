@@ -144,6 +144,40 @@ fn the_sweep_ends_a_child_left_outside_a_job_and_nothing_else() {
 }
 
 #[test]
+fn a_record_is_deleted_only_after_its_process_has_signalled() {
+    // A suspended child in no job, and its record, swept by shell-core's rule with the real OS
+    // call. When sweep_one says Ended, the process handle has already signalled and the record is
+    // still there; it's deleted only after.
+    let mut cmd = whoami();
+    cmd.creation_flags(CREATE_SUSPENDED.0);
+    let child = cmd.spawn().unwrap();
+    let pid = child.id();
+    let watch = Watch::of(pid);
+    let created = creation_time(pid).expect("its creation time");
+    let dir = std::env::temp_dir().join(format!("shell-win-records-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = dir.join(format!("{pid}.json"));
+    std::fs::write(&record, shell_core::records::bytes(pid, created)).unwrap();
+    let mut seen = Vec::new();
+    let out = shell_core::records::sweep(&dir, |p, c| {
+        let r = sweep_one(p, c);
+        seen.push((r, watch.gone_within(0), record.exists()));
+        match r {
+            Swept::Ended => shell_core::records::Swept::Ended,
+            Swept::Gone => shell_core::records::Swept::Gone,
+            Swept::Failed => shell_core::records::Swept::Failed,
+        }
+    });
+    assert_eq!(seen, vec![(Swept::Ended, true, true)], "Ended only once the handle signalled, with the record still there");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1, shell_core::records::Outcome::Ended);
+    assert!(!record.exists(), "and then the record is deleted");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_sweep_keeps_a_record_it_cant_prove_gone() {
     // The System process (id 4) can't be opened by a user: access denied proves nothing about a
     // child of ours, so the record is kept, whatever its creation time.
