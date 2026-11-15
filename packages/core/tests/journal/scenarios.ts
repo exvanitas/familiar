@@ -58,7 +58,10 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
     return env.counters.bump(`starts:${name}`);
   };
   const maybeHang = async (name: string) => {
-    if (hang(name)) await never;
+    if (!hang(name)) return;
+    // Counted where the hang starts: for a write, after its commit is stored.
+    env.counters.bump(`hung:${name}`);
+    await never;
   };
   const object = (properties: Record<string, unknown>) => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
   return [
@@ -195,7 +198,7 @@ function toolKill(name: string, scenario: string, tool: string, args: unknown, e
       });
       if (env.life === 1) {
         void journal.send('Please do the thing.', 'turn-1');
-        while (env.counters.get(`starts:${tool}`) < 1) await sleep(10);
+        while (env.counters.get(`hung:${tool}`) < 1) await sleep(10);
         env.ready(() => journal.kill());
         return undefined;
       }
