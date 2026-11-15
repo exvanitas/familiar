@@ -71,7 +71,25 @@ This keeps the spike's condition (every tool unsafe except pure reads) with the 
 
 ## The step cap
 
-8 tool steps per turn, then the turn asks: "I've taken 8 steps on this. Shall I keep going?". A step here is one model reply that calls tools, pi-durable's `maxTurns`, with its calls run one by one inside it. Most replies call one tool. Counting each call instead would mean stopping in the middle of a reply's calls. Yes starts a continue, with a fresh 8.
+8 tool steps per turn, then the turn asks: "I've taken 8 steps on this. Shall I keep going?". A step here is one model reply that calls tools, pi-durable's `maxTurns`, with its calls run one by one inside it. Yes starts a continue, with a fresh 8 steps. The calls themselves are bounded separately, below.
+
+## Bounds on tool calls
+
+The step cap counts replies, so on its own it doesn't bound how many calls one reply makes. Consent doesn't either, once a tool is always allowed. So `bounds.ts` sets two numbers, in one place:
+
+- `TOOL_CALLS_PER_REPLY`, 8: at most 8 calls of one model reply run.
+- `TOOL_CALLS_PER_TURN`, 32: at most 32 calls run in one turn, across every reply and every step-cap "go on". That Yes continues the steps but doesn't lift the 32.
+
+A call past either bound never runs. The `beforeTool` hook blocks it before anything else is asked, consent included. The model gets a tool error that says why: "Familiar stopped after 8 tool calls in one reply. This call was not run." The chat gets one line per reply, or per turn: a `familiar.notice` entry, "Familiar stopped after 8 tool calls in one reply." or "Familiar stopped after 32 tool calls in this turn."
+
+**The count is in the journal.** A tool-budget document holds the turn's admitted and refused calls by step id, changed in one commit per call. A call's place in its reply is its position among the reply's calls, which the journal keeps. A call asked again after a restart keeps its verdict: admitted stays admitted, refused stays refused, so a resume can't run a refused call. Only a message you send starts a new turn. A step-cap or cap-pause Yes, a "Do it now?" and a Run again carry on the turn they answer: their submission and its turn are written in one commit. A call that's admitted and then denied consent still counts. The count errs high.
+
+Tests (`bounds.test.ts`):
+
+- A reply with 20 calls runs 8 and refuses 12, each with the reason, and there's one line in chat.
+- A turn of five replies of 8 calls, with a step cap of 3 (two "go on"s) and a kill in the middle, runs 32 and refuses the rest. The next message gets a new 32.
+- A property over 25 seeds: replies with 0 to 20 calls, reads and always-allowed effects, step caps of 2 to 5, and one to three kills mid-call. No reply runs more than 8, no turn more than 32, and no refused call ever runs.
+- Three mutations fail them: dropping the reply check, dropping the turn check, and letting a "go on" start a new turn.
 
 ## Caps that pause, not fail
 

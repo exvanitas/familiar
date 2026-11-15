@@ -52,8 +52,11 @@ export function offsetClock(counters: Counters): JournalClock & { advance(ms: nu
 export const NotesDoc = defineJournalDoc<{ notes: Record<string, string> }>('familiar.test-notes', () => ({ notes: {} }));
 
 /** The fake tools: one of each kind. Each counts its starts; a hang holds it in flight for the kill. */
-export function fakeTools(env: Env, hang: (name: string) => boolean): FamiliarTool[] {
-  const start = (name: string) => env.counters.bump(`starts:${name}`);
+export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (name: string, args: any) => void): FamiliarTool[] {
+  const start = (name: string, args?: unknown) => {
+    onRun?.(name, args);
+    return env.counters.bump(`starts:${name}`);
+  };
   const maybeHang = async (name: string) => {
     if (hang(name)) await never;
   };
@@ -66,7 +69,7 @@ export function fakeTools(env: Env, hang: (name: string) => boolean): FamiliarTo
       kind: 'read',
       doing: (a: any) => `looking up ${a.what}`,
       async run(args: any) {
-        start('look');
+        start('look', args);
         await maybeHang('look');
         return `seen: ${args.what}`;
       }
@@ -78,7 +81,7 @@ export function fakeTools(env: Env, hang: (name: string) => boolean): FamiliarTo
       kind: 'write',
       doing: (a: any) => `saving a note "${a.text}"`,
       async run(args: any, step) {
-        start('save_note');
+        start('save_note', args);
         await step.write(async (tx) => {
           env.counters.bump('writes:save_note');
           (await tx.doc(NotesDoc)).notes[step.id] = args.text;
@@ -96,7 +99,7 @@ export function fakeTools(env: Env, hang: (name: string) => boolean): FamiliarTo
       asks: true,
       doing: (a: any) => `sending a message to ${a.to}`,
       async run(args: any) {
-        start('send_message');
+        start('send_message', args);
         await maybeHang('send_message');
         return `sent to ${args.to}`;
       }
@@ -108,7 +111,7 @@ export function fakeTools(env: Env, hang: (name: string) => boolean): FamiliarTo
       kind: 'server',
       doing: (a: any) => `asking the server about ${a.q}`,
       async run(args: any) {
-        start('server_lookup');
+        start('server_lookup', args);
         await maybeHang('server_lookup');
         return `server says: ${args.q}`;
       }
@@ -131,6 +134,7 @@ export interface OpenOptions {
   readonly decider?: DecisionPort;
   readonly onReaction?: (decision: Decision, event: PersonaEvent) => void;
   readonly newGen?: () => string;
+  readonly onRun?: (name: string, args: any) => void;
 }
 
 /** Opens the scenario's journal over the shared store, with the fake model, tools and ports. */
@@ -148,7 +152,7 @@ export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
     model,
     modelId: 'fake-1',
     caps: { config: { maxReplyTokens: 200, ...o.caps }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
-    tools: fakeTools(env, o.hang ?? (() => false)),
+    tools: fakeTools(env, o.hang ?? (() => false), o.onRun),
     clock,
     wake: { wakeAt: (at) => wakes.push(at) },
     consent: {

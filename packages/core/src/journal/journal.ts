@@ -26,6 +26,7 @@ import type { PresencePort } from './presence.ts';
 import { presenceReporter, stateOf } from './presence.ts';
 import { decodeModelError, portProvider } from './provider.ts';
 import type { JournalStore } from './store.ts';
+import { admit, boundWords, emptyBudget, type Budget } from './bounds.ts';
 import type { FamiliarTool, JournalDocToken } from './tools.ts';
 import { defineJournalDoc, toDurableTool } from './tools.ts';
 
@@ -147,6 +148,14 @@ export interface WakeTask {
 const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; opened?: number }>('familiar.questions', () => ({ open: {}, dismissed: {} }));
 const ConsentDoc = defineJournalDoc<{ cards: Record<string, ConsentCard & { answer?: 'allow' | 'deny' }>; opened?: number }>('familiar.consent', () => ({ cards: {} }));
 const AckEntry = 'familiar.ack';
+const NoticeEntry = 'familiar.notice';
+/** The tool-call budget of the current turn, and which turn each submission belongs to. */
+const BudgetDoc = defineJournalDoc<{ budget: Budget; turns: Record<string, string>; order: string[]; current: string }>('familiar.tool-budget', () => ({
+  budget: emptyBudget(),
+  turns: {},
+  order: [],
+  current: ''
+}));
 
 const STOPPED_WORDS = 'Not done: the app closed while this was running, and it was not run again. The person was asked whether to do it now.';
 
@@ -240,8 +249,53 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
 
   /* ---------- consent, and the questions a restart leaves ---------- */
 
+  /** The bounds on tool calls (bounds.ts), counted in the journal before anything else about the call. */
+  const bounded = async (api: any): Promise<string | undefined> => {
+    const id = String(api.taskId);
+    const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
+    const slots: any[] = live?.tools ?? [];
+    const found = slots.findIndex((s) => String(s.taskId) === id);
+    const index = found < 0 ? slots.length : found;
+    const inputs: string[] = (live?.run?.inputs ?? []).map(String);
+    const verdict = await harness.commit(async (tx: any) => {
+      const doc = await tx.doc(BudgetDoc);
+      // The turn: the newest of the run's inputs that belongs to one. A run with none (a continue)
+      // goes on counting the turn it continues.
+      const key = [...inputs].reverse().map((i) => doc.turns[i]).find((k) => k !== undefined) ?? doc.budget.turn;
+      const budget: Budget = key === doc.budget.turn ? JSON.parse(JSON.stringify(doc.budget)) : emptyBudget(key);
+      const out = admit(budget, id, index);
+      doc.budget = budget;
+      return { ...out, turn: budget.turn };
+    }, ctx);
+    if (verdict.ok) return undefined;
+    const words = boundWords(verdict.bound);
+    // One line in chat per reply, or per turn. The request id finds the same line after a restart.
+    const reply = verdict.bound === 'reply' ? `:${String(slots[0]?.taskId ?? id)}` : '';
+    await root.submit({ type: 'write', entry: { kind: NoticeEntry, data: { text: words } }, requestId: `bound:${verdict.turn}:${verdict.bound}${reply}` }, ctx);
+    return `${words} This call was not run.`;
+  };
+
+  /** Submits for the person's own message (a new turn) or for an answer that carries on the current one. */
+  const submitInTurn = async (draft: any, carry: boolean) => {
+    const id = await harness.commit(async (tx: any) => {
+      const sid = String(await root.submit(tx, draft));
+      const doc = await tx.doc(BudgetDoc);
+      const key = carry ? doc.current || sid : sid;
+      if (!carry) doc.current = sid;
+      if (doc.turns[sid] === undefined) {
+        doc.turns[sid] = key;
+        doc.order.push(sid);
+        while (doc.order.length > 64) delete doc.turns[doc.order.shift()!];
+      }
+      return sid;
+    }, ctx);
+    return harness.submission(Number(id), ctx);
+  };
+
   const consentHook = hook(ToolTask, {
     beforeTool: async (call: any, api: any) => {
+      const refused = await bounded(api);
+      if (refused) return { block: refused };
       const tool = tools.get(call.name);
       if (!tool?.asks) return undefined;
       const id = String(api.taskId);
@@ -465,7 +519,7 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
         return { replied: false, decision: await notice({ name: 'ack-sent', at }) };
       }
       lastChatAt = at;
-      const submission = await root.submit({ type: 'input', content: text, requestId }, ctx);
+      const submission = await submitInTurn({ type: 'input', content: text, requestId }, false);
       return { replied: true, turn: turnFor(submission) };
     },
     turn(id) {
@@ -492,9 +546,10 @@ export async function openJournal(options: JournalOptions & { wakeTask?: WakeTas
         doc.dismissed[id] = true;
       }, ctx);
       if (!yes) return undefined;
-      if (question.kind === 'steps' || question.kind === 'cap') return turnFor(await root.submit({ type: 'continue', requestId }, ctx));
+      // A yes carries on the same turn: its tool-call budget goes on counting.
+      if (question.kind === 'steps' || question.kind === 'cap') return turnFor(await submitInTurn({ type: 'continue', requestId }, true));
       const words = question.kind === 'redo' ? `Yes, do it now: ${tools.get(question.tool!)?.doing(question.arguments) ?? question.tool}.` : `Run ${question.tool} again.`;
-      return turnFor(await root.submit({ type: 'input', content: words, requestId }, ctx));
+      return turnFor(await submitInTurn({ type: 'input', content: words, requestId }, true));
     },
     async parkUntil(text, at) {
       await root.commit((tx: any) => tx.createTask(WakeAt, { text, at }, { ownership: { kind: 'conversation' }, background: true }), ctx);
