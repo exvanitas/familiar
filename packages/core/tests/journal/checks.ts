@@ -42,12 +42,15 @@ export const CHECKS: Record<string, Check> = {
     }
   },
   'effect-started': {
-    title: 'a built-in effect that had started is not run: it becomes a question, "Do it now?"',
+    title: 'a built-in effect that had started is not run: the turn waits on a question, "Do it now?", and yes asks consent again',
     verify(s) {
       expect(s.starts).toBe(1);
       expect(s.questions).toEqual([expect.objectContaining({ kind: 'redo', tool: 'send_message', text: 'I was sending a message to Sam when the app closed. Do it now?' })]);
       expect(toolResult(s).text).toMatch(/not run again/);
-      expect(s.end).toMatchObject({ status: 'answered' });
+      // The turn parks on the question: the model got no request after the interruption.
+      expect(s.end).toMatchObject({ status: 'asks', question: { kind: 'redo' } });
+      expect(s.requestsSent).toBe(0);
+      expect(s.states.at(-1)).toBe('waiting');
       // Yes: she does it now, as a new step that asks first again.
       expect(s.redo).toMatchObject({ status: 'answered' });
       expect(s.startsAfterRedo).toBe(2);
@@ -55,12 +58,49 @@ export const CHECKS: Record<string, Check> = {
     }
   },
   'server-started': {
-    title: 'a server tool that had started is never repeated: reported as interrupted, with Run again',
+    title: 'a server tool that had started is never repeated: reported as interrupted, and the turn waits on Run again',
     verify(s) {
       expect(s.starts).toBe(1);
       expect(s.questions).toEqual([expect.objectContaining({ kind: 'rerun', tool: 'server_lookup', text: expect.stringMatching(/may have partially run/) })]);
       expect(toolResult(s).text).toMatch(/interrupted and may have partially run/);
-      expect(s.end).toMatchObject({ status: 'answered' });
+      expect(s.end).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
+      expect(s.requestsSent).toBe(0);
+    }
+  },
+  'server-reissue': {
+    title: 'a server tool always allowed, cut off, is not called again on its own: the model gets no chance until Run again',
+    verify(s) {
+      expect(s.end).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
+      expect(s.asksBefore).toBe(0);
+      expect(s.startsBefore).toBe(1);
+      // Run again: the person's answer. Now it runs, always allowed, without a card.
+      expect(s.rerun).toMatchObject({ status: 'answered' });
+      expect(s.startsAfter).toBe(2);
+    }
+  },
+  'server-skip': {
+    title: 'skipping a cut-off server tool goes on without it, and the model calling it again in that turn runs nothing',
+    verify(s) {
+      expect(s.after).toMatchObject({ status: 'answered' });
+      expect(s.reissued).toBe(1);
+      expect(s.startsAfter).toBe(1);
+    }
+  },
+  'redo-withheld': {
+    title: '"Do it now?" yes with consent withheld runs nothing: the card waits',
+    verify(s) {
+      expect(s.asksAfterYes).toBe(1);
+      expect(s.startsAfter).toBe(1);
+      expect(s.cards).toEqual([expect.objectContaining({ tool: 'send_message' })]);
+    }
+  },
+  'redo-denied': {
+    title: '"Do it now?" yes with consent denied runs nothing',
+    verify(s) {
+      expect(s.asksAfterYes).toBe(1);
+      expect(s.startsAfter).toBe(1);
+      expect(s.redo).toMatchObject({ status: 'answered' });
+      expect(s.transcriptAfter.filter((e: any) => e.role === 'toolResult').at(-1).text).toMatch(/said no/);
     }
   },
   'replay-restart': {

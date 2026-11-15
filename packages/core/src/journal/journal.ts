@@ -12,7 +12,7 @@
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
-import { AssistantEntry, Harness, LiveDoc, ToolTask, createRegistry, defineExtension, defineTask, hook } from '@earendil-works/pi-durable';
+import { AssistantEntry, GenerationTask, Harness, LiveDoc, ToolTask, createRegistry, defineExtension, defineTask, hook } from '@earendil-works/pi-durable';
 import { needsReply } from '../decide/ack.ts';
 import type { Decision, DecisionContext, DecisionPort, PastReaction, PersonaEvent } from '../decide/port.ts';
 import type { CallInfo, CapsConfig, CapsOptions, Clock, Ledger } from '../model/caps.ts';
@@ -27,6 +27,7 @@ import { presenceReporter, stateOf } from './presence.ts';
 import { decodeModelError, portProvider } from './provider.ts';
 import type { JournalStore } from './store.ts';
 import { admit, boundWords, emptyBudget, type Budget } from './bounds.ts';
+import { gateFor, type GatePolicy } from './gate.ts';
 import type { FamiliarTool, JournalDocToken } from './tools.ts';
 import { defineJournalDoc, toDurableTool } from './tools.ts';
 
@@ -84,6 +85,8 @@ export interface Question {
   readonly tool?: string;
   readonly arguments?: unknown;
   readonly pause?: string;
+  /** For `redo` and `rerun`: the turn the cut-off call belonged to. */
+  readonly turn?: string;
 }
 
 /** What the decider sees that the loop doesn't know itself. */
@@ -107,6 +110,8 @@ export interface JournalOptions {
   readonly tools: readonly FamiliarTool[];
   readonly clock?: JournalClock;
   readonly wake: WakePort;
+  /** The person's per-tool choices (step 8's Settings), read at each call. The gate's defaults hold without it. */
+  readonly policy?: () => GatePolicy;
   /** Shows a parked wake's notification when it fires. */
   readonly notifier: NotifierPort;
   readonly consent: ConsentPort;
@@ -157,7 +162,7 @@ export interface NotifierPort {
   notify(notification: Notification): void | Promise<void>;
 }
 
-const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; answered: Record<string, { yes: boolean; submission?: string }>; opened?: number }>(
+const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; answered: Record<string, { yes: boolean; submission?: string; tool?: string; turn?: string }>; opened?: number }>(
   'familiar.questions',
   () => ({ open: {}, dismissed: {}, answered: {} })
 );
@@ -355,16 +360,43 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     while (sent.order.length > 256) delete sent.byRequest[sent.order.shift()!];
   };
 
+  /** Why a call of `name` waits for the person, if it does: an open interruption, or one skipped this turn. */
+  const parkedFor = async (name: string, step: string): Promise<string | undefined> => {
+    const doc: any = await harness.snapshot(QuestionsDoc, ctx);
+    const open = Object.values(doc?.open ?? {}).find((q: any) => (q.kind === 'rerun' || q.kind === 'redo') && q.tool === name && q.id !== step);
+    if (open) return `${name} was cut off when the app closed. It waits for the person to choose Run again or skip.`;
+    const turn = turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(BudgetDoc, ctx));
+    const skipped = Object.entries(doc?.answered ?? {}).some(([qid, a]: [string, any]) => !a.yes && a.tool === name && a.turn === turn && qid !== step);
+    if (skipped) return `The person chose to skip ${name} in this turn.`;
+    return undefined;
+  };
+  // A round that left an interruption question ends the run: the model gets no chance to call the tool
+  // again on its own. The turn waits for the person's answer.
+  let parkAfterRound = false;
+  const parkHook = hook(GenerationTask, {
+    afterTools: async () => {
+      if (!parkAfterRound) return;
+      parkAfterRound = false;
+      void root.abort(ctx).catch((e: unknown) => report('park', e));
+    }
+  } as any);
+
   const consentHook = hook(ToolTask, {
     beforeTool: async (call: any, api: any, context: any) => {
       const refused = await bounded(api);
       if (refused) return { block: refused };
       const tool = tools.get(call.name);
-      if (!tool?.asks) return undefined;
       const id = String(api.taskId);
+      // A tool cut off by a close waits for the person: Run again, or skip. Until then, and for the
+      // rest of the turn after a skip, a call the model makes to it again doesn't run.
+      const parked = await parkedFor(call.name, id);
+      if (parked) return { block: parked };
+      const policy = gateFor(call.name, tool, options.policy?.());
+      if (policy === 'deny') return { block: `${call.name} is turned off.` };
+      if (policy === 'allow') return undefined;
       const stored = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
       if (stored?.answer) return stored.answer === 'allow' ? undefined : { block: 'The person said no.' };
-      const card: ConsentCard = stored ?? { id, tool: call.name, arguments: call.arguments, doing: tool.doing(call.arguments), askedAt: clock.now() };
+      const card: ConsentCard = stored ?? { id, tool: call.name, arguments: call.arguments, doing: tool ? tool.doing(call.arguments) : `using ${call.name}`, askedAt: clock.now() };
       if (!stored) {
         await harness.commit(async (tx: any) => {
           (await tx.doc(ConsentDoc)).cards[id] = card;
@@ -389,6 +421,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       const id = String(api.taskId);
       const tool = tools.get(call.name);
       const interrupted = (result.diagnostics ?? []).some((d: any) => d.code === 'interrupted');
+      const turn = interrupted ? turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(BudgetDoc, ctx)) : '';
       await harness.commit(async (tx: any) => {
         const consent = await tx.doc(ConsentDoc);
         if (consent.cards[id]) delete consent.cards[id];
@@ -397,15 +430,16 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         if (questions.dismissed[id] || questions.open[id]) return;
         questions.open[id] =
           tool.kind === 'server'
-            ? { id, kind: 'rerun', tool: call.name, arguments: call.arguments, text: `${call.name} was cut off when the app closed, and may have partially run.` }
-            : { id, kind: 'redo', tool: call.name, arguments: call.arguments, text: `I was ${tool.doing(call.arguments)} when the app closed. Do it now?` };
+            ? { id, kind: 'rerun', tool: call.name, arguments: call.arguments, turn, text: `${call.name} was cut off when the app closed, and may have partially run.` }
+            : { id, kind: 'redo', tool: call.name, arguments: call.arguments, turn, text: `I was ${tool.doing(call.arguments)} when the app closed. Do it now?` };
       }, ctx);
+      if (interrupted && tool) parkAfterRound = true;
       if (interrupted && tool?.kind === 'effect') return { ...result, output: [{ type: 'text', text: STOPPED_WORDS }] };
       return undefined;
     }
   } as any);
 
-  const familiar = defineExtension({ name: 'familiar', tools: options.tools.map(toDurableTool), hooks: [consentHook], tasks: [WakeAt] } as any);
+  const familiar = defineExtension({ name: 'familiar', tools: options.tools.map(toDurableTool), hooks: [consentHook, parkHook], tasks: [WakeAt] } as any);
   const registry = createRegistry();
   registry.install(familiar);
 
@@ -508,7 +542,8 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   let consentOpen = false;
   let lastLive: any;
   let dismissedNow: Record<string, true> = {};
-  const refresh = () => presence.update(stateOf({ live: lastLive, waiting: consentOpen || !!failureQuestion(lastLive, dismissedNow), failed: failedRun(lastLive) }));
+  let questionOpen = false;
+  const refresh = () => presence.update(stateOf({ live: lastLive, waiting: consentOpen || questionOpen || !!failureQuestion(lastLive, dismissedNow), failed: failedRun(lastLive) }));
   // Watches need their documents to exist.
   await harness.commit(async (tx: any) => {
     (await tx.doc(ConsentDoc)).opened = clock.now();
@@ -539,6 +574,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   onLive(liveWatch.value);
   consentOpen = openCards(consentWatch.value);
   dismissedNow = questionsWatch.value?.dismissed ?? {};
+  questionOpen = Object.keys(questionsWatch.value?.open ?? {}).length > 0;
   refresh();
   liveWatch.start(async (call: any) => call.kind === 'value' && onLive(call.value));
   consentWatch.start(async (call: any) => {
@@ -549,6 +585,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   questionsWatch.start(async (call: any) => {
     if (call.kind !== 'value') return;
     dismissedNow = call.value?.dismissed ?? {};
+    questionOpen = Object.keys(call.value?.open ?? {}).length > 0;
     refresh();
   });
 
@@ -580,6 +617,9 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
       const question = failureQuestion(live, {});
       if (question) return { status: 'asks', question };
+      // A run ended to wait on a cut-off tool: the turn asks the person.
+      const interruption = (await questions()).find((q) => q.kind === 'redo' || q.kind === 'rerun');
+      if (interruption) return { status: 'asks', question: interruption };
       const error = decodeModelError(live?.runFailure?.detail);
       return { status: 'failed', reason: String(settled.reason ?? live?.runFailure?.reason ?? 'unknown'), message: error?.message ?? String(live?.runFailure?.detail ?? '') };
     }
@@ -640,13 +680,16 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       if (!question) return undefined;
       // A yes carries on the same turn: its tool-call budget goes on counting.
       const words = question.kind === 'redo' ? `Yes, do it now: ${tools.get(question.tool!)?.doing(question.arguments) ?? question.tool}.` : `Run ${question.tool} again.`;
-      const draft = !yes ? undefined : question.kind === 'steps' || question.kind === 'cap' ? { type: 'continue', requestId } : { type: 'input', content: words, requestId };
+      // Skipping a cut-off tool lets the turn go on without it; the gate keeps that tool from running
+      // again in this turn.
+      const skipInterrupted = !yes && (question.kind === 'redo' || question.kind === 'rerun');
+      const draft = skipInterrupted ? { type: 'continue', requestId } : !yes ? undefined : question.kind === 'steps' || question.kind === 'cap' ? { type: 'continue', requestId } : { type: 'input', content: words, requestId };
       // The answer and what it starts are one commit, so a kill can't keep one without the other.
       const submission = await submitInTurn(draft, true, async (tx, sid) => {
         const doc = await tx.doc(QuestionsDoc);
         delete doc.open[id];
         doc.dismissed[id] = true;
-        (doc.answered ??= {})[id] = { yes, ...(sid ? { submission: sid } : {}) };
+        (doc.answered ??= {})[id] = { yes, ...(sid ? { submission: sid } : {}), ...(question.tool ? { tool: question.tool, turn: question.turn ?? '' } : {}) };
       });
       return submission ? turnFor(submission) : undefined;
     },

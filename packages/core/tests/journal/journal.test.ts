@@ -8,7 +8,7 @@ import { isRetryableAssistantError } from '@earendil-works/pi-ai/utils/retry';
 import { registerStorageConformance } from '@earendil-works/pi-durable/testing';
 import { IDBFactory } from 'fake-indexeddb';
 import { describe, expect, it } from 'vitest';
-import { decodeModelError, encodeModelError, NotStrict, openJournalStore, replayOf, type Decision, type ModelRequest, type PersonaEvent } from '../../src/index.ts';
+import { decodeModelError, encodeModelError, gateFor, NotStrict, openJournalStore, replayOf, RUN_WITHOUT_ASKING, type Decision, type FamiliarTool, type ModelRequest, type PersonaEvent } from '../../src/index.ts';
 import { nodeWorld } from './node-env.ts';
 import { openFor, type Env } from './scenarios.ts';
 
@@ -75,6 +75,49 @@ describe('tools and replay', () => {
   it('sends no attribution: no request names pi to a provider', () => {
     const source = readFileSync(join(import.meta.dirname, '../../src/journal/journal.ts'), 'utf8');
     expect(source).toMatch(/identity: \{ attribution: null \}/);
+  });
+});
+
+describe('the consent gate', () => {
+  const tool = (o: Partial<FamiliarTool>): FamiliarTool => ({ name: 'x', description: '', inputSchema: {}, kind: 'read', doing: () => 'x', run: async () => '', ...o });
+
+  it('fails closed: only the listed built-ins run without asking; deny wins; asks only makes it stricter', () => {
+    expect(RUN_WITHOUT_ASKING).toEqual(['note_add', 'reminder_set', 'reminder_cancel']);
+    expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write' }))).toBe('allow');
+    // Not on the list: a read, an effect, a server tool named like a listed one, a tool nobody knows.
+    expect(gateFor('look', tool({ name: 'look', kind: 'read' }))).toBe('ask');
+    expect(gateFor('send_message', tool({ name: 'send_message', kind: 'effect' }))).toBe('ask');
+    expect(gateFor('note_add', tool({ name: 'note_add', kind: 'server' }))).toBe('ask');
+    expect(gateFor('mystery', undefined)).toBe('ask');
+    // Deny wins, over the list too.
+    expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write' }), { perTool: { note_add: 'deny' } })).toBe('deny');
+    // The person's always-allow holds, but a tool's own `asks` still asks: it can only be stricter.
+    expect(gateFor('srv', tool({ name: 'srv', kind: 'server' }), { perTool: { srv: 'allow' } })).toBe('allow');
+    expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write', asks: true }))).toBe('ask');
+    expect(gateFor('srv', tool({ name: 'srv', kind: 'server', asks: true }), { perTool: { srv: 'allow' } })).toBe('ask');
+  });
+
+  it('in the loop: a read asks, a server tool asks, note_add runs without asking, and a denied tool never runs or asks', async () => {
+    const env = envOf();
+    const calls = [
+      { id: 'a', name: 'look', arguments: { what: 'x' } },
+      { id: 'b', name: 'server_lookup', arguments: { q: 'y' } },
+      { id: 'c', name: 'note_add', arguments: { text: 'z' } },
+      { id: 'd', name: 'send_message', arguments: { to: 'Sam', text: 'hi' } }
+    ];
+    const asked: string[] = [];
+    const { journal } = await openFor(env, await env.world.open('gate'), {
+      script: (r) => (lastIsTool(r) ? { text: 'Done.' } : { toolCalls: calls }),
+      consent: (_life, id) => (asked.push(id), Promise.resolve(true)),
+      policy: { perTool: { send_message: 'deny' } }
+    });
+    const sent = await journal.send('Do four things.', 'r1');
+    if (sent.replied) await sent.turn.wait();
+    expect(asked).toHaveLength(2);
+    expect(['look', 'server_lookup', 'note_add', 'send_message'].map((n) => env.counters.get(`starts:${n}`))).toEqual([1, 1, 1, 0]);
+    const results = (await journal.transcript()).filter((e) => e.role === 'toolResult').map((e) => e.text);
+    expect(results.at(-1)).toMatch(/send_message is turned off/);
+    await journal.close();
   });
 });
 

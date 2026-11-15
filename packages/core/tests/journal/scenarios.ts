@@ -8,7 +8,7 @@
 // No Node imports here: this file is bundled into the page.
 
 import { createFakeModel, type FakeReply } from '../../src/testing/index.ts';
-import { decideByRules, defineJournalDoc, openJournal, type Decision, type DecisionPort, type PersonaEvent, type FamiliarTool, type Journal, type JournalClock, type JournalStore, type OwnerLock, type PresenceSnapshot, type ModelRequest } from '../../src/index.ts';
+import { decideByRules, defineJournalDoc, openJournal, type GatePolicy, type Decision, type DecisionPort, type PersonaEvent, type FamiliarTool, type Journal, type JournalClock, type JournalStore, type OwnerLock, type PresenceSnapshot, type ModelRequest } from '../../src/index.ts';
 
 export interface Counters {
   get(name: string): number;
@@ -148,6 +148,8 @@ export interface OpenOptions {
   readonly onRun?: (name: string, args: any) => void;
   /** Timers that fire this many milliseconds early, as real timers can. */
   readonly earlyTimersMs?: number;
+  /** The person's per-tool choices, as step 8's Settings will give them. */
+  readonly policy?: GatePolicy;
 }
 
 /** Opens the scenario's journal over the shared store, with the fake model, tools and ports. */
@@ -185,6 +187,7 @@ export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
     newGen: o.newGen,
     stepCap: o.stepCap,
     resendDelayMs: 50,
+    policy: o.policy ? () => o.policy! : undefined,
     // A notifier that shows each id once, as the real one must. Calls and ids are counted apart.
     notifier: {
       notify: (n) => {
@@ -205,14 +208,15 @@ const callOnce = (name: string, args: unknown): FakeReply => ({ text: 'On it.', 
 const answerTool = (r: ModelRequest): FakeReply => ({ text: `Done. (${lastText(r)})` });
 
 /** A scenario where the first reply calls one tool, which hangs in life 1. */
-function toolKill(name: string, scenario: string, tool: string, args: unknown, extra: (env: Env, j: Journal) => Promise<Summary> = async () => ({})): Scenario {
+function toolKill(name: string, scenario: string, tool: string, args: unknown, extra: (env: Env, j: Journal) => Promise<Summary> = async () => ({}), more: (env: Env) => Partial<OpenOptions> = () => ({})): Scenario {
   return {
     name,
     async run(env) {
       const store = await env.openStore(scenario);
       const { journal, model, presence } = await openFor(env, store, {
         script: (r) => (lastIsTool(r) ? answerTool(r) : callOnce(tool, args)),
-        hang: (n) => env.life === 1 && n === tool
+        hang: (n) => env.life === 1 && n === tool,
+        ...more(env)
       });
       if (env.life === 1) {
         void journal.send('Please do the thing.', 'turn-1');
@@ -270,6 +274,92 @@ export const SCENARIOS: readonly Scenario[] = [
 
   // A server tool, started: never repeated on its own. Reported as interrupted, with Run again.
   toolKill('server-started', 'server-started', 'server_lookup', { q: 'trains' }),
+
+  // The same, with the tool set to always allow, and a model that calls it again on its own, with a new id,
+  // as soon as it sees the interruption. The turn ends instead: the model gets no request, and nothing
+  // runs until the person picks Run again.
+  toolKill(
+    'server-reissue',
+    'server-reissue',
+    'server_lookup',
+    { q: 'trains' },
+    async (env, j) => {
+      const [question] = await j.questions();
+      const asksBefore = env.counters.get('reissue-asked');
+      const startsBefore = env.counters.get('starts:server_lookup');
+      const turn = question ? await j.answer(question.id, true, 'rerun-1') : undefined;
+      const rerun = turn ? await turn.wait() : undefined;
+      return { asksBefore, startsBefore, rerun, startsAfter: env.counters.get('starts:server_lookup') };
+    },
+    (env) => ({
+      policy: { perTool: { server_lookup: 'allow' } },
+      script: (r) => {
+        const last = r.messages.at(-1);
+        if (last?.role === 'user' && last.content.startsWith('Run ')) return { toolCalls: [{ id: 'call-3', name: 'server_lookup', arguments: { q: 'trains' } }] };
+        if (lastIsTool(r) && /may have partially run/.test(last!.content)) {
+          env.counters.bump('reissue-asked');
+          return { toolCalls: [{ id: 'call-2', name: 'server_lookup', arguments: { q: 'trains' } }] };
+        }
+        return lastIsTool(r) ? answerTool(r) : callOnce('server_lookup', { q: 'trains' });
+      }
+    })
+  ),
+
+  // Skip: the turn goes on without it, and a call the model makes to it again doesn't run in this turn.
+  toolKill(
+    'server-skip',
+    'server-skip',
+    'server_lookup',
+    { q: 'trains' },
+    async (env, j) => {
+      const [question] = await j.questions();
+      const turn = question ? await j.answer(question.id, false, 'skip-1') : undefined;
+      const after = turn ? await turn.wait() : undefined;
+      return { after, startsAfter: env.counters.get('starts:server_lookup'), reissued: env.counters.get('reissue-asked') };
+    },
+    (env) => ({
+      policy: { perTool: { server_lookup: 'allow' } },
+      script: (r) => {
+        const last = r.messages.at(-1);
+        if (lastIsTool(r) && /may have partially run/.test(last!.content)) {
+          env.counters.bump('reissue-asked');
+          return { toolCalls: [{ id: 'call-2', name: 'server_lookup', arguments: { q: 'trains' } }] };
+        }
+        return lastIsTool(r) ? answerTool(r) : callOnce('server_lookup', { q: 'trains' });
+      }
+    })
+  ),
+
+  // "Do it now?" asks consent again: withheld, nothing runs; denied, nothing runs.
+  toolKill(
+    'redo-withheld',
+    'redo-withheld',
+    'send_message',
+    { to: 'Sam', text: 'hi' },
+    async (env, j) => {
+      const [question] = await j.questions();
+      const asks = env.counters.get('consent-asks');
+      if (question) void j.answer(question.id, true, 'redo-1');
+      for (let i = 0; i < 100 && env.counters.get('consent-asks') === asks; i++) await sleep(10);
+      await sleep(200);
+      return { asksAfterYes: env.counters.get('consent-asks') - asks, startsAfter: env.counters.get('starts:send_message'), cards: await j.consents() };
+    },
+    () => ({ consent: (life) => (life === 1 ? Promise.resolve(true) : never) })
+  ),
+  toolKill(
+    'redo-denied',
+    'redo-denied',
+    'send_message',
+    { to: 'Sam', text: 'hi' },
+    async (env, j) => {
+      const [question] = await j.questions();
+      const asks = env.counters.get('consent-asks');
+      const turn = question ? await j.answer(question.id, true, 'redo-1') : undefined;
+      const redo = turn ? await turn.wait() : undefined;
+      return { redo, asksAfterYes: env.counters.get('consent-asks') - asks, startsAfter: env.counters.get('starts:send_message'), transcriptAfter: await j.transcript() };
+    },
+    () => ({ consent: (life) => Promise.resolve(life === 1) })
+  ),
 
   // Replay state across a restart: the reply that called the tool gave replay state (signed thinking),
   // and, as step 4's contract control does, the next request is refused unless it comes back unchanged.
