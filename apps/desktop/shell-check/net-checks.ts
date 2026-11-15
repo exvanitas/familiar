@@ -490,6 +490,7 @@ export async function netChecks(ctx: Ctx) {
       const outcome = await within(fetched, 30000, 'net_fetch');
       await sleep(300);
       tries.push({ offset, outcome, cancelled, next: Date.now() });
+      await sleep(50);
     }
     // Five more held just before sending: their lookup answers 1.5 s late, and each is cancelled
     // while it waits. Nothing of them may reach the proxy, then or once the lookup has answered.
@@ -507,6 +508,8 @@ export async function netChecks(ctx: Ctx) {
       heldOutcomes.push(await within(fetched, 30000, 'net_fetch'));
       await sleep(1500);
       heldWindows.push([returned, Date.now()]);
+      // A gap before the next try, so its own first query can't land in this window's last ms.
+      await sleep(50);
     }
     // The lookup was under way when each cancel came: the cancel returns only once it's over, so
     // the check's DNS server sees no query for the name after a cancel returned.
