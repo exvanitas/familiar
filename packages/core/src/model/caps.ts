@@ -1,10 +1,11 @@
 // Caps on what model calls may spend, kept as a reservation ledger. A pure unit: the clock and the
-// usage store are passed in (the real store arrives with the journal in step 5).
+// usage store are passed in. The app's store is the journal's (journal/ledger.ts), so open reservations
+// and settled spend survive a restart.
 //
 //   - `before` reserves a call's worst case, in tokens and in dollars, against today's settled spend
-//     plus every open reservation, all in one step under one lock. If that would pass a cap, the call
-//     pauses and nothing is reserved or sent. So two calls that overlap can't both spend the same
-//     remainder.
+//     plus every open reservation, all in one atomic update of the store. If that would pass a cap,
+//     the call pauses and nothing is reserved or sent. So two calls that overlap, in one instance or
+//     two on the same store, can't both spend the same remainder.
 //   - The worst case is the input's upper bound (`inputBound`) plus the reply's cap, priced at the
 //     highest rate that could apply. With caching on, input may be billed as a cache write, so the
 //     input rate is the higher of the two. If any rate that could apply is unknown, a dollar cap pauses.
@@ -12,7 +13,8 @@
 //     the endpoint reported its final usage for the call, and releases it only when the endpoint said
 //     the request wasn't processed. Anything else (a stop, an error after sending, a stream that ended
 //     early, usage that's missing or partial) keeps the reservation as spent, or the reported usage if
-//     that's more. A reservation not settled within `reservationMs` stays spent.
+//     that's more. A reservation not settled within `reservationMs` stays spent. Only the instance that
+//     made a reservation settles it, so one left open by a restart stays spent too.
 //   - A cost it can't price is 'unknown', never $0, and is counted by its tokens.
 
 import type { ModelEvent, ModelPort, ModelRequest, Usage } from './port.ts';
@@ -148,14 +150,29 @@ export interface Reservation {
   readonly deadline: number;
 }
 
+/**
+ * The ledger as one value: settled records, open reservations, and, for turns settled more than
+ * `FOLD_AFTER_MS` ago, their tokens per turn, so a turn keeps its cap however old it is without the
+ * ledger growing a record per call forever.
+ */
+export interface Ledger {
+  records: UsageRecord[];
+  open: Reservation[];
+  /** Settled tokens per turn, and when it was last used, of records folded out of `records`. */
+  turns: Record<string, { tokens: number; last: number }>;
+}
+
+/**
+ * Where the ledger lives. `update` runs `change` on the whole ledger as one atomic step: no other
+ * update, in this instance or any other that opens the same store, sees the ledger between its read and
+ * its write. `change` is synchronous and may mutate the ledger it gets; what it returns is returned.
+ * Atomicity is the store's, not a lock in the caller: the journal's store runs it as one commit of the
+ * journal's single owner (journal/ledger.ts), the memory store runs it without yielding.
+ */
 export interface UsageStore {
-  add(record: UsageRecord): Promise<void>;
-  /** Every settled record of one day, or of every day. */
-  records(day?: string): Promise<readonly UsageRecord[]>;
-  reserve(r: Reservation): Promise<void>;
-  release(id: string): Promise<void>;
-  /** Every open reservation. */
-  open(): Promise<readonly Reservation[]>;
+  update<T>(change: (ledger: Ledger) => T): Promise<T>;
+  /** A copy of the ledger as it is now. */
+  read(): Promise<Ledger>;
 }
 
 export interface Clock {
@@ -223,29 +240,41 @@ export interface CapsOptions {
   readonly newId?: () => string;
 }
 
+/** Records settled longer ago than this fold into per-turn totals. Two days, so today and yesterday stay whole. */
+export const FOLD_AFTER_MS = 2 * 24 * 60 * 60_000;
+/** A folded turn last used longer ago than this is dropped: no turn runs for a month. */
+export const DROP_TURN_AFTER_MS = 30 * 24 * 60 * 60_000;
+
+export function emptyLedger(): Ledger {
+  return { records: [], open: [], turns: {} };
+}
+
 export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, opts: CapsOptions = {}): Caps {
   const dayOf = opts.dayOf ?? localDay;
   const ttl = opts.reservationMs ?? 30 * 60_000;
   let n = 0;
-  const newId = opts.newId ?? (() => `r${clock.now().toString(36)}-${(n++).toString(36)}`);
-  const pending = new Map<string, { call: CallInfo; reserved: Reservation }>();
+  const newId = opts.newId ?? (() => `r${clock.now().toString(36)}-${(n++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
+  // What this instance needs to settle its own calls. A reservation made by another instance, or by this
+  // one before a restart, has no entry here, so nothing settles it: it stays spent, and becomes a record
+  // at its deadline.
+  const pending = new Map<string, CallInfo>();
   const seen = new Map<string, Seen>();
 
-  // One lock over every read-then-write of the ledger, so no two calls see the same remainder.
-  let chain: Promise<unknown> = Promise.resolve();
-  const locked = <T>(f: () => Promise<T>): Promise<T> => {
-    const run = chain.then(f, f);
-    chain = run.catch(() => {});
-    return run;
-  };
-
-  async function expire(now: number): Promise<void> {
-    for (const r of await store.open()) {
-      if (r.deadline > now) continue;
-      await store.release(r.id);
-      await store.add({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens: r.tokens, cost: { usd: r.usd } as Cost, reservation: r.id });
+  /** Open past their deadline: spent as reserved. Old records fold into per-turn totals. */
+  function tidy(ledger: Ledger, now: number): void {
+    for (const r of ledger.open.filter((x) => x.deadline <= now)) {
+      ledger.open.splice(ledger.open.indexOf(r), 1);
+      ledger.records.push({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens: r.tokens, cost: { usd: r.usd } as Cost, reservation: r.id });
       pending.delete(r.id);
     }
+    if (ledger.records.some((r) => r.at < now - FOLD_AFTER_MS)) {
+      for (const r of ledger.records.filter((x) => x.at < now - FOLD_AFTER_MS)) {
+        const t = ledger.turns[r.turn];
+        ledger.turns[r.turn] = { tokens: (t?.tokens ?? 0) + r.tokens, last: Math.max(t?.last ?? 0, r.at) };
+      }
+      ledger.records = ledger.records.filter((r) => r.at >= now - FOLD_AFTER_MS);
+    }
+    for (const [turn, t] of Object.entries(ledger.turns)) if (t.last < now - DROP_TURN_AFTER_MS) delete ledger.turns[turn];
   }
 
   function boundFor(call: CallInfo): number {
@@ -258,25 +287,26 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
   }
 
   return {
-    before(call) {
-      return locked(async () => {
+    async before(call) {
+      // What doesn't read the ledger is worked out first. The check and the reservation are one update.
+      const maxOutputTokens = Math.max(1, Math.min(call.request.maxOutputTokens ?? config.maxReplyTokens, config.maxReplyTokens));
+      const input = boundFor(call);
+      const tokens = input + maxOutputTokens;
+      const worst = worstCost(input, maxOutputTokens, call.price, call.caching ?? false);
+      const id = newId();
+      const result = await store.update((ledger): CapCheck => {
         const now = clock.now();
-        await expire(now);
+        tidy(ledger, now);
         const day = dayOf(now);
-        const maxOutputTokens = Math.max(1, Math.min(call.request.maxOutputTokens ?? config.maxReplyTokens, config.maxReplyTokens));
-        const input = boundFor(call);
-        const tokens = input + maxOutputTokens;
-        const worst = worstCost(input, maxOutputTokens, call.price, call.caching ?? false);
         // A turn is counted across every date, so one that runs past midnight keeps its cap; the
         // daily limits count only today.
-        const everything = await store.records();
-        const records = everything.filter((r) => r.day === day);
-        const allOpen = await store.open();
-        const open = allOpen.filter((r) => r.day === day);
+        const records = ledger.records.filter((r) => r.day === day);
+        const open = ledger.open.filter((r) => r.day === day);
         const sum = (xs: readonly { tokens: number }[]) => xs.reduce((t, x) => t + x.tokens, 0);
 
         if (config.maxTurnTokens !== undefined) {
-          const used = sum(everything.filter((r) => r.turn === call.turn)) + sum(allOpen.filter((r) => r.turn === call.turn));
+          const mine = (r: { turn: string }) => r.turn === call.turn;
+          const used = (ledger.turns[call.turn]?.tokens ?? 0) + sum(ledger.records.filter(mine)) + sum(ledger.open.filter(mine));
           if (used + tokens > config.maxTurnTokens) {
             return { go: false, pause: 'turn-tokens', message: `This turn has used or set aside ${used} tokens. One more reply could take it past its cap of ${config.maxTurnTokens}.` };
           }
@@ -306,34 +336,32 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
             };
           }
         }
-        const reserved: Reservation = {
-          id: newId(), at: now, day, persona: call.persona, turn: call.turn, model: call.request.model, tokens, usd: worst.usd, deadline: now + ttl
-        };
-        await store.reserve(reserved);
-        pending.set(reserved.id, { call, reserved });
-        return { go: true, maxOutputTokens, reservation: reserved.id, inputBound: input, reserved: { tokens, usd: worst.usd } };
+        ledger.open.push({ id, at: now, day, persona: call.persona, turn: call.turn, model: call.request.model, tokens, usd: worst.usd, deadline: now + ttl });
+        return { go: true, maxOutputTokens, reservation: id, inputBound: input, reserved: { tokens, usd: worst.usd } };
       });
+      if (result.go) pending.set(id, call);
+      return result;
     },
 
-    settle(id, last) {
-      return locked(async () => {
-        await expire(clock.now());
-        const p = pending.get(id);
-        if (!p || !(await store.open()).some((r) => r.id === id)) return undefined;
-        pending.delete(id);
-        const { call, reserved: r } = p;
-        await store.release(id);
+    async settle(id, last) {
+      const call = pending.get(id);
+      if (!call) return undefined;
+      pending.delete(id);
+      // Final only when the endpoint said so and the counts are whole numbers: an empty or partial
+      // usage object is no count at all.
+      const said = last?.type === 'done' ? !last.unreported : last?.type === 'error' && last.usageFinal === true;
+      const final = said && wholeUsage(last?.usage) ? last!.usage : undefined;
+      const cost = await store.update((ledger): Cost | undefined => {
+        tidy(ledger, clock.now());
+        const i = ledger.open.findIndex((r) => r.id === id);
+        if (i < 0) return undefined;
+        const r = ledger.open.splice(i, 1)[0]!;
         // The endpoint said it didn't take the request: nothing was billed.
         if (last?.type === 'error' && last.error.notProcessed) return { usd: 0 };
-        // Final only when the endpoint said so and the counts are whole numbers: an empty or partial
-        // usage object is no count at all.
-        const said = last?.type === 'done' ? !last.unreported : last?.type === 'error' && last.usageFinal === true;
-        const final = said && wholeUsage(last?.usage) ? last!.usage : undefined;
         let tokens: number, cost: Cost;
         if (final) {
           tokens = tokensOf(final);
           cost = costOf(final, call.price);
-          if (call.conversation) seen.set(seenKey(call), { k: call.request.messages.length, prefix: prefixOf(call.request, call.request.messages.length), inputTokens: final.inputTokens });
         } else {
           // Not the endpoint's final word: it stays spent as reserved, or as reported if that's more.
           const partial = wholeUsage(last?.usage) ? last.usage : undefined;
@@ -341,9 +369,13 @@ export function createCaps(config: CapsConfig, store: UsageStore, clock: Clock, 
           tokens = Math.max(r.tokens, tokensOf(partial));
           cost = r.usd === 'unknown' || reportedCost?.usd === 'unknown' ? { usd: 'unknown' } : { usd: Math.max(r.usd, reportedCost?.usd ?? 0) };
         }
-        await store.add({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens, cost, reservation: r.id });
+        ledger.records.push({ at: r.at, day: r.day, persona: r.persona, turn: r.turn, model: r.model, tokens, cost, reservation: r.id });
         return cost;
       });
+      if (cost && final && call.conversation) {
+        seen.set(seenKey(call), { k: call.request.messages.length, prefix: prefixOf(call.request, call.request.messages.length), inputTokens: final.inputTokens });
+      }
+      return cost;
     }
   };
 }
@@ -374,21 +406,27 @@ export function cappedPort(port: ModelPort, caps: Caps, info: (request: ModelReq
   };
 }
 
-/** A usage store in memory, for tests and until the journal's store exists. `pause` runs inside every call. */
+/**
+ * A usage store in memory, for tests. `pause` runs before every update and read, so a test can interleave
+ * calls; the change itself runs without yielding, so an update is atomic.
+ */
 export function memoryUsageStore(pause: () => Promise<void> = async () => {}): UsageStore & { readonly all: readonly UsageRecord[]; readonly reservations: readonly Reservation[] } {
-  const all: UsageRecord[] = [];
-  const reservations: Reservation[] = [];
+  let ledger = emptyLedger();
+  const copy = (l: Ledger): Ledger => structuredClone(l);
   return {
-    all,
-    reservations,
-    async add(record) { await pause(); all.push(record); },
-    async records(day) { await pause(); return all.filter((r) => day === undefined || r.day === day); },
-    async reserve(r) { await pause(); reservations.push(r); },
-    async release(id) {
+    get all() { return ledger.records; },
+    get reservations() { return ledger.open; },
+    async update(change) {
       await pause();
-      const i = reservations.findIndex((r) => r.id === id);
-      if (i >= 0) reservations.splice(i, 1);
+      // On a throw nothing changes, as a store transaction would roll back.
+      const next = copy(ledger);
+      const out = change(next);
+      ledger = next;
+      return out;
     },
-    async open() { await pause(); return [...reservations]; }
+    async read() {
+      await pause();
+      return copy(ledger);
+    }
   };
 }

@@ -79,18 +79,18 @@ Best first: a price the person typed; a local server's $0; the endpoint's own li
 
 ## Caps
 
-A pure unit, `packages/core/src/model/caps.ts`, kept as a reservation ledger. The clock and the usage store are passed in, and the real store comes with the journal in step 5. `cappedPort` wraps a model port so every call goes through it.
+A pure unit, `packages/core/src/model/caps.ts`, kept as a reservation ledger. The clock and the usage store are passed in. The app's store is the journal's (step 5, [turn-design.md](turn-design.md#durable-cap-reservations)), so reservations and settled spend survive a restart. `cappedPort` wraps a model port so every call goes through it.
 
 - **Reply length:** every request's max output tokens is capped at `maxReplyTokens`.
-- **Before each call, `before` reserves the call's worst case**, in tokens and in dollars, against today's settled spend plus every open reservation. All of that happens in one step under one lock, so two calls that overlap can never both spend the same remainder. If the reservation would pass a cap, the call pauses: nothing is reserved or sent, and the message says which cap and why.
+- **Before each call, `before` reserves the call's worst case**, in tokens and in dollars, against today's settled spend plus every open reservation. All of that is one atomic update of the store, so two calls that overlap, in one instance or two on the same store, can never both spend the same remainder. If the reservation would pass a cap, the call pauses: nothing is reserved or sent, and the message says which cap and why.
 - **The worst case** is the input's upper bound plus the reply cap. The input bound is the request's UTF-8 bytes plus framing per message, since byte-level tokenizers never give more than one token per byte, whatever the script. When the same conversation's earlier call reported its final input count, the bound is that count plus the bytes added since, if the prefix is unchanged. That count is kept per endpoint and model, and the prefix includes the system prompt, the tools and the thinking setting, so a model switch or a changed prompt starts again from the byte count. Dollars are at the highest rate that could apply: with caching, input may be billed as a cache write, so the input rate is the higher of the two, and a tiered price uses its top tier. If any rate that could apply is unknown, a dollar cap pauses.
 - **After each call, `settle`** reconciles the reservation:
   - The endpoint reported its final usage, as whole numbers: it drops to that. An empty, partial or malformed usage object is no count.
   - The endpoint said the request wasn't processed: it's released.
   - Anything else (a stop, an error after sending, a stream that ended early, usage that's missing or partial): it stays spent as reserved, or as the reported usage if that's more. Missing usage is unknown, never zero.
-  - A reservation not settled within its deadline (30 minutes) stays spent.
+  - A reservation not settled within its deadline (30 minutes) stays spent. Only the instance that made it can settle it, so one a restart left open stays spent too.
 - **Caps:** tokens per turn and per day, across personas, and an optional daily dollar cap per persona. A turn counts its spend across every date, so one that runs past midnight keeps its cap; only the daily caps start again. A cost that can't be priced is `unknown`, never $0, and only its tokens count.
-- **The property test** runs 200 seeded random interleavings of reservations, settlements, stops and errors across concurrent calls in one conversation, switching between two models that count the same bytes differently, with empty and partial usage among the outcomes. It checks that recorded plus reserved spend never passes a cap, that nothing settles below the usage reported or really used, and that no call uses more than was reserved for it.
+- **The property test** runs, on the memory store and on the journal's store, 200 seeded random interleavings of reservations, settlements, stops and errors across concurrent calls in one conversation, switching between two models that count the same bytes differently, with empty and partial usage among the outcomes. It checks that recorded plus reserved spend never passes a cap, that nothing settles below the usage reported or really used, and that no call uses more than was reserved for it.
 
 ## Retries
 

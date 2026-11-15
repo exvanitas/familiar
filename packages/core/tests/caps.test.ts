@@ -2,6 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { cappedPort, costOf, createCaps, inputBound, localDay, memoryUsageStore, wholeUsage, withRetries, worstCost } from '../src/index.ts';
 import type { CallInfo, Caps, ModelError, ModelEvent, ModelRequest, Price, Usage } from '../src/index.ts';
 import { createFakeModel } from '../src/testing/index.ts';
+import { durableUsageStore } from './journal/durable-ledger.ts';
+
+// Every ledger test runs on the memory store and on the journal's store (a Harness on a strict fake
+// IndexedDB), whose updates are commits. ledger.test.ts adds restarts.
+type MakeStore = (pause?: () => Promise<void>) => ReturnType<typeof memoryUsageStore>;
+const STORES: readonly { name: string; make: MakeStore; seeds: number }[] = [
+  { name: 'memory store', make: (pause) => memoryUsageStore(pause), seeds: 200 },
+  { name: "journal's store", make: (pause) => durableUsageStore(pause), seeds: 200 }
+];
 
 const request: ModelRequest = { model: 'm', system: 'You are kind.', messages: [{ role: 'user', content: 'Hello there' }], tools: [] };
 const price: Price = { inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75 };
@@ -69,16 +78,16 @@ describe('the input bound', () => {
   });
 });
 
-describe('the ledger', () => {
+describe.each(STORES)('the ledger, $name', ({ make }) => {
   it('caps each reply at maxReplyTokens, and keeps a smaller request', async () => {
-    const caps = createCaps({ maxReplyTokens: 500 }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    const caps = createCaps({ maxReplyTokens: 500 }, make(), at('2026-11-15T10:00:00Z'));
     expect((await go(caps, call())).maxOutputTokens).toBe(500);
     expect((await go(caps, call({ request: { ...request, maxOutputTokens: 80 } }))).maxOutputTokens).toBe(80);
   });
 
   it('two calls that overlap cannot both spend the same remainder', async () => {
     const cap = inputBound(request) + 100;
-    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: cap + 50 }, memoryUsageStore(() => new Promise((r) => setTimeout(r, 1))), at('2026-11-15T10:00:00Z'));
+    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: cap + 50 }, make(() => new Promise((r) => setTimeout(r, 1))), at('2026-11-15T10:00:00Z'));
     const [a, b] = await Promise.all([caps.before(call()), caps.before(call())]);
     expect([a.go, b.go].sort()).toEqual([false, true]);
   });
@@ -86,7 +95,7 @@ describe('the ledger', () => {
   it('a turn that runs past midnight keeps its cap; only the daily caps start again', async () => {
     let now = new Date('2026-11-15T23:59:00Z').getTime();
     const worst = inputBound(request) + 100;
-    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2, maxDayTokens: worst * 2 }, memoryUsageStore(), { now: () => now }, { dayOf: day });
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2, maxDayTokens: worst * 2 }, make(), { now: () => now }, { dayOf: day });
     const first = await go(caps, call());
     await caps.settle(first.reservation, done({ inputTokens: worst - 100, outputTokens: 100 }));
     await go(caps, call());
@@ -96,7 +105,7 @@ describe('the ledger', () => {
   });
 
   it('a remembered input count holds only for the same endpoint and model, thinking and prompt', async () => {
-    const caps = createCaps({ maxReplyTokens: 100 }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    const caps = createCaps({ maxReplyTokens: 100 }, make(), at('2026-11-15T10:00:00Z'));
     const big: ModelRequest = { ...request, messages: [{ role: 'user', content: 'x'.repeat(4000) }] };
     const first = await go(caps, call({ request: big, conversation: 'c', endpoint: 'openai' }));
     await caps.settle(first.reservation, done({ inputTokens: 1010, outputTokens: 20 }));
@@ -114,7 +123,7 @@ describe('the ledger', () => {
   it('a turn and a day count open reservations, and a new day starts again', async () => {
     let now = new Date('2026-11-15T10:00:00Z').getTime();
     const worst = inputBound(request) + 100;
-    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2, maxDayTokens: worst * 3 }, memoryUsageStore(), { now: () => now }, { dayOf: day });
+    const caps = createCaps({ maxReplyTokens: 100, maxTurnTokens: worst * 2, maxDayTokens: worst * 3 }, make(), { now: () => now }, { dayOf: day });
     await go(caps, call());
     await go(caps, call());
     expect(await caps.before(call())).toMatchObject({ go: false, pause: 'turn-tokens' });
@@ -125,7 +134,7 @@ describe('the ledger', () => {
   });
 
   it("a persona's dollar cap counts today's spend plus open reservations plus the call's worst cost", async () => {
-    const caps = createCaps({ maxReplyTokens: 1000, personaDayUsd: { a: 0.04 } }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    const caps = createCaps({ maxReplyTokens: 1000, personaDayUsd: { a: 0.04 } }, make(), at('2026-11-15T10:00:00Z'));
     const first = await go(caps, call({ persona: 'a' }));
     expect(first.reserved.usd).toBeCloseTo(worstCost(first.inputBound, 1000, price, false).usd as number, 12);
     await go(caps, call({ persona: 'a' }));
@@ -135,7 +144,7 @@ describe('the ledger', () => {
   });
 
   it('pauses a capped persona when any rate that could apply is unknown, and a token cap still works', async () => {
-    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: 100_000, personaDayUsd: { a: 1 } }, memoryUsageStore(), at('2026-11-15T10:00:00Z'));
+    const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: 100_000, personaDayUsd: { a: 1 } }, make(), at('2026-11-15T10:00:00Z'));
     expect(await caps.before(call({ persona: 'a', price: undefined }))).toMatchObject({ go: false, pause: 'persona-unpriced' });
     expect(await caps.before(call({ persona: 'a', price: { inputPerMTok: 1, outputPerMTok: 1 }, caching: true }))).toMatchObject({ go: false, pause: 'persona-unpriced' });
     expect((await caps.before(call({ persona: 'uncapped', price: undefined }))).go).toBe(true);
@@ -143,7 +152,7 @@ describe('the ledger', () => {
 
   describe('settling', () => {
     const fresh = () => {
-      const store = memoryUsageStore();
+      const store = make();
       return { store, caps: createCaps({ maxReplyTokens: 100 }, store, at('2026-11-15T10:00:00Z')) };
     };
     it('drops to the actual usage when the endpoint reported its final count', async () => {
@@ -202,7 +211,7 @@ describe('the ledger', () => {
     });
     it('a reservation not settled within its deadline stays spent, and a late settle changes nothing', async () => {
       let now = 0;
-      const store = memoryUsageStore();
+      const store = make();
       const caps = createCaps({ maxReplyTokens: 100 }, store, { now: () => now }, { reservationMs: 1000, dayOf: () => 'd' });
       const r = await go(caps, call());
       now = 2000;
@@ -214,7 +223,7 @@ describe('the ledger', () => {
   });
 
   it('every retry takes its own reservation, and a not-processed try is released', async () => {
-    const store = memoryUsageStore();
+    const store = make();
     const caps = createCaps({ maxReplyTokens: 100 }, store, at('2026-11-15T10:00:00Z'));
     const busy: ModelError = { kind: 'rate-limit', message: 'x', notProcessed: true };
     const model = createFakeModel([{ error: busy }, { error: busy }, { text: 'ok', usage: { inputTokens: 9, outputTokens: 1 } }]);
@@ -227,7 +236,7 @@ describe('the ledger', () => {
   });
 
   it('a capped port pauses over a cap and sends nothing; a reader that stops early leaves it spent', async () => {
-    const store = memoryUsageStore();
+    const store = make();
     const caps = createCaps({ maxReplyTokens: 100, maxDayTokens: 10 }, store, at('2026-11-15T10:00:00Z'));
     const model = createFakeModel([{ text: 'never' }]);
     const events: ModelEvent[] = [];
@@ -254,10 +263,10 @@ function rng(seed: number) {
   return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32);
 }
 
-async function interleave(seed: number): Promise<string[]> {
+async function interleave(seed: number, make: MakeStore): Promise<string[]> {
   const rand = rng(seed);
   const tick = () => new Promise<void>((r) => (rand() < 0.9 ? queueMicrotask(r) : setTimeout(r, 0)));
-  const store = memoryUsageStore(tick);
+  const store = make(tick);
   const worst = inputBound(request) + 100;
   const config = { maxReplyTokens: 100, maxDayTokens: worst * 7, maxTurnTokens: worst * 4, personaDayUsd: { a: worstCost(inputBound(request), 100, price, false).usd as number * 3.5 } };
   const caps = createCaps(config, store, { now: () => 0 }, { dayOf: () => 'd' });
@@ -320,10 +329,10 @@ async function interleave(seed: number): Promise<string[]> {
   return problems;
 }
 
-describe('the ledger under concurrent calls', () => {
-  it('over 200 seeded interleavings, with model switches and empty or partial usage, recorded plus reserved spend never passes a cap, and nothing settles below reported or real usage', { timeout: 60000 }, async () => {
+describe.each(STORES)('the ledger under concurrent calls, $name', ({ make, seeds }) => {
+  it(`over ${seeds} seeded interleavings, with model switches and empty or partial usage, recorded plus reserved spend never passes a cap, and nothing settles below reported or real usage`, { timeout: 120000 }, async () => {
     const problems: string[] = [];
-    for (let seed = 1; seed <= 200; seed++) problems.push(...(await interleave(seed)));
+    for (let seed = 1; seed <= seeds; seed++) problems.push(...(await interleave(seed, make)));
     expect(problems.slice(0, 5)).toEqual([]);
   });
 });

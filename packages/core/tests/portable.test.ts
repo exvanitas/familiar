@@ -13,6 +13,18 @@ const NODE_BUILTINS = [
 
 // A package goes here only once it's checked to run without Node or Tauri (the MCP SDK's client parts, in step 7).
 const ALLOWED_PACKAGES: readonly string[] = [];
+// Exact entry points only. The pi-durable spike bundled each of these for the browser with no Node
+// built-ins (spikes/pi-durable-web/RESULT.md); their /node entries and pi-ai's root reach Node.
+const ALLOWED_ENTRIES: readonly string[] = [
+  '@earendil-works/pi-durable',
+  '@earendil-works/pi-durable/storage/indexeddb',
+  '@earendil-works/chord/context',
+  '@earendil-works/pi-ai/models',
+  '@earendil-works/pi-ai/utils/event-stream',
+  '@earendil-works/pi-ai/utils/transcript'
+];
+// Pinned exactly: pi-durable calls itself experimental, with API changes between releases.
+const PINNED = ['@earendil-works/pi-durable', '@earendil-works/pi-ai', '@earendil-works/chord'];
 
 function files(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((d) =>
@@ -42,10 +54,15 @@ describe('core stays portable', () => {
         const isNode = spec.startsWith('node:') || NODE_BUILTINS.includes(spec);
         const isTauri = spec.startsWith('@tauri-apps/');
         const isRelative = spec.startsWith('./') || spec.startsWith('../');
-        const isAllowed = ALLOWED_PACKAGES.some((p) => spec === p || spec.startsWith(`${p}/`));
+        const isAllowed = ALLOWED_PACKAGES.some((p) => spec === p || spec.startsWith(`${p}/`)) || ALLOWED_ENTRIES.includes(spec);
         if (isNode || isTauri || !(isRelative || isAllowed)) bad.push(`${relative(src, file)}: ${spec}`);
       }
     }
     expect(bad).toEqual([]);
+  });
+
+  it('pins pi-durable and what it stands on to one exact version', () => {
+    const pkg = JSON.parse(readFileSync(join(src, '..', 'package.json'), 'utf8'));
+    for (const name of PINNED) expect(pkg.dependencies?.[name], name).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });

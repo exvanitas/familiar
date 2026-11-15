@@ -55,6 +55,10 @@ Decided 2026-11-14 by the maintainer: "so we do option 1, the rest of your decis
 
 `packages/core/src/model/port.ts`. One reply is a stream of events (thinking, text, tool calls) that ends in exactly one `done` or `error`. It never throws, and a stop signal ends it promptly with an `aborted` error. Every adapter runs the same contract (`packages/core/src/testing/model-contract.ts`): the fake model, and the pi-ai adapter over recorded responses. [model-design.md](model-design.md) has the model layer: the adapter, the presets, the model list, Test, caps and retries.
 
+### The turn loop and the journal
+
+`packages/core/src/journal/`. The turn loop runs on pi-durable 1.5.2 behind a small facade, on its IndexedDB store with every transaction strict, and journals each step before anything is shown. A turn killed at any step goes on by the resume rules when the app opens again. [turn-design.md](turn-design.md) has the facade, the resume table as built, parked waits, the step cap, the state it reports, the decision slot's wiring, and the cap reservations kept in the journal.
+
 ## The decision slot: should the persona react?
 
 Most moments are fixed rules: you send a message and she answers, a reminder fires, a consent card shows, an error shows. Between them sits an ambient middle: something happened, nobody asked, should she react, and roughly how?

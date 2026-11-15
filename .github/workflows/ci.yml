@@ -19,6 +19,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      # The journal on real Chromium IndexedDB, headless, with the runner's own Chrome: pi-durable's
+      # storage conformance suite against the strict store, and every kill-mid-step scenario with the
+      # page closed. A missing browser fails here instead of skipping.
+      - name: Journal in headless Chromium (storage conformance, kill tests)
+        run: |
+          chrome="$(command -v google-chrome || command -v chromium || command -v chromium-browser)"
+          "$chrome" --version
+          FAMILIAR_CHROME="$chrome" pnpm exec vitest run --project core packages/core/tests/journal/browser.test.ts --reporter verbose
+        env:
+          FAMILIAR_REQUIRE_BROWSER: '1'
 
   # The shell's plain rules, on every push. rustup reads apps/desktop/rust-toolchain.toml.
   shell-core:
