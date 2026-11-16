@@ -5,8 +5,10 @@
 // the injected clock, callers answered. Whatever the I/O sends back comes in as another message, tagged
 // with its generation or its number, so the machine can drop what's late.
 //
-// The setup is held here too. An edit is admitted by the machine and counts only once saved; each run is
-// started from the setup committed at its launch, which stays bound to that run.
+// The whole saved record is held here too, and every change to it goes through here: an edit of the setup
+// (admitted only while stopped), the rest of the record, the add, the removal. A change counts only once
+// its write lands, and each run is started from the record committed at its launch, which stays bound to
+// that run. An effect stays owned until it settles, even past its deadline (machine.ts).
 
 import type { JournalClock } from '../journal/journal.ts';
 import { CatalogError } from './catalog.ts';
@@ -22,14 +24,20 @@ export interface ServerView {
 }
 
 export interface ActorOptions<S> {
-  /** The setup as saved when the actor is made. */
+  /** The record as saved when the actor is made, or as it will be added. */
   readonly setup: S;
-  /** What "always for this" binds to, for a setup. */
+  /** Made for an add: it starts `adding`, and `register` adds it. */
+  readonly adding?: boolean;
+  /** What "always for this" binds to, for a record. */
   readonly fingerprint: (setup: S) => string;
-  /** Opens one run of this setup. */
+  /** Opens one run of this record's setup. */
   readonly open: (events: SessionEvents, setup: S) => Session;
-  /** Saves an edited setup. It counts once this resolves. */
-  readonly save: (setup: S) => Promise<void>;
+  /** Writes the record, fenced by `n`, which grows with every write this actor makes. */
+  readonly save: (setup: S, n: number) => Promise<void>;
+  /** After an edit lands: removes what the old record had and the new one doesn't (its dropped secrets). */
+  readonly cleanup: (before: S, after: S) => Promise<void>;
+  /** Adds the record: its address if remote, then its first write. Resolves with the record as added. */
+  readonly register: (setup: S) => Promise<S>;
   /** Removes what the exe, the fetch and the store keep for this server. */
   readonly forget: (setup: S) => Promise<void>;
   readonly clock: Pick<JournalClock, 'now' | 'setTimer'>;
@@ -54,8 +62,13 @@ export class ServerActor<S> {
   private draining = false;
   private token = 0;
   private committed: S;
-  private pending: S | undefined;
-  private readonly edits = new Map<number, S>();
+  /** The record with every change asked for so far, written by the next write. */
+  private pending: S;
+  /** What each write in flight carried. */
+  private readonly snapshots = new Map<number, S>();
+  /** Edits not yet applied, by caller, and the record before the one applied, for its cleanup. */
+  private readonly edits = new Map<number, (s: S) => S>();
+  private editedFrom: S | undefined;
   private readonly runs = new Map<number, { session: Session; setup: S }>();
   private readonly aborts = new Map<number, AbortController>();
   private readonly timers = new Map<string, () => void>();
@@ -65,17 +78,23 @@ export class ServerActor<S> {
   constructor(options: ActorOptions<S>) {
     this.o = options;
     this.committed = options.setup;
-    this.m = createMachine(options.limits ?? DEFAULT_LIMITS);
+    this.pending = options.setup;
+    this.m = createMachine(options.limits ?? DEFAULT_LIMITS, options.adding ? 'adding' : 'stopped');
   }
 
   get view(): ServerView {
     return { phase: this.m.phase, tools: this.m.tools, ...(this.m.failure ? { failure: this.m.failure } : {}) };
   }
 
-  /** The setup as saved. */
+  /** The record as saved. */
   get setup(): S { return this.committed; }
-  /** An edited setup being saved, if one is. */
-  get pendingSetup(): S | undefined { return this.pending; }
+  /** The record with every change asked for, saved or not. */
+  get pendingSetup(): S { return this.pending; }
+  /** Callers waiting on this server, of every kind: bounded by the admission caps. */
+  get waiting(): number {
+    const m = this.m;
+    return m.starts.length + m.stops.length + m.removes.length + m.writeTokens.length + m.nextTokens.length + m.calls.size + (m.edit && !m.edit.replied ? 1 : 0) + (m.registering && !m.registering.replied ? 1 : 0);
+  }
   /** The setup the current run was started from, while there is one. */
   get runSetup(): S | undefined { return this.runs.get(this.m.gen)?.setup; }
 
@@ -84,13 +103,37 @@ export class ServerActor<S> {
   remove(): Promise<Reply> { return this.command('remove'); }
   refresh(): void { this.post({ t: 'refresh' }); }
 
-  /** Admitted only while stopped or down; it counts once saved. */
-  edit(setup: S): Promise<Reply> {
+  /** A change to the setup. Admitted only while stopped or down; it counts once saved, and once the
+      secrets it dropped are deleted. */
+  edit(change: (s: S) => S): Promise<Reply> {
     const token = ++this.token;
-    this.edits.set(token, setup);
+    this.edits.set(token, change);
+    return this.ask(token, { t: 'edit', token });
+  }
+
+  /** A change to the rest of the record: enabled, limits, review. It counts once saved. */
+  update(change: (s: S) => S): Promise<Reply> {
+    const token = ++this.token;
+    this.pending = change(this.pending);
+    return this.ask(token, { t: 'update', token });
+  }
+
+  /** A change no one waits for, such as a new tool list's fingerprints: written when the writer is free. */
+  touch(change: (s: S) => S): void {
+    this.pending = change(this.pending);
+    this.post({ t: 'touch' });
+  }
+
+  /** Adds the server, if it was made for an add. */
+  register(): Promise<Reply> {
+    const token = ++this.token;
+    return this.ask(token, { t: 'register', token });
+  }
+
+  private ask(token: number, input: Input): Promise<Reply> {
     return new Promise<Reply>(resolve => {
       this.repliers.set(token, resolve);
-      this.post({ t: 'edit', token });
+      this.post(input);
     });
   }
 
@@ -182,15 +225,49 @@ export class ServerActor<S> {
       case 'halt':
         this.runs.get(e.gen)?.session.close();
         return;
-      case 'save': {
+      case 'write': {
         const n = e.n;
-        const token = this.m.editing?.token;
-        const setup = token === undefined ? undefined : this.edits.get(token);
-        if (setup === undefined) return;
-        this.pending = setup;
-        this.o.save(setup).then(
-          () => this.post({ t: 'saved', n }),
-          () => this.post({ t: 'saved', n, failure: { kind: 'failed', words: "Familiar couldn't save the change. Try again." } })
+        // An admitted edit is applied to the pending record when the write that carries it starts.
+        const token = this.m.edit?.write === n ? this.m.edit.token : undefined;
+        const change = token === undefined ? undefined : this.edits.get(token);
+        if (change) {
+          this.editedFrom = this.committed;
+          this.pending = change(this.pending);
+          this.edits.delete(token!);
+        }
+        const snapshot = this.pending;
+        this.snapshots.set(n, snapshot);
+        this.o.save(snapshot, n).then(
+          () => this.post({ t: 'written', n }),
+          () => this.post({ t: 'written', n, failure: { kind: 'failed', words: "Familiar couldn't save the change. Try again." } })
+        );
+        return;
+      }
+      case 'committed':
+        this.committed = this.snapshots.get(e.n) ?? this.committed;
+        this.snapshots.delete(e.n);
+        return;
+      case 'reverted':
+        this.snapshots.delete(e.n);
+        this.pending = this.committed;
+        return;
+      case 'cleanup': {
+        const n = e.n;
+        const before = this.editedFrom ?? this.committed;
+        this.editedFrom = undefined;
+        // A failed cleanup leaves an unused secret behind, and the edit still stands.
+        this.o.cleanup(before, this.committed).then(() => this.post({ t: 'cleaned', n }), () => this.post({ t: 'cleaned', n }));
+        return;
+      }
+      case 'register': {
+        const n = e.n;
+        this.o.register(this.pending).then(
+          added => {
+            this.committed = added;
+            this.pending = added;
+            this.post({ t: 'registered', n });
+          },
+          (err: unknown) => this.post({ t: 'registered', n, failure: { kind: 'failed', words: err instanceof Error ? err.message : "Familiar couldn't add the server." } })
         );
         return;
       }
@@ -224,13 +301,8 @@ export class ServerActor<S> {
         return;
       }
       case 'reply': {
-        if (this.edits.has(e.token)) {
-          // The edit's own answer: it counts only once saved.
-          const edited = this.edits.get(e.token)!;
-          this.edits.delete(e.token);
-          if (e.reply.kind === 'edited') this.committed = edited;
-          if (this.pending === edited) this.pending = undefined;
-        }
+        // An edit refused before it was applied leaves nothing behind.
+        this.edits.delete(e.token);
         const reply = this.repliers.get(e.token);
         this.repliers.delete(e.token);
         reply?.(e.reply);

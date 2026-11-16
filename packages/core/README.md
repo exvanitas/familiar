@@ -19,7 +19,7 @@ Familiar's core: the model port, caps and retries, the turn loop and journal on 
 | `McpClient.open(options)` | Loads the saved servers. Options are ports: the settings store, a `ProcessPort`, `fetchFor(address)`, an `AddressPort`, a `SecretPort` (delete only) and a clock |
 | `client.add(draft)`, `edit(id, draft)` | Saves a draft (a remote one's address added first); returns the refs Settings stores the secret values under |
 | `client.test(id)` | Starts, lists the tools with fingerprints and which are fresh, stops again; or a `Failure` in plain words |
-| `client.start`, `stop`, `remove`, `startEnabled`, `setEnabled`, `setLimits`, `markReviewed` | The person's actions in Settings, and starting with the app |
+| `client.start`, `stop`, `remove`, `startEnabled`, `setEnabled`, `setLimits`, `markReviewed` | The person's actions in Settings, and starting with the app. Every change goes through the server's actor, and an effect stays owned until it lands |
 | `client.tools()` | The Ready servers' tools, as `ServerTool`s for a turn |
 | `parsePaste(text, options)`, `localDraft(form)`, `remoteDraft(form)` | A pasted block or a form as drafts: the setup, the secret values apart, problems and notes |
 | `unpinned(program, args)` | The unpinned flag, with how to pin |

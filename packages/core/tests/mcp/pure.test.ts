@@ -6,7 +6,6 @@ import { canonicalJson, sha256 } from '../../src/mcp/hash.ts';
 import { CHECKED_AT_TEST, checkPrerequisites, FINDABLE, prerequisiteOf } from '../../src/mcp/prerequisites.ts';
 import { modelNames, outcomeText, toolChanges, toolFingerprint } from '../../src/mcp/server-tools.ts';
 import { CatalogError, checkTools, effectiveDescription } from '../../src/mcp/catalog.ts';
-import { CoalescedWriter } from '../../src/mcp/writer.ts';
 import { posixPaths, windowsPaths } from '../../src/mcp/native-rules.ts';
 import { REPO, testPaths } from './fake.ts';
 import { resultText } from '../../src/mcp/session.ts';
@@ -255,27 +254,6 @@ describe('tool lists, bounded before anything hashes them (r19 #6, #10, #11)', (
   });
 });
 
-describe('the record writer', () => {
-  it('coalesces a storm into at most two writes, each of the record as it is then, and stops at close', async () => {
-    let value = 0;
-    const written: number[] = [];
-    let release!: () => void;
-    const w = new CoalescedWriter(async () => { written.push(value); await new Promise<void>(r => { release = r; }); });
-    const first = w.request();
-    const storm: Promise<void>[] = [];
-    for (let i = 1; i <= 1000; i++) { value = i; storm.push(w.request()); }
-    release();
-    await first;
-    await new Promise(r => setTimeout(r, 0));
-    release();
-    await Promise.all(storm);
-    expect(written).toEqual([0, 1000]);
-    await w.close();
-    await expect(w.request()).rejects.toThrow(/being removed/);
-    expect(written).toEqual([0, 1000]);
-  });
-});
-
 describe("the tests' path rules match the machine they run on", () => {
   // The Windows runner's Node and checkout (run 43838005541), which the Linux job never sees.
   const runnerNode = 'C:\\hostedtoolcache\\windows\\node\\22.23.4\\x64\\node.exe';
@@ -291,4 +269,18 @@ describe("the tests' path rules match the machine they run on", () => {
     expect(testPaths.program(process.execPath)).toBeUndefined();
     expect(testPaths.folder(REPO)).toBeUndefined();
   });
+});
+
+describe("the runner's own options only (r20 #7)", () => {
+  // A child's own --package (or --with) after the package can't hide an unpinned package.
+  const cases: [string, string[], string][] = [
+    ['npm', ['exec', '--', 'server@latest', '--package', 'helper@1.0.0'], 'server@latest'],
+    ['npx', ['-y', 'server@latest', '--package', 'helper@1.0.0'], 'server@latest'],
+    ['npx', ['server', '-p', 'helper@1.0.0'], 'server'],
+    ['bunx', ['server@latest', '--package=helper@1.0.0'], 'server@latest'],
+    ['pnpm', ['dlx', 'server@latest', '--package', 'helper@1.0.0'], 'server@latest'],
+    ['uvx', ['server', '--from', 'server==1.0.0'], 'server'],
+    ['uvx', ['server==1.0.0', '--with', 'pinned==1.0.0', '--with', 'extra'], undefined as never]
+  ];
+  for (const [program, args, what] of cases) it(`${program} ${args.join(' ')}`, () => expect(unpinned(program, args)?.what).toBe(what));
 });

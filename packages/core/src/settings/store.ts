@@ -21,6 +21,11 @@ export interface SettingsStore {
   delete(key: string): Promise<void>;
   /** The keys that start with `prefix`, sorted. */
   keys(prefix: string): Promise<string[]>;
+  /** Writes the record only if `guard` accepts what's stored now, read and written in one transaction, so
+      nothing can change the record in between. Resolves whether it wrote. `guard` must be synchronous. */
+  putIf(key: string, record: Stored, guard: (current: Stored | undefined) => boolean): Promise<boolean>;
+  /** Deletes the record only if `guard` accepts it, in one transaction. Resolves whether it deleted. */
+  deleteIf(key: string, guard: (current: Stored | undefined) => boolean): Promise<boolean>;
 }
 
 export const MAX_KEY = 256;
@@ -58,6 +63,20 @@ export function memorySettingsStore(): SettingsStore {
     },
     async keys(prefix) {
       return [...rows.keys()].filter(k => k.startsWith(prefix)).sort();
+    },
+    async putIf(key, record, guard) {
+      const r = checked(key, record)!;
+      const now = rows.get(key);
+      if (!guard(now && copy(now))) return false;
+      rows.set(key, r);
+      return true;
+    },
+    async deleteIf(key, guard) {
+      checked(key);
+      const now = rows.get(key);
+      if (!guard(now && copy(now))) return false;
+      rows.delete(key);
+      return true;
     }
   };
 }
@@ -88,6 +107,31 @@ export async function openSettingsStore(factory: IDBFactory, name = 'familiar-se
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error ?? new Error('The settings transaction was aborted.'));
     });
+  /** Reads, decides and writes in one readwrite transaction. The write is issued from the read's own
+      success handler, so the transaction never commits between them. */
+  const guarded = (key: string, guard: (current: Stored | undefined) => boolean, write: (s: IDBObjectStore) => void): Promise<boolean> =>
+    new Promise<boolean>((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      let wrote = false;
+      const req = store.get(key);
+      req.onsuccess = () => {
+        let ok = false;
+        try {
+          ok = guard(req.result === undefined ? undefined : copy(req.result as Stored));
+        } catch (e) {
+          tx.abort();
+          return reject(e);
+        }
+        if (ok) {
+          write(store);
+          wrote = true;
+        }
+      };
+      tx.oncomplete = () => resolve(wrote);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error('The settings transaction was aborted.'));
+    });
   return {
     async get(key) {
       checked(key);
@@ -105,6 +149,14 @@ export async function openSettingsStore(factory: IDBFactory, name = 'familiar-se
     async keys(prefix) {
       const all = await run<IDBValidKey[]>('readonly', s => s.getAllKeys());
       return all.map(String).filter(k => k.startsWith(prefix)).sort();
+    },
+    async putIf(key, record, guard) {
+      const r = checked(key, record)!;
+      return guarded(key, guard, s => s.put(r, key));
+    },
+    async deleteIf(key, guard) {
+      checked(key);
+      return guarded(key, guard, s => s.delete(key));
     },
     close: () => db.close()
   };

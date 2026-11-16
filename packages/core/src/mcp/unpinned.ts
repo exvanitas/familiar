@@ -59,20 +59,31 @@ export function unpinned(program: string, args: readonly string[]): Unpinned | u
   return undefined;
 }
 
+/**
+ * The runner's own options, up to `--` or its first positional argument, and that positional. Whatever
+ * comes after belongs to the program it runs, so a `--package` there can't hide the real package.
+ */
+function scope(args: readonly string[], withValue: readonly string[]): { options: string[]; positional?: string } {
+  const options: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--') return { options, ...(args[i + 1] !== undefined ? { positional: args[i + 1] } : {}) };
+    if (!a.startsWith('-')) return { options, positional: a };
+    options.push(a);
+    if (withValue.includes(a) && args[i + 1] !== undefined) options.push(args[++i]!);
+  }
+  return { options };
+}
+
+const NPM_WITH_VALUE = ['-p', '--package', '-c', '--call', '--cache', '--registry', '--userconfig'];
+
 function npmLike(runner: 'npx' | 'npm exec' | 'bunx' | 'pnpm dlx', args: readonly string[], before: readonly string[] = []): Unpinned | undefined {
-  // `-p <pkg>` / `--package <pkg>` / `--package=<pkg>` name every package fetched, and each must be pinned;
-  // without them it's the first plain argument.
-  const packages: string[] = [];
-  const all = [...before, ...args];
-  for (let i = 0; i < all.length; i++) {
-    const a = all[i]!;
-    if ((a === '-p' || a === '--package') && all[i + 1]) packages.push(all[++i]!);
-    else if (a.startsWith('--package=')) packages.push(a.slice('--package='.length));
-  }
-  if (packages.length === 0) {
-    const { arg } = firstPlain(args, ['-c', '--call', '--cache', '--registry', '--userconfig']);
-    if (arg) packages.push(arg);
-  }
+  // `-p <pkg>` / `--package <pkg>` / `--package=<pkg>` among the runner's own options name every package
+  // fetched, and each must be pinned; without them it's the first positional argument.
+  const own = scope(args, NPM_WITH_VALUE);
+  const options = [...scope(before, NPM_WITH_VALUE).options, ...own.options];
+  const packages = values(options, ['-p', '--package']);
+  if (packages.length === 0 && own.positional) packages.push(own.positional);
   for (const spec of packages) {
     if (spec.startsWith('.') || /^[A-Za-z]:[\\/]/.test(spec) || spec.startsWith('/') || /^(file|git|https?):/.test(spec)) continue;
     const { name, version } = npmVersion(spec);
@@ -102,10 +113,14 @@ function values(args: readonly string[], flags: readonly string[]): string[] {
 
 /** uvx fetches its main package (`--from`, or the first plain argument) and every `--with`. Each must be
     pinned exactly; what those packages depend on is beyond the flag. */
+const UV_WITH_VALUE = ['--from', '--with', '-w', '--python', '-p', '--index-url', '--extra-index-url', '--index', '--with-requirements', '--with-editable'];
+
 function uvx(args: readonly string[]): Unpinned | undefined {
-  const from = values(args, ['--from']);
-  const main = from.length ? from : [firstPlain(args, ['--with', '--python', '-p', '--index-url', '--extra-index-url', '--index', '--with-requirements', '--with-editable']).arg].filter((a): a is string => a !== undefined);
-  for (const spec of [...main, ...values(args, ['--with', '-w'])]) {
+  // Only uvx's own options count: those before `--` or its first positional, the command.
+  const { options, positional } = scope(args, UV_WITH_VALUE);
+  const from = values(options, ['--from']);
+  const main = from.length ? from : positional !== undefined ? [positional] : [];
+  for (const spec of [...main, ...values(options, ['--with', '-w'])]) {
     if (/^(\.|\/|[A-Za-z]:[\\/]|git\+|https?:)/.test(spec)) continue;
     const m = /^([A-Za-z0-9._-]+(?:\[[^\]]*\])?)\s*(?:(==|@)\s*([^\s,;]+))?/.exec(spec);
     const name = m?.[1] ?? spec;

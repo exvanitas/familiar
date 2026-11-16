@@ -2,6 +2,13 @@
 // (never a secret's value), whether it starts with the app, its own limits, and the tools last seen with
 // their fingerprints and whether the person has reviewed each. A record of a newer version than this
 // code knows is left as it is and not loaded, never overwritten.
+//
+// Every write and delete is fenced in the same IndexedDB transaction that makes it: a record carries the
+// incarnation it was added as and a revision that only grows. A write lands only on the same incarnation
+// at a lower revision, the first write only where there's nothing, and a delete only on its own
+// incarnation. So a write or delete that lands late can't touch a newer record, or a server added again
+// under the same id. (`incarnation` and `rev` were added after version 1 shipped to no one; a record
+// without them reads as incarnation "" and revision 0.)
 
 import type { JsonValue } from '../model/port.ts';
 import type { SettingsStore } from '../settings/store.ts';
@@ -33,16 +40,31 @@ export interface SavedServer {
   readonly enabled: boolean;
   readonly limits: ServerLimits;
   readonly tools: readonly SavedTool[];
+  /** Which adding of this id the record belongs to. */
+  readonly incarnation: string;
+  /** Grows with every write. */
+  readonly rev: number;
 }
 
 export const keyOf = (id: string) => `${SERVER_PREFIX}${id}`;
 
-export async function saveServer(store: SettingsStore, s: SavedServer): Promise<void> {
-  await store.put(keyOf(s.setup.id), { v: SAVED_VERSION, value: s as unknown as JsonValue });
+const fields = (v: unknown) => (v !== null && typeof v === 'object' ? (v as { incarnation?: unknown; rev?: unknown }) : {});
+const incarnationOf = (v: unknown) => (typeof fields(v).incarnation === 'string' ? (fields(v).incarnation as string) : '');
+const revOf = (v: unknown) => (typeof fields(v).rev === 'number' ? (fields(v).rev as number) : 0);
+
+/** The first write of an added server: only where nothing is saved under its id. */
+export async function addServer(store: SettingsStore, s: SavedServer): Promise<boolean> {
+  return store.putIf(keyOf(s.setup.id), { v: SAVED_VERSION, value: s as unknown as JsonValue }, cur => cur === undefined);
 }
 
-export async function deleteServer(store: SettingsStore, id: string): Promise<void> {
-  await store.delete(keyOf(id));
+/** A later write: only over the same incarnation at a lower revision. */
+export async function saveServer(store: SettingsStore, s: SavedServer): Promise<boolean> {
+  return store.putIf(keyOf(s.setup.id), { v: SAVED_VERSION, value: s as unknown as JsonValue }, cur => cur !== undefined && incarnationOf(cur.value) === s.incarnation && revOf(cur.value) < s.rev);
+}
+
+/** The removal's delete: only of its own incarnation. */
+export async function deleteServer(store: SettingsStore, id: string, incarnation: string): Promise<boolean> {
+  return store.deleteIf(keyOf(id), cur => cur !== undefined && incarnationOf(cur.value) === incarnation);
 }
 
 /** Every saved server this code can read. Records it can't read are skipped, and left in the store. */
@@ -77,5 +99,5 @@ export function readServer(v: unknown): SavedServer | undefined {
     ...(typeof v.limits.callMs === 'number' ? { callMs: v.limits.callMs } : {}),
     ...(typeof v.limits.initMs === 'number' ? { initMs: v.limits.initMs } : {})
   };
-  return { setup: s as unknown as ServerSetup, enabled: v.enabled, limits, tools };
+  return { setup: s as unknown as ServerSetup, enabled: v.enabled, limits, tools, incarnation: incarnationOf(v), rev: revOf(v) };
 }

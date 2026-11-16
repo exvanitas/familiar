@@ -83,6 +83,24 @@ export const settingsStoreContract: readonly SettingsContractCase[] = [
     }
   },
   {
+    name: 'a guarded write or delete happens only if the guard accepts what is stored',
+    async run(h) {
+      const s = await h.open();
+      const v = (n: number) => ({ v: 1, value: { rev: n } });
+      const rev = (r: { value: unknown } | undefined) => (r?.value as { rev?: number } | undefined)?.rev ?? 0;
+      check(await s.putIf('g', v(1), cur => cur === undefined), 'a first write to an empty key was refused');
+      check(!(await s.putIf('g', v(1), cur => cur === undefined)), 'a write meant for an empty key went over a record');
+      check(await s.putIf('g', v(3), cur => rev(cur) < 3), 'a newer write was refused');
+      check(!(await s.putIf('g', v(2), cur => rev(cur) < 2)), 'an older write went over a newer record');
+      check(same(await s.get('g'), v(3)), 'the record is not the newest');
+      check(!(await s.deleteIf('g', cur => rev(cur) === 2)), 'a delete meant for another record went through');
+      check(same(await s.get('g'), v(3)), 'a refused delete changed the record');
+      check(await s.deleteIf('g', cur => rev(cur) === 3), 'a delete of the right record was refused');
+      check((await s.get('g')) === undefined, 'the record is still there');
+      check(!(await s.deleteIf('g', cur => cur !== undefined)), 'a delete of nothing reported a delete');
+    }
+  },
+  {
     name: 'what was written is there after a reopen',
     async run(h) {
       if (!h.reopen) return;

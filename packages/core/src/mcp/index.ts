@@ -2,7 +2,6 @@
 export { ServerActor } from './actor.ts';
 export type { ActorOptions, CallOptions, ServerView } from './actor.ts';
 export { McpClient } from './client.ts';
-export { CoalescedWriter } from './writer.ts';
 export type { AddressPort, McpClientOptions, SecretPort, ServerStatus, TestedTool, TestReport } from './client.ts';
 export { canonicalJson, sha256 } from './hash.ts';
 export { CALL_MS, CALL_MS_MAX, CALL_MS_MIN, createMachine, DEFAULT_LIMITS, INIT_MS, INIT_MS_MAX, INIT_MS_MIN, resting, step } from './machine.ts';
@@ -17,7 +16,7 @@ export { ProcessTransport } from './process-transport.ts';
 export type { RunTransport } from './process-transport.ts';
 export { KEY_HEADERS, KEY_PLACEHOLDER, RemoteTransport, remoteHeaders } from './remote.ts';
 export type { FetchLike, RemoteTarget } from './remote.ts';
-export { deleteServer, fresh, keyOf, loadServers, readServer, SAVED_VERSION, saveServer, SERVER_PREFIX } from './saved.ts';
+export { addServer, deleteServer, fresh, keyOf, loadServers, readServer, SAVED_VERSION, saveServer, SERVER_PREFIX } from './saved.ts';
 export type { SavedServer, SavedTool, ServerLimits } from './saved.ts';
 export { choiceKey, modelNames, outcomeText, wrapperPolicy, outsideContent, serverTool, toolChanges, toolFingerprint, toolPolicies, MAX_MODEL_NAME } from './server-tools.ts';
 export type { ServerTool, ToolChanges, ToolChoice } from './server-tools.ts';

@@ -11,7 +11,7 @@ Step 7 of the [build order](design.md#build-order). Familiar's client for MCP se
 | The remote transport, over a fetch | `packages/core/src/mcp/remote.ts` |
 | A tool list's bounds and fingerprints | `packages/core/src/mcp/catalog.ts` |
 | The exe's path and address rules, mirrored | `packages/core/src/mcp/native-rules.ts` |
-| One server's saved record, one writer | `packages/core/src/mcp/writer.ts` |
+| The saved record, fenced by incarnation and revision | `packages/core/src/mcp/saved.ts` |
 | The desktop process port, over the exe | `apps/desktop/src/mcp.ts` |
 
 ## One actor per server
@@ -23,7 +23,25 @@ Each server has one actor. It is the only thing that changes that server's state
 - **Commands**, from the app: start, stop, call, stop a call, edit, list the tools again, remove.
 - **Completions and events**, from the transport, the store and the clock: the run started, the handshake finished, a call's answer, the tools changed, a tool list's answer, an edit saved, a removal done, the run closed, a deadline came.
 
-Nothing goes around it. An edit is admitted by the actor (only while the server is stopped or down), reserves its place before anything is written, and counts only once it's saved; a start made meanwhile waits for it. The actor holds the setup, and each run keeps the setup it was started from, so an edit never changes a run under way, and that run's tools carry that setup's fingerprint.
+Nothing goes around it. Two rules hold every effect that changes something outside the actor (step 7's second review found both broken, with one shape: the actor serialized decisions, not effects):
+
+1. **Every change goes through the actor.** The whole saved record lives in the actor: the setup, whether it starts with the app, its limits and the tools the person reviewed. An edit of the setup (admitted only while stopped or down), the other changes (`setEnabled`, `setLimits`, `markReviewed`), the new tool list's fingerprints, the deletion of secrets an edit dropped, the add and the removal are all messages to it. An add is tracked from its first moment, with its address, before the exe's dialog, so a second add of the same id or address is refused while it runs. Each run is started from the record committed at its launch, which stays bound to that run.
+2. **An effect stays owned until it settles.** A deadline answers the caller (timed out, "it may still finish"), but the server stays busy for anything that conflicts until the effect lands, and what lands late is what's kept: a write that lands late is committed; a removal that lands late removes. Nothing is released early, so nothing can land on top of something newer. This holds for writes and deletes of the saved record, Credential Manager deletes, the exe's address add and remove, and `server_forget`.
+
+The saved record has one write in flight and a dirty flag for the next, with no list of waiters beyond the actor's admission cap. Callers of a change wait within it (8), and past it are refused at once.
+
+**What guards each effect:**
+
+| Effect | Guard |
+| --- | --- |
+| Writing the saved record | A revision check in the same IndexedDB readwrite transaction: it lands only on the same incarnation at a lower revision (`saved.ts`) |
+| The first write of an added server | The same transaction: it lands only where nothing is saved under the id |
+| Deleting the saved record | The same transaction: it deletes only its own incarnation |
+| Credential Manager deletes (an edit's cleanup, a removal) | Ownership until settled: no edit, add or removal of the server starts until the delete lands |
+| The exe's address add and remove | Ownership until settled: the add's entry holds the address from before the dialog; a removal holds the id until it lands |
+| `server_forget` (the exe's approval) | Ownership until settled, within the removal |
+
+Credential Manager and the exe can't take a revision, so ownership is their only guard; the store can, so it has both.
 
 The rules are a pure function in `machine.ts`: a state and a message in, a new state and a list of effects out. The effects are what the actor then does: start a run, send a call, cancel a call, close a run, arm a timer, answer a caller. Nothing in the machine waits or touches I/O, so a property test can drive it with any order of messages.
 
@@ -71,7 +89,7 @@ Start, stop, edit and remove are answered exactly once too. A start is answered 
 
 **Admission is bounded, and a stop wins over the starts before it.** At most 8 starts, 8 stops and 8 removes wait on one server; past that a command is refused at once with plain words. Stops coalesce: one waiting stop answers them all. A stop settles every start made before it, so only a start made after the last stop can ask for another run. (Found in review: Stop A, Start B while stopping, Stop C used to start a run after C.)
 
-**Tool lists are one at a time.** When the server says its tools changed, its catalog is stale: calls wait, and one list is asked for. Another change while it's under way asks for exactly one more after it, however many arrive. An answer whose number isn't the newest is dropped, so an older list never replaces a newer one. Writes of the saved record coalesce the same way (`writer.ts`): one write at a time, and a storm of changes makes at most one more.
+**Tool lists are one at a time.** When the server says its tools changed, its catalog is stale: calls wait, and one list is asked for. Another change while it's under way asks for exactly one more after it, however many arrive. An answer whose number isn't the newest is dropped, so an older list never replaces a newer one. Writes of the saved record coalesce the same way: one write in flight, and a storm of changes makes at most one more.
 
 ### Limits
 
@@ -82,7 +100,8 @@ Start, stop, edit and remove are answered exactly once too. A start is answered 
 | Calls waiting or running at once, per server | 16 | No. Past it a call is answered `busy` |
 | Starting a run, the exe's dialog included | 5 min | No |
 | A tool list after the first | 30 s | No |
-| Saving an edit, and a removal | 30 s each | No |
+| Writing the record, an edit's cleanup, a removal | 30 s each, then the caller hears it timed out and the server stays busy until it lands | No |
+| Adding (the exe's dialog included) | 5 min, the same way | No |
 | Starts, stops or removes waiting | 8 each | No |
 | Restarts after a crash | 2 in 10 minutes, each 1 s after the old run closed | No |
 | Closing a run | 5 s, then it counts as closed | No. The exe ends the job after 500 ms anyway |
@@ -196,7 +215,7 @@ On Ready, and on `notifications/tools/list_changed`, the actor lists the server'
 
 `apps/desktop/tests/mcp.test.ts` reads shell-core's source and fails if the lists (settings that change what runs, invisible characters, device names, swap headers) or the limits drift apart; core's tests check the rules case by case.
 
-**The unpinned flag.** `npx`, `npm exec` (and `npm x`), `bunx`, `pnpm dlx`, `uvx` (and `uv tool run`) and `docker run` fetch what they run. With no exact version (`name@1.2.3`, `name==1.2.3`), with `@latest` or a range, or for an image with no tag other than `latest` and no digest, they can fetch new code at any start, which the approval never saw. Every package the command names is checked, not just the first: each `-p`/`--package` of npx, npm exec, bunx and pnpm dlx, and uvx's `--from` and every `--with`. A pinned main package with an unpinned extra is flagged for the extra. What those packages themselves depend on is beyond the flag. A local path, a `file:` or `git` spec, and a plain `node server.js` aren't flagged.
+**The unpinned flag.** `npx`, `npm exec` (and `npm x`), `bunx`, `pnpm dlx`, `uvx` (and `uv tool run`) and `docker run` fetch what they run. With no exact version (`name@1.2.3`, `name==1.2.3`), with `@latest` or a range, or for an image with no tag other than `latest` and no digest, they can fetch new code at any start, which the approval never saw. Every package the command names is checked, not just the first: each `-p`/`--package` of npx, npm exec, bunx and pnpm dlx, and uvx's `--from` and every `--with`. Only the runner's own options count, those before `--` or the package: what follows belongs to the program it runs, so a `--package` there can't hide an unpinned package. A pinned main package with an unpinned extra is flagged for the extra. What those packages themselves depend on is beyond the flag. A local path, a `file:` or `git` spec, and a plain `node server.js` aren't flagged.
 
 **Adding** saves the setup stopped and not enabled. A remote server's address (its URL) is added first, with the exe's own dialog, and refused if another server already uses it.
 
@@ -206,7 +225,7 @@ On Ready, and on `notifications/tools/list_changed`, the actor lists the server'
 
 A small key-value settings store (`packages/core/src/settings/store.ts`), general so step 11 can keep personas and the rest of Settings in it. Each record carries its schema version. Values are JSON, copied in and out. Two implementations run one contract (`src/testing/settings-contract.ts`): in memory, and on IndexedDB through core's `strictIndexedDB`, so every transaction is strict and a write counts only once it's complete (fake-indexeddb in Node).
 
-One writer per server writes its record (`writer.ts`): one write at a time, coalesced, each of the record as it is then, and nothing after a removal begins, so a late write can't bring a removed record back. A saved server is `mcp.server.<id>`, version 1: the setup (never a secret's value), whether it starts with the app, its own limits, and its tools as last seen with the fingerprints the person reviewed. A record of a version this code doesn't know is skipped and left as it is, never overwritten.
+The actor writes its record: one write at a time, the next coalesced behind a dirty flag, each of the record as it is then, nothing after a removal begins, and each fenced by incarnation and revision in its own transaction, so a late write can't bring a removed record back or land over a newer one. A saved server is `mcp.server.<id>`, version 1: the setup (never a secret's value), whether it starts with the app, its own limits, and its tools as last seen with the fingerprints the person reviewed. A record of a version this code doesn't know is skipped and left as it is, never overwritten.
 
 ## Test and prerequisites
 
@@ -235,10 +254,12 @@ One writer per server writes its record (`writer.ts`): one write at a time, coal
 Core's tests, in Node:
 
 - `tests/mcp/machine.property.test.ts`: the machine under 5,000 seeded random sequences of 60 steps and 300 of 400 steps, in the unkind world above. Before review four breaks were shown to fail it (a crash that keeps its sent calls, a result accepted from any run, a start during a stop launched at once, an answer that keeps its call); after review seven more (listed above). Plus unit cases: a crash mid-call, down after three crashes, the person's failed start not retried, review's Stop A / Start B / Stop C sequence, a start and a removal that never answer, a late removal answer dropped, an edit admitted only while stopped with a start waiting for it, a call for a changed tool or another setup never sent, a storm of a thousand tool changes making one list at a time with an older answer dropped, and 10,000 starts with only 8 waiting.
+- `tests/mcp/client.property.test.ts`: the whole client under a seeded scheduler, with fake store, Credential Manager, exe and session ports whose every effect can stall, land in any order, or land after its deadline (newer effects often run first, so older ones linger). Random adds with clashing ids and addresses, edits that drop secrets and bring them back, removes, starts, stops, metadata changes and tool storms, with deadlines firing; Settings stores a value whenever an add or edit asks for one. Then: every public promise settled; the store holds exactly what each actor committed and nothing for a server that's gone; no secret a server needs was deleted after it was stored; no address serves two servers or was removed under one; waits per server stayed under the cap. Its control plants one late write past the fence, and the checks catch it. An edit released before its cleanup lands, and a removal released at its deadline, each fail it.
+- `tests/mcp/ownership.test.ts`: review r20's cases by hand: two adds of one address at once, two edits where the first's secret delete is held, a write and a removal held past their deadlines, and 10,000 changes behind one stalled write.
 - `tests/mcp/client.test.ts`, against the real fake server over the Node process adapter: add by paste with nothing secret saved, Test, the second start asking nothing, calls and their outside-content mark, Stop and a deadline answered at once with the cancellation sent, a crash mid-call answered `interrupted` and sent once, three crashes then Down with the last output, an edit to variant b made together with a start (the run is the new setup, and no "always" survives it), echo changed on the running server (the old wrapper refused before sending, only echo back to ask), "always" not passing between two servers with identical setups, a call already stopped writing nothing, `print_secret` blanked, remove with a call in flight, plain words for a refused start, a missing program, an exit and a silent program, starting with the app. Over HTTP: the address added, only the placeholder sent, a refused key and a missing key in plain words. Legacy SSE and a second server on one address refused.
 - `tests/mcp/journal.test.ts`: a real server tool in the turn loop, killed mid-call. After the restart it's reported interrupted with Run again, and the server never gets it again. And a tool with "always" that the running server changes: the next call in the same turn loop goes back to ask through the gate, and the wrapper the loop holds is refused without sending. Dropping the expectation from the wrapper fails both this and the client's stale-wrapper test.
 - `tests/mcp/process-contract.test.ts`: the process port contract on the Node adapter.
-- `tests/mcp/paste.test.ts` and `tests/mcp/pure.test.ts`: the paste shapes, secrets and short credentials, the exe's limits and path rules, remote headers and literal addresses, the unpinned flag with unpinned extras, model names, tool-list bounds (10,000 levels, 5,000 parts, 70 KB, 129 tools, a duplicate name), the title-only fingerprint, fingerprints (SHA-256 against node:crypto), the marker rule, plain words, result text, prerequisites, the coalescing writer.
+- `tests/mcp/paste.test.ts` and `tests/mcp/pure.test.ts`: the paste shapes, secrets and short credentials, the exe's limits and path rules, remote headers and literal addresses, the unpinned flag with unpinned extras, model names, tool-list bounds (10,000 levels, 5,000 parts, 70 KB, 129 tools, a duplicate name), the title-only fingerprint, fingerprints (SHA-256 against node:crypto), the marker rule, plain words, result text, prerequisites, the runner's own options for the unpinned flag.
 - `tests/settings-store.test.ts`: the settings store contract on memory and IndexedDB, and every IndexedDB transaction strict.
 - `tests/mcp/bundle.test.ts`: the client bundles for the browser with no Node built-in and no stub.
 - `tests/mcp/no-eval.test.ts`: the client with code generation from strings off, as above.
@@ -263,7 +284,7 @@ On the Windows runner, through the real exe: the `proc-mcp` phase (`apps/desktop
 - **A secret holding a quote, or another character JSON escapes, isn't blanked from a server's JSON output.** The exe blanks literal copies only. A server printing its secret inside JSON writes `abcd\"efgh` for `abcd"efgh`, the literal match misses it, and core's `JSON.parse` rebuilds the secret, which then reaches the model and the journal. Core never sees secret values, so it can't blank them itself. So the claim is: **literal copies of a server's secrets are blanked before core sees a line; copies the server escapes or encodes are not.** The fix belongs to the exe, in the pre-release native pass: match each secret's JSON-escaped form too, bounded, on every path back. Until then a person can avoid it by using secrets without quotes, backslashes or control characters.
 
   **How the gap is held open, visibly.** `security.mcp.secret-json-escaped` is a security id like the others, and its entry in `security-inventory.json`'s `knownGaps` carries the reason "pre-release native pass: JSON-escaped redaction". The gate (`gate.mjs`) reports a marked id as KNOWN GAP: printed in the summary and counted, whatever the check reported, and never failing an everyday run. In release mode (`gate.mjs --release`, or `FAMILIAR_GATE_RELEASE=1`) every mark still present fails the gate, so no release ships with it. Closing it means the check passes and the mark is removed in the same change. A static test fails if a mark has no reason or names an id outside the inventory, so a gap can't be marked silently. Nothing runs the gate in release mode yet: step 12's release workflow must.
-- **A save that times out may still land.** An edit's save past its 30 s deadline is reported failed and the old setup stays in use; if the write completes after, the next start of the app loads the edited setup. The writer writes one record at a time, so it can't land over a newer one.
+- **A change that lands after its deadline is kept.** Its caller heard it timed out, and Settings shows what was kept once it lands. Until then the server is busy for anything that conflicts. If an effect never lands at all (the exe or the store wedged), the server stays busy until the app restarts; nothing is released early to get around that.
 - **A remote server that goes away** isn't seen as a crash. Its transport closes only when the SDK's does: a failed call is answered with an error, and the server stays Ready. So restarts and Down apply to local servers, and to remote ones only when the transport closes.
 - **A remote server's quiet stream.** The guarded fetch ends a read that's quiet past its idle limit. The desktop ports give server addresses the exe's cap of 15 minutes, and the SDK opens the stream again after.
 - **A stop whose run never closes.** After 5 s the machine counts it closed. If the exe still holds that run, the next start is `busy`, which comes back as a failure in plain words rather than a second run.

@@ -13,6 +13,11 @@
 //   - at most one tool list, one save and one removal was under way, and an older list never replaced a
 //     newer one
 //   - no waiting list grew past its bound
+//   - an owned effect (a write, an edit's cleanup, an add, a removal) is never released early: none that
+//     conflicts with it starts while it's unsettled, even past its deadline, and a run never starts while
+//     an edit is unsettled; writes commit in order
+// Owned effects land late (after their deadline) or fail, but always land in the end: under the rule,
+// one that never landed would keep the server busy for good.
 import { describe, expect, it } from 'vitest';
 import { createMachine, DEFAULT_LIMITS, resting, step, type Effect, type Expect, type Input, type Machine } from '../../src/mcp/machine.ts';
 import type { CallOutcome, ListedTool, Reply } from '../../src/mcp/types.ts';
@@ -48,9 +53,16 @@ class World {
   calls = new Set<number>();
   commands = new Set<number>();
   expects = new Map<number, Expect>();
-  /** The setup as the actor would hold it: committed only when its save is answered `edited`. */
+  /** The setup as the actor would hold it: pending changes, and what each write carried and committed. */
   committed = 's1';
+  pendingSetup = 's1';
+  snapshots = new Map<number, string>();
+  lastCommitted = 0;
   edits = new Map<number, string>();
+  /** Owned effects issued and not yet landed, by number. */
+  owned = new Map<number, 'write' | 'cleanup' | 'register' | 'forget'>();
+  /** Completions held back to land late, in the drain. */
+  lateLanding: Input[] = [];
   /** The newest tool list asked for, per run. */
   newestList = new Map<number, number>();
   problems: string[] = [];
@@ -62,15 +74,13 @@ class World {
 
   feed(input: Input, origin?: { resultGen: number }) {
     const listingBefore = this.m.listing;
-    const forgettingBefore = this.m.forgetting;
-    const editingBefore = this.m.editing;
+
     const toolsBefore = this.m.tools;
     const newestBefore = 'gen' in input ? this.newestList.get(input.gen) : undefined;
     const fx = step(this.m, input, this.now);
     const bad = (s: string) => this.problems.push(`${s} (after ${JSON.stringify(input)})`);
     if (fx.filter(e => e.t === 'list').length > 1) bad('two tool lists asked for at once');
-    if (fx.some(e => e.t === 'forget') && forgettingBefore !== undefined) bad(`a removal asked for while removal ${forgettingBefore} was under way`);
-    if (fx.some(e => e.t === 'save') && editingBefore !== undefined) bad(`a save asked for while save ${editingBefore.n} was under way`);
+
     for (const e of fx) this.effect(e, input, listingBefore, origin);
     if (input.t === 'listed' && this.m.tools !== toolsBefore && input.n !== newestBefore) bad(`list ${input.n} applied, but ${newestBefore} is newer`);
     for (const [name, list] of [['starts', this.m.starts], ['stops', this.m.stops], ['removes', this.m.removes]] as const) {
@@ -84,6 +94,7 @@ class World {
       case 'launch':
         if (e.gen !== this.m.gen) bad(`launch of gen ${e.gen}, current ${this.m.gen}`);
         for (const r of this.runs.values()) if (r.stage !== 'closed' && !(r.halted && r.stopExpired)) bad(`run ${e.gen} launched while run ${r.gen} is open`);
+        if ([...this.owned.values()].some(k => k === 'cleanup' || k === 'register' || k === 'forget') || (this.m.edit !== undefined)) bad(`run ${e.gen} launched while an owned effect is unsettled: ${[...this.owned.values()].join(',')}`);
         this.runs.set(e.gen, { gen: e.gen, stage: 'starting', halted: false, stopExpired: false, hung: this.r() < 0.1, setup: this.committed });
         return;
       case 'send': {
@@ -117,16 +128,36 @@ class World {
         }
         return;
       }
-      case 'save': {
-        const x = this.r();
-        if (x < 0.15) return; // never answered
-        this.pending.push(x < 0.3 ? { t: 'saved', n: e.n, failure: { kind: 'failed', words: 'no' } } : { t: 'saved', n: e.n });
+      case 'write': {
+        const kinds = [...this.owned.values()];
+        if (kinds.includes('write') || kinds.includes('forget') || kinds.includes('register')) bad(`write ${e.n} asked for while ${kinds.join(',')} is unsettled`);
+        const edit = this.m.edit?.write === e.n ? this.edits.get(this.m.edit.token) : undefined;
+        if (edit !== undefined) this.pendingSetup = edit;
+        this.snapshots.set(e.n, this.pendingSetup);
+        this.ownedEffect(e.n, 'write', { t: 'written', n: e.n }, { t: 'written', n: e.n, failure: { kind: 'failed', words: 'no' } });
         return;
       }
+      case 'committed':
+        if (e.n <= this.lastCommitted) bad(`write ${e.n} committed after write ${this.lastCommitted}`);
+        this.lastCommitted = e.n;
+        this.committed = this.snapshots.get(e.n)!;
+        return;
+      case 'reverted':
+        this.pendingSetup = this.committed;
+        return;
+      case 'cleanup': {
+        const kinds = [...this.owned.values()];
+        if (kinds.includes('forget')) bad(`cleanup ${e.n} asked for while a removal is unsettled`);
+        this.ownedEffect(e.n, 'cleanup', { t: 'cleaned', n: e.n });
+        return;
+      }
+      case 'register':
+        this.ownedEffect(e.n, 'register', { t: 'registered', n: e.n }, { t: 'registered', n: e.n, failure: { kind: 'failed', words: 'no' } });
+        return;
       case 'forget': {
-        const x = this.r();
-        if (x < 0.15) return; // never answered
-        this.pending.push(x < 0.4 ? { t: 'forgotten', n: e.n, failure: { kind: 'failed', words: 'no' } } : { t: 'forgotten', n: e.n });
+        const kinds = [...this.owned.values()];
+        if (kinds.length) bad(`removal ${e.n} asked for while ${kinds.join(',')} is unsettled`);
+        this.ownedEffect(e.n, 'forget', { t: 'forgotten', n: e.n }, { t: 'forgotten', n: e.n, failure: { kind: 'failed', words: 'no' } });
         return;
       }
       case 'arm':
@@ -151,8 +182,6 @@ class World {
         list.push(e.reply);
         this.replies.set(e.token, list);
         if (list.length > 1) bad(`token ${e.token} replied ${list.length} times`);
-        const edited = this.edits.get(e.token);
-        if (edited !== undefined && e.reply.kind === 'edited') this.committed = edited;
         return;
       }
       case 'changed':
@@ -160,8 +189,20 @@ class World {
     }
   }
 
-  command(kind: 'start' | 'stop' | 'remove' | 'call' | 'edit') {
+  /** An owned effect lands now, later, or late (past its deadline, in the drain), or fails. */
+  ownedEffect(n: number, kind: 'write' | 'cleanup' | 'register' | 'forget', ok: Input, failed?: Input) {
+    this.owned.set(n, kind);
+    const x = this.r();
+    const input = failed && x < 0.2 ? failed : ok;
+    if (x > 0.8) this.lateLanding.push(input);
+    else this.pending.push(input);
+  }
+
+  kinds = new Map<number, string>();
+
+  command(kind: 'start' | 'stop' | 'remove' | 'call' | 'edit' | 'update' | 'touch' | 'register') {
     const token = ++this.token;
+    this.kinds.set(token, kind);
     if (kind === 'call') {
       this.calls.add(token);
       const expect = this.r() < 0.5 ? { setup: SETUPS[Math.floor(this.r() * 2)]!, tool: FPS[Math.floor(this.r() * 2)]! } : undefined;
@@ -169,7 +210,8 @@ class World {
       this.feed({ t: 'call', token, tool: 't', args: {}, ms: this.r() < 0.3 ? 1000 + Math.floor(this.r() * 5000) : undefined, ...(expect ? { expect } : {}) });
     } else {
       this.commands.add(token);
-      if (kind === 'edit') this.edits.set(token, this.committed === 's1' ? 's2' : 's1');
+      if (kind === 'touch') { this.commands.delete(token); this.feed({ t: 'touch' }); return; }
+      if (kind === 'edit') this.edits.set(token, this.pendingSetup === 's1' ? 's2' : 's1');
       this.feed({ t: kind, token });
     }
   }
@@ -192,9 +234,10 @@ class World {
     }
   }
 
-  deliver(i: number) {
-    const [input] = this.pending.splice(i, 1);
+  deliver(i: number, from: Input[] = this.pending) {
+    const [input] = from.splice(i, 1);
     if (!input) return;
+    if ('n' in input && (input.t === 'written' || input.t === 'cleaned' || input.t === 'registered' || input.t === 'forgotten')) this.owned.delete(input.n);
     if (input.t === 'closed') {
       const run = this.runs.get(input.gen);
       if (run) run.stage = 'closed';
@@ -231,13 +274,13 @@ class World {
     const pick: Input[] = [
       { t: 'launched', gen }, { t: 'ready', gen, tools: tools('fa'), setup: 's1' }, { t: 'closed', gen }, { t: 'tools-changed', gen },
       { t: 'result', gen, call, outcome: { kind: 'result', text: 'stale', isError: false } },
-      { t: 'listed', gen, n, tools: tools('fb') }, { t: 'saved', n }, { t: 'forgotten', n }
+      { t: 'listed', gen, n, tools: tools('fb') }, { t: 'written', n }, { t: 'cleaned', n }, { t: 'forgotten', n }
     ];
     // Only an old run's events, or an old number's: the current ones are the world's to send. An old
     // list's answer may come on the current run.
     const input = pick[Math.floor(this.r() * pick.length)]!;
     if ('gen' in input && input.gen === this.m.gen && input.t !== 'listed') return;
-    if ((input.t === 'listed' && input.n === this.m.listing) || (input.t === 'saved' && input.n === this.m.editing?.n) || (input.t === 'forgotten' && input.n === this.m.forgetting)) return;
+    if ((input.t === 'listed' && input.n === this.m.listing) || ('n' in input && this.owned.has(input.n)) || (input.t === 'forgotten' && input.n === this.m.forgetting)) return;
     this.feed(input, input.t === 'result' ? { resultGen: gen } : undefined);
   }
 
@@ -247,7 +290,9 @@ class World {
     if (x < 0.09) this.command('start');
     else if (x < 0.14) this.command('stop');
     else if (x < 0.17) this.command('remove');
-    else if (x < 0.2) this.command('edit');
+    else if (x < 0.18) this.command('edit');
+    else if (x < 0.19) this.command('update');
+    else if (x < 0.2) this.command('touch');
     else if (x < 0.36) this.command('call');
     else if (x < 0.4) {
       const open = [...this.calls].filter(c => !this.answers.has(c));
@@ -270,6 +315,9 @@ class World {
   drain() {
     for (let guard = 0; guard < 20_000; guard++) {
       if (this.pending.length) { this.deliver(0); continue; }
+      const key0 = this.earliestTimer();
+      // Late completions land once every deadline before them has fired.
+      if (!key0 && this.lateLanding.length) { this.deliver(0, this.lateLanding); continue; }
       const current = this.runs.get(this.m.gen);
       if (current && !current.hung && current.stage !== 'closed' && (current.stage !== 'ready' || current.halted)) { this.progress(current, false); continue; }
       const key = this.earliestTimer();
@@ -282,11 +330,18 @@ class World {
 
 function run(seed: number, steps: number): string[] {
   const w = new World(rng(seed));
+  // One run in five starts with an add.
+  if (seed % 5 === 0) {
+    w.m = createMachine(w.m.limits, 'adding');
+    w.command('register');
+  }
   for (let i = 0; i < steps; i++) w.randomStep();
   w.drain();
   for (const c of w.calls) if ((w.answers.get(c)?.length ?? 0) !== 1) w.problems.push(`call ${c} answered ${w.answers.get(c)?.length ?? 0} times`);
-  for (const t of w.commands) if ((w.replies.get(t)?.length ?? 0) !== 1) w.problems.push(`token ${t} replied ${w.replies.get(t)?.length ?? 0} times`);
-  if (!resting(w.m)) w.problems.push(`ended in ${w.m.phase}${w.m.editing ? ' editing' : ''}${w.m.listing !== undefined ? ' listing' : ''}${w.m.stale ? ' stale' : ''}`);
+  for (const t of w.commands) if ((w.replies.get(t)?.length ?? 0) !== 1) w.problems.push(`token ${t} (${w.kinds.get(t)}) replied ${w.replies.get(t)?.length ?? 0} times, ending ${w.m.phase}${w.m.edit ? ' edit' : ''}${w.m.writing !== undefined ? ' writing' : ''} starts ${w.m.starts} removes ${w.m.removes} next ${w.m.nextTokens}`);
+  if (w.owned.size) w.problems.push(`owned effects never landed: ${[...w.owned.values()].join(',')}`);
+  if (w.committed !== w.pendingSetup && w.m.phase !== 'removed' && w.m.phase !== 'removing') w.problems.push(`quiet, but the pending setup ${w.pendingSetup} isn't the committed ${w.committed}`);
+  if (!resting(w.m)) w.problems.push(`ended in ${w.m.phase}${w.m.edit ? ' editing' : ''}${w.m.writing !== undefined ? ' writing' : ''}${w.m.listing !== undefined ? ' listing' : ''}${w.m.stale ? ' stale' : ''}`);
   if (w.m.calls.size) w.problems.push(`${w.m.calls.size} calls left`);
   return w.problems.map(p => `seed ${seed}: ${p}`);
 }
@@ -390,26 +445,44 @@ describe('the server machine, case by case', () => {
     expect(m.failure?.kind).toBe('timed-out');
   });
 
-  it('a removal that never answers fails at its deadline, a late answer is dropped, and the next remove tries again', () => {
+  it('an edit is admitted only while stopped, a start waits for its write and its cleanup, and the run starts after', () => {
     const m = createMachine();
-    step(m, { t: 'remove', token: 1 }, 0);
-    const fx = step(m, { t: 'timer', key: 'forget:1' }, DEFAULT_LIMITS.saveMs);
-    expect(fx).toContainEqual({ t: 'reply', token: 1, reply: { kind: 'failed', failure: expect.objectContaining({ kind: 'timed-out' }) } });
-    step(m, { t: 'forgotten', n: 1 }, DEFAULT_LIMITS.saveMs + 1);
-    expect(m.phase).toBe('removing');
-    expect(step(m, { t: 'remove', token: 2 }, 0)).toContainEqual({ t: 'forget', n: 2 });
-    step(m, { t: 'forgotten', n: 2 }, 0);
-    expect(m.phase).toBe('removed');
-  });
-
-  it('an edit is admitted only while stopped, a start waits for its save, and the run starts after', () => {
-    const m = createMachine();
-    expect(step(m, { t: 'edit', token: 1 }, 0)).toContainEqual({ t: 'save', n: 1 });
+    expect(step(m, { t: 'edit', token: 1 }, 0)).toContainEqual({ t: 'write', n: 1 });
     expect(step(m, { t: 'start', token: 2 }, 0).filter(e => e.t === 'launch')).toEqual([]);
     expect(step(m, { t: 'edit', token: 3 }, 0)).toContainEqual({ t: 'reply', token: 3, reply: { kind: 'refused', words: 'Another change to this server is being saved.' } });
-    const saved = step(m, { t: 'saved', n: 1 }, 0);
-    expect(saved.map(e => e.t)).toEqual(['disarm', 'reply', 'launch', 'arm', 'changed']);
+    const written = step(m, { t: 'written', n: 1 }, 0);
+    expect(written).toContainEqual({ t: 'committed', n: 1 });
+    expect(written).toContainEqual({ t: 'cleanup', n: 2 });
+    expect(written.filter(e => e.t === 'launch')).toEqual([]);
+    const cleaned = step(m, { t: 'cleaned', n: 2 }, 0);
+    expect(cleaned).toContainEqual({ t: 'reply', token: 1, reply: { kind: 'edited' } });
+    expect(cleaned.filter(e => e.t === 'launch')).toHaveLength(1);
     expect(step(m, { t: 'edit', token: 4 }, 0)).toContainEqual({ t: 'reply', token: 4, reply: { kind: 'refused', words: 'Stop the server before changing it.' } });
+  });
+
+  it('r20 #4: a write past its deadline answers the caller, stays owned, and when it lands late it is what is committed', () => {
+    const m = createMachine();
+    step(m, { t: 'edit', token: 1 }, 0);
+    const overdue = step(m, { t: 'timer', key: 'write:1' }, DEFAULT_LIMITS.saveMs);
+    expect(overdue).toContainEqual({ t: 'reply', token: 1, reply: { kind: 'failed', failure: expect.objectContaining({ kind: 'timed-out' }) } });
+    // Everything that conflicts is busy until it lands: another edit, a change, a removal, a start.
+    for (const input of [{ t: 'edit', token: 2 }, { t: 'update', token: 3 }, { t: 'remove', token: 4 }, { t: 'start', token: 5 }] as Input[]) {
+      expect(step(m, input, DEFAULT_LIMITS.saveMs + 1)).toContainEqual({ t: 'reply', token: (input as { token: number }).token, reply: expect.objectContaining({ kind: 'refused', words: expect.stringMatching(/still finishing an earlier change/) }) });
+    }
+    const landed = step(m, { t: 'written', n: 1 }, DEFAULT_LIMITS.saveMs + 2);
+    expect(landed).toContainEqual({ t: 'committed', n: 1 });
+    expect(landed.filter(e => e.t === 'reply')).toEqual([]);
+  });
+
+  it('r20 #2: a removal past its deadline stays owned: a second remove is busy, and only its own landing ends it', () => {
+    const m = createMachine();
+    step(m, { t: 'remove', token: 1 }, 0);
+    expect(step(m, { t: 'timer', key: 'forget:1' }, DEFAULT_LIMITS.saveMs)).toContainEqual({ t: 'reply', token: 1, reply: { kind: 'failed', failure: expect.objectContaining({ kind: 'timed-out' }) } });
+    const again = step(m, { t: 'remove', token: 2 }, DEFAULT_LIMITS.saveMs + 1);
+    expect(again.filter(e => e.t === 'forget')).toEqual([]);
+    expect(again).toContainEqual({ t: 'reply', token: 2, reply: expect.objectContaining({ kind: 'refused' }) });
+    step(m, { t: 'forgotten', n: 1 }, DEFAULT_LIMITS.saveMs + 2);
+    expect(m.phase).toBe('removed');
   });
 
   it('a call for a tool that changed, or from another setup, is never sent', () => {

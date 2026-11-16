@@ -57,8 +57,10 @@ export type CallOutcome =
 /** How a start, stop or remove ended. */
 export type Reply =
   | { readonly kind: 'ready' }
-  /** An edit was saved. */
+  /** A change was saved. */
   | { readonly kind: 'edited' }
+  /** The server was added. */
+  | { readonly kind: 'added' }
   | { readonly kind: 'stopped' }
   | { readonly kind: 'removed' }
   | { readonly kind: 'failed'; readonly failure: Failure }
