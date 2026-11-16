@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { readCard, toV3Json } from '../src/index.ts';
 import { pngFixtures } from './png-fixtures.ts';
-import { allFixtures, readFixture } from './helpers.ts';
+import { allFixtures, posixPath, readFixture } from './helpers.ts';
 
 /** Fixtures that are refused on purpose, by the error they get (read.test.ts checks each). */
 const REFUSED: Record<string, string> = {
@@ -25,9 +25,28 @@ const REFUSED: Record<string, string> = {
 
 const fixtures = allFixtures();
 
+/** The kinds of fixture, by their first folder. Every fixture is one of these. */
+const KINDS = ['cards/', 'lore/', 'hostile/', 'trait-styles/', 'png/'];
+
 describe('every fixture', () => {
   it('there are fixtures of every kind', () => {
-    for (const dir of ['cards/', 'lore/', 'hostile/', 'trait-styles/', 'png/']) expect(fixtures.some((f) => f.startsWith(dir)), dir).toBe(true);
+    for (const dir of KINDS) expect(fixtures.some((f) => f.startsWith(dir)), dir).toBe(true);
+  });
+
+  // These two hold on every OS: a path keyed with the wrong separator, or a stale name, finds no fixture.
+  it('every fixture is of a known kind', () => {
+    expect(fixtures.filter((f) => !KINDS.some((k) => f.startsWith(k)))).toEqual([]);
+  });
+
+  it('every refusal on the list names a fixture that exists', () => {
+    expect(Object.keys(REFUSED).filter((name) => !fixtures.includes(name))).toEqual([]);
+  });
+
+  it('fixture names use / between folders, whatever the OS gives', () => {
+    expect(fixtures.filter((f) => f.includes('\\'))).toEqual([]);
+    expect(posixPath('hostile\\deep.json', '\\')).toBe('hostile/deep.json');
+    expect(posixPath('png\\hostile\\ztxt.png', '\\')).toBe('png/hostile/ztxt.png');
+    expect(posixPath('cards/v3.json', '/')).toBe('cards/v3.json');
   });
 
   for (const path of fixtures) {
