@@ -3,7 +3,7 @@
 // never run again after a restart, and it says which server it called. What it returns is outside
 // content: the server's word, never the person's.
 
-import type { FamiliarTool, ToolStep } from '../journal/tools.ts';
+import type { AllowedBy, FamiliarTool, ToolStep } from '../journal/tools.ts';
 import type { ToolPolicy } from '../journal/gate.ts';
 import { effectiveDescription } from './catalog.ts';
 import { sha256 } from './hash.ts';
@@ -122,7 +122,7 @@ export interface ServerTool extends FamiliarTool {
   readonly fresh: boolean;
 }
 
-export type Caller = (tool: string, args: unknown, options: { signal?: AbortSignal; expect: Expect }) => Promise<CallOutcome>;
+export type Caller = (tool: string, args: unknown, options: { signal?: AbortSignal; expect: Expect; allowedBy?: AllowedBy }) => Promise<CallOutcome>;
 
 const MAX_DESCRIPTION = 2000;
 
@@ -156,7 +156,8 @@ export function serverTool(input: {
       // Sent only if the server still offers exactly this tool, from the same setup: an old wrapper can't
       // call a tool that changed under it.
       const expect = { setup: input.setupFingerprint, tool: listed.fingerprint };
-      const outcome = await call(listed.name, args, step.signal ? { signal: step.signal, expect } : { expect });
+      // How the gate let it through goes with it, and is checked again when it's sent.
+      const outcome = await call(listed.name, args, { expect, ...(step.signal ? { signal: step.signal } : {}), ...(step.allowedBy ? { allowedBy: step.allowedBy } : {}) });
       return outcomeText(server.label, listed.name, outcome);
     }
   };

@@ -45,6 +45,9 @@ export interface CallOptions {
   readonly signal?: AbortSignal;
   /** The tool as offered and the setup it came from: sent only if the server still offers exactly that. */
   readonly expect?: Expect;
+  /** Checked at the moment the call is sent, after any wait in the queue: words to refuse it with, or
+      undefined to send it. The person's choice is read here, not when the call was made. */
+  readonly admit?: () => string | undefined;
 }
 
 export class ServerActor<S> {
@@ -60,6 +63,7 @@ export class ServerActor<S> {
   private readonly aborts = new Map<number, AbortController>();
   private readonly timers = new Map<string, () => void>();
   private readonly callers = new Map<number, (o: CallOutcome) => void>();
+  private readonly admits = new Map<number, () => string | undefined>();
   private readonly repliers = new Map<number, (r: Reply) => void>();
 
   constructor(options: ActorOptions<S>) {
@@ -102,8 +106,10 @@ export class ServerActor<S> {
     return new Promise<CallOutcome>(resolve => {
       const onAbort = () => this.post({ t: 'cancel', call: token });
       signal?.addEventListener('abort', onAbort, { once: true });
+      if (options.admit) this.admits.set(token, options.admit);
       this.callers.set(token, outcome => {
         signal?.removeEventListener('abort', onAbort);
+        this.admits.delete(token);
         resolve(outcome);
       });
       this.post({
@@ -155,6 +161,12 @@ export class ServerActor<S> {
         return;
       }
       case 'send': {
+        // The last check, at the send itself: refused here, nothing reaches the server.
+        const refused = this.admits.get(e.call)?.();
+        if (refused !== undefined) {
+          this.post({ t: 'result', gen: e.gen, call: e.call, outcome: { kind: 'error', reason: 'changed', words: refused } });
+          return;
+        }
         const session = this.runs.get(e.gen)?.session;
         const abort = new AbortController();
         this.aborts.set(e.call, abort);

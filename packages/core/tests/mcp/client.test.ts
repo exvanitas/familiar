@@ -262,6 +262,35 @@ describe('the MCP client, local, against the fake server', () => {
     expect(await echo.run({ text: 'yes' }, { id: 's', write: async () => { throw new Error('no'); } })).toMatch(/\nyes$/);
   });
 
+  it('a queued call let through on "always" is checked again at the send: revoked, nothing is written; kept, it goes', async () => {
+    let choices: Record<string, ToolChoice> = {};
+    const w = await world({ choices: () => choices });
+    const id = await addFake(w);
+    await w.client.start(id);
+    const echo = w.client.tools().find(t => t.serverName === 'echo')!;
+    const always = { [choiceKey(id, 'echo')]: { policy: 'allow' as const, fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
+    const allowed = { id: 's', allowedBy: 'always' as const, write: async () => { throw new Error('no'); } };
+    await w.client.stop(id);
+    // The control: the call waits while the server starts, the "always" stands, and it's sent.
+    choices = always;
+    const starting = w.client.start(id);
+    const kept = echo.run({ text: 'kept' }, allowed);
+    await starting;
+    expect(await kept).toMatch(/\nkept$/);
+    expect(sentCalls(w.port, 'echo')).toBe(1);
+    await w.client.stop(id);
+    // The same, with the "always" taken back while the call waits: refused at the send, nothing written.
+    const again = w.client.start(id);
+    const revoked = echo.run({ text: 'revoked' }, allowed).then(() => 'sent', (e: Error) => e.message);
+    choices = {};
+    await again;
+    expect(await revoked).toMatch(/Your "always" for echo on this server no longer stands, so Familiar didn't send the call/);
+    expect(sentCalls(w.port, 'echo')).toBe(1);
+    // A call the person said yes to needs only the tool unchanged.
+    expect(await echo.run({ text: 'asked' }, { ...allowed, allowedBy: 'asked' })).toMatch(/\nasked$/);
+    expect(sentCalls(w.port, 'echo')).toBe(2);
+  });
+
   it('a call already stopped is answered at once and writes nothing (r19 #13)', async () => {
     const w = await world();
     const id = await addFake(w);

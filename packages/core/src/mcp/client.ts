@@ -17,6 +17,7 @@ import { ProcessTransport } from './process-transport.ts';
 import { RemoteTransport, type FetchLike } from './remote.ts';
 import { deleteServer, fresh, loadServers, saveServer, type SavedServer, type SavedTool, type ServerLimits } from './saved.ts';
 import type { Expect } from './machine.ts';
+import type { AllowedBy } from '../journal/tools.ts';
 import { choiceKey, modelNames, serverTool, toolChanges, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
 import { openSession } from './session.ts';
 import { processSetupOf, remoteTargetOf, secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
@@ -49,8 +50,9 @@ export interface McpClientOptions {
   readonly paths?: PathRules;
   /** Hears that a server's state, tools or failure changed. */
   readonly onChange?: (id: string) => void;
-  /** The person's choices, keyed by `choiceKey` (step 8 keeps them). Read again at every call a wrapper
-      makes, by the wrapper's own identity: a "never" refuses the call even if the gate let it through. */
+  /** The person's choices, keyed by `choiceKey` (step 8 keeps them). Read again when a wrapper's call is
+      sent, by the wrapper's own identity: a "never" refuses it, and a call the gate let through on an
+      "always" is refused unless that "always" still stands for exactly this tool and setup. */
   readonly choices?: () => Readonly<Record<string, ToolChoice>>;
 }
 
@@ -262,17 +264,27 @@ export class McpClient {
   }
 
   /** One call, under the server's own deadline unless the caller gives one. With `expect`, it's sent only
-      if the server still offers exactly that tool, from that setup. */
-  call(id: string, tool: string, args: unknown, options: { ms?: number; signal?: AbortSignal; expect?: Expect } = {}): Promise<CallOutcome> {
+      if the server still offers exactly that tool, from that setup, and only if the person's choice for
+      this identity still allows it at the moment it's sent. */
+  call(id: string, tool: string, args: unknown, options: { ms?: number; signal?: AbortSignal; expect?: Expect; allowedBy?: AllowedBy } = {}): Promise<CallOutcome> {
     const e = this.entries.get(id);
     if (!e) return Promise.resolve({ kind: 'error', reason: 'removed', words: 'The server was removed.' });
-    // A wrapper's call: its identity is this server's id and the tool's own name, and the person's
-    // choice for exactly that identity is read now.
-    if (options.expect && this.o.choices?.()[choiceKey(id, tool)]?.policy === 'deny') {
-      return Promise.resolve({ kind: 'error', reason: 'changed', words: `You chose never to run ${tool} on this server, so Familiar didn't send the call.` });
-    }
     const ms = options.ms ?? e.meta.limits.callMs;
-    return e.actor.call(tool, args, { ...(ms !== undefined ? { ms } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.expect ? { expect: options.expect } : {}) });
+    const expect = options.expect;
+    const admit = expect ? () => this.admit(id, tool, expect, options.allowedBy) : undefined;
+    return e.actor.call(tool, args, { ...(ms !== undefined ? { ms } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(expect ? { expect } : {}), ...(admit ? { admit } : {}) });
+  }
+
+  /** The person's choice for a wrapper's identity, read at the send. "Never" refuses whatever let the
+      call through. A call let through on "always" needs that "always" still to stand for exactly this
+      tool and setup; one the person said yes to needs only the tool unchanged, which the actor checks. */
+  private admit(id: string, tool: string, expect: Expect, allowedBy: AllowedBy | undefined): string | undefined {
+    const choice = this.o.choices?.()[choiceKey(id, tool)];
+    if (choice?.policy === 'deny') return `You chose never to run ${tool} on this server, so Familiar didn't send the call.`;
+    if (allowedBy === 'always' && !(choice?.policy === 'allow' && choice.fingerprint === expect.tool && choice.setupFingerprint === expect.setup)) {
+      return `Your "always" for ${tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`;
+    }
+    return undefined;
   }
 
   private entry(id: string): Entry {

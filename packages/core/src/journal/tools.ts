@@ -37,6 +37,11 @@ export interface ToolStep {
   readonly id: string;
   readonly signal?: AbortSignal;
   /**
+   * How the consent gate let this call through: by the person's standing "always" (`always`), or because
+   * they said yes to this call (`asked`). A server tool checks it again when the call is sent.
+   */
+  readonly allowedBy?: AllowedBy;
+  /**
    * A built-in write. `change` runs in one commit with the step's receipt, so the write is all made or
    * not made, and a rerun of the step gets the first run's value back without changing anything. Writes
    * are matched by their order within the step, so a rerun must make them in the same order.
@@ -76,8 +81,10 @@ const ReceiptDoc = defineDoc<{ writes: any[] }>({
   checkpointWhen: () => true
 });
 
-/** The consent gate, as the tool's own execute sees it: a reason not to run, or undefined. */
-export type Gate = (call: { readonly name: string; readonly arguments: unknown }, api: any, context: Context) => Promise<string | undefined>;
+export type AllowedBy = 'always' | 'asked';
+
+/** The consent gate, as the tool's own execute sees it: a reason not to run, or how the call was allowed. */
+export type Gate = (call: { readonly name: string; readonly arguments: unknown }, api: any, context: Context) => Promise<{ refused: string } | { allowedBy: AllowedBy }>;
 
 export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
   return defineTool({
@@ -88,12 +95,13 @@ export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
     execute: async (args: unknown, api: any, context: Context) => {
       // The gate again, inside the tool: a call pi-durable recovers after a crash (a read or a built-in
       // write, run again) never passes `beforeTool`, so it's checked here against today's policy.
-      const refused = await gate?.({ name: tool.name, arguments: args }, api, context);
-      if (refused) return { isError: true, output: [{ type: 'text', text: refused }] };
+      const verdict = await gate?.({ name: tool.name, arguments: args }, api, context);
+      if (verdict && 'refused' in verdict) return { isError: true, output: [{ type: 'text', text: verdict.refused }] };
       let writes = 0;
       const step: ToolStep = {
         id: String(api.taskId),
         signal: context?.abortSignal,
+        ...(verdict ? { allowedBy: verdict.allowedBy } : {}),
         write: async (change) => {
           if (tool.kind !== 'write') throw new Error(`${tool.name} is not a built-in write, so it can't write.`);
           const index = writes++;
