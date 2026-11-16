@@ -4,10 +4,10 @@
 // interrupted, with Run again, and the server never gets it a second time.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFakeModel, type FakeReply } from '../../src/testing/index.ts';
-import { choiceKey, decideByRules, McpClient, openJournal, parsePaste, posixPaths, systemClock, toolPolicies, type GatePolicy, type ModelRequest, type ToolChoice } from '../../src/index.ts';
+import { choiceKey, decideByRules, McpClient, openJournal, parsePaste, systemClock, toolPolicies, type GatePolicy, type ModelRequest, type ToolChoice } from '../../src/index.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 import { nodeWorld, type NodeWorld } from '../journal/node-env.ts';
-import { FAKE_MAIN, REPO } from './fake.ts';
+import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
@@ -21,10 +21,10 @@ const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes
 async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => void; storeName?: string } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
-  const client = await McpClient.open({ paths: posixPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+  const client = await McpClient.open({ paths: testPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
   let serverId = id;
   if (!serverId) {
-    const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: posixPaths });
+    const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: testPaths });
     serverId = (await client.add(drafts[0]!)).id;
   }
   expect((await client.start(serverId)).kind).toBe('ready');

@@ -7,6 +7,8 @@ import { CHECKED_AT_TEST, checkPrerequisites, FINDABLE, prerequisiteOf } from '.
 import { modelNames, outcomeText, toolChanges, toolFingerprint } from '../../src/mcp/server-tools.ts';
 import { CatalogError, checkTools, effectiveDescription } from '../../src/mcp/catalog.ts';
 import { CoalescedWriter } from '../../src/mcp/writer.ts';
+import { posixPaths, windowsPaths } from '../../src/mcp/native-rules.ts';
+import { REPO, testPaths } from './fake.ts';
 import { resultText } from '../../src/mcp/session.ts';
 import { secretValueProblem, setupFingerprint, touchesAMarker, type LocalSetup } from '../../src/mcp/setup.ts';
 import { unpinned } from '../../src/mcp/unpinned.ts';
@@ -246,5 +248,22 @@ describe('the record writer', () => {
     await w.close();
     await expect(w.request()).rejects.toThrow(/being removed/);
     expect(written).toEqual([0, 1000]);
+  });
+});
+
+describe("the tests' path rules match the machine they run on", () => {
+  // The Windows runner's Node and checkout (run 43838005541), which the Linux job never sees.
+  const runnerNode = 'C:\\hostedtoolcache\\windows\\node\\22.23.4\\x64\\node.exe';
+  const runnerRepo = 'D:\\a\\familiar\\familiar';
+  it("windowsPaths takes the runner's paths, and posixPaths refuses them", () => {
+    expect(windowsPaths.program(runnerNode)).toBeUndefined();
+    expect(windowsPaths.folder(runnerRepo)).toBeUndefined();
+    expect(posixPaths.program(runnerNode)).toBeDefined();
+    expect(posixPaths.folder(runnerRepo)).toBeDefined();
+  });
+  it('testPaths takes the paths of this machine', () => {
+    expect(testPaths).toBe(process.platform === 'win32' ? windowsPaths : posixPaths);
+    expect(testPaths.program(process.execPath)).toBeUndefined();
+    expect(testPaths.folder(REPO)).toBeUndefined();
   });
 });

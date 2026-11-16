@@ -5,9 +5,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { startHttp } from '../../../../tools/fake-mcp-server/src/http.ts';
 import { OUTSIDE_CONTENT } from '../../../../tools/fake-mcp-server/src/server.ts';
 import { systemClock } from '../../src/journal/journal.ts';
-import { choiceKey, KEY_PLACEHOLDER, localDraft, McpClient, parsePaste, posixPaths, remoteDraft, SSE_WORDS, toolPolicies, type FetchLike, type McpClientOptions, type ServerTool } from '../../src/index.ts';
+import { choiceKey, KEY_PLACEHOLDER, localDraft, McpClient, parsePaste, remoteDraft, SSE_WORDS, toolPolicies, type FetchLike, type McpClientOptions, type ServerTool } from '../../src/index.ts';
 import { memorySettingsStore } from '../../src/settings/store.ts';
-import { FAKE_MAIN, BLANKED_VALUE, REPO } from './fake.ts';
+import { FAKE_MAIN, BLANKED_VALUE, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
@@ -34,7 +34,7 @@ async function world(extra: Partial<McpClientOptions> = {}): Promise<World> {
   const deleted: string[] = [];
   const addresses = { added: [] as string[], removed: [] as string[] };
   const client = await McpClient.open({
-    paths: posixPaths,
+    paths: testPaths,
     store,
     processes: port,
     fetchFor: () => fetch,
@@ -56,7 +56,7 @@ const paste = (env: Record<string, string> = {}, args: string[] = []) => JSON.st
 /** Adds the fake server by paste, as Settings would: the draft's secret values go to "Credential
     Manager", and core gets the draft. */
 async function addFake(w: World, env: Record<string, string> = {}, args: string[] = []) {
-  const { drafts } = parsePaste(paste(env, args), { newId, defaultCwd: REPO, paths: posixPaths });
+  const { drafts } = parsePaste(paste(env, args), { newId, defaultCwd: REPO, paths: testPaths });
   const draft = drafts[0]!;
   expect(draft.problems).toEqual([]);
   const { id, secretRefs } = await w.client.add(draft);
@@ -191,7 +191,7 @@ describe('the MCP client, local, against the fake server', () => {
 
     // The same server, now variant b, edited and started at once: the start waits for the edit, and the
     // run that starts is the new setup.
-    const { drafts } = parsePaste(paste({}, ['--variant', 'b']), { newId, defaultCwd: REPO, paths: posixPaths });
+    const { drafts } = parsePaste(paste({}, ['--variant', 'b']), { newId, defaultCwd: REPO, paths: testPaths });
     const editing = w.client.edit(id, drafts[0]!);
     const starting = w.client.start(id);
     await editing;
@@ -297,22 +297,22 @@ describe('the MCP client, local, against the fake server', () => {
     const no = await world();
     const port = nodeProcessPort({ ask: () => false });
     cleanups.push(() => port.closeAll());
-    const client = await McpClient.open({ paths: posixPaths, store: memorySettingsStore(), processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
-    const { drafts } = parsePaste(paste(), { newId, defaultCwd: REPO, paths: posixPaths });
+    const client = await McpClient.open({ paths: testPaths, store: memorySettingsStore(), processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+    const { drafts } = parsePaste(paste(), { newId, defaultCwd: REPO, paths: testPaths });
     const { id } = await client.add(drafts[0]!);
     const r = await client.test(id);
     expect(r).toEqual({ ok: false, failure: { kind: 'declined', words: 'You chose not to start it.' } });
     expect(client.get(id)?.phase).toBe('stopped');
     expect(port.asked).toBe(1);
 
-    const missing = localDraft({ label: 'Missing', command: 'npx', args: ['-y', 'familiar-no-such-package'], settings: [] }, { newId, defaultCwd: REPO, paths: posixPaths });
+    const missing = localDraft({ label: 'Missing', command: 'npx', args: ['-y', 'familiar-no-such-package'], settings: [] }, { newId, defaultCwd: REPO, paths: testPaths });
     const { id: m } = await no.client.add({ ...missing, setup: { ...missing.setup, kind: 'local', program: 'familiar-no-such-npx' } as typeof missing.setup });
     const r2 = await no.client.test(m);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.failure.words).toContain("Familiar couldn't find the program");
 
     // A program that exits at once: its last output.
-    const quick = localDraft({ label: 'Quick', command: process.execPath, args: ['-e', "console.error('no config file'); process.exit(2)"], settings: [] }, { newId, defaultCwd: REPO, paths: posixPaths });
+    const quick = localDraft({ label: 'Quick', command: process.execPath, args: ['-e', "console.error('no config file'); process.exit(2)"], settings: [] }, { newId, defaultCwd: REPO, paths: testPaths });
     const { id: q } = await no.client.add(quick);
     const r3 = await no.client.test(q);
     expect(r3).toMatchObject({ ok: false, failure: { kind: 'exited', words: 'The server exited with code 2. Its last output is below.', lastOutput: 'no config file' } });
@@ -320,7 +320,7 @@ describe('the MCP client, local, against the fake server', () => {
 
   it('the handshake deadline: a program that never speaks MCP', async () => {
     const w = await world({ limits: { initMs: 300, backoffMs: 50, stopMs: 3000 } });
-    const silent = localDraft({ label: 'Silent', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], settings: [] }, { newId, defaultCwd: REPO, paths: posixPaths });
+    const silent = localDraft({ label: 'Silent', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], settings: [] }, { newId, defaultCwd: REPO, paths: testPaths });
     const { id } = await w.client.add(silent);
     const r = await w.client.test(id);
     expect(r).toMatchObject({ ok: false, failure: { kind: 'timed-out' } });
@@ -333,7 +333,7 @@ describe('the MCP client, local, against the fake server', () => {
     const off = await addFake(w);
     await w.client.setEnabled(on, true);
     // A fresh client over the same store, as at the next start of the app.
-    const again = await McpClient.open({ paths: posixPaths, store: w.store, processes: w.port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+    const again = await McpClient.open({ paths: testPaths, store: w.store, processes: w.port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
     again.startEnabled();
     await until(() => again.get(on)?.phase === 'ready');
     expect(again.get(off)?.phase).toBe('stopped');
