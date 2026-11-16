@@ -36,7 +36,7 @@ const PREFIX_CHARS = 20;
 
 /** Letters, digits, `_` and `-` only, runs of `_` collapsed so `__` stays the separator. */
 function safe(text: string): string {
-  return text.normalize('NFKD').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/_+/g, '_').replace(/^[_-]+|[_-]+$/g, '');
+  return text.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/_+/g, '_').replace(/^[_-]+|[_-]+$/g, '');
 }
 
 /**
