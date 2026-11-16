@@ -43,10 +43,10 @@ describe('the gate', () => {
     expect(judge(['RUN abc', 'PASS security.egress.core closed'], inv, []).ok).toBe(false);
   });
 
-  it('a known gap is reported, never fails an everyday run, and fails a release', () => {
+  it('a known gap holds only for a FAIL with its expected detail, and fails a release', () => {
     const inv = ['a.one', 'a.gap'];
-    const knownGaps = { 'a.gap': 'pre-release native pass: something' };
-    for (const gap of ['FAIL security.a.gap leaked', 'PASS security.a.gap fixed', 'SKIP security.a.gap', '']) {
+    const knownGaps = { 'a.gap': { reason: 'pre-release native pass: something', expect: 'the gap showed' } };
+    for (const gap of ['FAIL security.a.gap the gap showed: in 2 texts', 'PASS security.a.gap fixed']) {
       const lines = ['PASS security.a.one', gap];
       const everyday = judge(lines, inv, [], { knownGaps });
       expect(everyday, gap).toMatchObject({ ok: true, problems: [] });
@@ -56,21 +56,31 @@ describe('the gate', () => {
       expect(release.ok, gap).toBe(false);
       expect(release.problems.join()).toMatch(/a release can't ship with an open known gap/);
     }
-    // Without the mark, the same FAIL fails an everyday run; and the mark covers only its own id.
-    expect(judge(['PASS security.a.one', 'FAIL security.a.gap'], inv, []).ok).toBe(false);
-    expect(judge(['FAIL security.a.one', 'FAIL security.a.gap'], inv, [], { knownGaps }).ok).toBe(false);
-    // A mark with no reason, or on an id outside the inventory, fails.
-    expect(judge(['PASS security.a.one', 'PASS security.a.gap'], inv, [], { knownGaps: { 'a.gap': ' ' } }).ok).toBe(false);
-    expect(judge(['PASS security.a.one', 'PASS security.a.gap'], inv, [], { knownGaps: { 'a.other': 'why' } }).ok).toBe(false);
+    // The control: a FAIL that isn't the gap (the check couldn't measure), a SKIP, or no report at all,
+    // fails an everyday run, with the detail shown.
+    const odd = judge(['PASS security.a.one', 'FAIL security.a.gap refused: that window is already open'], inv, [], { knownGaps });
+    expect(odd.ok).toBe(false);
+    expect(odd.problems.join()).toMatch(/isn't the known gap it's marked for: refused: that window is already open/);
+    expect(judge(['PASS security.a.one', 'SKIP security.a.gap no desktop'], inv, [], { knownGaps }).ok).toBe(false);
+    expect(judge(['PASS security.a.one'], inv, [], { knownGaps }).problems).toContain('security.a.gap: never reported');
+    // Without the mark, the expected FAIL fails too; and the mark covers only its own id.
+    expect(judge(['PASS security.a.one', 'FAIL security.a.gap the gap showed'], inv, []).ok).toBe(false);
+    expect(judge(['FAIL security.a.one', 'FAIL security.a.gap the gap showed'], inv, [], { knownGaps }).ok).toBe(false);
+    // A mark with no reason or no expected detail, or on an id outside the inventory, fails.
+    const lines = ['PASS security.a.one', 'PASS security.a.gap'];
+    expect(judge(lines, inv, [], { knownGaps: { 'a.gap': { reason: ' ', expect: 'x' } } }).ok).toBe(false);
+    expect(judge(lines, inv, [], { knownGaps: { 'a.gap': { reason: 'why', expect: '' } } }).ok).toBe(false);
+    expect(judge(lines, inv, [], { knownGaps: { 'a.other': { reason: 'why', expect: 'x' } } }).ok).toBe(false);
   });
 
-  it('every known-gap mark in the real inventory carries a reason and names a listed id', () => {
-    const real = JSON.parse(readFileSync(new URL('../shell-check/security-inventory.json', import.meta.url), 'utf8')) as { ids: string[]; knownGaps?: Record<string, unknown> };
-    for (const [id, reason] of Object.entries(real.knownGaps ?? {})) {
+  it('every known-gap mark in the real inventory carries a reason and an expected detail, and names a listed id', () => {
+    const real = JSON.parse(readFileSync(new URL('../shell-check/security-inventory.json', import.meta.url), 'utf8')) as { ids: string[]; knownGaps?: Record<string, { reason?: unknown; expect?: unknown }> };
+    for (const [id, mark] of Object.entries(real.knownGaps ?? {})) {
       expect(real.ids, id).toContain(id);
-      expect(typeof reason === 'string' && reason.trim().length > 10, id).toBe(true);
+      expect(typeof mark.reason === 'string' && mark.reason.trim().length > 10, id).toBe(true);
+      expect(typeof mark.expect === 'string' && mark.expect.trim().length > 5, id).toBe(true);
     }
-    expect(real.knownGaps).toEqual({ 'mcp.secret-json-escaped': 'pre-release native pass: JSON-escaped redaction' });
+    expect(real.knownGaps).toEqual({ 'mcp.secret-json-escaped': { reason: 'pre-release native pass: JSON-escaped redaction', expect: 'an escaped copy came back' } });
   });
 
   it('the real lists are well formed and apart', () => {

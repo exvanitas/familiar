@@ -30,7 +30,7 @@ import { admit, boundWords, type Budget } from './bounds.ts';
 import { finishTurn, openTurn, turnKeyOf, TurnsDoc } from './turns.ts';
 import { gateFor, type GatePolicy } from './gate.ts';
 import type { FamiliarTool, JournalDocToken } from './tools.ts';
-import { defineJournalDoc, toDurableTool } from './tools.ts';
+import { defineJournalDoc, toDurableTool, type AllowedBy } from './tools.ts';
 
 const ctx = BACKGROUND_CONTEXT;
 const PROVIDER = 'familiar';
@@ -369,10 +369,15 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
 
   /**
    * The consent gate (gate.ts): the bounds, a parked interruption, then the policy, and consent when it
-   * asks. A reason not to run, or undefined. `beforeTool` runs it on every call, and each tool's own
-   * execute runs it again, for a call recovered after a crash, which never passes `beforeTool`.
+   * asks. A reason not to run, or how the call was allowed: by a standing "always", or by the person's yes
+   * to this call. `beforeTool` runs it on every call, and each tool's own execute runs it again, for a call
+   * recovered after a crash, which never passes `beforeTool`; the execute hands the tool how it was allowed.
    */
-  const gateCall = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<string | undefined> => {
+  const gateCall = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<{ refused: string } | { allowedBy: AllowedBy }> => {
+    const v = await gateWords(call, api, context);
+    return typeof v === 'string' ? { refused: v } : { allowedBy: v.allowedBy };
+  };
+  const gateWords = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<string | { allowedBy: AllowedBy }> => {
     const refused = await bounded(api);
     if (refused) return refused;
     const tool = tools.get(call.name);
@@ -383,9 +388,9 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     if (parked) return parked;
     const policy = gateFor(call.name, tool, options.policy?.());
     if (policy === 'deny') return `${call.name} is turned off.`;
-    if (policy === 'allow') return undefined;
+    if (policy === 'allow') return { allowedBy: 'always' };
     const stored = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
-    if (stored?.answer) return stored.answer === 'allow' ? undefined : 'The person said no.';
+    if (stored?.answer) return stored.answer === 'allow' ? { allowedBy: 'asked' } : 'The person said no.';
     const turn = turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
     const card: ConsentCard = stored ?? { id, tool: call.name, arguments: call.arguments, doing: tool ? tool.doing(call.arguments) : `using ${call.name}`, askedAt: clock.now(), turn };
     if (!stored) {
@@ -406,13 +411,13 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       const doc = await tx.doc(ConsentDoc);
       if (doc.cards[id]) doc.cards[id].answer = ok ? 'allow' : 'deny';
     }, ctx);
-    return ok ? undefined : 'The person said no.';
+    return ok ? { allowedBy: 'asked' } : 'The person said no.';
   };
 
   const consentHook = hook(ToolTask, {
     beforeTool: async (call: any, api: any, context: any) => {
-      const refused = await gateCall(call, api, context);
-      return refused ? { block: refused } : undefined;
+      const verdict = await gateCall(call, api, context);
+      return 'refused' in verdict ? { block: verdict.refused } : undefined;
     },
     afterTool: async (call: any, result: any, api: any) => {
       const id = String(api.taskId);

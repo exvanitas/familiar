@@ -32,6 +32,8 @@ async function ask<T = unknown>(to: string, cmd: string, args?: unknown, ms = 30
   return r.value as T;
 }
 const up = (role: string) => until(() => hello.get(role), 20000, role + ' to load');
+/* A window that closed said hello once; forget it, so `up` after reopening waits for the new page. */
+const closed = (role: string) => { hello.delete(role); };
 
 /* ---------- small things ---------- */
 
@@ -479,7 +481,7 @@ async function pinRead(info: Info, value: string, id: string) {
       await say('DONE');
       await shell.quit();
     } else if (phase === 'proc-mcp') {
-      await mcpChecks({ ask, up });
+      await mcpChecks({ ask, up, closed });
       onQuitting = () => { shell.quitReady().catch(() => {}); };
       await say('DONE');
       await shell.quit();

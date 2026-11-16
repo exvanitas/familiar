@@ -18,10 +18,10 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => boolean | void; storeName?: string } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => boolean | void; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
-  const client = await McpClient.open({ paths: testPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+  const client = await McpClient.open({ paths: testPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock, ...(extra.choices ? { choices: extra.choices } : {}) });
   let serverId = id;
   if (!serverId) {
     const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: testPaths });
@@ -106,7 +106,8 @@ describe('a server tool in the turn loop', () => {
     // The gate's policy comes from the wrappers the turn loop holds, each by its own identity.
     let held: ServerTool[] = [];
     const policy = () => ({ perTool: toolPolicies(held, choices) });
-    const one = await life(world, store, undefined, script, { policy, ask: () => { asks++; }, storeName: 'mcp-consent' });
+    // The client reads the same choices again at the send.
+    const one = await life(world, store, undefined, script, { policy, ask: () => { asks++; }, storeName: 'mcp-consent', choices: () => choices });
     held = one.tools;
     client = one.client;
     const echo = client.tools().find(t => t.serverName === 'echo')!;
