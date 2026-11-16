@@ -82,7 +82,7 @@ What the decider sees: her traits (sociability, closeness, lively hours) and int
 - Late night with a long session: one nudge per night at most. At high chattiness it's a chat, one of the day's two (owner, 2026-11-16: "chat at high chattiness, sure").
 - A long session in the day (2 hours with no break of 15 minutes): one break nudge per session, a bubble at medium and high, a gesture at low, never a chat (owner, 2026-11-16: "daytime break nudge, sure").
 - Tool done or reply done while the chat is hidden: the teaser rule handles it. The decider only picks gesture or quiet when no teaser is due.
-- Clicked once: a gesture at most (plain clicks are petting).
+- Clicked: a gesture, from every persona, however quiet (owner, 2026-11-16: "Gesture, yes. Even for quiet personas."). A click is you reaching out, and silence there reads as broken. No trait lowers it, and it stays a gesture at most (plain clicks are petting). Only do-not-disturb, fullscreen, a lock, being sent home or hidden, or the settle make it quiet.
 - When in doubt: quiet.
 - Chat, unprompted: only at six moments and the late-night nudge, by the chat rule in [moments.md](moments.md#the-chat-rule).
 
