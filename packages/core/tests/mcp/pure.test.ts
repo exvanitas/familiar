@@ -68,18 +68,43 @@ describe('model names', () => {
     expect(modelNames([{ id: 'd', label: '', tools: [{ name: 't' }] }]).get('d')!.get('t')).toBe('server__t');
   });
 
-  it('collisions settle the same way whatever order the servers come in', () => {
+  it('names come from labels and ids, never order: a clash of labels gets a tag from each id', () => {
     const a = { id: 'a', label: 'Same', tools: [{ name: 'echo' }, { name: 'Echo' }] };
     const b = { id: 'b', label: 'Same', tools: [{ name: 'echo' }] };
-    const one = modelNames([a, b]);
-    const two = modelNames([b, a]);
-    expect([...one.get('a')!, ...one.get('b')!]).toEqual([...two.get('a')!, ...two.get('b')!]);
-    const all = [...one.get('a')!.values(), ...one.get('b')!.values()];
-    expect(new Set(all.map(n => n.toLowerCase())).size).toBe(3);
-    expect(one.get('b')!.get('echo')).toBe('Same__echo_3');
-    // A cut name that collides still fits.
+    const c = { id: 'c', label: 'Other', tools: [{ name: 'echo' }] };
+    const one = modelNames([a, b, c]);
+    const two = modelNames([c, b, a]);
+    for (const s of [a, b, c]) expect([...one.get(s.id)!]).toEqual([...two.get(s.id)!]);
+    const all = [...one.values()].flatMap(m => [...m.values()]);
+    expect(new Set(all.map(n => n.toLowerCase())).size).toBe(all.length);
+    expect(one.get('b')!.get('echo')).toBe(`Same_${sha256('b').slice(0, 4)}__echo`);
+    expect(one.get('c')!.get('echo')).toBe('Other__echo');
+    // a's echo and Echo clash ignoring case: each gets a tag of its own name.
+    expect(one.get('a')!.get('echo')).toBe(`Same_${sha256('a').slice(0, 4)}__echo_${sha256('echo').slice(0, 4)}`);
+    // Alone, a server keeps its plain label; with others its name doesn't depend on which others.
+    expect(modelNames([b]).get('b')!.get('echo')).toBe('Same__echo');
+    expect(modelNames([b, a]).get('b')!.get('echo')).toBe(modelNames([a, b, c]).get('b')!.get('echo'));
+    // A cut name that clashes still fits, and stays unique.
     const long = { id: 'l', label: 'L', tools: [{ name: 'y'.repeat(70) }, { name: 'y'.repeat(71) }] };
-    for (const n of modelNames([long]).get('l')!.values()) expect(n.length).toBeLessThanOrEqual(64);
+    const cut = [...modelNames([long]).get('l')!.values()];
+    expect(cut.every(n => n.length <= 64)).toBe(true);
+    expect(new Set(cut).size).toBe(2);
+  });
+
+  it('when two ids share a short tag, the tags grow until they differ', () => {
+    // Find two ids whose first four hex characters agree.
+    const seen = new Map<string, string>();
+    let pair: [string, string] | undefined;
+    for (let i = 0; !pair; i++) {
+      const id = `id${i}`;
+      const t = sha256(id).slice(0, 4);
+      if (seen.has(t)) pair = [seen.get(t)!, id];
+      else seen.set(t, id);
+    }
+    const names = modelNames(pair.map(id => ({ id, label: 'Same', tools: [{ name: 'echo' }] })));
+    const [x, y] = pair.map(id => names.get(id)!.get('echo')!);
+    expect(x).not.toBe(y);
+    expect(x).toBe(`Same_${sha256(pair[0]).slice(0, 6)}__echo`);
   });
 });
 

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { startHttp } from '../../../../tools/fake-mcp-server/src/http.ts';
 import { OUTSIDE_CONTENT } from '../../../../tools/fake-mcp-server/src/server.ts';
 import { systemClock } from '../../src/journal/journal.ts';
-import { choiceKey, KEY_PLACEHOLDER, localDraft, McpClient, parsePaste, remoteDraft, SSE_WORDS, toolPolicies, type FetchLike, type McpClientOptions, type ServerTool } from '../../src/index.ts';
+import { choiceKey, KEY_PLACEHOLDER, sha256, localDraft, McpClient, parsePaste, remoteDraft, SSE_WORDS, toolPolicies, type FetchLike, type McpClientOptions, type ServerTool, type ToolChoice } from '../../src/index.ts';
 import { memorySettingsStore } from '../../src/settings/store.ts';
 import { FAKE_MAIN, BLANKED_VALUE, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
@@ -238,6 +238,8 @@ describe('the MCP client, local, against the fake server', () => {
     await w.client.start(a);
     const tool = w.client.tools().find(t => t.serverName === 'echo')!;
     const always = { [choiceKey(tool.server.id, 'echo')]: { policy: 'allow' as const, fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint } };
+    // The control: the choice does allow A's own tool.
+    expect(toolPolicies([tool], always)).toEqual({ [tool.name]: 'allow' });
     await w.client.stop(a);
     const b = await addFake(w);
     await w.client.start(b);
@@ -245,6 +247,19 @@ describe('the MCP client, local, against the fake server', () => {
     expect(other.name).toBe(tool.name);
     expect(other.fingerprint).toBe(tool.fingerprint);
     expect(toolPolicies([other], always)).toEqual({});
+  });
+
+  it('a "never" for the wrapper\'s own identity refuses its call before sending, even past the gate', async () => {
+    let choices: Record<string, ToolChoice> = {};
+    const w = await world({ choices: () => choices });
+    const id = await addFake(w);
+    await w.client.start(id);
+    const echo = w.client.tools().find(t => t.serverName === 'echo')!;
+    choices = { [choiceKey(id, 'echo')]: { policy: 'deny', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
+    await expect(echo.run({ text: 'no' }, { id: 's', write: async () => { throw new Error('no'); } })).rejects.toThrow(/You chose never to run echo/);
+    expect(sentCalls(w.port, 'echo')).toBe(0);
+    choices = {};
+    expect(await echo.run({ text: 'yes' }, { id: 's', write: async () => { throw new Error('no'); } })).toMatch(/\nyes$/);
   });
 
   it('a call already stopped is answered at once and writes nothing (r19 #13)', async () => {
@@ -399,9 +414,9 @@ describe('the tools a turn sees', () => {
     const names = tools.map(t => t.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names.every(n => /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(n))).toBe(true);
-    // Two servers with the same label: the later id gets _2.
-    expect(names).toContain('Fake_server__echo');
-    expect(names).toContain('Fake_server__echo_2');
+    // Two servers with the same label: each gets a tag from its own id, so neither name depends on the other.
+    expect(names).toContain(`Fake_server_${sha256(a).slice(0, 4)}__echo`);
+    expect(names).toContain(`Fake_server_${sha256(b).slice(0, 4)}__echo`);
     await w.client.stop(b);
     expect(w.client.tools().every(t => t.server.id === a)).toBe(true);
   });

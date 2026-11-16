@@ -17,7 +17,7 @@ import { ProcessTransport } from './process-transport.ts';
 import { RemoteTransport, type FetchLike } from './remote.ts';
 import { deleteServer, fresh, loadServers, saveServer, type SavedServer, type SavedTool, type ServerLimits } from './saved.ts';
 import type { Expect } from './machine.ts';
-import { modelNames, serverTool, toolChanges, type ServerTool, type ToolChanges } from './server-tools.ts';
+import { choiceKey, modelNames, serverTool, toolChanges, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
 import { openSession } from './session.ts';
 import { processSetupOf, remoteTargetOf, secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
@@ -49,6 +49,9 @@ export interface McpClientOptions {
   readonly paths?: PathRules;
   /** Hears that a server's state, tools or failure changed. */
   readonly onChange?: (id: string) => void;
+  /** The person's choices, keyed by `choiceKey` (step 8 keeps them). Read again at every call a wrapper
+      makes, by the wrapper's own identity: a "never" refuses the call even if the gate let it through. */
+  readonly choices?: () => Readonly<Record<string, ToolChoice>>;
 }
 
 export interface ServerStatus {
@@ -263,6 +266,11 @@ export class McpClient {
   call(id: string, tool: string, args: unknown, options: { ms?: number; signal?: AbortSignal; expect?: Expect } = {}): Promise<CallOutcome> {
     const e = this.entries.get(id);
     if (!e) return Promise.resolve({ kind: 'error', reason: 'removed', words: 'The server was removed.' });
+    // A wrapper's call: its identity is this server's id and the tool's own name, and the person's
+    // choice for exactly that identity is read now.
+    if (options.expect && this.o.choices?.()[choiceKey(id, tool)]?.policy === 'deny') {
+      return Promise.resolve({ kind: 'error', reason: 'changed', words: `You chose never to run ${tool} on this server, so Familiar didn't send the call.` });
+    }
     const ms = options.ms ?? e.meta.limits.callMs;
     return e.actor.call(tool, args, { ...(ms !== undefined ? { ms } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.expect ? { expect: options.expect } : {}) });
   }

@@ -4,7 +4,7 @@
 // interrupted, with Run again, and the server never gets it a second time.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFakeModel, type FakeReply } from '../../src/testing/index.ts';
-import { choiceKey, decideByRules, McpClient, openJournal, parsePaste, systemClock, toolPolicies, type GatePolicy, type ModelRequest, type ToolChoice } from '../../src/index.ts';
+import { choiceKey, decideByRules, McpClient, openJournal, parsePaste, systemClock, toolPolicies, type GatePolicy, type ModelRequest, type ServerTool, type ToolChoice } from '../../src/index.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 import { nodeWorld, type NodeWorld } from '../journal/node-env.ts';
 import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
@@ -18,7 +18,7 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => void; storeName?: string } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => boolean | void; storeName?: string } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
   const client = await McpClient.open({ paths: testPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
@@ -28,6 +28,13 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
     serverId = (await client.add(drafts[0]!)).id;
   }
   expect((await client.start(serverId)).kind).toBe('ready');
+  const tools = client.tools();
+  const { journal, model } = await turnLoop(world, tools, script, extra);
+  return { port, client, journal, model, serverId, tools };
+}
+
+/** A journal over the given wrappers: the tools a turn loop holds until it's opened again. */
+async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => boolean | void; storeName?: string } = {}) {
   const model = createFakeModel(script);
   const journal = await openJournal({
     store: await world.open(extra.storeName ?? 'mcp-kill'),
@@ -35,10 +42,10 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
     model,
     modelId: 'fake-1',
     caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
-    tools: client.tools(),
+    tools,
     clock: systemClock,
     wake: { wakeAt: () => {} },
-    consent: { ask: () => { extra.ask?.(); return Promise.resolve(true); } },
+    consent: { ask: () => Promise.resolve(extra.ask?.() ?? true) },
     ...(extra.policy ? { policy: extra.policy } : {}),
     presence: { report: () => {} },
     persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
@@ -47,7 +54,7 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
     resendDelayMs: 50,
     notifier: { notify: () => {} }
   });
-  return { port, client, journal, model, serverId };
+  return { journal, model };
 }
 
 describe('a server tool in the turn loop', () => {
@@ -96,8 +103,11 @@ describe('a server tool in the turn loop', () => {
       return { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'Fake_server__echo', arguments: { text: 'hi' } }] };
     };
     let client!: McpClient;
-    const policy = () => ({ perTool: toolPolicies(client.tools(), choices) });
-    const one = await life(world, store, undefined, script, { policy, ask: () => asks++, storeName: 'mcp-consent' });
+    // The gate's policy comes from the wrappers the turn loop holds, each by its own identity.
+    let held: ServerTool[] = [];
+    const policy = () => ({ perTool: toolPolicies(held, choices) });
+    const one = await life(world, store, undefined, script, { policy, ask: () => { asks++; }, storeName: 'mcp-consent' });
+    held = one.tools;
     client = one.client;
     const echo = client.tools().find(t => t.serverName === 'echo')!;
     choices = { [choiceKey(echo.server.id, 'echo')]: { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
@@ -113,13 +123,57 @@ describe('a server tool in the turn loop', () => {
     await client.call(one.serverId, 'set_variant', { variant: 'b' });
     for (let i = 0; i < 200 && client.tools().find(t => t.serverName === 'echo')!.fingerprint === echo.fingerprint; i++) await sleep(10);
 
-    // The same journal, with the old wrapper: the gate asks, and the call isn't sent.
+    // The same turn loop, with the old wrapper: its "always" was for exactly that wrapper, so the gate
+    // doesn't ask, but the actor refuses it before sending, since the server no longer offers it.
     const t2 = await one.journal.send('Echo something again.', 'turn-2');
     if (!t2.replied) throw new Error('not replied');
     await one.journal.turn(t2.turn.id).wait();
-    expect(asks).toBe(1);
     expect(echoCalls(one.port)).toBe(1);
     expect(JSON.stringify(await one.journal.transcript())).toMatch(/echo changed since it was offered, so Familiar didn't send the call/);
     await one.journal.close();
+
+    // A turn loop given the current wrappers: the changed echo has no "always", so the gate asks again,
+    // and once the person says yes it's sent.
+    held = client.tools();
+    const two = await turnLoop(world, held, script, { policy, ask: () => { asks++; }, storeName: 'mcp-consent-2' });
+    const t3 = await two.journal.send('Echo something once more.', 'turn-3');
+    if (!t3.replied) throw new Error('not replied');
+    await two.journal.turn(t3.turn.id).wait();
+    expect(asks).toBe(1);
+    expect(echoCalls(one.port)).toBe(2);
+    await two.journal.close();
+  });
+
+  it("r20 #1: a turn's saved wrapper from z is never allowed by a's \"always\", whatever names the servers have now", async () => {
+    const world = nodeWorld();
+    const port = nodeProcessPort();
+    cleanups.push(() => port.closeAll());
+    const client = await McpClient.open({ paths: testPaths, store: memorySettingsStore(), processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'x' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+    const add = async (id: string) => {
+      const { drafts } = parsePaste(JSON.stringify({ mcpServers: { Same: { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => id, defaultCwd: REPO, paths: testPaths });
+      await client.add(drafts[0]!);
+    };
+    await add('z');
+    await add('a');
+    expect((await client.start('z')).kind).toBe('ready');
+    // A turn loop holds z's wrappers, from when z ran alone.
+    const held = client.tools();
+    expect(held.find(t => t.serverName === 'echo')!.name).toBe('Same__echo');
+    expect((await client.start('a')).kind).toBe('ready');
+    const aEcho = client.tools().find(t => t.server.id === 'a' && t.serverName === 'echo')!;
+    // "Always" only for a's echo.
+    const choices: Record<string, ToolChoice> = { [choiceKey('a', 'echo')]: { policy: 'allow', fingerprint: aEcho.fingerprint, setupFingerprint: aEcho.setupFingerprint } };
+    // With both running, neither has the name z's wrapper carries.
+    expect(client.tools().map(t => t.name)).not.toContain('Same__echo');
+    let asks = 0;
+    const script = (r: ModelRequest): FakeReply => (r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'Same__echo', arguments: { text: 'hi' } }] });
+    const loop = await turnLoop(world, held, script, { policy: () => ({ perTool: toolPolicies(held, choices) }), ask: () => { asks++; return false; }, storeName: 'mcp-r20-1' });
+    const t = await loop.journal.send('Echo something.', 'turn-1');
+    if (!t.replied) throw new Error('not replied');
+    await loop.journal.turn(t.turn.id).wait();
+    // z's wrapper went to the gate as z's: it asked, the person said no, and nothing was sent.
+    expect(asks).toBe(1);
+    expect(port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"'))).toEqual([]);
+    await loop.journal.close();
   });
 });

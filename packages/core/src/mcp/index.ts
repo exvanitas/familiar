@@ -19,7 +19,7 @@ export { KEY_HEADERS, KEY_PLACEHOLDER, RemoteTransport, remoteHeaders } from './
 export type { FetchLike, RemoteTarget } from './remote.ts';
 export { deleteServer, fresh, keyOf, loadServers, readServer, SAVED_VERSION, saveServer, SERVER_PREFIX } from './saved.ts';
 export type { SavedServer, SavedTool, ServerLimits } from './saved.ts';
-export { choiceKey, modelNames, outcomeText, outsideContent, serverTool, toolChanges, toolFingerprint, toolPolicies, MAX_MODEL_NAME } from './server-tools.ts';
+export { choiceKey, modelNames, outcomeText, wrapperPolicy, outsideContent, serverTool, toolChanges, toolFingerprint, toolPolicies, MAX_MODEL_NAME } from './server-tools.ts';
 export type { ServerTool, ToolChanges, ToolChoice } from './server-tools.ts';
 export { acceptAll, MAX_RESULT_CHARS, openSession, resultText } from './session.ts';
 export { CatalogError, checkTools, effectiveDescription, MAX_CATALOG_BYTES, MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES, MAX_TOOL_BYTES, MAX_TOOLS } from './catalog.ts';

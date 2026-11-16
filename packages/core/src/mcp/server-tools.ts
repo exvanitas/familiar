@@ -6,6 +6,7 @@
 import type { FamiliarTool, ToolStep } from '../journal/tools.ts';
 import type { ToolPolicy } from '../journal/gate.ts';
 import { effectiveDescription } from './catalog.ts';
+import { sha256 } from './hash.ts';
 import type { Expect } from './machine.ts';
 import type { CallOutcome, ListedTool } from './types.ts';
 
@@ -36,29 +37,64 @@ function safe(text: string): string {
   return text.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/_+/g, '_').replace(/^[_-]+|[_-]+$/g, '');
 }
 
+/** The first `n` hex characters of a SHA-256: a short, stable tag. */
+const tag = (text: string, n: number) => sha256(text).slice(0, n);
+
+/** For each group of keys that clash, the shortest tag length (from 4, by 2) that tells its members apart
+    by `tag(of(member))`. Deterministic: it depends only on who is in the group, never on order. */
+function tagLength<T>(group: readonly T[], of: (m: T) => string): number {
+  for (let n = 4; n < 64; n += 2) if (new Set(group.map(m => tag(of(m), n))).size === group.length) return n;
+  return 64;
+}
+
+function groupBy<T>(items: readonly T[], key: (t: T) => string): T[][] {
+  const groups = new Map<string, T[]>();
+  for (const i of items) groups.set(key(i), [...(groups.get(key(i)) ?? []), i]);
+  return [...groups.values()];
+}
+
 /**
  * The names the model sees: `<server>__<tool>`, made of letters, digits, `_` and `-`, at most 64
- * characters, starting with a letter, as every provider accepts. Collisions are settled the same way
- * every time: servers in id order, tools in name order, and a later duplicate gets `_2`, `_3` and so on.
+ * characters, starting with a letter, as every provider accepts. A name comes from the server's label and
+ * the tool's own name, never from order. When two servers' labels clash, each gets a short tag from a hash
+ * of its id (`Same_3f2a__echo`); when tags clash too, they grow until they don't. The same goes for two
+ * tools whose names clash once made safe or cut to length. So a name never moves to another server's
+ * tool because another server started or stopped: it's that server's, or no one's.
  */
 export function modelNames(servers: readonly { readonly id: string; readonly label: string; readonly tools: readonly { readonly name: string }[] }[]): Map<string, Map<string, string>> {
-  const out = new Map<string, Map<string, string>>();
-  const taken = new Set<string>();
-  for (const s of [...servers].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-    let prefix = safe(s.label).slice(0, PREFIX_CHARS).replace(/[_-]+$/, '') || 'server';
-    if (!/^[A-Za-z]/.test(prefix)) prefix = `s${prefix}`.slice(0, PREFIX_CHARS);
-    const names = new Map<string, string>();
-    for (const t of [...s.tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
-      // A server's list never names a tool twice (checkTools refuses it); a second one gets no name.
-      if (names.has(t.name)) continue;
-      const base = `${prefix}__${safe(t.name) || 'tool'}`.slice(0, MAX_MODEL_NAME);
-      let name = base;
-      for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base.slice(0, MAX_MODEL_NAME - String(n).length - 1)}_${n}`;
-      taken.add(name.toLowerCase());
-      names.set(t.name, name);
-    }
-    out.set(s.id, names);
+  const slug = (label: string) => {
+    const p = safe(label).slice(0, PREFIX_CHARS).replace(/[_-]+$/, '') || 'server';
+    return /^[A-Za-z]/.test(p) ? p : `s${p}`.slice(0, PREFIX_CHARS);
+  };
+  const prefix = new Map<string, string>();
+  for (const group of groupBy(servers, s => slug(s.label).toLowerCase())) {
+    if (group.length === 1) { prefix.set(group[0]!.id, slug(group[0]!.label)); continue; }
+    const n = tagLength(group, s => s.id);
+    for (const s of group) prefix.set(s.id, `${slug(s.label)}_${tag(s.id, n)}`);
   }
+  type Entry = { server: string; tool: string; name: string };
+  const entries: Entry[] = [];
+  for (const s of servers) {
+    // A server's list never names a tool twice (checkTools refuses it); a second one gets no name.
+    const tools = [...new Map(s.tools.map(t => [t.name, t])).values()];
+    const mine = tools.map(t => ({ server: s.id, tool: t.name, name: `${prefix.get(s.id)}__${safe(t.name) || 'tool'}`.slice(0, MAX_MODEL_NAME) }));
+    // Two of one server's tools that clash once made safe or cut: each gets a tag of its own name.
+    for (const group of groupBy(mine, e => e.name.toLowerCase())) {
+      if (group.length === 1) continue;
+      const n = tagLength(group, e => e.tool);
+      for (const e of group) e.name = `${e.name.slice(0, MAX_MODEL_NAME - n - 1)}_${tag(e.tool, n)}`;
+    }
+    entries.push(...mine);
+  }
+  // A clash left across servers can come only from cutting to 64: tagged by server and tool.
+  for (const group of groupBy(entries, e => e.name.toLowerCase())) {
+    if (group.length === 1) continue;
+    const n = tagLength(group, e => `${e.server}\u0000${e.tool}`);
+    for (const e of group) e.name = `${e.name.slice(0, MAX_MODEL_NAME - n - 1)}_${tag(`${e.server}\u0000${e.tool}`, n)}`;
+  }
+  const out = new Map<string, Map<string, string>>();
+  for (const s of servers) out.set(s.id, new Map());
+  for (const e of entries) out.get(e.server)!.set(e.tool, e.name);
   return out;
 }
 
@@ -156,19 +192,28 @@ export function choiceKey(serverId: string, toolName: string): string {
   return JSON.stringify([serverId, toolName]);
 }
 
+/** One wrapper's policy, from its own identity only: the server's id and the tool's own name, with both
+    fingerprints. "Always" holds only for the exact tool and setup it was given for; "never" holds whatever
+    changed, since stricter is safe. Undefined: the gate's default, which asks. */
+export function wrapperPolicy(t: ServerTool, choices: Readonly<Record<string, ToolChoice>>): ToolPolicy | undefined {
+  const c = choices[choiceKey(t.server.id, t.serverName)];
+  if (!c) return undefined;
+  if (c.policy === 'deny') return 'deny';
+  if (c.policy === 'allow' && c.fingerprint === t.fingerprint && c.setupFingerprint === t.setupFingerprint) return 'allow';
+  return undefined;
+}
+
 /**
- * The gate's per-tool policy from the person's choices, which are keyed by `choiceKey`. The policy comes
- * out keyed by model name, as the gate reads it. "Always" holds only for the exact tool and setup it was
- * given for: a changed tool or a new command, address or version puts it back to ask. "Never" holds
- * whatever changed, since stricter is safe.
+ * The gate's per-tool policy, keyed by model name as the gate reads it, for the wrappers a turn holds:
+ * each entry comes from that wrapper's own identity (`wrapperPolicy`), never from a map built by name
+ * across servers. Give it the very wrappers the turn loop was given, so a name always means the wrapper
+ * that carries it.
  */
 export function toolPolicies(tools: readonly ServerTool[], choices: Readonly<Record<string, ToolChoice>>): Record<string, ToolPolicy> {
   const out: Record<string, ToolPolicy> = {};
   for (const t of tools) {
-    const c = choices[choiceKey(t.server.id, t.serverName)];
-    if (!c) continue;
-    if (c.policy === 'deny') out[t.name] = 'deny';
-    else if (c.policy === 'allow' && c.fingerprint === t.fingerprint && c.setupFingerprint === t.setupFingerprint) out[t.name] = 'allow';
+    const p = wrapperPolicy(t, choices);
+    if (p) out[t.name] = p;
   }
   return out;
 }
