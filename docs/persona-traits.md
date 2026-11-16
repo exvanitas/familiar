@@ -46,7 +46,7 @@ Three traits and her interests. Each trait has three values, and the middle one 
 
 **What was left out.** A tone or mood trait (gentle, playful, dry): the kind of a reaction comes from the event, and how she sounds is the chat model's job, from the whole card. A per-day mood: random by design, so it can't be tested or taught. A trait per moment: too many to read from a card or set by hand.
 
-**Interests, matched exactly.** Compared trimmed and in lowercase. Music: an interest equal to the track's mood tag, as now. A new app: each entry in the known-app list carries its name and two or three interest words (Krita: drawing, painting, art). The app is among her interests when one of her interests equals its name, or contains one of its words as a whole word, so "digital painting" matches Krita. The list is a file in the app folder, and the same list goes to the data writers.
+**Interests, matched exactly.** Compared trimmed and in lowercase. Music: an interest equal to the track's mood tag, as now. A new app: each entry in the known-app list carries its name and two or three interest words (Krita: drawing, painting, art). The app is among her interests when one of her interests equals its name, or contains one of its words as a whole word, so "digital painting" matches Krita. The list and the exact matching rule are in [moments.md](moments.md#later-opt-in-device-added-and-app-installed). It ships as a file in the app folder, and the same list goes to the data writers.
 
 **Lively hours, exactly.** A morning person is lively from 05:00 to 11:59 and sleepy from 21:00 to 03:59. A night owl is lively from 20:00 to 03:59 and sleepy from 05:00 to 11:59. 04:00 to 04:59 is neither, since the day starts at 04:00.
 

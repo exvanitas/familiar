@@ -83,6 +83,32 @@ Decided by the owner on 2026-11-16: "opt-in is fine". Both need native reads the
 
 Nothing from either is ever sent anywhere: the app's network is closed to everything but the places you approved.
 
+**The known-app list, first version.** Each app has two or three interest words. An app counts as among her interests when, after both are lowercased, every character that isn't a letter or a digit is turned into a space and spaces are collapsed, one of her interests equals the app's name or contains one of its words as whole words. So "digital painting" matches Krita, "art" matches Krita, and "smart home" doesn't.
+
+| App | Interest words |
+| --- | --- |
+| Steam | games, gaming, video games |
+| Epic Games Launcher | games, gaming |
+| Battle.net | games, gaming |
+| Minecraft Launcher | minecraft, games, building |
+| Spotify | music, playlists, songs |
+| OBS Studio | streaming, recording, videos |
+| DaVinci Resolve | video editing, films, videos |
+| VLC media player | films, movies, videos |
+| Audacity | audio, podcasts, recording |
+| FL Studio | music production, beats, music |
+| MuseScore | composing, sheet music, music |
+| Blender | 3d, modelling, animation |
+| Krita | drawing, painting, art |
+| Aseprite | pixel art, sprites, art |
+| Inkscape | illustration, vector art, art |
+| GIMP | photo editing, photography, images |
+| Godot | game development, gamedev |
+| Visual Studio Code | coding, programming, code |
+| Obsidian | notes, writing, journaling |
+| Anki | studying, flashcards, languages |
+| Calibre | books, reading, ebooks |
+
 ## The chat rule
 
 This is the rule file for the data wave (plain text, appended to the writer and labeller prompts), and the rules decider's new rules, word for word:
