@@ -357,3 +357,36 @@ describe('the tools a turn sees', () => {
     expect(w.client.tools().every(t => t.server.id === a)).toBe(true);
   });
 });
+
+describe('the MCP client, remote, over legacy SSE', () => {
+  it('connects through the injected fetch, lists and calls, with the origin as its address', async () => {
+    const { createServer } = await import('node:http');
+    const { SSEServerTransport } = await import('../../../../tools/fake-mcp-server/node_modules/@modelcontextprotocol/sdk/dist/esm/server/sse.js');
+    const { createFakeServer } = await import('../../../../tools/fake-mcp-server/src/server.ts');
+    const sessions = new Map<string, InstanceType<typeof SSEServerTransport>>();
+    const http = createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/sse') {
+        const t = new SSEServerTransport('/messages', res);
+        sessions.set(t.sessionId, t);
+        void createFakeServer().connect(t);
+        return;
+      }
+      const id = new URL(req.url ?? '', 'http://x').searchParams.get('sessionId') ?? '';
+      const t = sessions.get(id);
+      if (req.method === 'POST' && t) return void t.handlePostMessage(req, res);
+      res.writeHead(404).end();
+    });
+    await new Promise<void>(r => http.listen(0, '127.0.0.1', r));
+    cleanups.push(() => new Promise<void>(r => { http.closeAllConnections(); http.close(() => r()); }));
+    const port = (http.address() as { port: number }).port;
+    let fetched = 0;
+    const counting: FetchLike = (url, init) => { fetched++; return fetch(url, init); };
+    const w = await world({ fetchFor: () => counting });
+    const { id } = await w.client.add(remoteDraft({ label: 'Old style', url: `http://127.0.0.1:${port}/sse`, transport: 'sse', headers: [] }, { newId }));
+    expect(w.addresses.added).toEqual([`http://127.0.0.1:${port}`]);
+    expect((await w.client.start(id)).kind).toBe('ready');
+    expect(await w.client.call(id, 'echo', { text: 'over sse' })).toMatchObject({ kind: 'result', text: 'over sse' });
+    expect(fetched).toBeGreaterThan(1);
+    await w.client.stop(id);
+  });
+});

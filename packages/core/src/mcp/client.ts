@@ -20,6 +20,15 @@ import { processSetupOf, remoteTargetOf, secretRefs, setupFingerprint, setupProb
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 import { unpinned, type Unpinned } from './unpinned.ts';
 
+/**
+ * The address the person approves for a remote server. Streamable HTTP uses one URL, so that's the
+ * address. A legacy SSE server names the URL for its posts itself, often beside the stream's path rather
+ * than under it, and the SDK keeps it to the same origin, so an SSE server's address is its origin.
+ */
+export function addressUrl(s: { url: string; transport: 'http' | 'sse' }): string {
+  return s.transport === 'sse' ? new URL(s.url).origin : s.url;
+}
+
 /** Saved addresses: the exe's `address_add` (which asks the person) and `address_remove` (which deletes
     the address's key). */
 export interface AddressPort {
@@ -116,7 +125,7 @@ export class McpClient {
     if (this.entries.has(draft.setup.id)) throw new Error('A server with this id is already saved.');
     let setup: ServerSetup = draft.setup;
     if (setup.kind === 'remote') {
-      const address = await this.o.addresses.add({ url: setup.url, label: setup.label });
+      const address = await this.o.addresses.add({ url: addressUrl(setup), label: setup.label });
       setup = { ...setup, address: address.id };
     }
     const saved: SavedServer = { setup, enabled: false, limits: {}, tools: [] };

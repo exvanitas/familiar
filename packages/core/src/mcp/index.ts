@@ -1,7 +1,7 @@
 // The MCP client. See docs/mcp-design.md.
 export { ServerActor } from './actor.ts';
 export type { ActorOptions, CallOptions, ServerView } from './actor.ts';
-export { McpClient } from './client.ts';
+export { addressUrl, McpClient } from './client.ts';
 export type { AddressPort, McpClientOptions, SecretPort, ServerStatus, TestedTool, TestReport } from './client.ts';
 export { canonicalJson, sha256 } from './hash.ts';
 export { CALL_MS, CALL_MS_MAX, CALL_MS_MIN, createMachine, DEFAULT_LIMITS, INIT_MS, INIT_MS_MAX, INIT_MS_MIN, resting, step } from './machine.ts';
