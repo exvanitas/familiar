@@ -37,7 +37,7 @@ Later, opt-in, with a new exe: new devices (class only) and installed apps (matc
 
 **Idle under fullscreen or presentation doesn't count as away, but a lock always does.** Watching a film is not being away, and a locked PC is. So the time away is the idle stretch without the parts that fullscreen or a presentation covered, and any part while the PC was locked always counts. Unlocking is an arrival, like input after idle, even if you don't touch anything after the password. While the PC is locked she's quiet: nobody can see her.
 
-**When the lock can't be read.** The exe reports `locked` as yes, no or unknown, never a guess. A failed read is never an unlock. After a confirmed lock, unknown keeps it locked: she stays quiet and the held moments stay held until a read says unlocked. With no confirmed lock (at start, say), unknown means Familiar runs on the idle number alone, as it did before the lock was added, rather than going silent on a PC where the read never works. If reads keep failing for a minute, the log says so once, and Settings shows "Can't tell when the screen is locked".
+**When the lock can't be read.** The exe reports `locked` as yes, no or unknown, never a guess. A failed read is never an unlock. After a confirmed lock, unknown keeps it locked: she stays quiet and the held moments stay held until a read says unlocked. At start, unknown means quiet, with the once-a-day moments held, for up to 2 minutes. If reads still fail after that, Familiar runs on the idle number alone, as it did before the lock was added, rather than going silent on a PC where the read never works. If reads keep failing for a minute, the log says so once, and Settings shows "Can't tell when the screen is locked".
 
 ## The presence coordinator: one moment at a time
 
@@ -109,12 +109,12 @@ The Claviger Familiar pool (key1, 21,254 points) has no `chat`. The rule above g
 `schemas.py`, `EVENTS`:
 
 ```python
-"app": (... existing ..., "question-unanswered"),
+"app": (... existing ..., "question-unanswered", "ack-sent"),
 "system": (... existing ..., "back-after-long", "device-added", "app-installed"),
 "day": ("first-hello", "special-day"),
 ```
 
-None goes in `RULE_EVENTS`. The writer prompt also says: don't use `first-open-today`; `back-after` only for 20 to 59 minutes away (or shorter, labelled quiet); the `detail` formats above; a late-night `long-session` has its time between 23:00 and 05:00; at most 2 chats per timeline-day; and after a goodbye, `message-sent` carries detail `"a goodbye"`.
+None goes in `RULE_EVENTS`. `ack-sent` is a bare thanks that doesn't answer her question, for the traits ([persona-traits.md](persona-traits.md#the-data-wave-contrast-pairs)); a message that answers her stays `message-sent`. The writer prompt also says: don't use `first-open-today`; `back-after` only for 20 to 59 minutes away (or shorter, labelled quiet); the `detail` formats above; a late-night `long-session` has its time between 23:00 and 05:00; at most 2 chats per timeline-day; and after a goodbye, `message-sent` carries detail `"a goodbye"`.
 
 Three checks the validator can add cheaply: `chat` only on the six types and on `long-session` between 23:00 and 05:00; no more than 2 `chat` labels per local day, the day starting at 04:00 (a timeline that crosses 04:00 can have 2 on each side); and at most one `nudge` above quiet per night, 23:00 to 05:00, not reset at 04:00.
 
