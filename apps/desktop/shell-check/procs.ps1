@@ -422,6 +422,11 @@ function Run-ProcChecks {
     [void](Run-Phase 'proc-race' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-race-data'), '--log', $log, '--seconds', '400', '--phase', 'proc-race') 430)
     [void](No-Strays 'proc-race')
 
+    # The MCP client through the exe (mcp-checks.ts), in a data folder of its own.
+    $log = Join-Path $Out 'proc-mcp.log'
+    [void](Run-Phase 'proc-mcp' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-mcp-data'), '--log', $log, '--seconds', '300', '--phase', 'proc-mcp') 330)
+    [void](No-Strays 'proc-mcp')
+
     $log = Join-Path $Out 'proc-stopped.log'
     [void](Run-Phase 'proc-stopped' $log @('--app-dir', $App, '--data-dir', (Join-Path $tmp 'proc-stopped-data'), '--log', $log, '--seconds', '240', '--phase', 'proc-stopped') 270)
     [void](No-Strays 'proc-stopped')

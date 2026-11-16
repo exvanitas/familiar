@@ -9,7 +9,7 @@ import { probe } from './net-checks.ts';
 /* The spike's ENV_ALLOWLIST, which is all a server inherits. */
 const ALLOWLIST = ['SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT', 'Path', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'CommonProgramFiles', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'USERNAME'];
 
-interface Paths {
+export interface Paths {
   repo: string;
   mainTs: string;
   node: string;
@@ -20,12 +20,12 @@ interface Paths {
 
 interface Dialog { shown: boolean; text: string }
 
-const START = ['Start it', "Don't start"] as const;
+export const START = ['Start it', "Don't start"] as const;
 const OPEN = ['Open', "Don't open"] as const;
 
 /* The confirm, answered by driver-net.ps1's dialog step: approve, refuse, or none (look for one,
    and refuse it if it came). What it showed, details included. */
-async function dialog(act: 'approve' | 'refuse' | 'none', [approve, refuse]: readonly [string, string]): Promise<Dialog> {
+export async function dialog(act: 'approve' | 'refuse' | 'none', [approve, refuse]: readonly [string, string]): Promise<Dialog> {
   const r = await step<{ found: boolean; texts: string[]; details: string; answered: string }>('dialog', { act, approve, refuse, details: act !== 'none' }, 60000);
   if (act === 'none' && r.found) await step('dialog', { act: 'refuse', approve, refuse }, 60000);
   return { shown: r.found, text: [...(r.texts ?? []), r.details ?? ''].join('\n') };

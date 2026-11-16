@@ -11,6 +11,7 @@ import { confirmChecks } from './confirm-checks.ts';
 import { netChecks, proxyStartChecks, removeRestartChecks, responsiveControl } from './net-checks.ts';
 import { modelChecks } from './model-checks.ts';
 import { procPhase } from './procs.ts';
+import { mcpChecks } from './mcp-checks.ts';
 
 const messages: CoreMessage[] = [];
 let onQuitting: () => void = () => {};
@@ -474,6 +475,11 @@ async function pinRead(info: Info, value: string, id: string) {
       await shell.quit();
     } else if (phase === 'proxy-start') {
       await proxyStartChecks();
+      onQuitting = () => { shell.quitReady().catch(() => {}); };
+      await say('DONE');
+      await shell.quit();
+    } else if (phase === 'proc-mcp') {
+      await mcpChecks({ ask, up });
       onQuitting = () => { shell.quitReady().catch(() => {}); };
       await say('DONE');
       await shell.quit();
