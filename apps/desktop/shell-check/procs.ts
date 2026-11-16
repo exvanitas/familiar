@@ -110,7 +110,10 @@ async function refusedBefore(setup: Setup, kind: string): Promise<string | null>
 /* What core.ts hands over: asking another check page, and waiting for one to load. */
 export interface Ctx {
   ask<T = unknown>(to: string, cmd: string, args?: unknown, ms?: number): Promise<T>;
+  /** Waits for a page's hello. A window already open answers at once. */
   up(role: string): Promise<unknown>;
+  /** Forgets a closed window's hello, so `up` after reopening it waits for the new page. */
+  closed?(role: string): void;
 }
 
 async function main(info: Info, ctx: Ctx) {

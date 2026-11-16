@@ -1,5 +1,5 @@
 {
-  "description": "Every security id that must PASS on the Windows runner, prefixed security. in the results. Only the ids with checks so far: later rounds append theirs (see section 7 of docs/shell-design.md). The release gate requires the whole list in the design. `knownGaps` marks ids the release must close, each with its reason: everyday runs report them as KNOWN GAP and stay green, and the gate's release mode fails while any mark is present.",
+  "description": "Every security id that must PASS on the Windows runner, prefixed security. in the results. Only the ids with checks so far: later rounds append theirs (see section 7 of docs/shell-design.md). The release gate requires the whole list in the design. `knownGaps` marks ids the release must close, each with its reason and the detail its FAIL is expected to start with: everyday runs report that FAIL as KNOWN GAP and stay green, any other FAIL or no report fails, and the gate's release mode fails while any mark is present.",
   "ids": [
     "caps.static",
     "caps.view-refused",
@@ -81,6 +81,9 @@
     "mcp.secret-json-escaped"
   ],
   "knownGaps": {
-    "mcp.secret-json-escaped": "pre-release native pass: JSON-escaped redaction"
+    "mcp.secret-json-escaped": {
+      "reason": "pre-release native pass: JSON-escaped redaction",
+      "expect": "an escaped copy came back"
+    }
   }
 }

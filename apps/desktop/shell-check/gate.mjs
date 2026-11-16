@@ -5,10 +5,12 @@
 // Any reported id in neither list, in either namespace, fails the run, so a renamed or new check
 // can't slip past.
 //
-// Known gaps: a security id marked in the inventory's `knownGaps`, with its reason, is a gap the release
-// must close. In everyday runs it's reported as KNOWN GAP, printed and counted, and never fails, whatever
-// it reports. In release mode (`--release`, or FAMILIAR_GATE_RELEASE=1) every mark still present fails,
-// so a gap can't ship. Closing one means making it pass and removing its mark. The egress verdicts come from an analysis of this run's capture: each must carry
+// Known gaps: a security id marked in the inventory's `knownGaps`, with its reason and the detail its FAIL
+// is expected to start with (`expect`), is a gap the release must close. In everyday runs a FAIL with that
+// detail is reported as KNOWN GAP, printed and counted, and doesn't fail. Any other FAIL, a SKIP, or no
+// report at all fails, since then the check couldn't measure the gap; a PASS is noted (the mark can go).
+// In release mode (`--release`, or FAMILIAR_GATE_RELEASE=1) every mark still present fails, so a gap
+// can't ship. Closing one means making it pass and removing its mark. The egress verdicts come from an analysis of this run's capture: each must carry
 // `run=<id>` matching the driver's `RUN <id>` line, so one left from another run fails.
 //
 //   node gate.mjs [--release] <results file>...
@@ -32,7 +34,12 @@ export function judge(lines, inventory, checks, { knownGaps = {}, release = fals
     if (id.startsWith('security.')) {
       const name = id.slice('security.'.length);
       if (!inventory.includes(name)) problems.push(`${id}: not in the security inventory`);
-      else if (Object.hasOwn(knownGaps, name)) continue;
+      else if (Object.hasOwn(knownGaps, name)) {
+        const expect = knownGaps[name]?.expect;
+        const odd = reports.find(r => r.state !== 'PASS' && !(r.state === 'FAIL' && typeof expect === 'string' && expect !== '' && r.detail.startsWith(expect)));
+        if (odd) problems.push(`${id}: ${odd.state} that isn't the known gap it's marked for: ${odd.detail}`);
+        continue;
+      }
       else if (states.some(s => s !== 'PASS')) problems.push(`${id}: ${states.join('/')}: ${reports.find(r => r.state !== 'PASS').detail}`);
       else if (id.startsWith('security.egress.') && !(runs.length === 1 && reports.every(r => r.detail.endsWith(` run=${runs[0]}`)))) {
         problems.push(`${id}: not from this run's analysis`);
@@ -45,13 +52,15 @@ export function judge(lines, inventory, checks, { knownGaps = {}, release = fals
       problems.push(`${id}: no namespace`);
     }
   }
-  for (const name of inventory) if (!seen.has(`security.${name}`) && !Object.hasOwn(knownGaps, name)) problems.push(`security.${name}: never reported`);
-  for (const [name, reason] of Object.entries(knownGaps)) {
+  for (const name of inventory) if (!seen.has(`security.${name}`)) problems.push(`security.${name}: never reported`);
+  for (const [name, mark] of Object.entries(knownGaps)) {
+    const reason = mark?.reason;
     const states = (seen.get(`security.${name}`) ?? []).map(r => r.state);
-    const line = `security.${name}: KNOWN GAP (${reason}): ${states.length ? states.join('/') : 'never reported'}`;
+    const line = `security.${name}: KNOWN GAP (${reason}): ${states.length ? states.join('/') : 'never reported'}${states.length && states.every(s => s === 'PASS') ? '; it passes now, so its mark can go' : ''}`;
     gaps.push(line);
     if (!inventory.includes(name)) problems.push(`security.${name}: marked as a known gap but not in the inventory`);
     if (typeof reason !== 'string' || reason.trim() === '') problems.push(`security.${name}: a known gap with no reason`);
+    if (typeof mark?.expect !== 'string' || mark.expect.trim() === '') problems.push(`security.${name}: a known gap with no expected detail`);
     if (release) problems.push(`${line}: a release can't ship with an open known gap`);
   }
   const count = s => [...seen.values()].flat().filter(r => r.state === s).length;

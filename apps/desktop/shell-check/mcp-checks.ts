@@ -20,10 +20,12 @@
      typed in again, shows the dialog again.
    - security.mcp.secret-json-escaped, a known gap: the driver types a key holding a quote into Settings,
      the fake server prints it, and it passes only if the JSON-escaped form (\") is blanked too. The
-     exe blanks literal copies only, so it fails until the pre-release native pass. Its mark in
-     security-inventory.json makes the gate report it as KNOWN GAP in everyday runs, and fail a release. */
+     exe blanks literal copies only, so it fails until the pre-release native pass, with exactly the
+     detail its mark in security-inventory.json expects. The gate reports that as KNOWN GAP in everyday
+     runs and fails a release; any other failure of this check fails every run. */
 import { gateFor, McpClient, openSettingsStore, parsePaste, systemClock, toolPolicies, choiceKey, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
 import { desktopMcpPorts } from '../src/mcp.ts';
+import { reason } from '../src/shell.ts';
 import { check, fail, ok, rand, shell, sleep, step, until } from './common.ts';
 import { dialog, START, type Ctx, type Paths } from './procs.ts';
 
@@ -32,6 +34,9 @@ interface Typed { head: string; tail: string; length: number }
 const noWrites: ToolStep = { id: 'mcp-check', write: async () => fail('a server tool made a built-in write') };
 const run = (t: ServerTool | undefined, args: object) => (t ? t.run(args, noWrites) : Promise.reject(new Error('no such tool')));
 const TOOLS = 10;
+/** The detail security.mcp.secret-json-escaped fails with while its known gap is open, as its mark in
+    security-inventory.json expects. */
+export const ESCAPED_GAP = 'an escaped copy came back';
 
 export async function mcpChecks(ctx: Ctx): Promise<void> {
   const p = await step<Paths>('proc-paths', {}, 120000);
@@ -58,15 +63,23 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
 
   /** Settings stores a key the driver types for `ref`: the page never learns it. */
   async function enterKey(ref: string, quote = false): Promise<Typed> {
+    // A Settings window opened before said hello then: forget it, so this waits for the new page.
+    ctx.closed?.('settings');
     await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
-    await ctx.up('settings');
-    await ctx.ask('settings', 'paste-ready');
-    const k = await step<Typed>('type-key', { title: 'Familiar check settings', long: false, quote });
-    const saved = await ctx.ask<string>('settings', 'save-key', ref);
-    await shell.windowCtl('settings', 'close');
-    if (saved !== 'ok') fail('Settings could not save the key: ' + saved);
-    typed.push(k);
-    return k;
+    try {
+      await ctx.up('settings');
+      await ctx.ask('settings', 'paste-ready');
+      const k = await step<Typed>('type-key', { title: 'Familiar check settings', long: false, quote });
+      const saved = await ctx.ask<string>('settings', 'save-key', ref);
+      if (saved !== 'ok') fail('Settings could not save the key: ' + saved);
+      typed.push(k);
+      return k;
+    } finally {
+      // Closed whatever happened, and gone before the next check opens it again.
+      await shell.windowCtl('settings', 'close').catch(() => {});
+      ctx.closed?.('settings');
+      await until(() => shell.windowCtl('settings', 'get-bounds').then(() => false, (e: unknown) => /missing/.test(reason(e))), 10_000, 'Settings to close');
+    }
   }
 
   /** Test, with the driver approving the dialog. */
@@ -231,7 +244,9 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const texts = [JSON.stringify(r), ...heard.slice(from)];
     await client.remove(added.id);
     const leaked = texts.filter(t => t.includes(k.head) || t.includes(k.tail)).length;
-    ok(leaked === 0, `KNOWN GAP: a key holding a quote came back JSON-escaped and unblanked in ${leaked} texts; the pre-release native pass blanks escaped forms`);
+    // Exactly the known gap's expected words when the escaped copy comes back; anything else that fails
+    // here (the server didn't start, Settings couldn't store the key) has other words, and fails the gate.
+    if (leaked) fail(`${ESCAPED_GAP}: in ${leaked} texts, unblanked; the pre-release native pass blanks escaped forms`);
     return 'a key holding a quote came back blanked in its JSON-escaped form too';
   });
 }
