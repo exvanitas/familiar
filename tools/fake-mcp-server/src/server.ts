@@ -1,6 +1,7 @@
 // A fake MCP server for dev and tests. Its tools cover what Familiar's MCP client must handle:
 // read-only and writing tools, a slow call to stop, a tool error, a crash mid-call, a secret in the output,
-// the settings it was started with, outside content, and a changed tool description (variant b).
+// the settings it was started with, outside content, and a changed tool description: variant b from the
+// start, or set_variant on a running server, which also tells the client its tools changed.
 //
 // It uses the SDK's low-level Server, not McpServer, so the tool list goes out exactly as written here,
 // the way an arbitrary third-party server's would.
@@ -20,6 +21,8 @@ export type Variant = 'a' | 'b';
 export interface FakeServerOptions {
   /** 'b' changes echo's description and behaviour, to test the re-ask on a changed tool. */
   readonly variant?: Variant;
+  /** The variant shared across connections, which set_variant changes. The HTTP server shares one. */
+  readonly shared?: { variant: Variant };
   /** The settings it was started with. print_secret and list_env read these. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Its log. The program writes it to stderr. */
@@ -114,6 +117,17 @@ export function fakeTools(variant: Variant = 'a'): Tool[] {
       annotations: { readOnlyHint: false, destructiveHint: false }
     },
     {
+      name: 'set_variant',
+      description: "Switches echo to variant a or b on this running server, and tells the client the server's tools changed.",
+      inputSchema: {
+        type: 'object',
+        properties: { variant: { type: 'string', enum: ['a', 'b'] } },
+        required: ['variant'],
+        additionalProperties: false
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false }
+    },
+    {
       name: 'read_page',
       description: 'Returns a fixed web page, the way outside content arrives.',
       inputSchema: noInput,
@@ -123,14 +137,14 @@ export function fakeTools(variant: Variant = 'a'): Tool[] {
 }
 
 export function createFakeServer(options: FakeServerOptions = {}): Server {
-  const variant = options.variant ?? 'a';
+  const shared = options.shared ?? { variant: options.variant ?? 'a' };
   const env = options.env ?? {};
   const log = options.log ?? (() => {});
   const notes = options.notes ?? [];
 
-  const server = new Server({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
+  const server = new Server({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: { listChanged: true } } });
 
-  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: fakeTools(variant) }));
+  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: fakeTools(shared.variant) }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
     const args: Record<string, unknown> = request.params.arguments ?? {};
@@ -138,7 +152,7 @@ export function createFakeServer(options: FakeServerOptions = {}): Server {
     switch (request.params.name) {
       case 'echo': {
         if (typeof args.text !== 'string') return toolError('text must be a string.');
-        return text(variant === 'b' ? args.text.toUpperCase() : args.text);
+        return text(shared.variant === 'b' ? args.text.toUpperCase() : args.text);
       }
       case 'add_note': {
         if (typeof args.text !== 'string') return toolError('text must be a string.');
@@ -173,6 +187,12 @@ export function createFakeServer(options: FakeServerOptions = {}): Server {
         );
       case 'read_page':
         return text(OUTSIDE_CONTENT);
+      case 'set_variant': {
+        if (args.variant !== 'a' && args.variant !== 'b') return toolError('variant must be a or b.');
+        shared.variant = args.variant;
+        await server.sendToolListChanged();
+        return text(`Variant ${args.variant}.`);
+      }
       case 'spawn_tree': {
         if (!options.spawnTree) return toolError('This server can not start processes.');
         if (typeof args.token !== 'string' || !/^[a-z0-9]{8,64}$/.test(args.token)) return toolError('token must be 8 to 64 lower-case letters and digits.');

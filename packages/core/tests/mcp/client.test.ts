@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { startHttp } from '../../../../tools/fake-mcp-server/src/http.ts';
 import { OUTSIDE_CONTENT } from '../../../../tools/fake-mcp-server/src/server.ts';
 import { systemClock } from '../../src/journal/journal.ts';
-import { KEY_PLACEHOLDER, localDraft, McpClient, parsePaste, remoteDraft, toolPolicies, type FetchLike, type McpClientOptions, type ServerTool } from '../../src/index.ts';
+import { choiceKey, KEY_PLACEHOLDER, localDraft, McpClient, parsePaste, posixPaths, remoteDraft, SSE_WORDS, toolPolicies, type FetchLike, type McpClientOptions, type ServerTool } from '../../src/index.ts';
 import { memorySettingsStore } from '../../src/settings/store.ts';
 import { FAKE_MAIN, BLANKED_VALUE, REPO } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
@@ -34,6 +34,7 @@ async function world(extra: Partial<McpClientOptions> = {}): Promise<World> {
   const deleted: string[] = [];
   const addresses = { added: [] as string[], removed: [] as string[] };
   const client = await McpClient.open({
+    paths: posixPaths,
     store,
     processes: port,
     fetchFor: () => fetch,
@@ -55,7 +56,7 @@ const paste = (env: Record<string, string> = {}, args: string[] = []) => JSON.st
 /** Adds the fake server by paste, as Settings would: the draft's secret values go to "Credential
     Manager", and core gets the draft. */
 async function addFake(w: World, env: Record<string, string> = {}, args: string[] = []) {
-  const { drafts } = parsePaste(paste(env, args), { newId, defaultCwd: REPO });
+  const { drafts } = parsePaste(paste(env, args), { newId, defaultCwd: REPO, paths: posixPaths });
   const draft = drafts[0]!;
   expect(draft.problems).toEqual([]);
   const { id, secretRefs } = await w.client.add(draft);
@@ -90,6 +91,7 @@ describe('the MCP client, local, against the fake server', () => {
     expect(report.ok).toBe(true);
     if (!report.ok) return;
     expect(report.tools.map(t => t.name)).toContain('echo');
+    expect(report.tools).toHaveLength(10);
     expect(report.tools.every(t => t.fresh && /^[0-9a-f]{64}$/.test(t.fingerprint))).toBe(true);
     // Test stops it again, since it wasn't running.
     expect(w.client.get(id)?.phase).toBe('stopped');
@@ -173,7 +175,7 @@ describe('the MCP client, local, against the fake server', () => {
     expect((await w.client.start(id)).kind).toBe('ready');
   });
 
-  it('a changed tool goes back to ask, and a new version puts every tool back to ask', async () => {
+  it('a new version puts every tool back to ask, and the edit waits its turn with a start (r19 #5)', async () => {
     const w = await world();
     const id = await addFake(w);
     const first = await w.client.test(id);
@@ -181,33 +183,80 @@ describe('the MCP client, local, against the fake server', () => {
     await w.client.markReviewed(id, first.tools.map(t => t.name));
     await w.client.start(id);
     const a = w.client.tools();
-    // The person said "always" to every tool, for this exact tool and setup.
-    const always = Object.fromEntries(a.map(t => [t.name, { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
+    // The person said "always" to every tool, for this exact tool and setup, keyed by server and tool.
+    const always = Object.fromEntries(a.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
     expect(Object.values(toolPolicies(a, always)).every(p => p === 'allow')).toBe(true);
+    expect(Object.keys(toolPolicies(a, always))).toHaveLength(a.length);
     await w.client.stop(id);
 
-    // The same server, now variant b: echo's description changed.
-    const { drafts } = parsePaste(paste({}, ['--variant', 'b']), { newId, defaultCwd: REPO });
-    await w.client.edit(id, drafts[0]!);
-    const second = await w.client.test(id);
-    if (!second.ok) throw new Error(second.failure.words);
-    expect(second.changes.changed).toEqual(['echo']);
-    expect(second.tools.filter(t => t.fresh).map(t => t.name)).toEqual(['echo']);
+    // The same server, now variant b, edited and started at once: the start waits for the edit, and the
+    // run that starts is the new setup.
+    const { drafts } = parsePaste(paste({}, ['--variant', 'b']), { newId, defaultCwd: REPO, paths: posixPaths });
+    const editing = w.client.edit(id, drafts[0]!);
+    const starting = w.client.start(id);
+    await editing;
+    expect((await starting).kind).toBe('ready');
+    expect(w.port.written.some(l => l.includes('initialize'))).toBe(true);
+    expect(await w.client.call(id, 'echo', { text: 'new' })).toMatchObject({ kind: 'result', text: 'NEW' });
+    const b = w.client.tools();
+    expect(b.every(t => t.setupFingerprint !== a[0]!.setupFingerprint)).toBe(true);
+    expect(b.filter(t => t.fresh).map(t => t.serverName)).toEqual(['echo']);
+    // A new setup: "always" no longer holds for any tool. "Never" still holds.
+    expect(toolPolicies(b, always)).toEqual({});
+    const echo = b.find(t => t.serverName === 'echo')!;
+    expect(toolPolicies(b, { [choiceKey(id, 'echo')]: { policy: 'deny', fingerprint: 'old', setupFingerprint: 'old' } })).toEqual({ [echo.name]: 'deny' });
     // The exe asked again, since the arguments changed.
     expect(w.port.asked).toBe(2);
+    // An edit is refused while the server runs.
+    await expect(w.client.edit(id, drafts[0]!)).rejects.toThrow('Stop the server before changing it.');
+  });
+
+  it('a tool changed on the running server: the old wrapper never sends, and only that tool goes back to ask (r19 #3)', async () => {
+    const w = await world();
+    const id = await addFake(w);
     await w.client.start(id);
-    const b = w.client.tools();
-    expect(b.filter(t => t.fresh).map(t => t.serverName)).toEqual(['echo']);
-    const echo = b.find(t => t.serverName === 'echo')!;
-    expect(echo.fingerprint).not.toBe(a.find(t => t.serverName === 'echo')!.fingerprint);
-    // A new setup: "always" no longer holds for any tool. Deny would still hold.
-    expect(toolPolicies(b, always)).toEqual({});
-    expect(toolPolicies(b, { [echo.name]: { policy: 'deny', fingerprint: 'old', setupFingerprint: 'old' } })).toEqual({ [echo.name]: 'deny' });
-    // With the setup as it is now, only the changed tool lost its "always".
-    const sameSetup = Object.fromEntries(Object.entries(always).map(([k, v]) => [k, { ...v, setupFingerprint: echo.setupFingerprint }]));
-    const now = toolPolicies(b, sameSetup);
-    expect(now[echo.name]).toBeUndefined();
-    expect(Object.keys(now)).toHaveLength(b.length - 1);
+    const before = w.client.tools();
+    const always = Object.fromEntries(before.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
+    const oldEcho = before.find(t => t.serverName === 'echo')!;
+    // The server changes echo while it runs, and says its tools changed.
+    expect(await w.client.call(id, 'set_variant', { variant: 'b' })).toMatchObject({ kind: 'result' });
+    await until(() => w.client.tools().find(t => t.serverName === 'echo')!.fingerprint !== oldEcho.fingerprint);
+    const sentBefore = sentCalls(w.port, 'echo');
+    await expect(oldEcho.run({ text: 'old' }, { id: 's', write: async () => { throw new Error('no'); } })).rejects.toThrow(/echo changed since it was offered, so Familiar didn't send the call/);
+    expect(sentCalls(w.port, 'echo')).toBe(sentBefore);
+    const after = w.client.tools();
+    const policies = toolPolicies(after, always);
+    expect(policies[oldEcho.name]).toBeUndefined();
+    expect(Object.keys(policies)).toHaveLength(after.length - 1);
+    const newEcho = after.find(t => t.serverName === 'echo')!;
+    expect(await newEcho.run({ text: 'new' }, { id: 's', write: async () => { throw new Error('no'); } })).toMatch(/\nNEW$/);
+  });
+
+  it('"always" never passes from one server to another with the same setup (r19 #4)', async () => {
+    const w = await world();
+    const a = await addFake(w);
+    await w.client.start(a);
+    const tool = w.client.tools().find(t => t.serverName === 'echo')!;
+    const always = { [choiceKey(tool.server.id, 'echo')]: { policy: 'allow' as const, fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint } };
+    await w.client.stop(a);
+    const b = await addFake(w);
+    await w.client.start(b);
+    const other = w.client.tools().find(t => t.serverName === 'echo')!;
+    expect(other.name).toBe(tool.name);
+    expect(other.fingerprint).toBe(tool.fingerprint);
+    expect(toolPolicies([other], always)).toEqual({});
+  });
+
+  it('a call already stopped is answered at once and writes nothing (r19 #13)', async () => {
+    const w = await world();
+    const id = await addFake(w);
+    await w.client.start(id);
+    const before = w.port.written.length;
+    const stop = new AbortController();
+    stop.abort();
+    expect(await w.client.call(id, 'add_note', { text: 'never' }, { signal: stop.signal })).toEqual({ kind: 'stopped' });
+    await new Promise(r => setTimeout(r, 100));
+    expect(w.port.written.length).toBe(before);
   });
 
   it("print_secret comes back blanked: the reply, the model's text and the last output", async () => {
@@ -248,22 +297,22 @@ describe('the MCP client, local, against the fake server', () => {
     const no = await world();
     const port = nodeProcessPort({ ask: () => false });
     cleanups.push(() => port.closeAll());
-    const client = await McpClient.open({ store: memorySettingsStore(), processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
-    const { drafts } = parsePaste(paste(), { newId, defaultCwd: REPO });
+    const client = await McpClient.open({ paths: posixPaths, store: memorySettingsStore(), processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+    const { drafts } = parsePaste(paste(), { newId, defaultCwd: REPO, paths: posixPaths });
     const { id } = await client.add(drafts[0]!);
     const r = await client.test(id);
     expect(r).toEqual({ ok: false, failure: { kind: 'declined', words: 'You chose not to start it.' } });
     expect(client.get(id)?.phase).toBe('stopped');
     expect(port.asked).toBe(1);
 
-    const missing = localDraft({ label: 'Missing', command: 'npx', args: ['-y', 'familiar-no-such-package'], settings: [] }, { newId, defaultCwd: REPO });
+    const missing = localDraft({ label: 'Missing', command: 'npx', args: ['-y', 'familiar-no-such-package'], settings: [] }, { newId, defaultCwd: REPO, paths: posixPaths });
     const { id: m } = await no.client.add({ ...missing, setup: { ...missing.setup, kind: 'local', program: 'familiar-no-such-npx' } as typeof missing.setup });
     const r2 = await no.client.test(m);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.failure.words).toContain("Familiar couldn't find the program");
 
     // A program that exits at once: its last output.
-    const quick = localDraft({ label: 'Quick', command: process.execPath, args: ['-e', "console.error('no config file'); process.exit(2)"], settings: [] }, { newId, defaultCwd: REPO });
+    const quick = localDraft({ label: 'Quick', command: process.execPath, args: ['-e', "console.error('no config file'); process.exit(2)"], settings: [] }, { newId, defaultCwd: REPO, paths: posixPaths });
     const { id: q } = await no.client.add(quick);
     const r3 = await no.client.test(q);
     expect(r3).toMatchObject({ ok: false, failure: { kind: 'exited', words: 'The server exited with code 2. Its last output is below.', lastOutput: 'no config file' } });
@@ -271,7 +320,7 @@ describe('the MCP client, local, against the fake server', () => {
 
   it('the handshake deadline: a program that never speaks MCP', async () => {
     const w = await world({ limits: { initMs: 300, backoffMs: 50, stopMs: 3000 } });
-    const silent = localDraft({ label: 'Silent', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], settings: [] }, { newId, defaultCwd: REPO });
+    const silent = localDraft({ label: 'Silent', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], settings: [] }, { newId, defaultCwd: REPO, paths: posixPaths });
     const { id } = await w.client.add(silent);
     const r = await w.client.test(id);
     expect(r).toMatchObject({ ok: false, failure: { kind: 'timed-out' } });
@@ -284,7 +333,7 @@ describe('the MCP client, local, against the fake server', () => {
     const off = await addFake(w);
     await w.client.setEnabled(on, true);
     // A fresh client over the same store, as at the next start of the app.
-    const again = await McpClient.open({ store: w.store, processes: w.port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+    const again = await McpClient.open({ paths: posixPaths, store: w.store, processes: w.port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
     again.startEnabled();
     await until(() => again.get(on)?.phase === 'ready');
     expect(again.get(off)?.phase).toBe('stopped');
@@ -358,35 +407,18 @@ describe('the tools a turn sees', () => {
   });
 });
 
-describe('the MCP client, remote, over legacy SSE', () => {
-  it('connects through the injected fetch, lists and calls, with the origin as its address', async () => {
-    const { createServer } = await import('node:http');
-    const { SSEServerTransport } = await import('../../../../tools/fake-mcp-server/node_modules/@modelcontextprotocol/sdk/dist/esm/server/sse.js');
-    const { createFakeServer } = await import('../../../../tools/fake-mcp-server/src/server.ts');
-    const sessions = new Map<string, InstanceType<typeof SSEServerTransport>>();
-    const http = createServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/sse') {
-        const t = new SSEServerTransport('/messages', res);
-        sessions.set(t.sessionId, t);
-        void createFakeServer().connect(t);
-        return;
-      }
-      const id = new URL(req.url ?? '', 'http://x').searchParams.get('sessionId') ?? '';
-      const t = sessions.get(id);
-      if (req.method === 'POST' && t) return void t.handlePostMessage(req, res);
-      res.writeHead(404).end();
-    });
-    await new Promise<void>(r => http.listen(0, '127.0.0.1', r));
-    cleanups.push(() => new Promise<void>(r => { http.closeAllConnections(); http.close(() => r()); }));
-    const port = (http.address() as { port: number }).port;
-    let fetched = 0;
-    const counting: FetchLike = (url, init) => { fetched++; return fetch(url, init); };
-    const w = await world({ fetchFor: () => counting });
-    const { id } = await w.client.add(remoteDraft({ label: 'Old style', url: `http://127.0.0.1:${port}/sse`, transport: 'sse', headers: [] }, { newId }));
-    expect(w.addresses.added).toEqual([`http://127.0.0.1:${port}`]);
-    expect((await w.client.start(id)).kind).toBe('ready');
-    expect(await w.client.call(id, 'echo', { text: 'over sse' })).toMatchObject({ kind: 'result', text: 'over sse' });
-    expect(fetched).toBeGreaterThan(1);
-    await w.client.stop(id);
+describe('the MCP client, remote: what it refuses (r19 #12)', () => {
+  it('legacy SSE, in plain words, and a second server on an address already in use', async () => {
+    const w = await world();
+    const sse = remoteDraft({ label: 'Old style', url: 'https://mcp.example.test/sse', transport: 'sse', headers: [] }, { newId });
+    expect(sse.problems).toContain(SSE_WORDS);
+    await expect(w.client.add(sse)).rejects.toThrow(SSE_WORDS);
+    expect(w.addresses.added).toEqual([]);
+    await w.client.add(remoteDraft({ label: 'First', url: 'https://mcp.example.test/mcp', headers: [] }, { newId }));
+    await expect(w.client.add(remoteDraft({ label: 'Second', url: 'https://mcp.example.test/mcp/', headers: [] }, { newId }))).rejects.toThrow(/Another server, First, already uses this address/);
+    // The exe answers an identical address with the id it already has: refused too, and never removed.
+    const w2 = await world({ addresses: { add: async () => ({ id: 'same' }), remove: async () => { throw new Error('must not remove'); } } });
+    await w2.client.add(remoteDraft({ label: 'One', url: 'https://mcp.example.test/a', headers: [] }, { newId }));
+    await expect(w2.client.add(remoteDraft({ label: 'Two', url: 'https://mcp.example.test/b', headers: [] }, { newId }))).rejects.toThrow(/Another server, One/);
   });
 });

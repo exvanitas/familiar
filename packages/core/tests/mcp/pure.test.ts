@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 import { canonicalJson, sha256 } from '../../src/mcp/hash.ts';
 import { CHECKED_AT_TEST, checkPrerequisites, FINDABLE, prerequisiteOf } from '../../src/mcp/prerequisites.ts';
 import { modelNames, outcomeText, toolChanges, toolFingerprint } from '../../src/mcp/server-tools.ts';
+import { CatalogError, checkTools, effectiveDescription } from '../../src/mcp/catalog.ts';
+import { CoalescedWriter } from '../../src/mcp/writer.ts';
 import { resultText } from '../../src/mcp/session.ts';
 import { secretValueProblem, setupFingerprint, touchesAMarker, type LocalSetup } from '../../src/mcp/setup.ts';
 import { unpinned } from '../../src/mcp/unpinned.ts';
@@ -90,12 +92,13 @@ describe('fingerprints', () => {
     expect(canonicalJson({ b: 1, a: { d: [3, { y: 1, x: 2 }], c: undefined } })).toBe('{"a":{"d":[3,{"x":2,"y":1}]},"b":1}');
   });
 
-  it("a tool's name, description or inputs change its fingerprint; key order and its title don't", () => {
+  it("a tool's name, title, description or inputs change its fingerprint; key order doesn't", () => {
     const base = { name: 'echo', description: 'Repeats.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } };
     const fp = toolFingerprint(base);
     expect(toolFingerprint({ ...base, inputSchema: { properties: { text: { type: 'string' } }, type: 'object' } })).toBe(fp);
     expect(toolFingerprint({ ...base, description: 'Repeats in capitals.' })).not.toBe(fp);
     expect(toolFingerprint({ ...base, name: 'echo2' })).not.toBe(fp);
+    expect(toolFingerprint({ ...base, title: 'Echo' })).not.toBe(fp);
     expect(toolFingerprint({ ...base, inputSchema: { type: 'object', properties: { text: { type: 'number' } } } })).not.toBe(fp);
     expect(toolChanges([{ name: 'a', fingerprint: '1' }, { name: 'b', fingerprint: '2' }], [{ name: 'b', fingerprint: '3' }, { name: 'c', fingerprint: '4' }])).toEqual({ added: ['c'], changed: ['b'], removed: ['a'] });
   });
@@ -175,5 +178,73 @@ describe('prerequisites', () => {
     const asked: string[] = [];
     await checkPrerequisites({ find: async p => { asked.push(p); return 'unknown'; } });
     expect([...new Set(asked)].sort()).toEqual([...FINDABLE].sort());
+  });
+});
+
+describe('unpinned secondary packages (r19 #17)', () => {
+  const cases: [string, string[], string][] = [
+    ['npm', ['exec', '--package', 'server@latest', '--', 'server'], 'server@latest'],
+    ['npm', ['x', 'some-server'], 'some-server'],
+    ['npm', ['--yes', 'exec', '--package=server@1.0.0', '--package=helper', '--', 'server'], 'helper'],
+    ['npx', ['-p', 'server@1.0.0', '-p', 'helper', 'server'], 'helper'],
+    ['pnpm', ['dlx', '--package', 'server@1.0.0', '--package', 'helper@^2', 'server'], 'helper@^2'],
+    ['uvx', ['--with', 'extra-package', 'server@1.2.3'], 'extra-package'],
+    ['uvx', ['--with=extra-package>=2', '--from', 'server==1.2.3', 'run'], 'extra-package>=2'],
+    ['uv', ['tool', 'run', '--with', 'extra', 'server==1.2.3'], 'extra']
+  ];
+  for (const [program, args, what] of cases) it(`flags ${what} in ${program} ${args.join(' ')}`, () => expect(unpinned(program, args)?.what).toBe(what));
+  it('leaves them when every fetched package is pinned', () => {
+    expect(unpinned('npm', ['exec', '--package', 'server@1.0.0', '--', 'server'])).toBeUndefined();
+    expect(unpinned('uvx', ['--with', 'extra==2.0.0', 'server@1.2.3'])).toBeUndefined();
+    expect(unpinned('npm', ['install'])).toBeUndefined();
+  });
+});
+
+describe('tool lists, bounded before anything hashes them (r19 #6, #10, #11)', () => {
+  const tool = (name: string, extra: object = {}) => ({ name, inputSchema: { type: 'object' as const }, ...extra });
+  it('a schema nested 10,000 levels fails in plain words, with no stack overflow', () => {
+    let deep: Record<string, unknown> = {};
+    const root = deep;
+    for (let i = 0; i < 10_000; i++) { const next = {}; deep.x = next; deep = next; }
+    expect(() => checkTools([tool('deep', { inputSchema: { type: 'object', 'x-extra': root } })])).toThrow(/nested deeper than 32 levels/);
+    const wide = { type: 'object', properties: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`p${i}`, { type: 'string' }])) };
+    expect(() => checkTools([tool('wide', { inputSchema: wide })])).toThrow(/more than 4000 parts/);
+    expect(() => checkTools([tool('long', { description: 'x'.repeat(70_000) })])).toThrow(/Familiar takes at most 65536 for one tool/);
+    expect(() => checkTools(Array.from({ length: 129 }, (_, i) => tool(`t${i}`)))).toThrow(/at most 128/);
+    try { checkTools([tool('deep', { inputSchema: { type: 'object', 'x-extra': root } })]); } catch (e) { expect(e).toBeInstanceOf(CatalogError); }
+  });
+
+  it('two tools with one name fail the list; model names stay unique', () => {
+    expect(() => checkTools([tool('echo'), tool('echo')])).toThrow(/two tools named echo/);
+    const names = modelNames([{ id: 'a', label: 'S', tools: [{ name: 'echo' }, { name: 'echo' }] }]).get('a')!;
+    expect([...names.values()]).toEqual(['S__echo']);
+  });
+
+  it("a title-only tool's fingerprint follows its title, which the model reads as its description", () => {
+    const [a] = checkTools([tool('notes', { title: 'Read notes' })]);
+    const [b] = checkTools([tool('notes', { title: 'Delete notes' })]);
+    expect(a!.fingerprint).not.toBe(b!.fingerprint);
+    expect(effectiveDescription(b!)).toBe('Delete notes');
+  });
+});
+
+describe('the record writer', () => {
+  it('coalesces a storm into at most two writes, each of the record as it is then, and stops at close', async () => {
+    let value = 0;
+    const written: number[] = [];
+    let release!: () => void;
+    const w = new CoalescedWriter(async () => { written.push(value); await new Promise<void>(r => { release = r; }); });
+    const first = w.request();
+    const storm: Promise<void>[] = [];
+    for (let i = 1; i <= 1000; i++) { value = i; storm.push(w.request()); }
+    release();
+    await first;
+    await new Promise(r => setTimeout(r, 0));
+    release();
+    await Promise.all(storm);
+    expect(written).toEqual([0, 1000]);
+    await w.close();
+    await expect(w.request()).rejects.toThrow(/being removed/);
+    expect(written).toEqual([0, 1000]);
   });
 });

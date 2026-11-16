@@ -14,8 +14,9 @@ describe('the MCP client in a page', () => {
     const inputs = Object.keys(r.metafile.inputs);
     expect(inputs.filter(i => i.startsWith('node:') || /(^|\/)node_modules\/(fs|path|child_process|os|crypto)\//.test(i))).toEqual([]);
     expect(inputs.some(i => i.includes('@modelcontextprotocol/sdk/dist/esm/client/index.js'))).toBe(true);
-    // The SDK's stdio transport, which needs Node, never comes in.
+    // The SDK's stdio transport, which needs Node, never comes in, and nor does legacy SSE, refused in v1.
     expect(inputs.some(i => i.includes('client/stdio'))).toBe(false);
+    expect(inputs.some(i => i.includes('client/sse'))).toBe(false);
     expect(Object.values(r.metafile.outputs)[0]!.imports).toEqual([]);
   });
 });

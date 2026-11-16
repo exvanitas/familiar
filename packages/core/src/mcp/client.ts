@@ -8,26 +8,20 @@
 import type { JournalClock } from '../journal/journal.ts';
 import type { SettingsStore } from '../settings/store.ts';
 import { ServerActor, type ServerView } from './actor.ts';
+import { CoalescedWriter } from './writer.ts';
+import type { PathRules } from './native-rules.ts';
 import { DEFAULT_LIMITS, INIT_MS_MAX, INIT_MS_MIN, type Limits, type Phase } from './machine.ts';
 import type { Draft } from './paste.ts';
 import type { ProcessPort } from './process.ts';
 import { ProcessTransport } from './process-transport.ts';
 import { RemoteTransport, type FetchLike } from './remote.ts';
 import { deleteServer, fresh, loadServers, saveServer, type SavedServer, type SavedTool, type ServerLimits } from './saved.ts';
-import { modelNames, serverTool, toolChanges, toolFingerprint, type ServerTool, type ToolChanges } from './server-tools.ts';
+import type { Expect } from './machine.ts';
+import { modelNames, serverTool, toolChanges, type ServerTool, type ToolChanges } from './server-tools.ts';
 import { openSession } from './session.ts';
 import { processSetupOf, remoteTargetOf, secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 import { unpinned, type Unpinned } from './unpinned.ts';
-
-/**
- * The address the person approves for a remote server. Streamable HTTP uses one URL, so that's the
- * address. A legacy SSE server names the URL for its posts itself, often beside the stream's path rather
- * than under it, and the SDK keeps it to the same origin, so an SSE server's address is its origin.
- */
-export function addressUrl(s: { url: string; transport: 'http' | 'sse' }): string {
-  return s.transport === 'sse' ? new URL(s.url).origin : s.url;
-}
 
 /** Saved addresses: the exe's `address_add` (which asks the person) and `address_remove` (which deletes
     the address's key). */
@@ -51,6 +45,8 @@ export interface McpClientOptions {
   readonly clock: Pick<JournalClock, 'now' | 'setTimer'>;
   /** Overrides for every server's limits, for tests. */
   readonly limits?: Partial<Limits>;
+  /** How setups' paths are checked: Windows' rules unless a test says otherwise. */
+  readonly paths?: PathRules;
   /** Hears that a server's state, tools or failure changed. */
   readonly onChange?: (id: string) => void;
 }
@@ -68,7 +64,6 @@ export interface ServerStatus {
 }
 
 export interface TestedTool extends ListedTool {
-  readonly fingerprint: string;
   /** New or changed since the person last reviewed it. */
   readonly fresh: boolean;
 }
@@ -78,10 +73,22 @@ export type TestReport =
   | { readonly ok: false; readonly failure: Failure };
 
 interface Entry {
-  saved: SavedServer;
-  actor: ServerActor;
-  /** Saves of this server, one after another. */
-  saving: Promise<void>;
+  readonly actor: ServerActor<ServerSetup>;
+  /** Everything of the record but the setup, which the actor holds. Changed here, then written. */
+  meta: Omit<SavedServer, 'setup'>;
+  /** The one writer of this server's record. */
+  readonly writer: CoalescedWriter;
+}
+
+/** An address as compared for sharing: one saved address can't serve two servers, since removing either
+    would remove the other's address and key. */
+function sameAddress(a: string, b: string): boolean {
+  try {
+    const x = new URL(a), y = new URL(b);
+    return x.origin === y.origin && x.pathname.replace(/\/+$/, '') === y.pathname.replace(/\/+$/, '');
+  } catch {
+    return a === b;
+  }
 }
 
 export class McpClient {
@@ -102,7 +109,7 @@ export class McpClient {
 
   /** Starting with the app: every enabled server starts. Approved ones start with no dialog. */
   startEnabled(): void {
-    for (const e of this.entries.values()) if (e.saved.enabled) void e.actor.start();
+    for (const e of this.entries.values()) if (e.meta.enabled) void e.actor.start();
   }
 
   list(): ServerStatus[] {
@@ -120,12 +127,19 @@ export class McpClient {
    * values under. The draft's values never pass through here.
    */
   async add(draft: Pick<Draft, 'setup' | 'problems'>): Promise<{ id: string; secretRefs: string[] }> {
-    const problems = [...draft.problems, ...setupProblems(draft.setup)];
+    const problems = [...draft.problems, ...setupProblems(draft.setup, this.o.paths)];
     if (problems.length) throw new Error(problems[0]);
     if (this.entries.has(draft.setup.id)) throw new Error('A server with this id is already saved.');
     let setup: ServerSetup = draft.setup;
     if (setup.kind === 'remote') {
-      const address = await this.o.addresses.add({ url: addressUrl(setup), label: setup.label });
+      const url = setup.url;
+      const sharing = (match: (s: ServerSetup) => boolean) => [...this.entries.values()].find(e => match(e.actor.setup));
+      const before = sharing(s => s.kind === 'remote' && sameAddress(s.url, url));
+      if (before) throw new Error(`Another server, ${before.actor.setup.label}, already uses this address. Familiar keeps one server per address.`);
+      const address = await this.o.addresses.add({ url, label: setup.label });
+      // The exe gives an identical address the same id. Never remove it here: it's the other server's.
+      const other = sharing(s => s.kind === 'remote' && s.address === address.id);
+      if (other) throw new Error(`Another server, ${other.actor.setup.label}, already uses this address. Familiar keeps one server per address.`);
       setup = { ...setup, address: address.id };
     }
     const saved: SavedServer = { setup, enabled: false, limits: {}, tools: [] };
@@ -136,26 +150,25 @@ export class McpClient {
 
   /**
    * Changes a stopped server's setup, keeping its id, so its tools' review carries over and a changed
-   * tool shows as changed. A new command, folder, setting or version asks in the exe's dialog at the next
-   * start, and puts every tool back to ask. A remote server's address can't change here: that's a new
-   * address, with its own approval and key, so it's removed and added again.
+   * tool shows as changed. The actor admits it (only while stopped or down) and it counts once saved; a
+   * start made meanwhile waits for it. A new command, folder, setting or version asks in the exe's dialog
+   * at the next start, and puts every tool back to ask. A remote server's address can't change here:
+   * that's a new address, with its own approval and key, so it's removed and added again.
    */
   async edit(id: string, draft: Pick<Draft, 'setup' | 'problems'>): Promise<{ secretRefs: string[] }> {
     const e = this.entry(id);
-    const phase = e.actor.view.phase;
-    if (phase !== 'stopped' && phase !== 'down') throw new Error('Stop the server before changing it.');
-    const before = e.saved.setup;
+    const before = e.actor.setup;
     let setup: ServerSetup = { ...draft.setup, id } as ServerSetup;
-    const problems = [...draft.problems, ...setupProblems(setup)];
+    const problems = [...draft.problems, ...setupProblems(setup, this.o.paths)];
     if (problems.length) throw new Error(problems[0]);
     if (setup.kind !== before.kind) throw new Error("A server can't change between local and remote. Add it again instead.");
     if (setup.kind === 'remote' && before.kind === 'remote') {
-      if (setup.url !== before.url || setup.transport !== before.transport) throw new Error('A new address needs its own approval and key. Remove the server and add it again.');
-      setup = { ...setup, ...(before.address ? { address: before.address } : {}) };
+      if (!sameAddress(setup.url, before.url)) throw new Error('A new address needs its own approval and key. Remove the server and add it again.');
+      setup = { ...setup, url: before.url, ...(before.address ? { address: before.address } : {}) };
     }
-    const gone = secretRefs(before).filter(r => !secretRefs(setup).includes(r));
-    await this.update(e, s => ({ ...s, setup }));
-    for (const ref of gone) await this.o.secrets.delete(ref);
+    const r = await e.actor.edit(setup);
+    if (r.kind !== 'edited') throw new Error(r.kind === 'failed' ? r.failure.words : r.kind === 'refused' ? r.words : 'The server was removed.');
+    for (const ref of secretRefs(before).filter(x => !secretRefs(setup).includes(x))) await this.o.secrets.delete(ref);
     return { secretRefs: secretRefs(setup) };
   }
 
@@ -184,52 +197,60 @@ export class McpClient {
       const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: r.kind === 'removed' ? 'The server was removed.' : 'The server was stopped before it was ready.' };
       return { ok: false, failure };
     }
-    const listed = e.actor.view.tools;
-    await e.saving;
-    const saved = new Map(e.saved.tools.map(t => [t.name, t]));
-    const tools = listed.map(t => {
-      const fingerprint = toolFingerprint(t);
-      return { ...t, fingerprint, fresh: fresh(saved.get(t.name), fingerprint) };
-    });
+    const saved = new Map(e.meta.tools.map(t => [t.name, t]));
+    const tools = e.actor.view.tools.map(t => ({ ...t, fresh: fresh(saved.get(t.name), t.fingerprint) }));
     if (!wasUp) await e.actor.stop();
-    const flag = e.saved.setup.kind === 'local' ? unpinned(e.saved.setup.program, e.saved.setup.args) : undefined;
+    const setup = e.actor.setup;
+    const flag = setup.kind === 'local' ? unpinned(setup.program, setup.args) : undefined;
     // Changes against what the person reviewed.
-    const reviewed = e.saved.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
+    const reviewed = e.meta.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
     return { ok: true, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}) };
   }
 
   /** The person has seen these tools' names and descriptions as they are now. */
   async markReviewed(id: string, names: readonly string[]): Promise<void> {
     const e = this.entry(id);
-    await this.update(e, s => ({ ...s, tools: s.tools.map(t => (names.includes(t.name) ? { ...t, reviewed: t.fingerprint } : t)) }));
+    e.meta = { ...e.meta, tools: e.meta.tools.map(t => (names.includes(t.name) ? { ...t, reviewed: t.fingerprint } : t)) };
+    await e.writer.request();
   }
 
   async setEnabled(id: string, enabled: boolean): Promise<void> {
-    await this.update(this.entry(id), s => ({ ...s, enabled }));
+    const e = this.entry(id);
+    e.meta = { ...e.meta, enabled };
+    await e.writer.request();
   }
 
   /** A call's deadline applies from the next call; the handshake's from the next start of the app. */
   async setLimits(id: string, limits: ServerLimits): Promise<void> {
-    await this.update(this.entry(id), s => ({ ...s, limits }));
+    const e = this.entry(id);
+    e.meta = { ...e.meta, limits };
+    await e.writer.request();
   }
 
-  /** The tools a turn may offer the model: those of every Ready server. */
+  /** The tools a turn may offer the model: those of every Ready server, each bound to the tool as listed
+      and the setup its run started from. Every model name is unique. */
   tools(): ServerTool[] {
-    const ready = [...this.entries.values()].filter(e => e.actor.view.phase === 'ready');
-    const names = modelNames(ready.map(e => ({ id: e.saved.setup.id, label: e.saved.setup.label, tools: e.actor.view.tools })));
+    const ready = [...this.entries.values()].flatMap(e => {
+      const setup = e.actor.runSetup;
+      return e.actor.view.phase === 'ready' && setup ? [{ e, setup }] : [];
+    });
+    const names = modelNames(ready.map(({ e, setup }) => ({ id: setup.id, label: setup.label, tools: e.actor.view.tools })));
     const out: ServerTool[] = [];
-    for (const e of ready) {
-      const server = { id: e.saved.setup.id, label: e.saved.setup.label };
-      const setupFp = setupFingerprint(e.saved.setup);
-      const saved = new Map(e.saved.tools.map(t => [t.name, t]));
+    const taken = new Set<string>();
+    for (const { e, setup } of ready) {
+      const server = { id: setup.id, label: setup.label };
+      const setupFp = setupFingerprint(setup);
+      const saved = new Map(e.meta.tools.map(t => [t.name, t]));
       for (const listed of e.actor.view.tools) {
-        const fp = toolFingerprint(listed);
+        const modelName = names.get(server.id)?.get(listed.name);
+        if (!modelName || taken.has(modelName.toLowerCase())) continue;
+        taken.add(modelName.toLowerCase());
         out.push(serverTool({
           server,
           listed,
-          modelName: names.get(server.id)!.get(listed.name)!,
+          modelName,
           setupFingerprint: setupFp,
-          fresh: fresh(saved.get(listed.name), fp),
+          fresh: fresh(saved.get(listed.name), listed.fingerprint),
           call: (tool, args, options) => this.call(server.id, tool, args, options)
         }));
       }
@@ -237,12 +258,13 @@ export class McpClient {
     return out;
   }
 
-  /** One call, under the server's own deadline unless the caller gives one. */
-  call(id: string, tool: string, args: unknown, options: { ms?: number; signal?: AbortSignal } = {}): Promise<CallOutcome> {
+  /** One call, under the server's own deadline unless the caller gives one. With `expect`, it's sent only
+      if the server still offers exactly that tool, from that setup. */
+  call(id: string, tool: string, args: unknown, options: { ms?: number; signal?: AbortSignal; expect?: Expect } = {}): Promise<CallOutcome> {
     const e = this.entries.get(id);
     if (!e) return Promise.resolve({ kind: 'error', reason: 'removed', words: 'The server was removed.' });
-    const ms = options.ms ?? e.saved.limits.callMs;
-    return e.actor.call(tool, args, { ...(ms !== undefined ? { ms } : {}), ...(options.signal ? { signal: options.signal } : {}) });
+    const ms = options.ms ?? e.meta.limits.callMs;
+    return e.actor.call(tool, args, { ...(ms !== undefined ? { ms } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.expect ? { expect: options.expect } : {}) });
   }
 
   private entry(id: string): Entry {
@@ -253,35 +275,39 @@ export class McpClient {
 
   private status(e: Entry): ServerStatus {
     const v = e.actor.view;
-    const s = e.saved.setup;
+    const s = e.actor.setup;
     const flag = s.kind === 'local' ? unpinned(s.program, s.args) : undefined;
-    return { id: s.id, label: s.label, kind: s.kind, enabled: e.saved.enabled, phase: v.phase, ...(v.failure ? { failure: v.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: e.saved.tools };
+    return { id: s.id, label: s.label, kind: s.kind, enabled: e.meta.enabled, phase: v.phase, ...(v.failure ? { failure: v.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: e.meta.tools };
   }
 
   private track(saved: SavedServer): void {
-    const id = saved.setup.id;
     const initMs = saved.limits.initMs === undefined ? undefined : Math.min(INIT_MS_MAX, Math.max(INIT_MS_MIN, saved.limits.initMs));
     const limits: Limits = { ...DEFAULT_LIMITS, ...(initMs !== undefined ? { initMs } : {}), ...this.o.limits };
+    const { setup: first, ...meta } = saved;
+    // The record as it is now: an edit being saved goes in with it.
+    const record = (): SavedServer => ({ setup: entry.actor.pendingSetup ?? entry.actor.setup, ...entry.meta });
     const entry: Entry = {
-      saved,
-      saving: Promise.resolve(),
-      actor: new ServerActor({
+      meta,
+      writer: new CoalescedWriter(() => saveServer(this.o.store, record())),
+      actor: new ServerActor<ServerSetup>({
+        setup: first,
         clock: this.o.clock,
         limits,
-        // The setup as saved at each start, so an edit applies from the next start.
-        open: events => {
-          const setup = entry.saved.setup;
+        fingerprint: setupFingerprint,
+        open: (events, setup) => {
           const transport = setup.kind === 'local' ? new ProcessTransport(this.o.processes, processSetupOf(setup)) : new RemoteTransport(remoteTargetOf(setup), this.o.fetchFor(setup.address ?? ''));
           return openSession(transport, events, { initMs: limits.initMs });
         },
-        forget: async () => {
-          await entry.saving;
-          await this.forget(entry.saved.setup);
+        save: () => entry.writer.request(),
+        forget: async setup => {
+          // Nothing more is written, so no write can bring the record back after it's deleted.
+          await entry.writer.close();
+          await this.forget(setup);
         },
         onChange: view => this.changed(entry, view)
       })
     };
-    this.entries.set(id, entry);
+    this.entries.set(first.id, entry);
   }
 
   /** What removing a server removes, in an order a retry can repeat. */
@@ -295,28 +321,20 @@ export class McpClient {
     await deleteServer(this.o.store, setup.id);
   }
 
-  /** A changed tool list is saved. What the person reviewed is kept, so a changed tool shows as changed. */
+  /** A changed tool list is saved, coalesced. What the person reviewed is kept, so a changed tool shows as
+      changed. */
   private changed(e: Entry, view: ServerView): void {
     if (view.phase === 'ready') {
-      const before = new Map(e.saved.tools.map(t => [t.name, t]));
+      const before = new Map(e.meta.tools.map(t => [t.name, t]));
       const tools: SavedTool[] = view.tools.map(t => {
         const reviewed = before.get(t.name)?.reviewed;
-        return { name: t.name, fingerprint: toolFingerprint(t), ...(reviewed ? { reviewed } : {}) };
+        return { name: t.name, fingerprint: t.fingerprint, ...(reviewed ? { reviewed } : {}) };
       });
-      if (JSON.stringify(tools) !== JSON.stringify(e.saved.tools)) void this.update(e, s => ({ ...s, tools }));
+      if (JSON.stringify(tools) !== JSON.stringify(e.meta.tools)) {
+        e.meta = { ...e.meta, tools };
+        e.writer.request().catch(() => {});
+      }
     }
-    this.o.onChange?.(e.saved.setup.id);
-  }
-
-  /** Changes a server's saved record, one change after another, and keeps the record in memory in step. */
-  private update(e: Entry, change: (s: SavedServer) => SavedServer): Promise<void> {
-    const next = e.saving.then(async () => {
-      if (e.actor.view.phase === 'removed' || e.actor.view.phase === 'removing') return;
-      const s = change(e.saved);
-      await saveServer(this.o.store, s);
-      e.saved = s;
-    });
-    e.saving = next.catch(() => {});
-    return next;
+    this.o.onChange?.(e.actor.setup.id);
   }
 }

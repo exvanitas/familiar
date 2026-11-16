@@ -1,11 +1,14 @@
 // One MCP server's rules, as a pure function: a state and a message in, the changed state and a list of
-// effects out. The actor (actor.ts) is the only owner of a Machine: it feeds every command and event
-// through `step`, one at a time, and does the effects. Nothing here waits or touches I/O, so a property
-// test can drive it with any order of messages. See "One actor per server" in docs/mcp-design.md.
+// effects out. The actor (actor.ts) is the only owner of a Machine: it feeds every command and every
+// completion through `step`, one at a time, and does the effects. Nothing here waits or touches I/O, so a
+// property test can drive it with any order of messages. See "One actor per server" in docs/mcp-design.md.
+// Longer than 400 lines on purpose: one server's rules read best in one place.
 //
-// Every run has a generation. Events and timers carry the generation they belong to, and anything that
-// isn't the current one is dropped. A call that was sent belongs to the run it was sent on: when that
-// run ends, the call is answered `interrupted` and is never sent again.
+// Every run has a generation, and every other wait (a save, a removal, a tool list) a number of its own.
+// Events and timers carry theirs, and anything that isn't current is dropped. Every external wait has a
+// deadline. A call that was sent belongs to the run it was sent on: when that run ends, the call is
+// answered `interrupted` and is never sent again. A call made for a tool as the person saw it is sent only
+// if the server still offers that exact tool, from that exact setup.
 
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 
@@ -14,10 +17,16 @@ export type Phase = 'stopped' | 'starting' | 'initializing' | 'ready' | 'restart
 export interface Limits {
   /** A call's deadline when it names none. */
   readonly callMs: number;
+  /** From the start of a run to the run starting: the exe's dialog, a remote connection. */
+  readonly startMs: number;
   /** The handshake's deadline: from the run starting to the first tool list. */
   readonly initMs: number;
+  /** A later tool list's deadline. */
+  readonly listMs: number;
   /** How long a run may take to close before it counts as closed. */
   readonly stopMs: number;
+  /** A save of an edited setup, and a removal. */
+  readonly saveMs: number;
   /** Restarts allowed in the window. One more crash and the server is down. */
   readonly restarts: number;
   readonly restartWindowMs: number;
@@ -25,6 +34,8 @@ export interface Limits {
   readonly backoffMs: number;
   /** Calls waiting or running at once. */
   readonly maxCalls: number;
+  /** Starts, stops or removes waiting at once, each. */
+  readonly maxWaiters: number;
 }
 
 export const CALL_MS = 60_000;
@@ -36,18 +47,29 @@ export const INIT_MS_MAX = 5 * 60_000;
 
 export const DEFAULT_LIMITS: Limits = {
   callMs: CALL_MS,
+  startMs: 5 * 60_000,
   initMs: INIT_MS,
+  listMs: 30_000,
   stopMs: 5_000,
+  saveMs: 30_000,
   restarts: 2,
   restartWindowMs: 10 * 60_000,
   backoffMs: 1_000,
-  maxCalls: 16
+  maxCalls: 16,
+  maxWaiters: 8
 };
+
+/** What a call was made for: the tool as the person saw it, from the setup it was offered by. */
+export interface Expect {
+  readonly setup: string;
+  readonly tool: string;
+}
 
 interface Call {
   readonly id: number;
   readonly tool: string;
   readonly args: unknown;
+  readonly expect?: Expect;
   /** The generation it was sent on. Undefined while it waits for the server to be ready. */
   sent?: number;
 }
@@ -59,10 +81,20 @@ export interface Machine {
   open: boolean;
   /** The current run is a restart after a crash, not a start the person made. */
   auto: boolean;
-  /** Why the machine itself is ending the current run (the handshake's deadline), if it is. */
+  /** Why the machine itself is ending the current run (a deadline, a bad tool list), if it is. */
   ending?: Failure;
-  /** A removal is under way. */
-  forgetting: boolean;
+  /** The number of the last save, removal or tool list asked for. */
+  seq: number;
+  /** A save of an edited setup under way: its number and its caller. */
+  editing?: { readonly n: number; readonly token: number };
+  /** A removal under way: its number. */
+  forgetting?: number;
+  /** A tool list under way: its number. */
+  listing?: number;
+  /** The tools changed again while a list was under way. */
+  listDirty: boolean;
+  /** The server said its tools changed, and no list since has answered: calls wait. */
+  stale: boolean;
   readonly calls: Map<number, Call>;
   readonly starts: number[];
   readonly stops: number[];
@@ -71,6 +103,9 @@ export interface Machine {
   crashes: number[];
   failure?: Failure;
   tools: readonly ListedTool[];
+  /** The current run's tools by name, with their fingerprints, and the setup it was started from. */
+  catalog: ReadonlyMap<string, string>;
+  setup?: string;
   readonly limits: Limits;
 }
 
@@ -78,29 +113,34 @@ export type Input =
   | { readonly t: 'start'; readonly token: number }
   | { readonly t: 'stop'; readonly token: number }
   | { readonly t: 'remove'; readonly token: number }
-  | { readonly t: 'call'; readonly token: number; readonly tool: string; readonly args: unknown; readonly ms?: number }
+  /** A change to the setup, which the actor then saves. Only while stopped or down. */
+  | { readonly t: 'edit'; readonly token: number }
+  | { readonly t: 'call'; readonly token: number; readonly tool: string; readonly args: unknown; readonly ms?: number; readonly expect?: Expect }
   /** The person pressed Stop on one call. */
   | { readonly t: 'cancel'; readonly call: number }
   | { readonly t: 'refresh' }
   /** The run started: the process runs, or the remote transport connected. */
   | { readonly t: 'launched'; readonly gen: number }
-  /** The handshake and the first tool list are done. */
-  | { readonly t: 'ready'; readonly gen: number; readonly tools: readonly ListedTool[] }
-  | { readonly t: 'listed'; readonly gen: number; readonly tools: readonly ListedTool[] }
+  /** The handshake and the first tool list are done. `setup` is the fingerprint of the setup this run was started from. */
+  | { readonly t: 'ready'; readonly gen: number; readonly tools: readonly ListedTool[]; readonly setup: string }
+  | { readonly t: 'listed'; readonly gen: number; readonly n: number; readonly tools: readonly ListedTool[] }
+  | { readonly t: 'list-failed'; readonly gen: number; readonly n: number; readonly failure: Failure }
   | { readonly t: 'tools-changed'; readonly gen: number }
   | { readonly t: 'result'; readonly gen: number; readonly call: number; readonly outcome: CallOutcome }
   /** The run ended, for any reason: an exit, a closed transport, a refused start, a failed handshake. */
   | { readonly t: 'closed'; readonly gen: number; readonly failure?: Failure }
   | { readonly t: 'timer'; readonly key: string }
-  | { readonly t: 'forgotten'; readonly failure?: Failure };
+  | { readonly t: 'saved'; readonly n: number; readonly failure?: Failure }
+  | { readonly t: 'forgotten'; readonly n: number; readonly failure?: Failure };
 
 export type Effect =
   | { readonly t: 'launch'; readonly gen: number }
   | { readonly t: 'send'; readonly gen: number; readonly call: number; readonly tool: string; readonly args: unknown }
   | { readonly t: 'abort'; readonly gen: number; readonly call: number }
-  | { readonly t: 'list'; readonly gen: number }
+  | { readonly t: 'list'; readonly gen: number; readonly n: number }
   | { readonly t: 'halt'; readonly gen: number }
-  | { readonly t: 'forget' }
+  | { readonly t: 'save'; readonly n: number }
+  | { readonly t: 'forget'; readonly n: number }
   | { readonly t: 'arm'; readonly key: string; readonly at: number }
   | { readonly t: 'disarm'; readonly key: string }
   | { readonly t: 'answer'; readonly call: number; readonly outcome: CallOutcome }
@@ -109,27 +149,34 @@ export type Effect =
 
 /** The states nothing pending will leave on its own. A failed removal rests too, until the next remove. */
 export function resting(m: Machine): boolean {
-  if (m.phase === 'removing') return !m.forgetting && m.failure !== undefined;
+  if (m.editing || m.listing !== undefined || m.stale) return false;
+  if (m.phase === 'removing') return m.forgetting === undefined && m.failure !== undefined;
   return m.phase === 'stopped' || m.phase === 'ready' || m.phase === 'down' || m.phase === 'removed';
 }
 
 export function createMachine(limits: Limits = DEFAULT_LIMITS): Machine {
   return {
-    phase: 'stopped', gen: 0, open: false, auto: false, forgetting: false,
-    calls: new Map(), starts: [], stops: [], removes: [], crashes: [], tools: [], limits
+    phase: 'stopped', gen: 0, open: false, auto: false, seq: 0, listDirty: false, stale: false,
+    calls: new Map(), starts: [], stops: [], removes: [], crashes: [], tools: [], catalog: new Map(), limits
   };
 }
 
 const callKey = (id: number) => `call:${id}`;
+const startKey = (gen: number) => `start:${gen}`;
 const initKey = (gen: number) => `init:${gen}`;
 const stopKey = (gen: number) => `stop:${gen}`;
 const restartKey = (gen: number) => `restart:${gen}`;
+const listKey = (n: number) => `list:${n}`;
+const saveKey = (n: number) => `save:${n}`;
+const forgetKey = (n: number) => `forget:${n}`;
 
-const refusal = (reason: 'not-running' | 'stopping' | 'removed' | 'busy' | 'down', words: string): CallOutcome => ({ kind: 'error', reason, words });
+const refusal = (reason: 'not-running' | 'stopping' | 'removed' | 'busy' | 'down' | 'changed', words: string): CallOutcome => ({ kind: 'error', reason, words });
 const NOT_RUNNING = refusal('not-running', "The server isn't running.");
 const STOPPING = refusal('stopping', 'The server is stopping.');
 const REMOVED = refusal('removed', 'The server was removed.');
 const BUSY = refusal('busy', 'The server has too many calls waiting. Try again in a moment.');
+const TOO_MANY: Reply = { kind: 'refused', words: 'Too many requests are waiting for this server. Try again in a moment.' };
+const secs = (ms: number) => Math.round(ms / 1000);
 
 /** Applies one message. Changes `m` and returns what the actor must do, in order. */
 export function step(m: Machine, input: Input, now: number): Effect[] {
@@ -142,9 +189,10 @@ export function step(m: Machine, input: Input, now: number): Effect[] {
 
 function handle(m: Machine, input: Input, now: number, fx: Effect[]): void {
   switch (input.t) {
-    case 'start': return start(m, input.token, now, fx);
+    case 'start': return start(m, input.token, fx, now);
     case 'stop': return stop(m, input.token, now, fx);
     case 'remove': return remove(m, input.token, now, fx);
+    case 'edit': return edit(m, input.token, now, fx);
     case 'call': return call(m, input, now, fx);
     case 'cancel': {
       const c = m.calls.get(input.call);
@@ -153,30 +201,40 @@ function handle(m: Machine, input: Input, now: number, fx: Effect[]): void {
       return answer(m, c, { kind: 'stopped' }, fx);
     }
     case 'refresh':
-      if (m.phase === 'ready') fx.push({ t: 'list', gen: m.gen });
+      if (m.phase === 'ready' && !m.ending) requestList(m, now, fx);
       return;
     case 'launched':
-      if (input.gen !== m.gen || m.phase !== 'starting') return;
+      if (input.gen !== m.gen || m.phase !== 'starting' || m.ending) return;
       m.phase = 'initializing';
-      fx.push({ t: 'arm', key: initKey(m.gen), at: now + m.limits.initMs });
+      fx.push({ t: 'disarm', key: startKey(m.gen) }, { t: 'arm', key: initKey(m.gen), at: now + m.limits.initMs });
       return;
     case 'ready':
       if (input.gen !== m.gen || m.phase !== 'initializing' || m.ending) return;
       m.phase = 'ready';
-      m.tools = input.tools;
+      m.setup = input.setup;
+      setTools(m, input.tools);
       m.failure = undefined;
       fx.push({ t: 'disarm', key: initKey(m.gen) });
-      for (const c of m.calls.values()) {
-        c.sent = m.gen;
-        fx.push({ t: 'send', gen: m.gen, call: c.id, tool: c.tool, args: c.args });
-      }
+      sendWaiting(m, fx);
       return replyAll(m.starts, { kind: 'ready' }, fx);
     case 'listed':
-      if (input.gen === m.gen && m.phase === 'ready') m.tools = input.tools;
-      return;
+      if (input.gen !== m.gen || m.phase !== 'ready' || input.n !== m.listing || m.ending) return;
+      fx.push({ t: 'disarm', key: listKey(input.n) });
+      m.listing = undefined;
+      setTools(m, input.tools);
+      if (m.listDirty) {
+        m.listDirty = false;
+        return requestList(m, now, fx);
+      }
+      m.stale = false;
+      return sendWaiting(m, fx);
+    case 'list-failed':
+      if (input.gen !== m.gen || m.phase !== 'ready' || input.n !== m.listing || m.ending) return;
+      return endRun(m, input.failure, now, fx);
     case 'tools-changed':
-      if (input.gen === m.gen && m.phase === 'ready') fx.push({ t: 'list', gen: m.gen });
-      return;
+      if (input.gen !== m.gen || m.phase !== 'ready' || m.ending) return;
+      m.stale = true;
+      return requestList(m, now, fx);
     case 'result': {
       const c = m.calls.get(input.call);
       if (!c || c.sent !== input.gen) return;
@@ -187,48 +245,58 @@ function handle(m: Machine, input: Input, now: number, fx: Effect[]): void {
       return closed(m, input.failure, now, fx);
     case 'timer':
       return timer(m, input.key, now, fx);
+    case 'saved':
+      if (!m.editing || m.editing.n !== input.n) return;
+      fx.push({ t: 'disarm', key: saveKey(input.n) });
+      return saved(m, input.failure, now, fx);
     case 'forgotten':
-      if (m.phase !== 'removing' || !m.forgetting) return;
-      m.forgetting = false;
-      if (input.failure) {
-        m.failure = input.failure;
-        return replyAll(m.removes, { kind: 'failed', failure: input.failure }, fx);
-      }
-      m.phase = 'removed';
-      m.failure = undefined;
-      m.tools = [];
-      return replyAll(m.removes, { kind: 'removed' }, fx);
+      if (m.phase !== 'removing' || m.forgetting !== input.n) return;
+      fx.push({ t: 'disarm', key: forgetKey(input.n) });
+      return forgotten(m, input.failure, fx);
   }
 }
 
-function start(m: Machine, token: number, now: number, fx: Effect[]): void {
+/** Joins a waiting list, or is refused when it's full. */
+function wait(m: Machine, list: number[], token: number, fx: Effect[]): boolean {
+  if (list.length >= m.limits.maxWaiters) {
+    reply(token, TOO_MANY, fx);
+    return false;
+  }
+  list.push(token);
+  return true;
+}
+
+function start(m: Machine, token: number, fx: Effect[], now: number): void {
   switch (m.phase) {
     case 'removed': return reply(token, { kind: 'removed' }, fx);
     case 'removing': return reply(token, { kind: 'refused', words: 'The server is being removed.' }, fx);
     case 'ready': return reply(token, { kind: 'ready' }, fx);
     case 'starting': case 'initializing': case 'restarting': case 'stopping':
-      m.starts.push(token);
+      wait(m, m.starts, token, fx);
       return;
     case 'stopped': case 'down':
-      m.starts.push(token);
+      if (!wait(m, m.starts, token, fx)) return;
+      // An edit being saved goes first; the start follows it.
+      if (m.editing) return;
       m.crashes = [];
       m.failure = undefined;
-      return launch(m, false, fx);
+      return launch(m, false, now, fx);
   }
 }
 
 function stop(m: Machine, token: number, now: number, fx: Effect[]): void {
+  // A stop settles every start made before it. Only a start after it can ask for another run.
+  replyAll(m.starts, { kind: 'stopped' }, fx);
   switch (m.phase) {
     case 'removed': return reply(token, { kind: 'removed' }, fx);
     case 'stopped': case 'down': case 'removing': return reply(token, { kind: 'stopped' }, fx);
     case 'stopping':
-      m.stops.push(token);
+      if (!wait(m, m.stops, token, fx)) return;
       return;
     case 'restarting':
       // Its run already closed: nothing to halt.
       fx.push({ t: 'disarm', key: restartKey(m.gen) });
       settleCalls(m, () => NOT_RUNNING, fx);
-      replyAll(m.starts, { kind: 'stopped' }, fx);
       m.phase = 'stopped';
       return reply(token, { kind: 'stopped' }, fx);
     case 'starting': case 'initializing': case 'ready':
@@ -241,14 +309,11 @@ function remove(m: Machine, token: number, now: number, fx: Effect[]): void {
   switch (m.phase) {
     case 'removed': return reply(token, { kind: 'removed' }, fx);
     case 'removing':
-      m.removes.push(token);
-      if (!m.forgetting) {
-        m.forgetting = true;
-        fx.push({ t: 'forget' });
-      }
+      if (!wait(m, m.removes, token, fx)) return;
+      if (m.forgetting === undefined) beginForget(m, now, fx);
       return;
     case 'stopping':
-      m.removes.push(token);
+      wait(m, m.removes, token, fx);
       return;
     case 'starting': case 'initializing': case 'ready':
       m.removes.push(token);
@@ -256,11 +321,46 @@ function remove(m: Machine, token: number, now: number, fx: Effect[]): void {
     case 'restarting':
       fx.push({ t: 'disarm', key: restartKey(m.gen) });
       m.removes.push(token);
-      return beginRemove(m, fx);
+      return beginRemove(m, now, fx);
     case 'stopped': case 'down':
-      m.removes.push(token);
-      return beginRemove(m, fx);
+      if (!wait(m, m.removes, token, fx)) return;
+      // An edit being saved finishes first; the removal follows it.
+      if (m.editing) return;
+      return beginRemove(m, now, fx);
   }
+}
+
+function edit(m: Machine, token: number, now: number, fx: Effect[]): void {
+  if (m.phase !== 'stopped' && m.phase !== 'down') return reply(token, { kind: 'refused', words: m.phase === 'removed' || m.phase === 'removing' ? 'The server was removed.' : 'Stop the server before changing it.' }, fx);
+  if (m.editing) return reply(token, { kind: 'refused', words: 'Another change to this server is being saved.' }, fx);
+  if (m.removes.length) return reply(token, { kind: 'refused', words: 'The server is being removed.' }, fx);
+  m.editing = { n: ++m.seq, token };
+  fx.push({ t: 'save', n: m.editing.n }, { t: 'arm', key: saveKey(m.editing.n), at: now + m.limits.saveMs });
+}
+
+function saved(m: Machine, failure: Failure | undefined, now: number, fx: Effect[]): void {
+  const token = m.editing!.token;
+  m.editing = undefined;
+  reply(token, failure ? { kind: 'failed', failure } : { kind: 'edited' }, fx);
+  if (m.removes.length) return beginRemove(m, now, fx);
+  if (m.starts.length) {
+    m.crashes = [];
+    m.failure = undefined;
+    launch(m, false, now, fx);
+  }
+}
+
+function forgotten(m: Machine, failure: Failure | undefined, fx: Effect[]): void {
+  m.forgetting = undefined;
+  if (failure) {
+    m.failure = failure;
+    return replyAll(m.removes, { kind: 'failed', failure }, fx);
+  }
+  m.phase = 'removed';
+  m.failure = undefined;
+  m.tools = [];
+  m.catalog = new Map();
+  replyAll(m.removes, { kind: 'removed' }, fx);
 }
 
 function call(m: Machine, input: Extract<Input, { t: 'call' }>, now: number, fx: Effect[]): void {
@@ -272,13 +372,43 @@ function call(m: Machine, input: Extract<Input, { t: 'call' }>, now: number, fx:
     case 'down': return void refuse(refusal('down', "The server is down: it stopped three times in ten minutes. Start it again in Settings."));
   }
   if (m.calls.size >= m.limits.maxCalls) return void refuse(BUSY);
-  const c: Call = { id: input.token, tool: input.tool, args: input.args };
+  const c: Call = { id: input.token, tool: input.tool, args: input.args, ...(input.expect ? { expect: input.expect } : {}) };
   m.calls.set(c.id, c);
   fx.push({ t: 'arm', key: callKey(c.id), at: now + callMs(m.limits, input.ms) });
-  if (m.phase === 'ready') {
-    c.sent = m.gen;
-    fx.push({ t: 'send', gen: m.gen, call: c.id, tool: c.tool, args: c.args });
+  if (m.phase === 'ready' && !m.stale && !m.ending) send(m, c, fx);
+}
+
+/** Sends a call, unless the tool it was made for isn't what the server offers now. */
+function send(m: Machine, c: Call, fx: Effect[]): void {
+  if (c.expect) {
+    const now = m.catalog.get(c.tool);
+    if (c.expect.setup !== m.setup || now !== c.expect.tool) {
+      return answer(m, c, refusal('changed', now === undefined
+        ? `The server no longer offers ${c.tool}, so Familiar didn't send the call.`
+        : `${c.tool} changed since it was offered, so Familiar didn't send the call. It will ask again.`), fx);
+    }
   }
+  c.sent = m.gen;
+  fx.push({ t: 'send', gen: m.gen, call: c.id, tool: c.tool, args: c.args });
+}
+
+function sendWaiting(m: Machine, fx: Effect[]): void {
+  for (const c of [...m.calls.values()]) if (c.sent === undefined) send(m, c, fx);
+}
+
+function setTools(m: Machine, tools: readonly ListedTool[]): void {
+  m.tools = tools;
+  m.catalog = new Map(tools.map(t => [t.name, t.fingerprint]));
+}
+
+/** One tool list at a time: a change while one is under way asks for one more, after it. */
+function requestList(m: Machine, now: number, fx: Effect[]): void {
+  if (m.listing !== undefined) {
+    m.listDirty = true;
+    return;
+  }
+  m.listing = ++m.seq;
+  fx.push({ t: 'list', gen: m.gen, n: m.listing }, { t: 'arm', key: listKey(m.listing), at: now + m.limits.listMs });
 }
 
 /** A call's deadline in ms, within the limits. */
@@ -288,34 +418,53 @@ export function callMs(limits: Limits, ms?: number): number {
 }
 
 function timer(m: Machine, key: string, now: number, fx: Effect[]): void {
-  const [kind, n] = key.split(':') as [string, string];
-  const id = Number(n);
-  if (kind === 'call') {
-    const c = m.calls.get(id);
-    if (!c) return;
-    if (c.sent !== undefined) fx.push({ t: 'abort', gen: c.sent, call: c.id });
-    return answer(m, c, { kind: 'timed-out' }, fx);
+  const [kind, num] = key.split(':') as [string, string];
+  const n = Number(num);
+  switch (kind) {
+    case 'call': {
+      const c = m.calls.get(n);
+      if (!c) return;
+      if (c.sent !== undefined) fx.push({ t: 'abort', gen: c.sent, call: c.id });
+      return answer(m, c, { kind: 'timed-out' }, fx);
+    }
+    case 'save':
+      if (m.editing?.n === n) saved(m, { kind: 'timed-out', words: "Familiar couldn't save the change in time. Try again." }, now, fx);
+      return;
+    case 'forget':
+      if (m.phase === 'removing' && m.forgetting === n) forgotten(m, { kind: 'timed-out', words: "Removing the server didn't finish in time. Try removing it again." }, fx);
+      return;
+    case 'list':
+      if (m.phase === 'ready' && m.listing === n && !m.ending) endRun(m, { kind: 'protocol', words: `The server didn't list its tools within ${secs(m.limits.listMs)} seconds.` }, now, fx);
+      return;
   }
-  if (id !== m.gen) return;
-  if (kind === 'init' && m.phase === 'initializing' && !m.ending) {
-    // The handshake took too long: end the run, and treat it as closed when it closes or its stop
-    // deadline passes.
-    m.ending = { kind: 'timed-out', words: `The server didn't finish starting within ${Math.round(m.limits.initMs / 1000)} seconds.` };
-    fx.push({ t: 'halt', gen: m.gen }, { t: 'arm', key: stopKey(m.gen), at: now + m.limits.stopMs });
-    return;
-  }
+  if (n !== m.gen) return;
+  if (kind === 'start' && m.phase === 'starting' && !m.ending) return endRun(m, { kind: 'timed-out', words: `The server didn't start within ${secs(m.limits.startMs)} seconds.` }, now, fx);
+  if (kind === 'init' && m.phase === 'initializing' && !m.ending) return endRun(m, { kind: 'timed-out', words: `The server didn't finish starting within ${secs(m.limits.initMs)} seconds.` }, now, fx);
   if (kind === 'stop' && m.open && (m.phase === 'stopping' || m.ending)) return closed(m, undefined, now, fx);
-  if (kind === 'restart' && m.phase === 'restarting') return launch(m, true, fx);
+  if (kind === 'restart' && m.phase === 'restarting') return launch(m, true, now, fx);
+}
+
+/** The machine ends the current run itself, and treats it as closed when it closes or its stop deadline
+    passes. Its calls are answered then, by the crash or failure path. */
+function endRun(m: Machine, why: Failure, now: number, fx: Effect[]): void {
+  m.ending = why;
+  if (m.listing !== undefined) fx.push({ t: 'disarm', key: listKey(m.listing) });
+  m.listing = undefined;
+  fx.push({ t: 'halt', gen: m.gen }, { t: 'arm', key: stopKey(m.gen), at: now + m.limits.stopMs });
 }
 
 /** The current run ended. */
 function closed(m: Machine, failure: Failure | undefined, now: number, fx: Effect[]): void {
   m.open = false;
-  fx.push({ t: 'disarm', key: initKey(m.gen) }, { t: 'disarm', key: stopKey(m.gen) });
+  fx.push({ t: 'disarm', key: startKey(m.gen) }, { t: 'disarm', key: initKey(m.gen) }, { t: 'disarm', key: stopKey(m.gen) });
+  if (m.listing !== undefined) fx.push({ t: 'disarm', key: listKey(m.listing) });
+  m.listing = undefined;
+  m.listDirty = false;
+  m.stale = false;
   const why = m.ending ?? failure ?? { kind: 'exited', words: 'The server stopped.' };
   m.ending = undefined;
   switch (m.phase) {
-    case 'stopping': return finishStop(m, fx);
+    case 'stopping': return finishStop(m, now, fx);
     case 'starting': case 'initializing':
       if (m.auto) return crash(m, why, now, fx);
       // The person's own start failed: say why, and don't try again on its own.
@@ -343,41 +492,51 @@ function crash(m: Machine, why: Failure, now: number, fx: Effect[]): void {
   replyAll(m.starts, { kind: 'failed', failure: why }, fx);
 }
 
-function launch(m: Machine, auto: boolean, fx: Effect[]): void {
+function launch(m: Machine, auto: boolean, now: number, fx: Effect[]): void {
   m.gen++;
   m.open = true;
   m.auto = auto;
   m.ending = undefined;
   m.phase = 'starting';
-  fx.push({ t: 'launch', gen: m.gen });
+  m.setup = undefined;
+  m.catalog = new Map();
+  fx.push({ t: 'launch', gen: m.gen }, { t: 'arm', key: startKey(m.gen), at: now + m.limits.startMs });
 }
 
 function beginStop(m: Machine, now: number, fx: Effect[]): void {
   settleCalls(m, c => (c.sent !== undefined ? { kind: 'interrupted' } : STOPPING), fx);
   replyAll(m.starts, { kind: 'stopped' }, fx);
+  if (m.listing !== undefined) fx.push({ t: 'disarm', key: listKey(m.listing) });
+  m.listing = undefined;
+  m.listDirty = false;
+  m.stale = false;
   m.phase = 'stopping';
   m.ending = undefined;
   fx.push({ t: 'halt', gen: m.gen }, { t: 'arm', key: stopKey(m.gen), at: now + m.limits.stopMs });
 }
 
-function finishStop(m: Machine, fx: Effect[]): void {
+function finishStop(m: Machine, now: number, fx: Effect[]): void {
   replyAll(m.stops, { kind: 'stopped' }, fx);
-  if (m.removes.length > 0) return beginRemove(m, fx);
+  if (m.removes.length > 0) return beginRemove(m, now, fx);
   m.phase = 'stopped';
   if (m.starts.length > 0) {
     m.crashes = [];
     m.failure = undefined;
-    launch(m, false, fx);
+    launch(m, false, now, fx);
   }
 }
 
-function beginRemove(m: Machine, fx: Effect[]): void {
+function beginRemove(m: Machine, now: number, fx: Effect[]): void {
   settleCalls(m, () => REMOVED, fx);
   replyAll(m.starts, { kind: 'removed' }, fx);
   m.phase = 'removing';
   m.failure = undefined;
-  m.forgetting = true;
-  fx.push({ t: 'forget' });
+  beginForget(m, now, fx);
+}
+
+function beginForget(m: Machine, now: number, fx: Effect[]): void {
+  m.forgetting = ++m.seq;
+  fx.push({ t: 'forget', n: m.forgetting }, { t: 'arm', key: forgetKey(m.forgetting), at: now + m.limits.saveMs });
 }
 
 /** Answers every call `outcome` gives an answer for, and keeps the rest. */

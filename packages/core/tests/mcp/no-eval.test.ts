@@ -16,7 +16,7 @@ describe('the MCP client with eval off', () => {
     expect(r.error).toBeUndefined();
     expect(r.start).toBe('ready');
     expect(r.tools).toContain('echo');
-    expect(r.tools).toHaveLength(9);
+    expect(r.tools).toHaveLength(10);
     expect(r.echo).toEqual({ kind: 'result', text: 'no eval', isError: false });
     expect(r.fail).toMatchObject({ kind: 'result', isError: true });
     expect(r.unknown).toMatchObject({ kind: 'error', reason: 'protocol' });

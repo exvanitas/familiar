@@ -26,7 +26,6 @@ const ALLOWED_ENTRIES: readonly string[] = [
   // The MCP SDK's client parts. tests/mcp/bundle.test.ts bundles them for the browser and finds no Node.
   '@modelcontextprotocol/sdk/client/index.js',
   '@modelcontextprotocol/sdk/client/streamableHttp.js',
-  '@modelcontextprotocol/sdk/client/sse.js',
   '@modelcontextprotocol/sdk/shared/transport.js',
   '@modelcontextprotocol/sdk/types.js',
   '@modelcontextprotocol/sdk/validation/types.js'

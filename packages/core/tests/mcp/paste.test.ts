@@ -131,11 +131,56 @@ describe('remote servers', () => {
     withUser.username = 'someone';
     withUser.password = 'pw';
     expect(p(withUser.href)).toMatch(/user name or password/);
-    expect(p('http://mcp.example.test/mcp')).toMatch(/must use https/);
+    // A name's reach is the exe's to decide, after the person approves it: only literal addresses here.
+    expect(p('http://mcp.example.test/mcp')).toBe('');
+    expect(p('http://93.184.216.34/mcp')).toMatch(/must use https/);
+    expect(p('http://[2606:4700::1111]/mcp')).toMatch(/must use https/);
+    expect(p('http://[::ffff:127.0.0.1]:3000/mcp')).toBe('');
+    expect(p('http://[fd00::5]/mcp')).toBe('');
+    expect(p('https://169.254.169.254/mcp')).toMatch(/never sends to that address/);
+    expect(p('https://[fe80::1]/mcp')).toMatch(/never sends to that address/);
+    expect(p('http://fcserver.example.test/mcp')).toBe('');
     expect(p('https://mcp.example.test/a%2fb')).toMatch(/encoded dot or slash/);
     expect(p('not a url')).toMatch(/isn't a web address/);
     expect(p('http://localhost:3000/mcp')).toBe('');
     expect(p('http://192.168.1.20:8080/mcp')).toBe('');
     expect(p('https://mcp.example.test/mcp')).toBe('');
+  });
+});
+
+describe('credentials are only ever secrets (r19 #1)', () => {
+  it('a short credential is refused, never kept as a plain setting', () => {
+    const d = one('{ "mcpServers": { "s": { "command": "npx", "args": ["x@1.0.0"], "env": { "API_KEY": "abc123", "LOG_LEVEL": "info" } } } }');
+    expect(d.setup).toMatchObject({ env: [['LOG_LEVEL', 'info']], secrets: ['API_KEY'] });
+    expect(d.problems.join(' ')).toMatch(/API_KEY is shorter than 8 characters\..*never shows one as a plain setting/);
+    expect(JSON.stringify(d.setup)).not.toContain('abc123');
+  });
+
+  it('a credential-like name as a plain setting is refused, by form or by edit', () => {
+    const formed = localDraft({ label: 's', command: 'npx', args: ['x@1.0.0'], settings: [{ name: 'SERVICE_TOKEN', value: 'value-one', secret: false }] }, opts);
+    expect(formed.problems.join(' ')).toMatch(/SERVICE_TOKEN looks like a key or password, so Familiar keeps it only as a secret/);
+    for (const name of ['DB_PASSWORD', 'GITHUB_PAT_KEY', 'AUTH_HEADER', 'CLIENT_SECRET', 'SESSION_ID', 'MY_PWD']) {
+      const d = localDraft({ label: 's', command: 'npx', args: ['x@1.0.0'], settings: [{ name, value: 'v', secret: false }] }, opts);
+      expect(d.problems.join(' '), name).toMatch(/looks like a key or password/);
+    }
+    // One that changes what runs and looks like a credential can be neither.
+    const both = localDraft({ label: 's', command: 'npx', args: ['x@1.0.0'], settings: [{ name: 'NPM_CONFIG__AUTH', value: 'value-one', secret: true }] }, opts);
+    expect(both.problems.join(' ')).toMatch(/neither a secret nor a plain setting/);
+  });
+});
+
+describe("paths, as the exe's syntax takes them (r19 #16)", () => {
+  const program = (p: string) => localDraft({ label: 's', command: p, args: [], settings: [] }, opts).problems.join(' ');
+  const folder = (c: string) => localDraft({ label: 's', command: 'npx', args: ['x@1.0.0'], cwd: c, settings: [] }, opts).problems.join(' ');
+  it('refuses what the exe refuses before touching the disk', () => {
+    for (const p of ['C:evil.exe', '\\\\server\\share\\tool.exe', '\\\\?\\C:\\tool.exe', '\\\\.\\C:\\tool.exe', 'C:\\Windows\\..\\tool.exe', 'C:\\tool.exe:stream', 'C:\\COM1\\x.exe', 'C:\\who\u200bami.exe', 'C:/tools/x.exe', 'tools\\x.exe', 'nul']) {
+      expect(program(p), p).toMatch(/won't start the program|isn't a program name/);
+    }
+    for (const c of ['relative', '.', 'C:', 'C:work', '\\\\server\\share', 'C:\\work\\..', 'D:\\a\\con.txt']) expect(folder(c), c).toMatch(/won't run a server in the folder/);
+  });
+
+  it('takes plain names and local full paths', () => {
+    for (const p of ['npx', 'uvx.exe', 'C:\\Program Files\\nodejs\\npx.cmd', 'D:\\tools\\server.exe']) expect(program(p), p).toBe('');
+    for (const c of ['C:\\work\\home', 'D:\\', 'C:\\Program Files\\x']) expect(folder(c), c).toBe('');
   });
 });

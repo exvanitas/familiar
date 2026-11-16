@@ -7,6 +7,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { McpClient } from '../../src/mcp/client.ts';
 import { openSession } from '../../src/mcp/session.ts';
 import { parsePaste } from '../../src/mcp/paste.ts';
+import { posixPaths } from '../../src/mcp/native-rules.ts';
 import { memorySettingsStore } from '../../src/settings/store.ts';
 import { FAKE_MAIN, REPO } from './fake.ts';
 import { nodeProcessPort } from './node-process.ts';
@@ -22,6 +23,7 @@ try {
 const port = nodeProcessPort();
 try {
   const client = await McpClient.open({
+    paths: posixPaths,
     store: memorySettingsStore(),
     processes: port,
     fetchFor: () => fetch,
@@ -29,7 +31,7 @@ try {
     secrets: { delete: async () => {} },
     clock: { now: () => Date.now(), setTimer: (f, ms) => { const t = setTimeout(f, ms); return () => clearTimeout(t); } }
   });
-  const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'no-eval', defaultCwd: REPO });
+  const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'no-eval', defaultCwd: REPO, paths: posixPaths });
   const { id } = await client.add(drafts[0]!);
   out.start = (await client.start(id)).kind;
   out.tools = client.tools().map(t => t.serverName);

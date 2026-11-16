@@ -50,6 +50,7 @@ describe('the fake MCP server over stdio', () => {
       ['print_secret', true],
       ['list_env', true],
       ['spawn_tree', false],
+      ['set_variant', false],
       ['read_page', true]
     ]);
     expect(tools).toEqual(fakeTools('a'));

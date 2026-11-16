@@ -4,7 +4,7 @@
 // changing the pin) asks again.
 
 export interface Unpinned {
-  readonly runner: 'npx' | 'uvx' | 'bunx' | 'pnpm dlx' | 'docker run';
+  readonly runner: 'npx' | 'npm exec' | 'uvx' | 'bunx' | 'pnpm dlx' | 'docker run';
   /** The package or image as written. */
   readonly what: string;
   readonly words: string;
@@ -39,6 +39,10 @@ function firstPlain(args: readonly string[], withValue: readonly string[]): { in
 export function unpinned(program: string, args: readonly string[]): Unpinned | undefined {
   const name = base(program);
   if (name === 'npx' || name === 'bunx') return npmLike(name, args);
+  if (name === 'npm') {
+    const exec = args.findIndex(a => a === 'exec' || a === 'x');
+    return exec < 0 ? undefined : npmLike('npm exec', args.slice(exec + 1), args.slice(0, exec));
+  }
   if (name === 'pnpm') {
     const dlx = args.indexOf('dlx');
     return dlx < 0 ? undefined : npmLike('pnpm dlx', args.slice(dlx + 1), args.slice(0, dlx));
@@ -55,8 +59,9 @@ export function unpinned(program: string, args: readonly string[]): Unpinned | u
   return undefined;
 }
 
-function npmLike(runner: 'npx' | 'bunx' | 'pnpm dlx', args: readonly string[], before: readonly string[] = []): Unpinned | undefined {
-  // `-p <pkg>` / `--package <pkg>` / `--package=<pkg>` name the packages; otherwise it's the first plain argument.
+function npmLike(runner: 'npx' | 'npm exec' | 'bunx' | 'pnpm dlx', args: readonly string[], before: readonly string[] = []): Unpinned | undefined {
+  // `-p <pkg>` / `--package <pkg>` / `--package=<pkg>` name every package fetched, and each must be pinned;
+  // without them it's the first plain argument.
   const packages: string[] = [];
   const all = [...before, ...args];
   for (let i = 0; i < all.length; i++) {
@@ -84,20 +89,36 @@ function npmLike(runner: 'npx' | 'bunx' | 'pnpm dlx', args: readonly string[], b
   return undefined;
 }
 
+/** The value of `--flag value` or `--flag=value`, for every time the flag appears. */
+function values(args: readonly string[], flags: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (flags.includes(a) && args[i + 1] !== undefined) out.push(args[++i]!);
+    else for (const f of flags) if (f.startsWith('--') && a.startsWith(`${f}=`)) out.push(a.slice(f.length + 1));
+  }
+  return out;
+}
+
+/** uvx fetches its main package (`--from`, or the first plain argument) and every `--with`. Each must be
+    pinned exactly; what those packages depend on is beyond the flag. */
 function uvx(args: readonly string[]): Unpinned | undefined {
-  const from = args.indexOf('--from');
-  const spec = from >= 0 ? args[from + 1] : args.find(a => a.startsWith('--from='))?.slice(7) ?? firstPlain(args, ['--with', '--python', '-p', '--index-url', '--extra-index-url', '--index']).arg;
-  if (!spec || /^(\.|\/|[A-Za-z]:[\\/]|git\+|https?:)/.test(spec)) return undefined;
-  const m = /^([A-Za-z0-9._-]+(?:\[[^\]]*\])?)\s*(?:(==|@)\s*([^\s,;]+))?/.exec(spec);
-  const name = m?.[1] ?? spec;
-  const version = m?.[3];
-  if (version && EXACT.test(version)) return undefined;
-  return {
-    runner: 'uvx',
-    what: spec,
-    words: version ? `uvx can fetch new code for ${name} at any start: "${version}" isn't an exact version.` : `uvx can fetch new code for ${name} at any start, since no version is pinned.`,
-    fix: `Pin an exact version, such as ${name}@1.2.3 (or --from ${name}==1.2.3), with the version you checked.`
-  };
+  const from = values(args, ['--from']);
+  const main = from.length ? from : [firstPlain(args, ['--with', '--python', '-p', '--index-url', '--extra-index-url', '--index', '--with-requirements', '--with-editable']).arg].filter((a): a is string => a !== undefined);
+  for (const spec of [...main, ...values(args, ['--with', '-w'])]) {
+    if (/^(\.|\/|[A-Za-z]:[\\/]|git\+|https?:)/.test(spec)) continue;
+    const m = /^([A-Za-z0-9._-]+(?:\[[^\]]*\])?)\s*(?:(==|@)\s*([^\s,;]+))?/.exec(spec);
+    const name = m?.[1] ?? spec;
+    const version = m?.[3];
+    if (version && EXACT.test(version)) continue;
+    return {
+      runner: 'uvx',
+      what: spec,
+      words: version ? `uvx can fetch new code for ${name} at any start: "${version}" isn't an exact version.` : `uvx can fetch new code for ${name} at any start, since no version is pinned.`,
+      fix: `Pin an exact version, such as ${name}==1.2.3, with the version you checked.`
+    };
+  }
+  return undefined;
 }
 
 const DOCKER_WITH_VALUE = [

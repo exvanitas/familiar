@@ -5,14 +5,11 @@
 
 import type { FamiliarTool, ToolStep } from '../journal/tools.ts';
 import type { ToolPolicy } from '../journal/gate.ts';
-import { canonicalJson, sha256 } from './hash.ts';
+import { effectiveDescription } from './catalog.ts';
+import type { Expect } from './machine.ts';
 import type { CallOutcome, ListedTool } from './types.ts';
 
-/** A tool's fingerprint: SHA-256 of its name, description and input schema, in canonical JSON. A new or
-    changed fingerprint is a new tool: it goes back to ask, whatever was allowed before. */
-export function toolFingerprint(t: Pick<ListedTool, 'name' | 'description' | 'inputSchema'>): string {
-  return sha256(canonicalJson({ name: t.name, description: t.description ?? '', inputSchema: t.inputSchema }));
-}
+export { toolFingerprint } from './catalog.ts';
 
 export interface ToolChanges {
   readonly added: readonly string[];
@@ -52,6 +49,8 @@ export function modelNames(servers: readonly { readonly id: string; readonly lab
     if (!/^[A-Za-z]/.test(prefix)) prefix = `s${prefix}`.slice(0, PREFIX_CHARS);
     const names = new Map<string, string>();
     for (const t of [...s.tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      // A server's list never names a tool twice (checkTools refuses it); a second one gets no name.
+      if (names.has(t.name)) continue;
       const base = `${prefix}__${safe(t.name) || 'tool'}`.slice(0, MAX_MODEL_NAME);
       let name = base;
       for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base.slice(0, MAX_MODEL_NAME - String(n).length - 1)}_${n}`;
@@ -74,17 +73,20 @@ export interface ServerTool extends FamiliarTool {
   readonly kind: 'server';
   /** Every result is outside content. */
   readonly outside: true;
+  /** The server's immutable id, and its label as shown. */
   readonly server: { readonly id: string; readonly label: string };
-  /** The tool's own name on its server. */
+  /** The tool's own name on its server. With the server's id, it's the tool's identity for consent; the
+      model's name for it never is. */
   readonly serverName: string;
+  /** The tool as offered: the call is sent only if the server still offers exactly this. */
   readonly fingerprint: string;
-  /** The server's setup fingerprint: "always for this" binds to both. */
+  /** The fingerprint of the setup its run started from. "Always for this" binds to both. */
   readonly setupFingerprint: string;
   /** New or changed since the person last reviewed it. */
   readonly fresh: boolean;
 }
 
-export type Caller = (tool: string, args: unknown, options: { signal?: AbortSignal }) => Promise<CallOutcome>;
+export type Caller = (tool: string, args: unknown, options: { signal?: AbortSignal; expect: Expect }) => Promise<CallOutcome>;
 
 const MAX_DESCRIPTION = 2000;
 
@@ -97,7 +99,7 @@ export function serverTool(input: {
   call: Caller;
 }): ServerTool {
   const { server, listed, call } = input;
-  const description = (listed.description ?? listed.title ?? '').slice(0, MAX_DESCRIPTION);
+  const description = effectiveDescription(listed).slice(0, MAX_DESCRIPTION);
   const schema = listed.inputSchema && listed.inputSchema.type === 'object' ? listed.inputSchema : { type: 'object', properties: {} };
   return {
     name: input.modelName,
@@ -110,12 +112,15 @@ export function serverTool(input: {
     ...(listed.readOnlyHint !== undefined ? { readOnlyHint: listed.readOnlyHint } : {}),
     server,
     serverName: listed.name,
-    fingerprint: toolFingerprint(listed),
+    fingerprint: listed.fingerprint,
     setupFingerprint: input.setupFingerprint,
     fresh: input.fresh,
     doing: () => `calling ${listed.name} on ${server.label}`,
     async run(args: unknown, step: ToolStep): Promise<string> {
-      const outcome = await call(listed.name, args, step.signal ? { signal: step.signal } : {});
+      // Sent only if the server still offers exactly this tool, from the same setup: an old wrapper can't
+      // call a tool that changed under it.
+      const expect = { setup: input.setupFingerprint, tool: listed.fingerprint };
+      const outcome = await call(listed.name, args, step.signal ? { signal: step.signal, expect } : { expect });
       return outcomeText(server.label, listed.name, outcome);
     }
   };
@@ -145,15 +150,22 @@ export interface ToolChoice {
   readonly fingerprint: string;
 }
 
+/** The key a choice is kept under: the server's immutable id and the tool's own name. Never the model's
+    name for it, which depends on labels and on the other servers. */
+export function choiceKey(serverId: string, toolName: string): string {
+  return JSON.stringify([serverId, toolName]);
+}
+
 /**
- * The gate's per-tool policy from the person's choices, keyed by model name. "Always" holds only for the
- * exact tool and setup it was given for: a changed tool or a new command, address or version puts it back
- * to ask. "Never" holds whatever changed, since stricter is safe.
+ * The gate's per-tool policy from the person's choices, which are keyed by `choiceKey`. The policy comes
+ * out keyed by model name, as the gate reads it. "Always" holds only for the exact tool and setup it was
+ * given for: a changed tool or a new command, address or version puts it back to ask. "Never" holds
+ * whatever changed, since stricter is safe.
  */
 export function toolPolicies(tools: readonly ServerTool[], choices: Readonly<Record<string, ToolChoice>>): Record<string, ToolPolicy> {
   const out: Record<string, ToolPolicy> = {};
   for (const t of tools) {
-    const c = choices[t.name];
+    const c = choices[choiceKey(t.server.id, t.serverName)];
     if (!c) continue;
     if (c.policy === 'deny') out[t.name] = 'deny';
     else if (c.policy === 'allow' && c.fingerprint === t.fingerprint && c.setupFingerprint === t.setupFingerprint) out[t.name] = 'allow';

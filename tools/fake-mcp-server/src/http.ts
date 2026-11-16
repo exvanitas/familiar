@@ -15,6 +15,7 @@ export interface HttpHandle {
 
 export async function startHttp(options: FakeServerOptions & { readonly port?: number } = {}): Promise<HttpHandle> {
   const notes: string[] = [];
+  const shared = { variant: options.variant ?? 'a' };
   let allowedHosts: string[] = [];
 
   const http = createServer((req, res) => {
@@ -25,6 +26,7 @@ export async function startHttp(options: FakeServerOptions & { readonly port?: n
     const server = createFakeServer({
       ...options,
       notes,
+      shared,
       // In-process there is no program to exit, so a crash drops every connection instead.
       crash: options.crash ?? (() => http.closeAllConnections())
     });

@@ -4,6 +4,7 @@
 
 import { canonicalJson, sha256 } from './hash.ts';
 import type { ProcessSetup } from './process.ts';
+import { literalClass, windowsPaths, type PathRules } from './native-rules.ts';
 import { KEY_HEADERS, type RemoteTarget } from './remote.ts';
 
 export interface LocalSetup {
@@ -72,6 +73,10 @@ export function validName(name: string): boolean {
   return name.length <= MAX_NAME && /^[A-Za-z_.-][A-Za-z0-9_.-]*$/.test(name);
 }
 
+/** Legacy SSE isn't taken in v1: its server names the URL for its posts itself, so its approval would have
+    to cover more than one address. */
+export const SSE_WORDS = "This server uses an older connection (SSE) that Familiar doesn't support yet. If it also offers Streamable HTTP, use that address.";
+
 /** Request headers the guarded fetch drops, so a setup may not rely on them. */
 const DROPPED_HEADERS = ['host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'te', 'trailer', 'upgrade', 'expect', 'cookie'];
 /** Header names that look like they carry a key. */
@@ -80,6 +85,12 @@ const KEY_LIKE = /key|token|secret|auth|password|passwd|credential|session|cooki
 /** Whether a header name looks like it carries a key. */
 export function keyLike(name: string): boolean {
   return KEY_LIKE.test(name);
+}
+
+/** Whether a setting's name looks like a credential: those are only ever secrets. */
+const CREDENTIAL_LIKE = /key|token|secret|auth|passw|pwd|passphrase|credential|session|cookie|private/i;
+export function credentialLike(name: string): boolean {
+  return CREDENTIAL_LIKE.test(name);
 }
 
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
@@ -98,7 +109,7 @@ export function touchesAMarker(value: string): boolean {
 /** What's wrong with a secret value, in the exe's terms (5a), or undefined. */
 export function secretValueProblem(name: string, value: string): string | undefined {
   const n = bytes(value);
-  if (n < SECRET_MIN_BYTES) return `${name} is shorter than ${SECRET_MIN_BYTES} characters, too short to keep as a secret. Make it a plain setting.`;
+  if (n < SECRET_MIN_BYTES) return `${name} is shorter than ${SECRET_MIN_BYTES} characters. Familiar keeps a secret only from ${SECRET_MIN_BYTES} characters, and never shows one as a plain setting, so it can't take this value.`;
   if (n > SECRET_MAX_BYTES) return `${name} is longer than ${SECRET_MAX_BYTES} bytes, too long to keep as a secret.`;
   if (CONTROL.test(value)) return `${name} holds a line break or another control character.`;
   if (touchesAMarker(value)) return `${name} holds part of a marker Familiar uses for blanked text ([key] or [hidden]), so it can't be kept as a secret.`;
@@ -106,21 +117,28 @@ export function secretValueProblem(name: string, value: string): string | undefi
 }
 
 /** Every problem with a setup, in plain words. Empty when the exe would take it. */
-export function setupProblems(setup: ServerSetup): string[] {
+export function setupProblems(setup: ServerSetup, paths: PathRules = windowsPaths): string[] {
   const p: string[] = [];
   if (!validId(setup.id)) p.push('The setup id must be 1 to 64 letters, digits, - or _.');
   const label = setup.label.trim();
   if (!label) p.push('Give the server a name.');
   else if (label.length > MAX_LABEL) p.push(`The server's name is longer than ${MAX_LABEL} characters.`);
   if (CONTROL.test(setup.label)) p.push("The server's name holds a control character.");
-  return setup.kind === 'local' ? [...p, ...localProblems(setup)] : [...p, ...remoteProblems(setup)];
+  return setup.kind === 'local' ? [...p, ...localProblems(setup, paths)] : [...p, ...remoteProblems(setup)];
 }
 
-function localProblems(s: LocalSetup): string[] {
+function localProblems(s: LocalSetup, paths: PathRules): string[] {
   const p: string[] = [];
   if (!s.program.trim()) p.push('Give the program to start, such as npx or uvx.');
-  if (CONTROL.test(s.program)) p.push('The program holds a control character.');
+  else {
+    const bad = paths.program(s.program);
+    if (bad) p.push(bad);
+  }
   if (!s.cwd.trim()) p.push('Choose the folder it runs in.');
+  else {
+    const bad = paths.folder(s.cwd);
+    if (bad) p.push(bad);
+  }
   if (s.args.length > MAX_ARGS) p.push(`It has ${s.args.length} arguments. Familiar takes at most ${MAX_ARGS}.`);
   if (s.env.length > MAX_SETTINGS) p.push(`It has ${s.env.length} plain settings. Familiar takes at most ${MAX_SETTINGS}.`);
   if (s.secrets.length > MAX_SECRETS) p.push(`It has ${s.secrets.length} secrets. Familiar takes at most ${MAX_SECRETS}.`);
@@ -128,6 +146,9 @@ function localProblems(s: LocalSetup): string[] {
   const seen = new Map<string, number>();
   for (const [name, value] of s.env) {
     if (!validName(name)) p.push(`"${name}" isn't a setting name Familiar takes: use letters, digits, _, - and ., not starting with a digit.`);
+    else if (credentialLike(name)) p.push(changesWhatRuns(name)
+      ? `${name} looks like a key or password, but it also changes what runs, so it can be neither a secret nor a plain setting. Familiar can't take it.`
+      : `${name} looks like a key or password, so Familiar keeps it only as a secret, never as a plain setting shown in the approval.`);
     if (value.includes('\0')) p.push(`${name} holds a NUL character.`);
     seen.set(name.toUpperCase(), (seen.get(name.toUpperCase()) ?? 0) + 1);
   }
@@ -143,6 +164,7 @@ function localProblems(s: LocalSetup): string[] {
 
 function remoteProblems(s: RemoteSetup): string[] {
   const p: string[] = [];
+  if (s.transport === 'sse') p.push(SSE_WORDS);
   p.push(...urlProblems(s.url));
   if (s.headers.length > MAX_HEADERS) p.push(`It has ${s.headers.length} headers. Familiar takes at most ${MAX_HEADERS}.`);
   const names = new Set<string>();
@@ -176,19 +198,10 @@ export function urlProblems(raw: string): string[] {
   if (u.search || raw.includes('?')) p.push("The address carries a query (after ?), which Familiar won't keep. If it holds a key, put the key in a header instead.");
   if (u.hash || raw.includes('#')) p.push('The address carries a # part, which Familiar won\'t keep.');
   if (/%2e|%2f|%5c/i.test(u.pathname)) p.push('The address path holds an encoded dot or slash, which Familiar refuses.');
-  if (u.protocol === 'http:' && !localHost(u.hostname)) p.push('The address must use https, unless it is on this PC or your own network.');
+  const reach = literalClass(u.hostname);
+  if (reach === 'refused') p.push('Familiar never sends to that address.');
+  else if (u.protocol === 'http:' && reach === 'public') p.push('The address must use https, unless it is on this PC or your own network.');
   return p;
-}
-
-/** Hosts plain http may reach: this PC and private networks, by literal address or `localhost`. The exe
-    classes a name that resolves privately itself, after the person approves it. */
-function localHost(host: string): boolean {
-  const h = host.replace(/^\[|\]$/g, '').toLowerCase();
-  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1') return true;
-  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
-  if (!m) return h.startsWith('fc') || h.startsWith('fd');
-  const [a, b] = [Number(m[1]), Number(m[2])];
-  return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
 }
 
 /** The local setup as the exe's `server_start` takes it. */

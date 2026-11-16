@@ -1,8 +1,7 @@
-// Remote servers: the SDK's Streamable HTTP and legacy SSE client transports, each with the fetch passed
-// in. In the app that fetch is the guarded fetch for the server's saved address, which reaches only that
-// address and swaps the key placeholder for the stored key. Core never sees a key.
+// Remote servers: the SDK's Streamable HTTP client transport, with the fetch passed in. In the app that
+// fetch is the guarded fetch for the server's saved address, which reaches only that address and swaps
+// the key placeholder for the stored key. Core never sees a key.
 
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
@@ -46,9 +45,8 @@ export class RemoteTransport implements RunTransport {
   constructor(target: RemoteTarget, fetch: FetchLike) {
     const url = new URL(target.url);
     const requestInit: RequestInit = { headers: remoteHeaders(target) };
-    this.inner = target.transport === 'sse'
-      ? new SSEClientTransport(url, { fetch, requestInit })
-      : new StreamableHTTPClientTransport(url, { fetch, requestInit });
+    // Streamable HTTP only: legacy SSE is refused when a server is added (SSE_WORDS in setup.ts).
+    this.inner = new StreamableHTTPClientTransport(url, { fetch, requestInit });
     this.inner.onclose = () => this.onclose?.();
     this.inner.onerror = e => this.onerror?.(e);
     this.inner.onmessage = m => this.onmessage?.(m);

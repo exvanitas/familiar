@@ -4,6 +4,7 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { ErrorCode, McpError, ToolListChangedNotificationSchema, type CallToolResult, type Tool } from '@modelcontextprotocol/sdk/types.js';
+import { CatalogError, checkTools, MAX_TOOLS } from './catalog.ts';
 import type { jsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/types.js';
 import { CALL_MS_MAX } from './machine.ts';
 import type { RunTransport } from './process-transport.ts';
@@ -11,8 +12,6 @@ import type { CallOutcome, Failure, ListedTool } from './types.ts';
 
 /** How much of a result's text the model gets. */
 export const MAX_RESULT_CHARS = 32_000;
-/** How many tools one server may list. */
-export const MAX_TOOLS = 128;
 const MAX_LIST_PAGES = 16;
 
 export const CLIENT_INFO = { name: 'familiar', version: '0.1.0' };
@@ -20,7 +19,7 @@ export const CLIENT_INFO = { name: 'familiar', version: '0.1.0' };
 export interface SessionEvents {
   /** The run started: the process runs, or the transport is ready to connect. */
   launched(): void;
-  /** The handshake and the first tool list are done. */
+  /** The handshake and the first tool list are done, the list checked against core's bounds. */
   ready(tools: ListedTool[]): void;
   /** The run ended. Called once, last. */
   closed(failure?: Failure): void;
@@ -30,6 +29,7 @@ export interface SessionEvents {
 export interface Session {
   /** Undefined when there's nothing to report: the call was stopped, or the run closed under it. */
   call(tool: string, args: unknown, signal: AbortSignal): Promise<CallOutcome | undefined>;
+  /** The tools again, checked. Rejects with a CatalogError for a list past core's bounds. */
   list(): Promise<ListedTool[]>;
   /** Ends the run. `closed` follows. */
   close(): void;
@@ -86,7 +86,8 @@ export function openSession(transport: RunTransport, events: SessionEvents, opti
       handshaking = false;
       // The run closed under the handshake: its exit says why. Otherwise it didn't speak MCP, or a
       // remote server refused it.
-      if (!closedError(e)) failure = transport.failure(e);
+      if (e instanceof CatalogError) failure = e.failure;
+      else if (!closedError(e)) failure = transport.failure(e);
       if (closedEarly) return end();
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -123,26 +124,18 @@ function closedError(e: unknown): boolean {
   return e instanceof McpError && e.code === ErrorCode.ConnectionClosed;
 }
 
+/** Every page of the list, then the whole list checked: bounded, and every name once. */
 async function listAll(client: Client, timeout: number): Promise<ListedTool[]> {
-  const out: ListedTool[] = [];
+  const raw: Tool[] = [];
   let cursor: string | undefined;
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const r = await client.listTools(cursor ? { cursor } : undefined, { timeout });
-    for (const t of r.tools) if (out.length < MAX_TOOLS) out.push(listed(t));
+    raw.push(...r.tools);
+    if (raw.length > MAX_TOOLS) break;
     cursor = r.nextCursor;
-    if (!cursor || out.length >= MAX_TOOLS) break;
+    if (!cursor) break;
   }
-  return out;
-}
-
-function listed(t: Tool): ListedTool {
-  return {
-    name: t.name,
-    ...(t.title !== undefined ? { title: t.title } : {}),
-    ...(t.description !== undefined ? { description: t.description } : {}),
-    inputSchema: t.inputSchema as Record<string, unknown>,
-    ...(t.annotations?.readOnlyHint !== undefined ? { readOnlyHint: t.annotations.readOnlyHint === true } : {})
-  };
+  return checkTools(raw);
 }
 
 /** A call's error, bounded. The server's message is its own word, never an instruction. */

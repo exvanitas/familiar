@@ -6,8 +6,9 @@
 // a bare map of servers, or one server object. Comments and trailing commas are forgiven.
 
 import { unpinned, type Unpinned } from './unpinned.ts';
+import type { PathRules } from './native-rules.ts';
 import { KEY_HEADERS } from './remote.ts';
-import { changesWhatRuns, keyLike, secretValueProblem, setupProblems, type LocalSetup, type RemoteSetup, type ServerSetup } from './setup.ts';
+import { changesWhatRuns, credentialLike, keyLike, secretValueProblem, setupProblems, type LocalSetup, type RemoteSetup, type ServerSetup } from './setup.ts';
 
 export interface Draft {
   readonly setup: ServerSetup;
@@ -27,6 +28,8 @@ export interface DraftOptions {
   readonly newId: () => string;
   /** The folder a local server runs in when the paste names none. */
   readonly defaultCwd?: string;
+  /** How paths are checked: Windows' rules unless a test says otherwise. */
+  readonly paths?: PathRules;
 }
 
 export interface PasteResult {
@@ -121,9 +124,12 @@ function draftOf(label: string, s: Obj, options: DraftOptions): Draft {
     return remoteDraft({ label, url, transport: type === 'sse' ? 'sse' : 'http', headers: pairs(s.headers) }, options);
   }
   // Every setting is a secret by default, except those that change what runs, and values too short
-  // to keep as one.
-  const settings = pairs(s.env).map(([name, value]) => ({ name, value, secret: !changesWhatRuns(name) && new TextEncoder().encode(value).length >= 8 }));
-  const shortOnes = pairs(s.env).filter(([name, value]) => !changesWhatRuns(name) && new TextEncoder().encode(value).length < 8).map(([n]) => n);
+  // to keep as one whose names don't look like credentials.
+  // A credential-like name is always a secret, however short (a short one is then a problem, never a
+  // plain setting).
+  const short = (v: string) => new TextEncoder().encode(v).length < 8;
+  const settings = pairs(s.env).map(([name, value]) => ({ name, value, secret: !changesWhatRuns(name) && (credentialLike(name) || !short(value)) }));
+  const shortOnes = pairs(s.env).filter(([name, value]) => !changesWhatRuns(name) && !credentialLike(name) && short(value)).map(([n]) => n);
   const d = localDraft({ label, command: String(s.command), args: strings(s.args), ...(typeof s.cwd === 'string' ? { cwd: s.cwd } : {}), settings }, options);
   const notes = [...d.notes];
   if (shortOnes.length) notes.push(`${shortOnes.join(', ')} ${shortOnes.length === 1 ? 'is' : 'are'} too short to keep as a secret, so ${shortOnes.length === 1 ? 'it is' : 'they are'} kept as plain settings, shown in the approval and saved with the setup.`);
@@ -155,7 +161,7 @@ export function localDraft(form: LocalForm, options: DraftOptions): Draft {
   };
   const flag = unpinned(setup.program, setup.args);
   if (flag) notes.push(`${flag.words} ${flag.fix}`);
-  return { setup, secrets, ...(flag ? { unpinned: flag } : {}), problems: [...setupProblems(setup), ...problems], notes };
+  return { setup, secrets, ...(flag ? { unpinned: flag } : {}), problems: [...setupProblems(setup, options.paths), ...problems], notes };
 }
 
 export function remoteDraft(form: RemoteForm, options: DraftOptions): Draft {

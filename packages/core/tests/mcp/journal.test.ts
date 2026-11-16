@@ -4,7 +4,7 @@
 // interrupted, with Run again, and the server never gets it a second time.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFakeModel, type FakeReply } from '../../src/testing/index.ts';
-import { decideByRules, McpClient, openJournal, parsePaste, systemClock, type ModelRequest } from '../../src/index.ts';
+import { choiceKey, decideByRules, McpClient, openJournal, parsePaste, posixPaths, systemClock, toolPolicies, type GatePolicy, type ModelRequest, type ToolChoice } from '../../src/index.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 import { nodeWorld, type NodeWorld } from '../journal/node-env.ts';
 import { FAKE_MAIN, REPO } from './fake.ts';
@@ -18,19 +18,19 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => void; storeName?: string } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
-  const client = await McpClient.open({ store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+  const client = await McpClient.open({ paths: posixPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
   let serverId = id;
   if (!serverId) {
-    const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO });
+    const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: posixPaths });
     serverId = (await client.add(drafts[0]!)).id;
   }
   expect((await client.start(serverId)).kind).toBe('ready');
   const model = createFakeModel(script);
   const journal = await openJournal({
-    store: await world.open('mcp-kill'),
+    store: await world.open(extra.storeName ?? 'mcp-kill'),
     owner: world.owner,
     model,
     modelId: 'fake-1',
@@ -38,7 +38,8 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
     tools: client.tools(),
     clock: systemClock,
     wake: { wakeAt: () => {} },
-    consent: { ask: () => Promise.resolve(true) },
+    consent: { ask: () => { extra.ask?.(); return Promise.resolve(true); } },
+    ...(extra.policy ? { policy: extra.policy } : {}),
     presence: { report: () => {} },
     persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
     decider: { decide: async (event, context) => decideByRules(event, context) },
@@ -81,5 +82,44 @@ describe('a server tool in the turn loop', () => {
     await sleep(200);
     expect(slowCalls(two.port)).toBe(0);
     await two.journal.close();
+  });
+
+  it('a tool changed on the running server: the gate asks again, and the old wrapper never sends (r19 #15)', async () => {
+    const world = nodeWorld();
+    const store = memorySettingsStore();
+    let asks = 0;
+    let choices: Record<string, ToolChoice> = {};
+    const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
+    const script = (r: ModelRequest): FakeReply => {
+      const last = r.messages.at(-1);
+      if (last?.role === 'tool') return { text: 'Done.' };
+      return { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'Fake_server__echo', arguments: { text: 'hi' } }] };
+    };
+    let client!: McpClient;
+    const policy = () => ({ perTool: toolPolicies(client.tools(), choices) });
+    const one = await life(world, store, undefined, script, { policy, ask: () => asks++, storeName: 'mcp-consent' });
+    client = one.client;
+    const echo = client.tools().find(t => t.serverName === 'echo')!;
+    choices = { [choiceKey(echo.server.id, 'echo')]: { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
+
+    // "Always": it runs without asking.
+    const t1 = await one.journal.send('Echo something.', 'turn-1');
+    if (!t1.replied) throw new Error('not replied');
+    await one.journal.turn(t1.turn.id).wait();
+    expect(asks).toBe(0);
+    expect(echoCalls(one.port)).toBe(1);
+
+    // The server changes echo while it runs.
+    await client.call(one.serverId, 'set_variant', { variant: 'b' });
+    for (let i = 0; i < 200 && client.tools().find(t => t.serverName === 'echo')!.fingerprint === echo.fingerprint; i++) await sleep(10);
+
+    // The same journal, with the old wrapper: the gate asks, and the call isn't sent.
+    const t2 = await one.journal.send('Echo something again.', 'turn-2');
+    if (!t2.replied) throw new Error('not replied');
+    await one.journal.turn(t2.turn.id).wait();
+    expect(asks).toBe(1);
+    expect(echoCalls(one.port)).toBe(1);
+    expect(JSON.stringify(await one.journal.transcript())).toMatch(/echo changed since it was offered, so Familiar didn't send the call/);
+    await one.journal.close();
   });
 });

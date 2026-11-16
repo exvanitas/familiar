@@ -1,6 +1,7 @@
 // The shapes the MCP client's parts share.
 
-/** A tool as the server listed it. Everything in it is the server's word. */
+/** A tool as the server listed it, checked against core's bounds. Everything in it but the fingerprint
+    is the server's word. */
 export interface ListedTool {
   readonly name: string;
   readonly title?: string;
@@ -8,6 +9,9 @@ export interface ListedTool {
   readonly inputSchema: Readonly<Record<string, unknown>>;
   /** MCP's `readOnlyHint`: shown, never trusted. */
   readonly readOnlyHint?: boolean;
+  /** Core's fingerprint of what the model and the person see of it: its name, its effective description
+      and its input schema. */
+  readonly fingerprint: string;
 }
 
 export type FailureKind =
@@ -42,7 +46,8 @@ export type CallOutcome =
   /** The server answered. A tool error is an answer too. The text is bounded. */
   | { readonly kind: 'result'; readonly text: string; readonly isError: boolean }
   /** It wasn't sent, or the protocol failed. */
-  | { readonly kind: 'error'; readonly reason: 'not-running' | 'stopping' | 'removed' | 'busy' | 'down' | 'protocol'; readonly words: string }
+  /** `changed`: the tool it was made for isn't what the server offers now, so it wasn't sent. */
+  | { readonly kind: 'error'; readonly reason: 'not-running' | 'stopping' | 'removed' | 'busy' | 'down' | 'protocol' | 'changed'; readonly words: string }
   /** The person pressed Stop. */
   | { readonly kind: 'stopped' }
   | { readonly kind: 'timed-out' }
@@ -52,6 +57,8 @@ export type CallOutcome =
 /** How a start, stop or remove ended. */
 export type Reply =
   | { readonly kind: 'ready' }
+  /** An edit was saved. */
+  | { readonly kind: 'edited' }
   | { readonly kind: 'stopped' }
   | { readonly kind: 'removed' }
   | { readonly kind: 'failed'; readonly failure: Failure }
