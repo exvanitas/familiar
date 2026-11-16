@@ -39,8 +39,10 @@ class World {
   commands = new Set<number>();
   forgetFails: () => boolean;
   problems: string[] = [];
+  private r: () => number;
 
-  constructor(private r: () => number) {
+  constructor(r: () => number) {
+    this.r = r;
     this.forgetFails = () => r() < 1 / 3;
   }
 

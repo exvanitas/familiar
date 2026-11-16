@@ -44,3 +44,7 @@ export { MAX_ANSWER_CHARS, oneJsonObject, READER_MAX_OUTPUT_TOKENS, readTraits }
 export type { ReadTraitsOptions, TraitFailure, TraitsResult } from './traits/read-traits.ts';
 export { memoryTraitCache } from './traits/cache.ts';
 export type { TraitCache } from './traits/cache.ts';
+
+export * from './mcp/index.ts';
+export { memorySettingsStore, openSettingsStore } from './settings/store.ts';
+export type { IndexedSettingsStore, SettingsStore, Stored } from './settings/store.ts';

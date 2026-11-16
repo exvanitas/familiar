@@ -11,7 +11,7 @@ const NODE_BUILTINS = [
   'worker_threads', 'zlib'
 ];
 
-// A package goes here only once it's checked to run without Node or Tauri (the MCP SDK's client parts, in step 7).
+// A package goes here only once it's checked to run without Node or Tauri.
 // @familiar/cards has its own portability test: no imports but its own files.
 const ALLOWED_PACKAGES: readonly string[] = ['@familiar/cards'];
 // Exact entry points only. The pi-durable spike bundled each of these for the browser with no Node
@@ -22,10 +22,18 @@ const ALLOWED_ENTRIES: readonly string[] = [
   '@earendil-works/chord/context',
   '@earendil-works/pi-ai/models',
   '@earendil-works/pi-ai/utils/event-stream',
-  '@earendil-works/pi-ai/utils/transcript'
+  '@earendil-works/pi-ai/utils/transcript',
+  // The MCP SDK's client parts. tests/mcp/bundle.test.ts bundles them for the browser and finds no Node.
+  '@modelcontextprotocol/sdk/client/index.js',
+  '@modelcontextprotocol/sdk/client/streamableHttp.js',
+  '@modelcontextprotocol/sdk/client/sse.js',
+  '@modelcontextprotocol/sdk/shared/transport.js',
+  '@modelcontextprotocol/sdk/types.js',
+  '@modelcontextprotocol/sdk/validation/types.js'
 ];
-// Pinned exactly: pi-durable calls itself experimental, with API changes between releases.
-const PINNED = ['@earendil-works/pi-durable', '@earendil-works/pi-ai', '@earendil-works/chord'];
+// Pinned exactly: pi-durable calls itself experimental, with API changes between releases, and the MCP SDK
+// is what speaks to every server.
+const PINNED = ['@earendil-works/pi-durable', '@earendil-works/pi-ai', '@earendil-works/chord', '@modelcontextprotocol/sdk'];
 
 function files(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((d) =>
