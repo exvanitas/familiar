@@ -366,6 +366,8 @@ How the swap works:
 
 **The streaming matcher.** A body is redacted as it streams by an incremental matcher (Aho-Corasick over the address's stored key and every secret that request used) that holds back only the longest tail of the output so far that could still be the start of one of them, and nothing else. Ordinary text with no secret prefix at its end passes at once. So an MCP server that sends one complete SSE event and then waits for the next request gets that event straight away. A chunk that produces no output doesn't end the read: `net_read` waits for the next chunk, and returns empty only at the real end of the body, when the held tail, which can't be a whole secret, is released. Literal copies only: an endpoint that returns the key encoded some other way defeats it, so **the recipient of a key is trusted**, which it already is, since it's the service the key belongs to.
 
+**JSON-escaped copies, in the pre-release native pass** (lead, 2026-11-16). One encoding isn't a choice of the recipient: JSON. A secret holding a quote, a backslash or a control character appears as `\"`, `\\` or `\u00XX` in JSON, which a model API or an MCP server writes as a matter of course, and core's `JSON.parse` turns it back into the secret. So from the native pass the matcher holds, for each secret, its literal form and the JSON-escaped forms common serializers write (JavaScript's and Python's defaults: a quote, a backslash and control characters escaped, and optionally `/` as `\/` and every non-ASCII character as `\uXXXX`), and blanks any of them. It stays bounded: a small fixed set of patterns a secret, each at most six times the secret's 1024 bytes. It serves every path back: the guarded fetch's responses, server output ([5b](#5b-starting-a-local-mcp-server)) and WebSocket messages. Until then a secret without quotes, backslashes or control characters is blanked whole. The runner measures it as `security.mcp.secret-json-escaped`, a known gap in everyday runs that fails the release gate while it's open ([7](#7-checks-on-the-windows-runner)).
+
 **What the guarantee is, worded honestly.** A key reaches only its own saved address, and no page can read it back, except the Settings window while the person types it. A page running bad script can still *use* a key through Familiar, while Familiar runs, at its own address. It can't carry it away.
 
 **Entering a key: in the Settings window** (decided 2026-11-14, [Decisions](#decisions)). Settings has a password field and calls `secret_set` itself, then clears the field. The key never touches IndexedDB, a channel or core. Four safeguards come with it:
@@ -430,7 +432,7 @@ type ServerEvent = { t: 'out', line } | { t: 'err', line } | { t: 'exit', code: 
 2. `CreateProcess` with `CREATE_NO_WINDOW | CREATE_SUSPENDED`, stdin, stdout and stderr piped.
 3. A new job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, the process assigned, then its thread resumed. If making the job, assigning or resuming fails, the suspended process is terminated, its handles are closed, and `server_start` returns `start-failed`, so nothing is left half-started. Just before resuming, under the lock that holds the runs, a start whose setup was forgotten since it began is refused (`revoked`), and otherwise the run joins the list, so a forget from then on finds it and stops it. Creating the process inside its job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) needs `CommandExt::raw_attribute`, which Rust 1.95 doesn't have stable, so a hard kill between the spawn and the assignment could leave a suspended process in no job: each child is recorded from its spawn until the start returns, and each start of the exe ends what such a record names, matched by process id and creation time. One job per server, its handle not inheritable and held only by the exe. In the spike, killing the app hard ended all 14 processes of three servers within 18 ms. Without the job, a busy server lived on.
 4. stdout is read line by line on its own thread. A line over 4 MiB is dropped with an `err` event saying so. stderr lines are cut at 8 KiB. Both go to core over the channel core passed in, which only core receives.
-5. **Before a line leaves Rust**, every secret value of the setup is replaced with `[hidden]`, on stdout and stderr both. Secrets are at least 8 bytes, so all of them are blanked.
+5. **Before a line leaves Rust**, every secret value of the setup is replaced with `[hidden]`, on stdout and stderr both. Secrets are at least 8 bytes, so all of them are blanked. From the pre-release native pass, each secret's JSON-escaped form is blanked too ([5a](#5a-credentials)): a server that prints its secret inside JSON escapes a quote in it, and core's `JSON.parse` would rebuild it.
 
 **The job is lifecycle control, not a security boundary.** It makes servers stop with Familiar. A server can still start work outside it (a scheduled task, another app), and can read or change anything the person can, `servers.json` included.
 
@@ -542,7 +544,9 @@ Each of these is here because a page can't do it and a later need would otherwis
 | `quit()` | Sends `quitting` to core, waits up to 3 s for `quit_ready`, then exits | Tray Quit takes the same path |
 | `quit_ready()` | Core has finished its last writes | After `quitting` only |
 | `tray_set({ tooltip, icon, items })` | Sets the menu, as Desktop Buddies' | `icon` a PNG from the app folder. The exe appends Quit, and "Let Familiar ask again" when the confirms are stopped. Menu ids starting `shell:` are the exe's |
-| `system()` | `{ userState, idleMs }` | `userState` from `SHQueryUserNotificationState`: `normal`, `fullscreen` (a D3D game or any full-screen app), `presentation`, `busy`, `quiet` (Windows' quiet time), `away`. `idleMs` from `GetLastInputInfo`, for the rules' "back after 20 minutes". Battery and session lock are left out until a feature uses them, and would be added before release if one does |
+| `system()` | `{ userState, idleMs, locked }` | `userState` from `SHQueryUserNotificationState`: `normal`, `fullscreen` (a D3D game or any full-screen app), `presentation`, `busy`, `quiet` (Windows' quiet time), `away`. `idleMs` from `GetLastInputInfo`, for the rules' "back after 20 minutes". `locked` from `WTSQuerySessionInformation(WTSSessionInfoEx)`'s session flags, for the moments (owner, 2026-11-16: "add lock"), **built in the pre-release native pass**: `true`, `false`, or `null` when the read fails, never a guess. The log says so at most once a minute. Core treats `null` as no change after a confirmed lock ([moments.md](moments.md#signals-what-core-reads)). Battery is left out until a feature uses it |
+| `tray_pinned()` | `pinned`, `not-pinned` or `unknown` | Reads `HKCU\Control Panel\NotifyIconSettings`, undocumented, so defensively: `pinned` only if exactly one subkey's `ExecutablePath`, with known-folder prefixes expanded, is this exe's own path, compared case-insensitively, and its `IsPromoted` is 1. A missing key, no match, two matches, a wrong value type or any read error gives `unknown`. Other subkeys are compared and dropped, never returned or logged. Read fresh on every call, with no cache. Answered from a blocking thread. **Built in the pre-release native pass**, for the tray bubble ([design.md](design.md#where-reactions-show-in-part-1)) |
+| `program_find(name)` | `found` or `not-found` | For step 7's prerequisites check. `name` only from a fixed list compiled into the exe: `node`, `npx`, `uv`, `uvx`, `docker`, anything else `invalid`, so it can't probe for other programs. Looked up as `server_start` resolves a program ([5b](#5b-starting-a-local-mcp-server)): absolute local folders on `PATH`, `PATHEXT`, `.exe`, `.cmd` and `.bat`, with the same path rules, and nothing is started or opened. No path is ever returned or logged. Answered from a blocking thread. **Built in the pre-release native pass** (lead, 2026-11-16) |
 | `wake_at(at)` | One native deadline: at `at` (Unix ms), the exe sends `wake` over the channel | One pending deadline, each call replaces it. Fired within 1 s, also late after a resume. Doesn't wake a sleeping PC |
 | `view_open(spec)` | Opens a view window, or Settings, bound to its page | Label `view-[a-z0-9-]{1,32}` with a plain `.html` page in the app folder other than `settings.html`, or `settings`, which always gets `settings.html`. size, title, `decorations`, `transparent`, `alwaysOnTop`, `skipTaskbar`, `visible`, `focused`, `focusable`. `core` can't be made |
 | `window_ctl(label, op, bounds?)` | show, hide, focus (restoring a minimized one), close, get and set bounds | `settings` and `view-*` labels only |
@@ -564,7 +568,7 @@ Each of these is here because a page can't do it and a later need would otherwis
 
 | Group | Command | Caller |
 | --- | --- | --- |
-| Shell | `shell_info`, `shell_ready`, `quit`, `quit_ready`, `tray_set`, `system`, `wake_at`, `autostart` | core |
+| Shell | `shell_info`, `shell_ready`, `quit`, `quit_ready`, `tray_set`, `tray_pinned`, `system`, `wake_at`, `autostart` | core |
 | | `log_line` | core, views, settings |
 | Windows | `view_open`, `window_ctl` | core |
 | | `window_self` | views, settings |
@@ -574,11 +578,11 @@ Each of these is here because a page can't do it and a later need would otherwis
 | | `secret_set`, for `peer` addresses only | core |
 | | `secret_status` | core, settings |
 | | `secret_delete` | core |
-| Servers | `server_start`, `server_write`, `server_stop`, `server_forget` | core |
+| Servers | `server_start`, `server_write`, `server_stop`, `server_forget`, `program_find` | core |
 | Files and links | `pick_path`, `save_as`, `open_url`, `open_folder`, `backup_write`, `backup_list`, `backup_read`, `backup_delete` | core |
 | Part 2 | `ws_connect`, `ws_send`, `ws_close` | core |
 
-36 commands. `COMMANDS` in `build.rs`, the capability files, the Rust handler list and `src/shell.ts` are one inventory, and the static test fails if they disagree.
+37 commands. `COMMANDS` in `build.rs`, the capability files, the Rust handler list and `src/shell.ts` are one inventory, and the static test fails if they disagree.
 
 ---
 
@@ -589,7 +593,7 @@ Each of these is here because a page can't do it and a later need would otherwis
 - **Autostart.** Off until the person turns it on. The Run entry starts `familiar.exe --autostart`. A sign-in start keeps chat closed and goes to the tray, and core never takes the keyboard.
 - **Single instance.** A second launch hands its arguments to the first and exits within a second. Core hears it and shows chat. A sign-in start while Familiar is already running is a no-op.
 - **Notifications.** Core shows reminder toasts with a title, body and up to three buttons (for example Done and Snooze). A click on the toast or a button reaches core while the toast is on screen, and core shows the reminder card in chat. A click from the Action Center is not reported (the plugin says so for Windows), so the card in chat is always the source of truth and a toast is only a nudge.
-- **System state.** The exe sends `system` over the channel when anything changes: `userState` (polled every 5 s) and resume after sleep (`WM_POWERBROADCAST`). Idle time is read on demand. The rules decider uses `fullscreen`, `presentation` and `quiet` as do-not-disturb, next to Familiar's own do-not-disturb setting. Windows has no public way to read Focus Assist on Windows 11 beyond these states, and Windows itself holds toasts back while it's on.
+- **System state.** The exe sends `system` over the channel when anything changes: `userState` and, from the pre-release native pass, `locked` (both polled every 5 s), and resume after sleep (`WM_POWERBROADCAST`). Idle time is read on demand. Polling the lock flag with the state needs no window and no message hook, and 5 s is soon enough for an arrival. The rules decider uses `fullscreen`, `presentation` and `quiet` as do-not-disturb, next to Familiar's own do-not-disturb setting. Windows has no public way to read Focus Assist on Windows 11 beyond these states, and Windows itself holds toasts back while it's on.
 - **Reminders and wake-ups.** pi-durable's Harness takes `setTimer` and `onWake`, so reminders are driven by `wake_at`, not by page timers that a hidden window might throttle. After a resume, core is told and re-checks what's due. There's no comparison of page timers against it: the native wake is in the exe either way. What's proven is that the wake reaches a hidden core (step 3, on the runner) and that a reminder due during sleep shows after resume (before release, on a real PC, since the runner can't sleep).
 
 ---
@@ -617,6 +621,7 @@ Modelled on Desktop Buddies' `shell.yml`: `.github/workflows/shell.yml` on `wind
    - `link.confirm`, `files.save-refused`, `quit.clean`
    - `model.key-swap` (step 4): the model adapter's requests carry only the placeholder, the endpoint gets the stored key, and its echo comes back blanked. See [model-design.md](model-design.md#recorded-replies).
    - Added with the pieces built later: `files.backup-budget` (step 10), `ws.saved-only`, `ws.host-origin`, `ws.owner-process` (the pre-release pass). The release gate requires them all.
+   - Also from the pre-release pass, as `check.` ids since they test Windows more than a gate: `system.lock` (the driver locks the session with `LockWorkStation` and reads `locked` true within 6 s, if the runner allows it), and `tray.pinned` (the driver writes a `NotifyIconSettings` subkey for the exe's path with `IsPromoted` 1, then 0, then a second matching subkey, and reads `pinned`, `not-pinned` and `unknown`). That proves the reading, not where Windows draws the icon, so step 13 checks both on a real PC: a lock and unlock, and the icon pinned, dragged to the overflow and back, and after Explorer restarts, with `pinned` never shown for an icon in the overflow.
 
    Declared `check.` ids include the measurements below, `system.idle`, `wake.hidden`, the smoke run's steps and anything the runner may not allow.
 5. **Measurements**, recorded as INFO: `persist()`, the web clipboard, the toast app id, TLS roots. Each settles a choice in this note before the exe does.
@@ -688,9 +693,9 @@ The exe settles just before the first release, not at step 3 ([Decisions](#decis
 | 7, the MCP client | 12 | 10.5 | The server start, its approval and blanking are built in step 3 |
 | 10, memory and export | 5 | 6 | Gains the native backup commands and their budget check |
 | 11, chat and settings | 10 | 10.25 | Gains the Trusted Types `<meta>` on every page and its test |
-| New: a pre-release native pass, before step 12 | 0 | 1.25 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks |
+| New: a pre-release native pass, before step 12 | 0 | 3.25 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks. From 2026-11-16, the lock flag in `system()` (0.5) and `tray_pinned()` (1), for the moments, and `program_find` (0.5) for step 7's prerequisites check. JSON-escaped redaction goes into the same pass's matcher work, with no hours of its own |
 | 4, 5 and 7, rework (2026-11-15) | 0 | 8 | A rework row of a third of build (1.75, 2.75 and 3.5), from what step 3's reviews cost. See [design.md](design.md#build-order) |
-| **Part 1** | **93** | **132.5** | |
+| **Part 1** | **93** | **154.75** | 132.5 on 2026-11-15. From 2026-11-16 also the moments, her portrait and her traits, which add steps 10b and 11b and hours to steps 6, 11 and 13 ([design.md](design.md#build-order)), and the lock flag and `tray_pinned()` above (1.5): 154.25. Then step 7's `program_find` (0.5): 154.75 |
 
 The riskiest pieces (the egress closure with the sink proxy, and the reparse walk) ran on the runner first, and neither moved the estimate. The code reviews did.
 
