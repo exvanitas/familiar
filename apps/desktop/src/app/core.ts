@@ -1,9 +1,23 @@
-/* The real app's core page, as far as step 3 goes: it checks the exe is new enough, asks for
-   persistent storage, says ready, sets the tray, and opens chat unless this was a sign-in start.
-   The agent core joins it in later steps. */
-import { createShell, MIN_API, type CoreMessage } from '../shell.ts';
+/* The real app's core page, as far as step 7 goes: it checks the exe is new enough, asks for
+   persistent storage, says ready, sets the tray, opens chat unless this was a sign-in start, and starts
+   the enabled MCP servers. The rest of the agent core joins it in later steps. */
+import { McpClient, openSettingsStore, systemClock } from '@familiar/core';
+import { desktopMcpPorts } from '../mcp.ts';
+import { createShell, MIN_API, reason, type CoreMessage } from '../shell.ts';
 
 const shell = createShell();
+
+/* The saved servers, the enabled ones started. An approved setup starts with no dialog. */
+async function startServers(): Promise<McpClient | undefined> {
+  try {
+    const client = await McpClient.open({ store: await openSettingsStore(indexedDB), ...desktopMcpPorts(shell), clock: systemClock });
+    client.startEnabled();
+    return client;
+  } catch (e) {
+    await shell.log(`mcp: the saved servers could not be loaded: ${reason(e)}`);
+    return undefined;
+  }
+}
 
 async function openChat() {
   await shell.viewOpen({ label: 'view-chat', page: 'chat.html', title: 'Familiar', width: 480, height: 640 }).catch(() => shell.windowCtl('view-chat', 'focus'));
@@ -32,4 +46,5 @@ async function onMessage(m: CoreMessage) {
   await shell.ready(m => { void onMessage(m); });
   await shell.traySet({ tooltip: 'Familiar', icon: 'tray.png', items: [{ id: 'chat', label: 'Open chat' }, { id: 'settings', label: 'Settings' }] });
   if (!info.autostarted) await openChat();
+  await startServers();
 })();

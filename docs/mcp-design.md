@@ -193,7 +193,7 @@ A saved server is `mcp.server.<id>`, version 1: the setup (never a secret's valu
 
 ## Starting with the app, and removing
 
-**Starting with the app**: `startEnabled` starts every enabled server. Approved ones start with no dialog, since the exe compares the setup with its stored approval. A turn's tools are the Ready servers' tools.
+**Starting with the app**: the app's core page (`apps/desktop/src/app/core.ts`) opens the client once it has said ready, and `startEnabled` starts every enabled server. Approved ones start with no dialog, since the exe compares the setup with its stored approval. A turn's tools are the Ready servers' tools.
 
 **Remove** stops the server (a call in flight is answered `interrupted`), then removes what's kept for it, in an order a retry can repeat: `server_forget` and each secret for a local server, or `address_remove` (which deletes the address's key) for a remote one, then its saved record and its tools with it. A removal that fails leaves the server Removing, refusing starts and calls, and the next remove tries again.
 
