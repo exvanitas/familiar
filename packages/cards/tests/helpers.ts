@@ -1,6 +1,6 @@
 // Fixture loading for the tests.
 import { readdirSync, readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { readCard, type Card, type ReadResult } from '../src/index.ts';
 import { pngFixtures } from './png-fixtures.ts';
 
@@ -30,11 +30,16 @@ export function card(path: string): Card {
   return r.card;
 }
 
-/** Every fixture: the committed files, relative to fixtures/, and the built ones. */
+/** A relative path with `/` between its names, whatever the OS gave. Fixture names are keyed that way. */
+export function posixPath(path: string, separator: string = sep): string {
+  return separator === '/' ? path : path.split(separator).join('/');
+}
+
+/** Every fixture: the committed files, relative to fixtures/ with `/` separators, and the built ones. */
 export function allFixtures(): string[] {
   const walk = (dir: string): string[] =>
     readdirSync(dir, { withFileTypes: true }).flatMap((d) => (d.isDirectory() ? walk(join(dir, d.name)) : [join(dir, d.name)]));
-  const files = walk(FIXTURES).map((f) => relative(FIXTURES, f)).filter((f) => !f.endsWith('.md'));
+  const files = walk(FIXTURES).map((f) => posixPath(relative(FIXTURES, f))).filter((f) => !f.endsWith('.md'));
   return [...files, ...builtFixtures().keys()].sort();
 }
 

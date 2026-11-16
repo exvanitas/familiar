@@ -1,6 +1,9 @@
 name: ci
 
-on: push
+on:
+  push:
+  # Lets the Windows job run on any branch by hand: gh workflow run ci.yml --ref <branch>
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,9 +44,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cargo test --locked
 
-  # Local MCP servers will run on Windows, so the tests run there too. Main only: Windows minutes count double.
+  # Local MCP servers will run on Windows, so the tests run there too. Not on every push: Windows minutes count double.
   windows:
-    if: github.ref == 'refs/heads/main'
+    # Main, every step branch (a step closes only with this green), and a run by hand.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/step-') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
