@@ -210,7 +210,7 @@ Core still enforces the daily cap and the goodbye rule itself, so a model decide
 
 ### What a card holds, and what's reliable
 
-Familiar takes V2 (`chara_card_v2`) and V3 (`chara_card_v3`) cards, as JSON, as PNG (`chara` or `ccv3` text chunks) and as CHARX (a zip with `card.json`). Real cards are written for roleplay scenes, not for a desktop, in several styles: prose, markdown sections, W++ (`Personality("shy" + "kind")`), PList (`[Mira's personality: calm, soft-spoken]`) and Ali:Chat example dialogue.
+Familiar takes V2 (`chara_card_v2`) and V3 (`chara_card_v3`) cards, as JSON and as PNG (`chara` or `ccv3` text chunks). CHARX (a zip with `card.json`) comes later, as the plan says. Real cards are written for roleplay scenes, not for a desktop, in several styles: prose, markdown sections, W++ (`Personality("shy" + "kind")`), PList (`[Mira's personality: calm, soft-spoken]`) and Ali:Chat example dialogue.
 
 | Field | What it usually holds | Used for traits | How reliable |
 | --- | --- | --- | --- |
