@@ -119,6 +119,19 @@ The rules decider does the same in code. Core also enforces the daily cap and th
 
 **What `chat` does.** Core starts a turn with no message from you, only a note of the moment and its kind ("first hello of the day, greet"; "her question is still open, curious"; "Christmas, celebrate"; "it's late and you've been at it a while, nudge"). The model writes the message with memory and the card as in any turn, and it's one model call on your key, at most two a day. If the chat is hidden, her portrait shows a bubble pointing at it. Without the portrait, the tray icon gets its dot if you've pinned it, and otherwise the message waits in the chat for when you open it. No Windows notification: those stay for reminders.
 
+**What `bubble` does.** Its one line is written by the chat model at the moment, from the moment's note and kind, with the card as in any turn. There's no bank of canned lines (owner, 2026-11-16: "I don't want a line bank actually. That's going to feel hollow of a shell real fast.").
+
+### When the chat model can't be reached
+
+Decided with the owner's model hierarchy on 2026-11-16 ([design.md](design.md#the-decision-slot-should-the-persona-react)). Can't be reached means no internet for an API model, or a local runtime that isn't running. A local chat model with no internet still works, and then she talks as usual.
+
+- **She stays present.** The rules and the decision model keep deciding. Gestures, her portrait's expressions, the tray mark and reminders all work.
+- **She doesn't talk.** A `bubble` or `chat` becomes a `gesture` of the same kind.
+- **The moment counts as given**, so she doesn't save up greetings for later: today's hello is used up, and so is a question's one follow-up. Holding moments until the model is back would be a queue of moments, so it isn't done.
+- **How she knows.** Only from the chat model's own last request failing to connect, never from a probe: no extra traffic, and no telemetry. The model is tried again at the next moment that needs words.
+- **Reminders** fire at their time with the text you gave them, which needs no model. If step 8's reminder turn exists, it's skipped, and the chat shows the reminder line alone.
+- **Your own messages** to her while she can't reach her model get the plain error they get today, with Run again.
+
 ## Why the existing data stays good
 
 The Claviger Familiar pool (key1, 21,254 points) has no `chat`. The rule above gives `chat` to new types and changes two existing rules: the late-night nudge at high becomes `chat`, and plain facts and a locked PC are quiet without exception. Only the points those touch go stale:
@@ -256,4 +269,4 @@ Short timelines: the lead-up, then the moment, with its right act. Times are 24 
 
 ## Where it's built
 
-Step 10b in the [build order](design.md#build-order): the presence coordinator, the six events and their holds, the lock and unlock as arrival and away, the goodbye check, the holiday list and memory dates, the unprompted turn, the daily cap, the rules decider's new rules with the late-night chat, her traits ([persona-traits.md](persona-traits.md)), and tests with a fake clock and fake system signals. The lock signal and the tray's pinned check are in the pre-release native pass. The portrait and the tray bubble are step 11b.
+Step 10b in the [build order](design.md#build-order): the presence coordinator, the six events and their holds, the lock and unlock as arrival and away, the goodbye check, the holiday list and memory dates, the unprompted turn, the daily cap, the rules decider's new rules with the late-night chat, her traits ([persona-traits.md](persona-traits.md)), and tests with a fake clock and fake system signals. The lock signal and the tray's pinned check are in the pre-release native pass. The portrait and the tray bubble are step 11b. What `bubble` and `chat` do when the chat model can't be reached is step 10c.

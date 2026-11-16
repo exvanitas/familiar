@@ -695,7 +695,7 @@ The exe settles just before the first release, not at step 3 ([Decisions](#decis
 | 11, chat and settings | 10 | 10.25 | Gains the Trusted Types `<meta>` on every page and its test |
 | New: a pre-release native pass, before step 12 | 0 | 3.25 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks. From 2026-11-16, the lock flag in `system()` (0.5) and `tray_pinned()` (1), for the moments, and `program_find` (0.5) for step 7's prerequisites check. JSON-escaped redaction goes into the same pass's matcher work, with no hours of its own |
 | 4, 5 and 7, rework (2026-11-15) | 0 | 8 | A rework row of a third of build (1.75, 2.75 and 3.5), from what step 3's reviews cost. See [design.md](design.md#build-order) |
-| **Part 1** | **93** | **154.75** | 132.5 on 2026-11-15. From 2026-11-16 also the moments, her portrait and her traits, which add steps 10b and 11b and hours to steps 6, 11 and 13 ([design.md](design.md#build-order)), and the lock flag and `tray_pinned()` above (1.5): 154.25. Then step 7's `program_find` (0.5): 154.75 |
+| **Part 1** | **93** | **168** | 132.5 on 2026-11-15. From 2026-11-16 also the moments, her portrait and her traits, which add steps 10b and 11b and hours to steps 6, 11 and 13 ([design.md](design.md#build-order)), and the lock flag and `tray_pinned()` above (1.5): 154.25. Then step 7's `program_find` (0.5): 154.75. Then step 10c, the decision models (13.25), with no exe change: 168 |
 
 The riskiest pieces (the egress closure with the sink proxy, and the reparse walk) ran on the runner first, and neither moved the estimate. The code reviews did.
 

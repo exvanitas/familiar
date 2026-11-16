@@ -78,7 +78,7 @@ Acts sit on a ladder: quiet, gesture, bubble, chat. Every persona's answer comes
    They run in that order, so a chat that falls back to a bubble can still become a gesture.
 5. **Kind.** The intent's kind stays. A reaction that rises from quiet takes the event's kind: `greet` for a greeting, a return or the chat closing, `playful` for a click or a pick-up.
 
-In core, `decideByRules` becomes step 1, the intent, then one pure function, `steer(intent, event, context)`, for steps 3 to 5. Today's rules decider mixes its spacing and settle checks into the intent. Step 10b moves them into step 4, so they apply after the traits as well as before. A model decider later gets the traits and [the summaries](#how-the-decider-gets-them) as input, and gives the final act itself.
+In core, `decideByRules` becomes step 1, the intent, then one pure function, `steer(intent, event, context)`, for steps 3 to 5. Today's rules decider mixes its spacing and settle checks into the intent. Step 10b moves them into step 4, so they apply after the traits as well as before. A model decider (step 10c) gets the traits and [the summaries](#how-the-decider-gets-them) as input and gives the intent and the move itself; the blockers (step 1), the limits on her own history (step 4) and the click floor still apply after it, as they do to the rules.
 
 **Base rules step 10b adds**, so the neutral intent matches the label rules where today's rules decider is silent or off:
 
