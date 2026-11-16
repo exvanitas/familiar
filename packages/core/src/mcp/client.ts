@@ -176,7 +176,9 @@ export class McpClient {
       stops it again if it wasn't running before. Every failure comes back in plain words. */
   async test(id: string): Promise<TestReport> {
     const e = this.entry(id);
-    const wasUp = e.actor.view.phase === 'ready';
+    // Running or on its way up (starting with the app, or restarting): Test leaves it so.
+    const before = e.actor.view.phase;
+    const wasUp = before !== 'stopped' && before !== 'down';
     const r = await e.actor.start();
     if (r.kind !== 'ready') {
       const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: r.kind === 'removed' ? 'The server was removed.' : 'The server was stopped before it was ready.' };

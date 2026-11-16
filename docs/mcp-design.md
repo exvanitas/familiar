@@ -128,3 +128,102 @@ A remote server is a saved address of kind `server`. Core adds it with `address_
 - Redirects stay with the guarded fetch's own rule: under the same saved address, or refused.
 - A key goes in one header, as the placeholder (`familiar-stored-key`), and the exe swaps it. The exe swaps only in `Authorization`, `X-API-Key`, `Api-Key` and `X-Goog-Api-Key`, so a key in any other header is refused when the server is added, with words that say so.
 - A remote run has no process. It starts when the transport connects and closes when the transport does (a stream error, the session ending, a stop). That close counts as a crash, so the same restarts apply.
+
+## Tools
+
+On Ready, and on `notifications/tools/list_changed`, the actor lists the server's tools (up to 128, in up to 16 pages).
+
+- **A fingerprint per tool**: SHA-256 of its name, description and input schema in canonical JSON (keys sorted at every level). Its title and annotations aren't in it. A new or changed fingerprint is a new tool.
+- **What the person reviewed is kept.** The saved record keeps each tool's last fingerprint and the fingerprint the person last reviewed. A tool whose two differ is fresh: new, or changed since review. Test reports which tools are fresh and which changed, against what was reviewed.
+- **"Always for this" is narrow.** Step 8 stores the person's choice for a tool with the tool's fingerprint and the server's setup fingerprint. `toolPolicies` turns those choices into the gate's per-tool policy: an "always" holds only while both fingerprints are the same, so a changed tool, or a new command, folder, setting, version or address, puts it back to ask. A "never" holds whatever changed, since stricter is safe.
+- **The setup fingerprint** covers the command, its arguments, its folder, the plain settings with their values and the secret names, or for a remote server its address, transport, plain headers and key header. Not secret values, so a renewed key asks nothing. Not the label.
+- **Names the model sees**: `<server>__<tool>`, letters, digits, `_` and `-` only, at most 64 characters, starting with a letter, which every provider accepts. Accents are dropped and anything else becomes `_`. Collisions are settled the same way every time: servers in id order, tools in name order, and a later duplicate gets `_2`, `_3` and so on, compared ignoring case.
+- **Each tool is a `FamiliarTool` of kind `server`.** So it's never run again after a restart: the journal reports it as interrupted, with Run again. The gate asks for it unless the person chose otherwise. It carries `readOnlyHint` to show, never to trust. Its `doing` names the server ("calling echo on Fake server"), and it carries the server's id and label, so a turn shows which server it called. It doesn't set `asks`, because that would also overrule the person's "always".
+- **Results are outside content.** Each server tool carries `outside: true`, and its text starts with a line saying it's what the server returned, not the person's words, and grants nothing (`outsideContent`, which step 8's rule may reword). The text is the result's text parts, a plain note for images, sounds, files and links, or the structured content as JSON if there's no text. At most 32,000 characters, with a note saying how much was cut. A tool error, a refusal, Stop, a deadline and `interrupted` reach the model as a tool error in plain words.
+- **The step cap and call bounds** apply as they do to every tool: server calls count against the same 8 per reply and 32 per turn.
+- **A turn's tools** are the tools of every Ready server, built fresh for each turn.
+
+## Adding a server
+
+**By paste.** `parsePaste(text, { newId, defaultCwd })` reads the common `mcpServers` block, VS Code's `servers` or `mcp.servers`, a bare map of servers, one server object, or the inside of a block without its braces. Comments and trailing commas are forgiven. A server with a `command` is local (`args`, `env`, `cwd`). One with `url`, `serverUrl` or `httpUrl` and no command is remote (`headers`, and `type` or `transport` of `sse` for legacy SSE). Each server gives a draft. The raw paste is never kept: the parser returns only what it read, and the caller drops the text.
+
+**By form.** `localDraft` (a label, a command, arguments, a folder, and settings each marked secret or not) and `remoteDraft` (a label, an address, a transport and headers) give the same draft, with the same checks.
+
+**A draft** is the setup, with no secret values in it, plus the values for Settings to store, plus problems (which stop it being added) and notes (which don't).
+
+**Secrets.**
+
+- Every setting of a local server is a secret by default, kept in Credential Manager as `server:<setupId>:<NAME>`.
+- Except the settings that change what runs (`PATH`, `NODE_OPTIONS` and the rest of the exe's list in 5b): those can only be plain settings, whose values the approval binds.
+- And except values under 8 bytes, which the exe won't store as a secret. Those stay plain, and a note says so, since a plain value is shown in the approval and saved with the setup.
+- A value the exe would refuse as a secret (over 1024 bytes, a control character, part of a `[key]` or `[hidden]` marker) is a problem, in the exe's own terms.
+- A README's example value (`<YOUR_TOKEN>`, `${input:token}`, `your-api-key-here`) is a problem: "put your own value in".
+- A remote server gets one key per address, as `addr:<addressId>`, from an `Authorization` (with its `Bearer`, `Token` or `Basic` prefix kept in the setup), `X-API-Key`, `Api-Key` or `X-Goog-Api-Key` header. The header then holds the placeholder. Any other header that looks like it carries a key (key, token, secret, auth, password, credential, session, cookie) is refused with words that say why, and so are two key headers.
+- `secret_set` is a Settings command. So Settings puts the draft's values straight into Credential Manager, and core gets the draft without them. `add` returns the refs to store them under. Core may only delete them, when the server is removed or a secret is dropped by an edit.
+
+**The exe's limits, early.** The checks mirror shell-core's: 64 arguments, 32 plain settings, 32 secrets, 8 KiB for the whole setup, setting names of ASCII letters, digits, `_`, `-` and `.` not starting with a digit, names compared ignoring case, no NUL, CR or LF in an argument, a folder given. For a remote address: https unless it's on this PC or a private network, no user name, query or `#` part, no encoded dot or slash in the path, and no header the guarded fetch drops. `apps/desktop/tests/mcp.test.ts` reads shell-core's source and fails if the lists or limits drift apart.
+
+**The unpinned flag.** `npx`, `bunx`, `pnpm dlx`, `uvx` (and `uv tool run`) and `docker run` fetch what they run. With no exact version (`name@1.2.3`, `name==1.2.3`), with `@latest` or a range, or for an image with no tag other than `latest` and no digest, they can fetch new code at any start, which the approval never saw. Such a setup is flagged, with how to pin it. A local path, a `file:` or `git` spec, and a plain `node server.js` aren't flagged.
+
+**Adding** saves the setup stopped and not enabled. A remote server's address is added first, with the exe's own dialog. For Streamable HTTP the address is the server's URL. For legacy SSE it's the URL's origin, since an SSE server names the URL for its posts itself, often beside the stream's path, and the SDK keeps that to the same origin.
+
+**Editing** keeps the id, so what the person reviewed carries over and a changed tool shows as changed. Only a stopped server can be edited. A remote server's address can't change: a new address needs its own approval and key, so it's removed and added again.
+
+## Saved setups
+
+A small key-value settings store (`packages/core/src/settings/store.ts`), general so step 11 can keep personas and the rest of Settings in it. Each record carries its schema version. Values are JSON, copied in and out. Two implementations run one contract (`src/testing/settings-contract.ts`): in memory, and on IndexedDB through core's `strictIndexedDB`, so every transaction is strict and a write counts only once it's complete (fake-indexeddb in Node).
+
+A saved server is `mcp.server.<id>`, version 1: the setup (never a secret's value), whether it starts with the app, its own limits, and its tools as last seen with the fingerprints the person reviewed. A record of a version this code doesn't know is skipped and left as it is, never overwritten.
+
+## Test and prerequisites
+
+**Test** starts the server if it isn't running (the exe asks if the setup is new or changed), lists its tools with their fingerprints and which are fresh, and stops it again unless it was running or on its way up. Every failure comes back in plain words:
+
+| What happened | What Test says |
+| --- | --- |
+| The program isn't there | "Familiar couldn't find the program "npx"." and what to install: Node.js (the LTS from nodejs.org) for `npx`, `node`, `npm`, `pnpm` and `bun`; uv for `uvx` and `uv`; Docker Desktop for `docker` |
+| It exited | "The server exited with code 2. Its last output is below.", with the last output |
+| It never finished the handshake | "The server didn't finish starting within 120 seconds." |
+| It started but didn't speak MCP | "The program started but didn't answer as an MCP server.", with its last output |
+| The person said no, or the exe stopped asking | "You chose not to start it.", or how to let Familiar ask again from the tray |
+| The exe refused the setup | Each of `unsafe-path`, `unsafe-argument`, `duplicate-setting`, `unsafe-secret`, `invalid`, `busy`, `start-failed` and `revoked` in its own words. The exe's message isn't shown |
+| A remote server refused or couldn't be reached | The guarded fetch's kind (`no-key`, `not-saved`, `insecure`, `blocked-address`, `redirect-refused`, `tls`, `timeout`, `network` and the rest), or the HTTP status: 401 and 403 say the key was refused, 404 that nothing answered there |
+
+**Prerequisites.** `checkPrerequisites(finder)` gives a row for each of Node.js, Python's uv and Docker: found or not, what it's for, and where to get it. Finding a program without starting it needs the exe, which has no such command. So the check takes a `ProgramFinder` port, and without one every row says "Checked when you press Test", where a missing program comes back as `not-found` with the same words. The command (`program_find`, looking a name up as `server_start` resolves it, and touching nothing else) is for the pre-release native pass.
+
+## Starting with the app, and removing
+
+**Starting with the app**: `startEnabled` starts every enabled server. Approved ones start with no dialog, since the exe compares the setup with its stored approval. A turn's tools are the Ready servers' tools.
+
+**Remove** stops the server (a call in flight is answered `interrupted`), then removes what's kept for it, in an order a retry can repeat: `server_forget` and each secret for a local server, or `address_remove` (which deletes the address's key) for a remote one, then its saved record and its tools with it. A removal that fails leaves the server Removing, refusing starts and calls, and the next remove tries again.
+
+## Proof
+
+Core's tests, in Node:
+
+- `tests/mcp/machine.property.test.ts`: the machine under 5,000 seeded random sequences of 60 steps and 300 of 400 steps. Four deliberate breaks each fail it: a crash that keeps its sent calls (they're sent twice after the restart), a result accepted from any run (an old run answers a new call), a start during a stop launched at once (two runs open), and an answer that keeps its call (answered twice). Plus unit cases: a crash mid-call, down after three crashes in the window and not outside it, the person's failed start not retried, the handshake deadline.
+- `tests/mcp/client.test.ts`, against the real fake server over the Node process adapter: add by paste with nothing secret saved, Test, the second start asking nothing, calls and their outside-content mark, Stop and a deadline answered at once with the cancellation sent, a crash mid-call answered `interrupted` and sent once, three crashes then Down with the last output, variant b with echo the one changed tool and no "always" left for the new setup, `print_secret` blanked, remove with a call in flight, plain words for a refused start, a missing program, an exit and a silent program, starting with the app. Over HTTP: the address added, only the placeholder sent, a refused key and a missing key in plain words. Over legacy SSE through the injected fetch.
+- `tests/mcp/journal.test.ts`: a real server tool in the turn loop, killed mid-call. After the restart it's reported interrupted with Run again, and the server never gets it again.
+- `tests/mcp/process-contract.test.ts`: the process port contract on the Node adapter.
+- `tests/mcp/paste.test.ts` and `tests/mcp/pure.test.ts`: the paste shapes, secrets, the exe's limits, remote headers and addresses, the unpinned flag, model names, fingerprints (SHA-256 against node:crypto), the marker rule, plain words, result text, prerequisites.
+- `tests/settings-store.test.ts`: the settings store contract on memory and IndexedDB, and every IndexedDB transaction strict.
+- `tests/mcp/bundle.test.ts`: the client bundles for the browser with no Node built-in and no stub.
+
+On the Windows runner, through the real exe: the `proc-mcp` phase (`apps/desktop/shell-check/mcp-checks.ts`) runs core's client over the desktop ports against the fake server, with the driver answering the exe's dialog. Its six ids are in the security inventory, so the gate requires each: `mcp.add`, `mcp.call`, `mcp.crash-mid-call`, `mcp.changed-tool`, `mcp.secret-blanked` and `mcp.remove`. The secret is a key the driver types into Settings, which the page never learns.
+
+## Later
+
+- **OAuth** sign-in for remote servers. v1 takes servers with no sign-in or a fixed key.
+- **`program_find`** in the exe, for the prerequisites check: the pre-release native pass.
+- **Step 8**: the consent cards (showing a fresh tool as new or changed, and the server it calls), the policies UI that stores choices with both fingerprints, and the outside-content rule.
+- **Step 9**: the capability matrix rows for servers: Down with its last output, the unpinned flag.
+- **Step 11**: the Settings pages that call these functions: paste and form, Test, review, edit, remove, the prerequisites.
+
+## Not settled
+
+- **A remote server that goes away** isn't seen as a crash. Its transport closes only when the SDK's does: a failed call is answered with an error, and the server stays Ready. Legacy SSE's event stream reconnects on its own. So restarts and Down apply to local servers, and to remote ones only when the transport closes.
+- **A remote server's quiet stream.** The guarded fetch ends a read that's quiet past its idle limit. The desktop ports give server addresses the exe's cap of 15 minutes, and the SDK opens the stream again after.
+- **A stop whose run never closes.** After 5 s the machine counts it closed. If the exe still holds that run, the next start is `busy`, which comes back as a failure in plain words rather than a second run.
+- **The handshake's deadline** is 120 s by default, for a first `npx` run that downloads its package. A slow network can need more, and the person can set up to 5 minutes.
+- **zod's eval probe.** The SDK checks messages with zod, which tries `new Function` once to decide whether it may compile, and falls back when the CSP refuses. The refusal shows as one CSP report in the page. Ajv isn't used at all (above).
+- **The process port contract** runs on the Node adapter only. The runner's checks cover the desktop adapter end to end through the client, but not case by case, since the contract's secret case needs a value the page knows and only Settings may store one.
