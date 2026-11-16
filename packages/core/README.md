@@ -23,11 +23,13 @@ Familiar's core: the model port, caps and retries, the turn loop and journal on 
 | `client.tools()` | The Ready servers' tools, as `ServerTool`s for a turn |
 | `parsePaste(text, options)`, `localDraft(form)`, `remoteDraft(form)` | A pasted block or a form as drafts: the setup, the secret values apart, problems and notes |
 | `unpinned(program, args)` | The unpinned flag, with how to pin |
-| `toolPolicies(tools, choices)` | The person's per-tool choices as the gate's policy, "always" bound to both fingerprints |
+| `choiceKey(serverId, toolName)`, `toolPolicies(tools, choices)` | Where the person's per-tool choices are kept, and those choices as the gate's policy, "always" bound to that server and to both fingerprints |
+| `checkTools(raw)` | A server's tool list bounded and fingerprinted, or a `CatalogError` in plain words |
 | `checkPrerequisites(finder?)` | Node.js, uv and Docker, found or not, with what each is for |
 | `ServerActor` | One server's actor, over any `open(events) => Session` |
 | `step(machine, input, now)` | One server's rules, pure |
-| `ProcessTransport`, `RemoteTransport`, `openSession` | The MCP SDK's client over a process port, or over a fetch |
+| `ProcessTransport`, `RemoteTransport`, `openSession` | The MCP SDK's client over a process port, or over a fetch (Streamable HTTP) |
+| `windowsPaths`, `literalClass` | The exe's path and literal-address rules, mirrored so a draft fails early |
 | `memorySettingsStore()`, `openSettingsStore(indexedDB)` | The settings store |
 
 The app's adapters are in `apps/desktop/src/mcp.ts` (the exe's server commands, the guarded fetch, saved addresses).
