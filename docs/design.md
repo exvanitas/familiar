@@ -80,6 +80,7 @@ What the decider sees: her traits (sociability, closeness, lively hours) and int
 - Back after 20 minutes or more: greet once. A gesture at low chattiness, a bubble at medium or high.
 - Music: track changes are quiet by default. A bubble only on the first play of the day, or when the mood clearly matches the persona's interests, and never twice in a row.
 - Late night with a long session: one nudge per night at most. At high chattiness it's a chat, one of the day's two (owner, 2026-11-16: "chat at high chattiness, sure").
+- A long session in the day (2 hours with no break of 15 minutes): one break nudge per session, a bubble at medium and high, a gesture at low, never a chat (owner, 2026-11-16: "daytime break nudge, sure").
 - Tool done or reply done while the chat is hidden: the teaser rule handles it. The decider only picks gesture or quiet when no teaser is due.
 - Clicked once: a gesture at most (plain clicks are petting).
 - When in doubt: quiet.
@@ -138,7 +139,7 @@ One list (step 9) feeds the Settings tab and the docs page. Each row: what she c
 
 Hours are a working estimate, not calendar time. Part 1 is re-estimated once the first real server works end to end in the installed app.
 
-**Her personality and the owner's four calls, 2026-11-16.** Traits read from the card ([persona-traits.md](persona-traits.md)): 2.5 in step 6 for the reader, 2 in step 10b for the decider and its summaries, 1 in step 11 for Settings, 0.5 in step 13 for the reader's real accuracy. The owner's calls on the moments: the screen lock and the tray's pinned check in the pre-release native pass (0.5 and 1), the lock as arrival and away in step 10b (0.25), and in step 11b the tray bubble replacing the notification and the card's own emotion pictures (0.25 net). Part 1 goes from 146 to 154 (154.25 if the owner picks the daytime break nudge).
+**Her personality and the owner's four calls, 2026-11-16.** Traits read from the card ([persona-traits.md](persona-traits.md)): 2.5 in step 6 for the reader, 2 in step 10b for the decider and its summaries, 1 in step 11 for Settings, 0.5 in step 13 for the reader's real accuracy. The owner's calls on the moments: the screen lock and the tray's pinned check in the pre-release native pass (0.5 and 1), the lock as arrival and away in step 10b (0.25), the daytime break nudge in step 10b (0.25, owner: "daytime break nudge, sure"), and in step 11b the tray bubble replacing the notification and the card's own emotion pictures (0.25 net). Part 1 goes from 146 to 154.25.
 
 **Moments and the portrait, 2026-11-16.** Two steps added for the owner's moments and her portrait, and half an hour more for the matrix's rows: part 1 goes from 132.5 to 146. Lettered so the later steps keep their numbers.
 
@@ -146,7 +147,7 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 
 | # | Step | Done when | Hours |
 | --- | --- | --- | --- |
-| | **Part 1: Familiar on its own** | | **154** |
+| | **Part 1: Familiar on its own** | | **154.25** |
 | 1 | Repo, workspace, CI, fake model, fake MCP server | Typecheck and tests green on CI | 3 |
 | 2 | Spikes: pi-durable in a Tauri webview, pi-ai bundling, the installed exe starting a local MCP server | A yes or no on each, written down | 5 |
 | 3 | Tauri shell ([shell-design.md](shell-design.md)): the app loaded from a folder beside the exe, its origin and WebView2 data folder pinned, persistent storage asked for, windows and capabilities, the egress closure, the native confirms, tray, keys typed in Settings, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch | Every security check passes on the Windows runner | 38.25 |
@@ -157,7 +158,7 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 | 8 | Tools, reminders, consent cards, activity list, the outside-content rule | Missed-reminder, exact-call consent, revoke and steering tests | 7 |
 | 9 | Capability matrix: the list, the Settings tab, the docs page, the setup guide | Settings and docs agree, checked in CI | 5.5 |
 | 10 | Memory: notes, summaries, the Memory tab, deletion. Export and import, and the fallback backup with its native commands | Notes survive restart and delete cleanly. Export then import gives back the same data | 6 |
-| 10b | Moments ([moments.md](moments.md)): the presence coordinator and its holds, the six events, the lock as arrival and away, the goodbye check, the holiday list and memory dates, the unprompted turn and its resume rule, the daily cap, the decider's chat rule with the late-night chat. Her traits in the decider: the intent split from the limits, `steer`, the summaries record, the new base rules | With a fake clock and fake system signals: one moment at a time, one hello a day, held through do-not-disturb and a lock (and an unreadable lock), one follow-up per question, never after a goodbye, never past two a day. The trait table, property and sequence tests | 8.25 |
+| 10b | Moments ([moments.md](moments.md)): the presence coordinator and its holds, the six events, the lock as arrival and away, the goodbye check, the holiday list and memory dates, the unprompted turn and its resume rule, the daily cap, the decider's chat rule with the late-night chat, the daytime break nudge. Her traits in the decider: the intent split from the limits, `steer`, the summaries record, the new base rules | With a fake clock and fake system signals: one moment at a time, one hello a day, held through do-not-disturb and a lock (and an unreadable lock), one follow-up per question, never after a goodbye, never past two a day. The trait table, property and sequence tests | 8.5 |
 | 11 | Chat window, first-run setup, settings with "How she is", the Trusted Types rule on every page | Headless screenshots, light and dark | 11.25 |
 | 11b | Her portrait: the view and its place, expressions and their fallbacks (the card's own emotion pictures included), the bubble, its events, and the tray bubble when the icon is pinned | Headless screenshots, light and dark, of every kind with a full and a one-picture set. A click, a double-click and a drag send the right events. No tray bubble unless `tray_pinned()` says pinned | 7.25 |
 | – | Pre-release native pass: the WebSocket to Desktop Buddies and its pairing token, against Desktop Buddies' settled protocol. The screen lock in `system()`, and `tray_pinned()`. Then the exe settles | Its security checks pass on the runner | 2.75 |
