@@ -10,13 +10,16 @@ describe('the MCP checks on the runner', () => {
   const ids = [...src.matchAll(/check\('(security|check)\.([a-z0-9.-]+)'/g)].map(m => `${m[1]}.${m[2]}`);
   const inventory = (JSON.parse(read('security-inventory.json')) as { ids: string[] }).ids;
 
-  it('reports six security ids, each in the inventory, and the known gap as a declared check', () => {
-    expect(ids).toEqual(['security.mcp.add', 'security.mcp.call', 'security.mcp.crash-mid-call', 'security.mcp.changed-tool', 'security.mcp.secret-blanked', 'security.mcp.remove', 'check.mcp.secret-json-escaped']);
-    for (const id of ids.filter(i => i.startsWith('security.'))) expect(inventory).toContain(id.replace(/^security\./, ''));
-    const checks = (JSON.parse(read('checks.json')) as { ids: string[] }).ids;
-    expect(checks).toContain('mcp.secret-json-escaped');
-    // Until the native pass, a leak is reported as a SKIP marked KNOWN GAP, never a PASS.
-    expect(src).toMatch(/if \(leaked\) skip\(`KNOWN GAP: /);
+  it('reports seven security ids, each in the inventory, the escaped-key one marked as a known gap', () => {
+    expect(ids).toEqual(['security.mcp.add', 'security.mcp.call', 'security.mcp.crash-mid-call', 'security.mcp.changed-tool', 'security.mcp.secret-blanked', 'security.mcp.remove', 'security.mcp.secret-json-escaped']);
+    for (const id of ids) expect(inventory).toContain(id.replace(/^security\./, ''));
+    const marks = (JSON.parse(read('security-inventory.json')) as { knownGaps: Record<string, string> }).knownGaps;
+    expect(Object.keys(marks)).toEqual(['mcp.secret-json-escaped']);
+    expect((JSON.parse(read('checks.json')) as { ids: string[] }).ids).not.toContain('mcp.secret-json-escaped');
+    // It passes only if no copy of the key, escaped or not, came back; the driver typed it with a quote.
+    expect(src).toMatch(/ok\(leaked === 0, `KNOWN GAP: /);
+    expect(src).toMatch(/enterKey\(added\.secretRefs\[0\]!, true\)/);
+    expect(read('driver-net.ps1')).toMatch(/if \(\$a\.quote\) \{ \$key = 'fk' \+ \(Random-Text 12\) \+ '"' \+ \(Random-Text 12\) \}/);
   });
 
   it('runs in the proc-mcp phase, which the driver starts', () => {

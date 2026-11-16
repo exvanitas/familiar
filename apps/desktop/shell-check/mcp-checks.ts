@@ -18,12 +18,13 @@
    - security.mcp.remove: a call in flight is interrupted, the secret, the saved setup and every node
      process go, and the approval with them: the exact same launch, secret name included and its key
      typed in again, shows the dialog again.
-   - check.mcp.secret-json-escaped, a measurement of a known gap: a key holding a quote comes back from
-     JSON output as \", which the exe's literal blanking misses. SKIP with "KNOWN GAP" until the
-     pre-release native pass blanks escaped forms too; PASS once it does. */
+   - security.mcp.secret-json-escaped, a known gap: the driver types a key holding a quote into Settings,
+     the fake server prints it, and it passes only if the JSON-escaped form (\") is blanked too. The
+     exe blanks literal copies only, so it fails until the pre-release native pass. Its mark in
+     security-inventory.json makes the gate report it as KNOWN GAP in everyday runs, and fail a release. */
 import { gateFor, McpClient, openSettingsStore, parsePaste, systemClock, toolPolicies, choiceKey, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
 import { desktopMcpPorts } from '../src/mcp.ts';
-import { check, fail, ok, rand, shell, skip, sleep, step, until } from './common.ts';
+import { check, fail, ok, rand, shell, sleep, step, until } from './common.ts';
 import { dialog, START, type Ctx, type Paths } from './procs.ts';
 
 interface Typed { head: string; tail: string; length: number }
@@ -56,11 +57,11 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   const need = () => { if (!id) fail('the server was never added'); };
 
   /** Settings stores a key the driver types for `ref`: the page never learns it. */
-  async function enterKey(ref: string): Promise<Typed> {
+  async function enterKey(ref: string, quote = false): Promise<Typed> {
     await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
     await ctx.up('settings');
     await ctx.ask('settings', 'paste-ready');
-    const k = await step<Typed>('type-key', { title: 'Familiar check settings', long: false });
+    const k = await step<Typed>('type-key', { title: 'Familiar check settings', long: false, quote });
     const saved = await ctx.ask<string>('settings', 'save-key', ref);
     await shell.windowCtl('settings', 'close');
     if (saved !== 'ok') fail('Settings could not save the key: ' + saved);
@@ -185,7 +186,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const kept = [JSON.stringify(client.list()), JSON.stringify(await store.get(`mcp.server.${id}`))];
     const n = leaks([...heard, model, ...kept]);
     ok(n === 0, `${n} texts carry the key`);
-    return `the key typed into Settings came back [hidden] in the reply, the model's text and all ${heard.length} lines core heard; nothing core keeps holds it. Literal copies only: see check.mcp.secret-json-escaped`;
+    return `the key typed into Settings came back [hidden] in the reply, the model's text and all ${heard.length} lines core heard; nothing core keeps holds it. Literal copies only: see security.mcp.secret-json-escaped`;
   });
 
   await check('security.mcp.remove', async () => {
@@ -215,24 +216,22 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     return 'the call in flight was interrupted; the secret, the saved setup and every node process went; the exact same launch, key typed in again, asked again';
   });
 
-  await check('check.mcp.secret-json-escaped', async () => {
-    // A second server, whose key holds a quote. The page learns only the key's last ten characters.
+  await check('security.mcp.secret-json-escaped', async () => {
+    // A second server, whose key, typed by the driver, holds a quote. The page learns only its first and
+    // last ten characters, which JSON leaves as they are.
     const { drafts } = parsePaste(fake(), { newId: () => 'mcp-q-' + rand(6), defaultCwd: p.repo });
     const added = await client.add(drafts[0]!);
-    await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
-    await ctx.up('settings');
-    const made = await ctx.ask<{ tail?: string; error?: string }>('settings', 'make-quoted-key', added.secretRefs[0]);
-    await shell.windowCtl('settings', 'close');
-    if (!made.tail) return fail('Settings could not store the key: ' + made.error);
+    const k = await enterKey(added.secretRefs[0]!, true);
     const { d, report } = await testApproved(added.id);
     ok(d.shown && report.ok, 'the quoted-key server did not start');
     await client.start(added.id);
+    const from = heard.length;
     const r = await client.call(added.id, 'print_secret', {});
     await sleep(300);
-    const texts = [JSON.stringify(r), ...heard];
+    const texts = [JSON.stringify(r), ...heard.slice(from)];
     await client.remove(added.id);
-    const leaked = texts.filter(t => t.includes(made.tail!)).length;
-    if (leaked) skip(`KNOWN GAP: a key holding a quote came back JSON-escaped and unblanked in ${leaked} texts; the pre-release native pass blanks escaped forms`);
-    return 'a key holding a quote came back blanked: the known gap is closed';
+    const leaked = texts.filter(t => t.includes(k.head) || t.includes(k.tail)).length;
+    ok(leaked === 0, `KNOWN GAP: a key holding a quote came back JSON-escaped and unblanked in ${leaked} texts; the pre-release native pass blanks escaped forms`);
+    return 'a key holding a quote came back blanked in its JSON-escaped form too';
   });
 }

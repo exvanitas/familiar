@@ -295,6 +295,8 @@ function Do-NetStep($action, $a) {
     'type-key' {
       # A fake key, made here and never shown to a page, typed into Settings by real key presses.
       $key = 'fk' + (Random-Text $(if ($a.long) { 38 } else { 10 }))
+      # With a quote in the middle, which JSON escapes as \": its first and last ten characters stay plain.
+      if ($a.quote) { $key = 'fk' + (Random-Text 12) + '"' + (Random-Text 12) }
       $script:keys.Add($key)
       $h = Bring-Front $a.title
       if (-not $h) { throw 'could not bring Settings to the front' }

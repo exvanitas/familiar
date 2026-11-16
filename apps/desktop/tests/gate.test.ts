@@ -43,12 +43,42 @@ describe('the gate', () => {
     expect(judge(['RUN abc', 'PASS security.egress.core closed'], inv, []).ok).toBe(false);
   });
 
+  it('a known gap is reported, never fails an everyday run, and fails a release', () => {
+    const inv = ['a.one', 'a.gap'];
+    const knownGaps = { 'a.gap': 'pre-release native pass: something' };
+    for (const gap of ['FAIL security.a.gap leaked', 'PASS security.a.gap fixed', 'SKIP security.a.gap', '']) {
+      const lines = ['PASS security.a.one', gap];
+      const everyday = judge(lines, inv, [], { knownGaps });
+      expect(everyday, gap).toMatchObject({ ok: true, problems: [] });
+      expect(everyday.gaps).toHaveLength(1);
+      expect(everyday.gaps[0]).toMatch(/^security\.a\.gap: KNOWN GAP \(pre-release native pass: something\)/);
+      const release = judge(lines, inv, [], { knownGaps, release: true });
+      expect(release.ok, gap).toBe(false);
+      expect(release.problems.join()).toMatch(/a release can't ship with an open known gap/);
+    }
+    // Without the mark, the same FAIL fails an everyday run; and the mark covers only its own id.
+    expect(judge(['PASS security.a.one', 'FAIL security.a.gap'], inv, []).ok).toBe(false);
+    expect(judge(['FAIL security.a.one', 'FAIL security.a.gap'], inv, [], { knownGaps }).ok).toBe(false);
+    // A mark with no reason, or on an id outside the inventory, fails.
+    expect(judge(['PASS security.a.one', 'PASS security.a.gap'], inv, [], { knownGaps: { 'a.gap': ' ' } }).ok).toBe(false);
+    expect(judge(['PASS security.a.one', 'PASS security.a.gap'], inv, [], { knownGaps: { 'a.other': 'why' } }).ok).toBe(false);
+  });
+
+  it('every known-gap mark in the real inventory carries a reason and names a listed id', () => {
+    const real = JSON.parse(readFileSync(new URL('../shell-check/security-inventory.json', import.meta.url), 'utf8')) as { ids: string[]; knownGaps?: Record<string, unknown> };
+    for (const [id, reason] of Object.entries(real.knownGaps ?? {})) {
+      expect(real.ids, id).toContain(id);
+      expect(typeof reason === 'string' && reason.trim().length > 10, id).toBe(true);
+    }
+    expect(real.knownGaps).toEqual({ 'mcp.secret-json-escaped': 'pre-release native pass: JSON-escaped redaction' });
+  });
+
   it('the real lists are well formed and apart', () => {
     const inv = JSON.parse(readFileSync(new URL('../shell-check/security-inventory.json', import.meta.url), 'utf8')).ids as string[];
     const chk = JSON.parse(readFileSync(new URL('../shell-check/checks.json', import.meta.url), 'utf8')).ids as string[];
     expect(new Set(inv).size).toBe(inv.length);
     expect(new Set(chk).size).toBe(chk.length);
-    expect(inv.length).toBe(77);
+    expect(inv.length).toBe(78);
     for (const id of [...inv, ...chk]) expect(id).toMatch(/^[a-z0-9-]+(\.[a-z0-9-]+)+$|^[a-z0-9-]+$/);
   });
 });
