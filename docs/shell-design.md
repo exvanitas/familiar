@@ -542,7 +542,8 @@ Each of these is here because a page can't do it and a later need would otherwis
 | `quit()` | Sends `quitting` to core, waits up to 3 s for `quit_ready`, then exits | Tray Quit takes the same path |
 | `quit_ready()` | Core has finished its last writes | After `quitting` only |
 | `tray_set({ tooltip, icon, items })` | Sets the menu, as Desktop Buddies' | `icon` a PNG from the app folder. The exe appends Quit, and "Let Familiar ask again" when the confirms are stopped. Menu ids starting `shell:` are the exe's |
-| `system()` | `{ userState, idleMs }` | `userState` from `SHQueryUserNotificationState`: `normal`, `fullscreen` (a D3D game or any full-screen app), `presentation`, `busy`, `quiet` (Windows' quiet time), `away`. `idleMs` from `GetLastInputInfo`, for the rules' "back after 20 minutes". Battery and session lock are left out until a feature uses them, and would be added before release if one does |
+| `system()` | `{ userState, idleMs, locked }` | `userState` from `SHQueryUserNotificationState`: `normal`, `fullscreen` (a D3D game or any full-screen app), `presentation`, `busy`, `quiet` (Windows' quiet time), `away`. `idleMs` from `GetLastInputInfo`, for the rules' "back after 20 minutes". `locked` from `WTSQuerySessionInformation(WTSSessionInfoEx)`'s session flags, for the moments (owner, 2026-11-16: "add lock"), **built in the pre-release native pass**. If the call fails, `locked` is `false` and the log says so once. Battery is left out until a feature uses it |
+| `tray_pinned()` | `pinned`, `not-pinned` or `unknown` | Reads `HKCU\Control Panel\NotifyIconSettings`, undocumented, so defensively: `pinned` only if exactly one subkey's `ExecutablePath`, with known-folder prefixes expanded, is this exe's own path, compared case-insensitively, and its `IsPromoted` is 1. A missing key, no match, two matches, a wrong value type or any read error gives `unknown`. Other subkeys are compared and dropped, never returned or logged. Answered from a blocking thread. **Built in the pre-release native pass**, for the tray bubble ([design.md](design.md#where-reactions-show-in-part-1)) |
 | `wake_at(at)` | One native deadline: at `at` (Unix ms), the exe sends `wake` over the channel | One pending deadline, each call replaces it. Fired within 1 s, also late after a resume. Doesn't wake a sleeping PC |
 | `view_open(spec)` | Opens a view window, or Settings, bound to its page | Label `view-[a-z0-9-]{1,32}` with a plain `.html` page in the app folder other than `settings.html`, or `settings`, which always gets `settings.html`. size, title, `decorations`, `transparent`, `alwaysOnTop`, `skipTaskbar`, `visible`, `focused`, `focusable`. `core` can't be made |
 | `window_ctl(label, op, bounds?)` | show, hide, focus (restoring a minimized one), close, get and set bounds | `settings` and `view-*` labels only |
@@ -564,7 +565,7 @@ Each of these is here because a page can't do it and a later need would otherwis
 
 | Group | Command | Caller |
 | --- | --- | --- |
-| Shell | `shell_info`, `shell_ready`, `quit`, `quit_ready`, `tray_set`, `system`, `wake_at`, `autostart` | core |
+| Shell | `shell_info`, `shell_ready`, `quit`, `quit_ready`, `tray_set`, `tray_pinned`, `system`, `wake_at`, `autostart` | core |
 | | `log_line` | core, views, settings |
 | Windows | `view_open`, `window_ctl` | core |
 | | `window_self` | views, settings |
@@ -589,7 +590,7 @@ Each of these is here because a page can't do it and a later need would otherwis
 - **Autostart.** Off until the person turns it on. The Run entry starts `familiar.exe --autostart`. A sign-in start keeps chat closed and goes to the tray, and core never takes the keyboard.
 - **Single instance.** A second launch hands its arguments to the first and exits within a second. Core hears it and shows chat. A sign-in start while Familiar is already running is a no-op.
 - **Notifications.** Core shows reminder toasts with a title, body and up to three buttons (for example Done and Snooze). A click on the toast or a button reaches core while the toast is on screen, and core shows the reminder card in chat. A click from the Action Center is not reported (the plugin says so for Windows), so the card in chat is always the source of truth and a toast is only a nudge.
-- **System state.** The exe sends `system` over the channel when anything changes: `userState` (polled every 5 s) and resume after sleep (`WM_POWERBROADCAST`). Idle time is read on demand. The rules decider uses `fullscreen`, `presentation` and `quiet` as do-not-disturb, next to Familiar's own do-not-disturb setting. Windows has no public way to read Focus Assist on Windows 11 beyond these states, and Windows itself holds toasts back while it's on.
+- **System state.** The exe sends `system` over the channel when anything changes: `userState` and, from the pre-release native pass, `locked` (both polled every 5 s), and resume after sleep (`WM_POWERBROADCAST`). Idle time is read on demand. Polling the lock flag with the state needs no window and no message hook, and 5 s is soon enough for an arrival. The rules decider uses `fullscreen`, `presentation` and `quiet` as do-not-disturb, next to Familiar's own do-not-disturb setting. Windows has no public way to read Focus Assist on Windows 11 beyond these states, and Windows itself holds toasts back while it's on.
 - **Reminders and wake-ups.** pi-durable's Harness takes `setTimer` and `onWake`, so reminders are driven by `wake_at`, not by page timers that a hidden window might throttle. After a resume, core is told and re-checks what's due. There's no comparison of page timers against it: the native wake is in the exe either way. What's proven is that the wake reaches a hidden core (step 3, on the runner) and that a reminder due during sleep shows after resume (before release, on a real PC, since the runner can't sleep).
 
 ---
@@ -617,6 +618,7 @@ Modelled on Desktop Buddies' `shell.yml`: `.github/workflows/shell.yml` on `wind
    - `link.confirm`, `files.save-refused`, `quit.clean`
    - `model.key-swap` (step 4): the model adapter's requests carry only the placeholder, the endpoint gets the stored key, and its echo comes back blanked. See [model-design.md](model-design.md#recorded-replies).
    - Added with the pieces built later: `files.backup-budget` (step 10), `ws.saved-only`, `ws.host-origin`, `ws.owner-process` (the pre-release pass). The release gate requires them all.
+   - Also from the pre-release pass, as `check.` ids since they test Windows more than a gate: `system.lock` (the driver locks the session with `LockWorkStation` and reads `locked` true within 6 s, if the runner allows it), and `tray.pinned` (the driver writes a `NotifyIconSettings` subkey for the exe's path with `IsPromoted` 1, then 0, then a second matching subkey, and reads `pinned`, `not-pinned` and `unknown`). Both are checked again on a real PC in step 13.
 
    Declared `check.` ids include the measurements below, `system.idle`, `wake.hidden`, the smoke run's steps and anything the runner may not allow.
 5. **Measurements**, recorded as INFO: `persist()`, the web clipboard, the toast app id, TLS roots. Each settles a choice in this note before the exe does.
@@ -688,9 +690,9 @@ The exe settles just before the first release, not at step 3 ([Decisions](#decis
 | 7, the MCP client | 12 | 10.5 | The server start, its approval and blanking are built in step 3 |
 | 10, memory and export | 5 | 6 | Gains the native backup commands and their budget check |
 | 11, chat and settings | 10 | 10.25 | Gains the Trusted Types `<meta>` on every page and its test |
-| New: a pre-release native pass, before step 12 | 0 | 1.25 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks |
+| New: a pre-release native pass, before step 12 | 0 | 2.75 | The peer WebSocket and core's peer-token `secret_set`, against Desktop Buddies' settled protocol, with their checks. From 2026-11-16, the lock flag in `system()` (0.5) and `tray_pinned()` (1), for the moments |
 | 4, 5 and 7, rework (2026-11-15) | 0 | 8 | A rework row of a third of build (1.75, 2.75 and 3.5), from what step 3's reviews cost. See [design.md](design.md#build-order) |
-| **Part 1** | **93** | **132.5** | |
+| **Part 1** | **93** | **153.5** | 132.5 on 2026-11-15. From 2026-11-16 also the moments, her portrait and her traits, which add steps 10b and 11b and hours to steps 6, 11 and 13 ([design.md](design.md#build-order)), and the 1.5 above |
 
 The riskiest pieces (the egress closure with the sink proxy, and the reparse walk) ran on the runner first, and neither moved the estimate. The code reviews did.
 

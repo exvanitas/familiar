@@ -4,19 +4,29 @@ Design, 2026-11-16. The owner's list of moments for unprompted chat, agreed on 1
 
 It's also the spec for the Claviger data wave that teaches `chat`: the rule text, the new event types for the validator, and timelines with the right act.
 
+**The owner's calls on this design, 2026-11-16:**
+
+1. New devices and apps: "opt-in is fine". Off by default, the device class only, about 20 known apps, a later tier with the next exe.
+2. The idle signal: "add lock". Idle time and the screen locking and unlocking, an exe addition in the pre-release native pass.
+3. A bubble without her portrait: "tray sounds fine. should only show up if they pinned the tray icon". So no Windows notification for reactions, and no bubble at all unless Familiar can tell the icon is pinned ([design.md](design.md#where-reactions-show-in-part-1)).
+4. The late-night nudge: "chat at high chattiness, sure". It becomes the seventh chat event.
+
+How her personality changes each of these is in [persona-traits.md](persona-traits.md).
+
 ## The idea in one paragraph
 
-A few moments open a day or a conversation: the first time you're at the PC today, a special day, coming back after an hour or more, a question of hers left hanging, and (later, opt-in) a new device or a known app. Only those moments may ever get `chat`. Each arrives as its own event, made by core from signals the exe already has, so the decider never has to piece a moment together from raw system events. Everything else keeps its rules unchanged.
+A few moments open a day or a conversation: the first time you're at the PC today, a special day, coming back after an hour or more, a question of hers left hanging, and (later, opt-in) a new device or a known app. With the late-night nudge, only those moments may ever get `chat`. Each arrives as its own event, made by core from signals the exe already has, so the decider never has to piece a moment together from raw system events. Everything else keeps its rules unchanged.
 
 ## Signals: what core reads
 
-Part 1 needs nothing new in the exe. Every part 1 moment comes from signals built in step 3 and core's own data:
+Every part 1 moment comes from signals built in step 3 and core's own data, plus the screen lock, which the pre-release native pass adds to the exe:
 
 | Signal | From | What it is |
 | --- | --- | --- |
 | Idle time | `system()`'s `idleMs`, from `GetLastInputInfo` | One number: milliseconds since any key or mouse input anywhere. Not which key, not where, not which app |
 | Fullscreen, presentation, Windows quiet time | `system()`'s `userState` | Do-not-disturb, next to Familiar's own setting |
 | Woke from sleep | the `system` message on resume (`WM_POWERBROADCAST`) | A fact, with no detail |
+| Screen locked or unlocked | `system()`'s `locked`, from the session's lock flag (`WTSQuerySessionInformation`, `WTSSessionInfoEx`), read with the 5-second state poll | Yes or no. Added in the pre-release native pass |
 | Started at sign-in | `shell_info().autostarted` | The Run entry started it |
 | Last seen | core, in its own store | The last time you were at the PC while Familiar ran |
 | Her last message asked something | core's chat log and step 5's `endsWithQuestion` | Local, no model call |
@@ -25,11 +35,11 @@ Part 1 needs nothing new in the exe. Every part 1 moment comes from signals buil
 
 Later, opt-in, with a new exe: new devices (class only) and installed apps (matches against a small known list). See [device-added and app-installed](#later-opt-in-device-added-and-app-installed).
 
-**Idle under fullscreen or presentation doesn't count as away.** Watching a film is not being away, so core starts the away clock only when no fullscreen or presentation state covered the stretch. Session lock isn't read: the idle number already grows while the PC is locked, and typing the password ends it.
+**Idle under fullscreen or presentation doesn't count as away, but a lock always does.** Watching a film is not being away, and a locked PC is. So the time away is the idle stretch without the parts that fullscreen or a presentation covered, and any part while the PC was locked always counts. Unlocking is an arrival, like input after idle, even if you don't touch anything after the password. While the PC is locked she's quiet: nobody can see her.
 
 ## The presence coordinator: one moment at a time
 
-When you show up (input after idle, a wake, a sign-in start, Familiar opened by hand), core makes **at most one** moment event, the first that applies:
+When you show up (input after idle, an unlock, a wake, a sign-in start, Familiar opened by hand), core makes **at most one** moment event, the first that applies:
 
 1. `day / special-day` if today is a special day and she hasn't greeted you today.
 2. `day / first-hello` if she hasn't greeted you today.
@@ -37,9 +47,9 @@ When you show up (input after idle, a wake, a sign-in start, Familiar opened by 
 4. `system / back-after-long` if you were away 60 minutes or more.
 5. `system / back-after` if you were away 20 to 59 minutes (as now).
 
-The day starts at 04:00 local, so someone up at 00:30 isn't greeted for a new day. The raw facts (`wake`, `unlocked`, `app-started`, `fullscreen-off`) still go to the decider as they happen, and stay quiet: the moment, if any, follows as its own event.
+The day starts at 04:00 local, so someone up at 00:30 isn't greeted for a new day. The raw facts (`wake`, `session-locked`, `unlocked`, `app-started`, `fullscreen-off`) still go to the decider as they happen, and stay quiet: the moment, if any, follows as its own event.
 
-**Held, not lost.** A once-a-day moment (special-day, first-hello) that would land while do-not-disturb, fullscreen or presentation is on, or while she's sent home or hidden, is held and offered at the next presence after that ends, the same day. So each day has exactly one, and the decider rarely meets one under do-not-disturb. The decider's rule 1 still says quiet if it does.
+**Held, not lost.** A once-a-day moment (special-day, first-hello) that would land while do-not-disturb, fullscreen, presentation or a lock is on, or while she's sent home or hidden, is held and offered at the next presence after that ends, the same day. So each day has exactly one, and the decider rarely meets one under do-not-disturb. The decider's rule 1 still says quiet if it does.
 
 **Retired names.** Core stops sending `app / first-open-today` (replaced by `first-hello`) and stops sending `back-after` for 60 minutes or more (that's `back-after-long` now). The names stay in the type list, so older data still reads.
 
@@ -49,7 +59,7 @@ New types, none of them rule events (every one is a decision point and carries a
 
 | Source / type | When core sends it | Fields (`PersonaEvent`) | `detail` |
 | --- | --- | --- | --- |
-| `day / first-hello` | The first presence of the local day, held through do-not-disturb | `cause`: `sign-in`, `wake`, `back`, `app-start`. `lastSeenMinutes` | `"<cause>, last seen <gap>"`: `"wake, last seen 9 h ago"`, `"sign-in, last seen 3 days ago"` |
+| `day / first-hello` | The first presence of the local day, held through do-not-disturb | `cause`: `sign-in`, `wake`, `unlock`, `back`, `app-start`. `lastSeenMinutes` | `"<cause>, last seen <gap>"`: `"wake, last seen 9 h ago"`, `"unlock, last seen 10 h ago"`, `"sign-in, last seen 3 days ago"` |
 | `day / special-day` | In place of first-hello, on a special day | `cause`, `lastSeenMinutes`, `day`: `{ kind, name? }`. `kind` is `holiday` (with `name` from the holiday list), `birthday` (yours), `setup` (a year, or more, since she was set up), `remembered` (a date in a memory note, never its text) | `"<day>, <cause>, last seen <gap>"`: `"Christmas, sign-in, last seen 10 h ago"`, `"your birthday, wake, last seen 8 h ago"`, `"a year since setup, back, last seen 14 h ago"`, `"a remembered date, sign-in, last seen 11 h ago"` |
 | `system / back-after-long` | Away 60 minutes or more, same day, no once-a-day moment due | `minutesAway` | `"away <gap>"`: `"away 1 h 40 min"` |
 | `app / question-unanswered` | Her last message asked something, 20 minutes or more ago, nothing from you since, and you're at the PC (input in the last 2 minutes) or just came back. Once per question | `minutesSinceAsked`, `minutesAway` (if you just came back) | `"asked <gap> ago"`, or `"asked <gap> ago, you were away <gap>"` |
@@ -64,7 +74,7 @@ New types, none of them rule events (every one is a decision point and carries a
 
 ### Later, opt-in: device-added and app-installed
 
-Both need native reads the exe doesn't have, so they're a later tier, off by default, batched with the next exe (with OAuth and the UI Automation tier). Their names are fixed now so the training data covers them. About 3 hours when that exe comes: 2 native, 1 in the app and Settings.
+Decided by the owner on 2026-11-16: "opt-in is fine". Both need native reads the exe doesn't have, so they're a later tier, off by default, batched with the next exe (with OAuth and the UI Automation tier). Their names are fixed now so the training data covers them. About 3 hours when that exe comes: 2 native, 1 in the app and Settings.
 
 - **Devices**: the exe watches device arrival and reports only a class from a fixed list (game controller, headset, speakers, microphone, webcam, drawing tablet, phone, keyboard, mouse, display, printer, storage). Never a name, a maker or a serial number. "Never seen before" is kept as salted hashes of device ids in the PC-tied data, never exported. A known device plugged in again sends nothing.
 - **Apps**: the app passes the exe its known-app list (a small file in the app folder, about 20 names, such as Steam, Spotify, OBS Studio, Blender, Krita); the exe reads the installed-apps entries and answers only which of those names are present. The full list never leaves the exe. Checked at start and every 6 hours.
@@ -75,19 +85,20 @@ Nothing from either is ever sent anywhere: the app's network is closed to everyt
 
 This is the rule file for the data wave (plain text, appended to the writer and labeller prompts), and the rules decider's new rules, word for word:
 
-> Only six events can ever get `chat`: day first-hello, day special-day, system back-after-long, app question-unanswered, system device-added, system app-installed. No other event gets `chat`, whatever happens. At these six, the act follows chattiness: high `chat`, medium `bubble`, low `gesture`. Two are big and go one step up (high and medium `chat`, low `bubble`): special-day, and first-hello after 2 days or more away. Kinds: first-hello and back-after-long `greet`; special-day `celebrate` for a holiday, birthday or setup day, `greet` for a remembered date; question-unanswered `curious`; device-added `curious`; app-installed `playful`. The usual rules still win: fullscreen or do-not-disturb, or sent home, hidden or paused, is quiet. If she reacted in the last 2 minutes, question-unanswered, device-added and app-installed are quiet; first-hello, special-day and back-after-long still go ahead. At most 2 unprompted chats a day: once she has sent 2 today, a `chat` drops to `bubble`. After the person says goodbye (message-sent, "a goodbye"), no `chat` until the next first-hello or special-day: a `bubble` at most. back-after is never `chat`: it's 20 to 59 minutes away and keeps its rule. wake, unlocked, app-started and fullscreen-off are facts, quiet: a moment, if any, comes as its own event after them.
+> Only seven events can ever get `chat`: day first-hello, day special-day, system back-after-long, app question-unanswered, system device-added, system app-installed, and clock long-session late at night (23:00 to 05:00). No other event gets `chat`, whatever happens. At the first six, the act follows chattiness: high `chat`, medium `bubble`, low `gesture`. Two are big and go one step up (high and medium `chat`, low `bubble`): special-day, and first-hello after 2 days or more away. The late-night long-session is the nudge to rest: at most one a night, `chat` at high, `bubble` at medium and low (a `gesture` if a bubble came too recently), kind `nudge`. Kinds: first-hello and back-after-long `greet`; special-day `celebrate` for a holiday, birthday or setup day, `greet` for a remembered date; question-unanswered `curious`; device-added `curious`; app-installed `playful`. The usual rules still win: fullscreen, do-not-disturb or a locked PC, or sent home, hidden or paused, is quiet. If she reacted in the last 2 minutes, question-unanswered, device-added, app-installed and long-session are quiet; first-hello, special-day and back-after-long still go ahead. At most 2 unprompted chats a day, the nudge included (the day starts at 04:00): once she has sent 2 today, a `chat` drops to `bubble`. After the person says goodbye (message-sent, "a goodbye"), no `chat` until the next first-hello or special-day: a `bubble` at most. back-after is never `chat`: it's 20 to 59 minutes away and keeps its rule. wake, session-locked, unlocked, app-started and fullscreen-off are facts, quiet: a moment, if any, comes as its own event after them.
 
 The rules decider does the same in code. Core also enforces the daily cap and the goodbye rule itself, so a model decider can't exceed them.
 
-**What `chat` does.** Core starts a turn with no message from you, only a note of the moment and its kind ("first hello of the day, greet"; "her question is still open, curious"; "Christmas, celebrate"). The model writes the message with memory and the card as in any turn, and it's one model call on your key, at most two a day. If the chat is hidden, the tray shows that she wrote, and the portrait shows a bubble pointing at it.
+**What `chat` does.** Core starts a turn with no message from you, only a note of the moment and its kind ("first hello of the day, greet"; "her question is still open, curious"; "Christmas, celebrate"; "it's late and you've been at it a while, nudge"). The model writes the message with memory and the card as in any turn, and it's one model call on your key, at most two a day. If the chat is hidden, her portrait shows a bubble pointing at it. Without the portrait, the tray icon gets its dot if you've pinned it, and otherwise the message waits in the chat for when you open it. No Windows notification: those stay for reminders.
 
 ## Why the existing data stays good
 
-The Claviger Familiar pool (key1, 21,254 points) has no `chat`. The rule above gives `chat` only to new types, and changes no existing type's rule, so none of those points goes stale:
+The Claviger Familiar pool (key1, 21,254 points) has no `chat`. The rule above gives `chat` to new types, and changes one existing rule, the late-night nudge at high, so only those points go stale:
 
 - `back-after` keeps "greet once, gesture at low, bubble at medium or high". key1 has 37 high-chattiness points with 60 minutes or more away, labelled bubble or quiet. Core won't send `back-after` for 60 or more any more, so those never meet a live event.
 - `first-open-today` keeps its points (711, greet as gesture or bubble). Core won't send it any more. Mapping them to `first-hello` is possible at low and medium, where the labels match the new rule, but not at high (201 points, where first-hello is now `chat`). Leaving key1 byte for byte is simpler.
-- `long-session` stays a bubble nudge. Making it `chat` at high would make 131 key1 points stale, and a nudge to sleep doesn't need the chat.
+- `long-session` at high, late at night, becomes `chat` (the owner's call). key1 has 131 `long-session` points labelled bubble at high, but only **63 are late at night** (23:00 to 05:00, the rules decider's window). Those 63 are relabelled `chat nudge`. None of their timelines has another chat, so the daily cap never bites. The other **68 are daytime**, "at the desk 3.5 h" breaks at 14:20 or 14:48, and they stay bubbles: the owner's call was about late at night.
+- **Daytime breaks, a gap to settle.** key1's writers and labellers agreed on a daytime "take a break" nudge (bubble at medium and high: 67 and 68 points, 20 at low), while today's rules decider leaves every daytime `long-session` quiet. The accepted kinds list `nudge` as "take a break, it's late", so the data reads the rules as they were meant. Recommended: step 10b adds a daytime break nudge to the rules decider, one per long session, a bubble at medium and high, a gesture at low, never `chat` (0.25 h). The other way is to relabel those 155 points quiet. A call for the lead.
 - `wake` and `unlocked`: key1 already labels them quiet (about 95%), which is what the rule says.
 
 ## For the data worker: the validator change
@@ -100,9 +111,9 @@ The Claviger Familiar pool (key1, 21,254 points) has no `chat`. The rule above g
 "day": ("first-hello", "special-day"),
 ```
 
-None goes in `RULE_EVENTS`. The writer prompt also says: don't use `first-open-today`; `back-after` only for 20 to 59 minutes away (or shorter, labelled quiet); the `detail` formats above; at most 2 chats per timeline-day; and after a goodbye, `message-sent` carries detail `"a goodbye"`.
+None goes in `RULE_EVENTS`. The writer prompt also says: don't use `first-open-today`; `back-after` only for 20 to 59 minutes away (or shorter, labelled quiet); the `detail` formats above; a late-night `long-session` has its time between 23:00 and 05:00; at most 2 chats per timeline-day; and after a goodbye, `message-sent` carries detail `"a goodbye"`.
 
-Two checks the validator can add cheaply: `chat` only on the six types; and no more than 2 `chat` labels per timeline.
+Three checks the validator can add cheaply: `chat` only on the six types and on `long-session` between 23:00 and 05:00; no more than 2 `chat` labels per timeline; and at most one `nudge` above quiet per night.
 
 **Names that differ today between core and the kit.** Core's `session-unlocked`, `playback-paused`, `playback-stopped` are the kit's `unlocked`, `paused`, `stopped`; core has `ack-sent` and `bubble-dismissed`, the kit has `time-of-day`. A model decider's adapter maps them. The new names here are the same in both.
 
@@ -186,19 +197,34 @@ Short timelines: the lead-up, then the moment, with its right act. Times are 24 
    - 09:01 day first-hello "sign-in, last seen 10 h ago" → chat greet
    - 09:02 system app-installed "Spotify" → **quiet**
 
+### The late-night nudge
+
+1. High.
+   - 23:10 music track-changed "piano, quiet" → quiet
+   - 23:40 clock long-session "3 h at the desk, late" → **chat nudge**
+2. Medium.
+   - 00:20 clock long-session "working 80 min, past midnight" → **bubble nudge**
+3. High, two chats already today (first-hello at 08:10, back-after-long at 14:00).
+   - 23:50 clock long-session "2 h at the desk, late" → **bubble nudge**
+4. High, already nudged tonight.
+   - 23:30 clock long-session "2 h at the desk, late" → chat nudge
+   - 01:15 clock long-session "4 h at the desk, late" → **quiet**
+5. High, the PC locked a minute ago.
+   - 00:41 system session-locked → quiet
+   - 00:42 clock long-session "3 h at the desk, late" → **quiet**
+
 ### Near misses for every wave
 
-- 23:30 clock long-session (late night, high) → bubble nudge, never chat.
+- 15:30 clock long-session "at the desk 3 h" (daytime, high) → bubble nudge at most, never chat.
 - 10:00 system dnd-off (high) → as key1: quiet, or a greet bubble after a long stretch. Never chat.
 - 07:42 system wake (high) → quiet. The first-hello right after it is the moment.
+- 08:05 system unlocked (high) → quiet. The first-hello "unlock, last seen 10 h ago" right after it is the moment.
 - 14:00 app question-unanswered under do-not-disturb → quiet. (device-added and app-installed aren't held: under do-not-disturb they're simply quiet.)
 
 ## Not in this round
 
 - **Do-not-disturb just ended, when you'd said what you were doing.** Dropped. It needs a "you told her" flag only the chat model could set, and the clean version already exists: ask her for a reminder ("ask me how it went at 3"), which is a fixed rule.
-- **Late-night long session as chat at high.** Stays a bubble (see above).
-- **Lock and unlock as their own signal.** Not needed: the idle number covers them. If a later feature needs them, they ride the next exe.
 
 ## Where it's built
 
-Step 10b in the [build order](design.md#build-order): the presence coordinator, the six events and their holds, the goodbye check, the holiday list and memory dates, the unprompted turn, the daily cap, the rules decider's new rules, and tests with a fake clock and fake system signals. The portrait and the bubble's fallback are step 11b.
+Step 10b in the [build order](design.md#build-order): the presence coordinator, the six events and their holds, the lock and unlock as arrival and away, the goodbye check, the holiday list and memory dates, the unprompted turn, the daily cap, the rules decider's new rules with the late-night chat, her traits ([persona-traits.md](persona-traits.md)), and tests with a fake clock and fake system signals. The lock signal and the tray's pinned check are in the pre-release native pass. The portrait and the tray bubble are step 11b.
