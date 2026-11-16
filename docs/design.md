@@ -9,7 +9,7 @@ This file holds the plan's decisions and the build order.
 - **Bring your own model:** OpenAI-compatible endpoints (which cover OpenRouter, LM Studio and Ollama), Anthropic and Gemini. Keys are typed into Familiar's own Settings window and live in Windows Credential Manager, one entry per endpoint, write-only. Never in files, the database, logs or exports.
 - **No account and no telemetry.** The app talks only to the model you picked, the remote servers you add, and in part 2 to Desktop Buddies on the same PC.
 - **It reaches only what has an API:** its own built-in tools and the MCP servers you add. No shell. Tools that write, open or send ask first. Windows UI Automation, and then screen and mouse, are later tiers with their own plans.
-- **A capability matrix** in Settings and in the docs, built from one list: what it can do, through what, and what's missing.
+- **A capability matrix** in Settings and in the docs, built from one list: what it can do, through what, and what's missing ([below](#the-capability-matrix)).
 - **The local app stays free, open (MIT) and bring-your-own-key.** Data that could one day sync stays apart from data tied to this PC (keys, server commands, window places).
 - **Dev and tests use fakes:** the fake model and the fake MCP server here, and a fake Desktop Buddies in part 2. No keys, no paid services. Test and demo runs use a scratch HOME. Browsers run headless.
 
@@ -83,25 +83,63 @@ What the decider sees: the persona's short sketch and a chattiness setting (low,
 - Tool done or reply done while the chat is hidden: the teaser rule handles it. The decider only picks gesture or quiet when no teaser is due.
 - Clicked once: a gesture at most (plain clicks are petting).
 - When in doubt: quiet.
+- Chat, unprompted: only at six moments, by the chat rule in [moments.md](moments.md#the-chat-rule).
+
+**Moments when she speaks first.** Agreed with the owner on 2026-11-16: the first hello of the day, a special day, coming back after an hour or more, a question of hers left hanging, and later, opt-in, a new device or a known app. Core makes each moment as its own event, one at a time, from signals the exe already has, and holds the once-a-day ones through do-not-disturb. Only those six events can get `chat`: high chattiness chats, medium bubbles, low gestures, two big moments go a step up, and there are at most two unprompted chats a day. [moments.md](moments.md) has the signals, the event names and fields, the rule word for word, and examples. It's also the spec for the decision model's training data.
 
 **A model later, if tests earn it.** A small local decision model can plug into the same port once it beats these rules on a shared test bench, runs on an ordinary PC's CPU, and ships as a separate download under its own licence. The rules stay as the fallback.
 
 ## A bare "thanks" or "ok" gets no reply message
 
-When you send only an acknowledgement, such as "thanks", "ok", "got it" or a thumbs up, the persona doesn't answer with a message. A reaction is fine: a small mark on your message in part 1, a pose from her buddy in part 2.
+When you send only an acknowledgement, such as "thanks", "ok", "got it" or a thumbs up, the persona doesn't answer with a message. A reaction is fine: an expression on her portrait in part 1 (or a small mark on your message when the portrait is off), a pose from her buddy in part 2.
 
 - A local check spots a bare acknowledgement. It costs no model call.
 - **Except when it answers her.** If her last message asked you something, "ok" is an answer, and it goes to the model as usual. Consent never rides on chat text: consent cards have their own buttons.
+
+## Where reactions show in part 1
+
+`gesture` and `bubble` need a body, and in part 2 that's a Desktop Buddies buddy. Part 1 gets one too: **her portrait**, an optional view (owner, 2026-11-16: "maybe familiar gets an extension that lets some kind of avatar/sprite view change expressions for the character. or some 3d character portrait being rendered, so gestures would fit there").
+
+- **A small window of her own.** `view-portrait`, opened with `view_open`: no frame, transparent, always on top, no taskbar entry, never taking the keyboard. You drag it where you like, and its place is kept with the PC-tied data. Off until you turn it on in first-run setup or Settings. No exe change: the window flags were designed for this.
+- **Expressions are gestures.** A set of images for her: neutral by default the card's own picture, and optionally happy, curious, playful, soft, surprised and sleepy, picked from files the way a card is imported (step 6) and kept as blobs in Familiar's data. Each kind maps to one (greet and celebrate happy, curious curious, playful playful, comfort soft, nudge sleepy, inform neutral). A gesture shows it for a few seconds. A missing image falls back to neutral with the small mark the chat uses, so a card with one picture works from the start.
+- **A bubble sits beside her.** One line, gone after about 8 seconds or on a click. A click on the bubble opens the chat.
+- **Her portrait sends the buddy's events**: a click is `clicked` (petting), a double-click opens the chat, dragging is `picked-up`, and her menu has hide and send home. Same names as a buddy's, so the decision data covers both.
+- **With the portrait off**: a gesture is the small mark on the last message and a short change of the tray icon. A bubble is a quiet Windows notification with its line (no sound, held by Windows itself during Focus Assist), or, if you prefer, only a tray line: the tooltip holds the last line and the icon gets a dot. A `chat` while the chat is hidden does the same with "she wrote to you".
+- **Part 2**: once she's linked to a buddy, the buddy is her body and the portrait closes. One body at a time.
+- **A 3D portrait is a later tier**: a VRM model drawn with three.js in the same view, with the kinds mapped to its expressions, blinking and breathing, a frame cap, and paused when hidden or under fullscreen. Bundled, so the CSP allows it and no exe changes. About 11 hours, after part 1.
+
+## The capability matrix
+
+One list (step 9) feeds the Settings tab and the docs page. Each row: what she can do, through what, its status, and what it reads. The moments' rows, settled 2026-11-16:
+
+| She can | Through | Status | What it reads, and where it goes |
+| --- | --- | --- | --- |
+| Notice you're back after an hour or more | The exe's idle number (`GetLastInputInfo`) | Part 1, step 10b (the signal is in the exe since step 3) | Only how long since any key or mouse input: one number. Never which keys, where the mouse is, or which app. Time under fullscreen or a presentation doesn't count as away |
+| Say hello once a day: at sign-in, after sleep, or when you first sit down | The autostart flag, the resume signal, the idle number, her own last-seen time | Part 1, step 10b | The last-seen time is kept in her data on this PC |
+| Greet you bigger after days away | The same last-seen time | Part 1, step 10b | As above |
+| Follow up once on a question she asked | Her own chat log: when her last message was, and a local "did it ask something" check | Part 1, step 10b | No model call to decide. The follow-up itself is one model call on your key, like any message |
+| Mark a special day: holidays, your birthday, her setup day, dates you told her | A holiday list in the app folder (you pick the region), and memory notes with dates | Part 1, step 10b (needs memory, step 10) | The decider sees only the kind of day, never a note's text. The model writing the greeting reads memory as in any turn |
+| Speak first at all | The unprompted turn, at most two a day | Part 1, step 10b | Each one is a model call on your key |
+| Stay quiet in a game, a presentation, Windows' quiet time or her own do-not-disturb | The exe's user state, and Familiar's own setting | Part 1, steps 3 and 5 | The state only, never what's on screen |
+| Nudge you late at night | The clock and how long the session has run | Part 1, step 5 | Nothing else |
+| Show reactions on a portrait: expressions and a bubble | The portrait view | Part 1, step 11b, off until you turn it on | The pictures you pick stay in her data |
+| Show a bubble without the portrait | A quiet Windows notification, or a tray line | Part 1, step 11b | The line shows in Windows' notification list like any notification |
+| Notice a new device | The exe's device arrival, the class only | Later tier, opt-in, off by default. Needs a new exe | A class from a fixed list (game controller, headset, webcam...). Never a name or serial number. Devices already seen are kept as hashes on this PC, never exported, never sent anywhere |
+| Notice a known app, such as Steam or Blender | The exe checks the installed apps against a small known-app list | Later tier, opt-in, off by default. Needs a new exe | Only matches from the list reach her. The full list of your apps never leaves the exe and is never sent anywhere |
+| A 3D portrait | The portrait view with a VRM model | Later tier | The model file you pick stays in her data |
+| Ask how it went when do-not-disturb ends | Not planned: a reminder does it ("ask me how it went at 3") | Covered by reminders, step 8 | |
 
 ## Build order
 
 Hours are a working estimate, not calendar time. Part 1 is re-estimated once the first real server works end to end in the installed app.
 
+**Moments and the portrait, 2026-11-16.** Two steps added for the owner's moments and her portrait, and half an hour more for the matrix's rows: part 1 goes from 132.5 to 146. Lettered so the later steps keep their numbers.
+
 **Re-estimated 2026-11-15, after step 3.** Step 3 took 38.25: the accepted 33.75, 3 more rework hours the lead approved, and 1.5 for the last batch of six review fixes. Its review rounds on security code took about as much work as the build itself, and they found races in concurrent code more than in rules. Steps 4, 5 and 7 build the same kind of code: the model layer streams over the guarded fetch, the turn loop resumes a durable journal after a kill, and the MCP client restarts servers under time limits. So each gets a rework row of a third of its build: 1.75, 2.75 and 3.5. Less than step 3's, because the hard parts they stand on (the fetch's single owner, the actor per setup, the gate) now exist and are proven. The other steps are app logic with ordinary tests, and step 14's review hours cover them. Part 1 goes from 120 to 132.5.
 
 | # | Step | Done when | Hours |
 | --- | --- | --- | --- |
-| | **Part 1: Familiar on its own** | | **132.5** |
+| | **Part 1: Familiar on its own** | | **146** |
 | 1 | Repo, workspace, CI, fake model, fake MCP server | Typecheck and tests green on CI | 3 |
 | 2 | Spikes: pi-durable in a Tauri webview, pi-ai bundling, the installed exe starting a local MCP server | A yes or no on each, written down | 5 |
 | 3 | Tauri shell ([shell-design.md](shell-design.md)): the app loaded from a folder beside the exe, its origin and WebView2 data folder pinned, persistent storage asked for, windows and capabilities, the egress closure, the native confirms, tray, keys typed in Settings, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch | Every security check passes on the Windows runner | 38.25 |
@@ -110,9 +148,11 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 | 6 | Cards: V2/V3, lorebook, prompt building, plain helper | Sample cards round-trip, lorebook budget tests | 5 |
 | 7 | MCP client: local and remote servers, add by paste or form, Test, prerequisites, saved setups, secrets, the unpinned flag, changed-tool re-ask, time limits and Stop, restarts (starting, approval and blanking are in the exe from step 3) | Against the fake server: add, crash mid-call (never sent again), change a tool, print a secret (blanked), remove | 14 (10.5 and 3.5 rework) |
 | 8 | Tools, reminders, consent cards, activity list, the outside-content rule | Missed-reminder, exact-call consent, revoke and steering tests | 7 |
-| 9 | Capability matrix: the list, the Settings tab, the docs page, the setup guide | Settings and docs agree, checked in CI | 5 |
+| 9 | Capability matrix: the list, the Settings tab, the docs page, the setup guide | Settings and docs agree, checked in CI | 5.5 |
 | 10 | Memory: notes, summaries, the Memory tab, deletion. Export and import, and the fallback backup with its native commands | Notes survive restart and delete cleanly. Export then import gives back the same data | 6 |
+| 10b | Moments ([moments.md](moments.md)): the presence coordinator and its holds, the six events, the goodbye check, the holiday list and memory dates, the unprompted turn and its resume rule, the daily cap, the decider's chat rule | With a fake clock and fake system signals: one moment at a time, one hello a day, held through do-not-disturb, one follow-up per question, never after a goodbye, never past two a day | 6 |
 | 11 | Chat window, first-run setup, settings, the Trusted Types rule on every page | Headless screenshots, light and dark | 10.25 |
+| 11b | Her portrait: the view and its place, expressions and their fallbacks, the bubble, its events, and the notification or tray fallback | Headless screenshots, light and dark, of every kind with a full and a one-picture set. A click, a double-click and a drag send the right events | 7 |
 | – | Pre-release native pass: the WebSocket to Desktop Buddies and its pairing token, against Desktop Buddies' settled protocol. Then the exe settles | Its security checks pass on the runner | 1.25 |
 | 12 | Packaging: the zip, the per-user installer and the draft release, an uninstaller that keeps data unless you tick the box. A winget manifest for the public flip | The installer runs on a real PC with Smart App Control on, and a local server runs there | 4 |
 | 13 | What screenshots can't show: data through an update, a reinstall and a winget upgrade, a write surviving a hard kill, sleep and wake, notification buttons, local servers under Smart App Control | Checked on the runner and once on a real PC. That last check gates the release | 8 |
