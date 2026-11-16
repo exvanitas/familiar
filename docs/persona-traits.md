@@ -26,9 +26,9 @@ These hold for every persona, whatever the card says:
 - Rule events keep their fixed handling: a message you send gets a reply, a reminder fires, a consent card shows, an error shows. Consent never rides on a trait.
 - A bare "thanks" or "ok" gets no spoken line. A gesture at most.
 - She reacted in the last 2 minutes: quiet, unless something bigger happens.
-- The bubble spacing (one per 30, 10 or 5 minutes by chattiness), the cap of two unprompted chats a day, and no chat after a goodbye.
+- The bubble spacing (one per 30, 10 or 5 minutes by chattiness), the cap of two unprompted chats a day, and no chat after a goodbye. These apply to every persona against her own recent reactions, after any trait has moved her.
 - Only the [chat events](moments.md#the-chat-rule) can ever get `chat`.
-- Care stays the same for everyone: the late-night nudge, comfort when a tool failed, and the teaser for a reply or tool that finished while the chat was hidden.
+- Care stays the same for everyone: the late-night nudge, comfort when a tool failed, and a reply or tool that finished while the chat was hidden.
 - Plain facts stay quiet: wake, sleep, lock, unlock, idle starting, fullscreen or do-not-disturb coming on, a meeting starting, the chat opening.
 
 ## The traits
@@ -37,7 +37,7 @@ Three traits and her interests. Each trait has three values, and the middle one 
 
 | Trait | Values | It's about | It steers |
 | --- | --- | --- | --- |
-| Sociability | `reserved`, `even`, `outgoing` | How much she comments on the world | Things happening: music, a finished tool, the app starting, a meeting soon, fullscreen ending, the time of day, a new device or app. And the chattiness her card suggests |
+| Sociability | `reserved`, `even`, `outgoing` | How much she comments on the world | Things happening: music, a tool that finished while you watched (the chat in front), the app starting, a meeting soon, fullscreen ending, the time of day, a new device or app. And the chattiness her card suggests |
 | Closeness | `aloof`, `warm`, `clingy` | How much she seeks you | Greetings and returns, her own open question, and your attention: a click, a pick-up, the chat closing, a bare thanks, being shown or resumed |
 | Lively hours | `morning`, `any`, `night` | When she's at her best | Everything the other two steer, by the clock |
 | Interests | up to 5 short phrases | What she likes | Music whose mood matches (as now), and a new app she knows |
@@ -45,6 +45,8 @@ Three traits and her interests. Each trait has three values, and the middle one 
 **Why these three.** They're what a card says most often about how someone behaves when nobody asked them anything, and each maps onto moments Familiar already has. Sociability and closeness are separate on purpose: a shy fairy who adores you (reserved, clingy) and a loud gremlin who ignores you (outgoing, aloof) are both common cards, and they react to opposite things. Lively hours is the one trait that needs the clock, and the decider already has the local hour.
 
 **What was left out.** A tone or mood trait (gentle, playful, dry): the kind of a reaction comes from the event, and how she sounds is the chat model's job, from the whole card. A per-day mood: random by design, so it can't be tested or taught. A trait per moment: too many to read from a card or set by hand.
+
+**Interests, matched exactly.** Compared trimmed and in lowercase. Music: an interest equal to the track's mood tag, as now. A new app: each entry in the known-app list carries its name and two or three interest words (Krita: drawing, painting, art). The app is among her interests when one of her interests equals its name, or contains one of its words as a whole word, so "digital painting" matches Krita. The list is a file in the app folder, and the same list goes to the data writers.
 
 **Lively hours, exactly.** A morning person is lively from 05:00 to 11:59 and sleepy from 21:00 to 03:59. A night owl is lively from 20:00 to 03:59 and sleepy from 05:00 to 11:59. 04:00 to 04:59 is neither, since the day starts at 04:00.
 
@@ -56,26 +58,38 @@ Chattiness stays the person's setting, because it's about how much they want to 
 
 ## How a trait moves an act
 
-Acts sit on a ladder: quiet, gesture, bubble, chat.
+Acts sit on a ladder: quiet, gesture, bubble, chat. Every persona's answer comes from the same five steps, in this order. Each step looks only at the event, the context and her own past reactions, so two personas on the same timeline can differ later because they differed earlier.
 
-1. **The base.** First the rules decide as they do now, for a neutral persona: the base act and kind. If the base came from do-not-disturb, fullscreen or a lock, from being sent away, from a rule event, from the 2-minute settle, or from a care event or a plain fact, that's the answer, and the traits don't apply. The spacing, the daily cap, the goodbye rule and "a gesture at most" for a bare thanks aren't answers but limits: they cap a move up (step 5).
-2. **The moves.** Each trait that steers this event gives one move: up, down or none. An event no trait steers keeps its base. Closeness: aloof down, clingy up. Sociability: reserved down, outgoing up. Lively hours: up in her lively hours, down in her sleepy hours. Interests: a new app among her interests, up.
-3. **One rung at most.** Add the moves, and keep the total to one rung: up, down or none. An aloof morning person at 08:00 cancels out.
-4. **Down** is one rung lower. A first hello and a special day never go below a gesture: once a day she acknowledges you, however aloof.
-5. **Up** is one rung higher, but no higher than:
-   - what chattiness reaches on its own: gesture at low, bubble at medium, chat at high;
-   - the event's own limit: a gesture at most for a click, a pick-up, the chat closing and a bare thanks; a bubble at most for `back-after` and anything that isn't a chat event; chat only at the chat events;
-   - a gesture if a bubble came too recently for her chattiness, and a bubble once she's sent two chats today or after a goodbye.
+1. **Blockers.** Do-not-disturb, fullscreen, presentation, quiet time, a locked PC, or sent home, hidden or paused: quiet. Rule events keep their fixed handling. Nothing else is looked at.
+2. **The intent.** The rules' answer for a neutral persona in the plain case, before anything that depends on her own recent reactions: what she'd do if she hadn't reacted to anything lately. The first song of the day is `bubble playful`, a click `gesture playful`, the chat closing `quiet`, `back-after-long` at high `chat greet`. Care events (the late-night nudge, `tool-failed`, a reply or tool finishing while the chat is hidden) and plain facts keep their intent: no trait moves them. So does any event no trait steers.
+3. **The move.** Each trait that steers this event gives up, down or none. Closeness: aloof down, clingy up. Sociability: reserved down, outgoing up. Lively hours: up in her lively hours, down in her sleepy hours. A new app among her interests: up. Add them, and keep the total to one rung: up, down or none. An aloof morning person at 08:00 cancels out.
+   - **Down** is one rung lower. A first hello and a special day never go below a gesture: once a day she acknowledges you, however aloof.
+   - **Up** is one rung higher, but no higher than chattiness' top (gesture at low, bubble at medium, chat at high), and no higher than the event's limit: a gesture at most for a click, a pick-up, the chat closing and a bare thanks; a bubble at most for `back-after` and anything that isn't a chat event; chat only at the chat events. A limit at or below the intent means no move: up never lowers.
+   - **From quiet.** Things happening never go up from quiet. A song that the rules leave quiet stays quiet, however outgoing she is, or she'd react to every track change. Greetings, returns, her question and your attention can go from quiet to a gesture: a clingy persona waves when you close the chat.
+   - An act above chattiness' top is only ever the intent itself: the two big moments at low and medium, and the late-night nudge at low. A move never makes one.
+4. **The limits**, on her own history, whatever the move did:
+   - She reacted in the last 2 minutes: quiet, except at a first hello, a special day, `back-after` and `back-after-long`.
+   - A music bubble when her last reaction was a music bubble: quiet.
+   - The late-night nudge: one a night, counted from 23:00 to 05:00, so it doesn't reset at 04:00. Another is quiet.
+   - Two unprompted chats already today (the day starts at 04:00), or a goodbye since the day's first hello: a `chat` becomes a `bubble`.
+   - Spacing: a `bubble` within her chattiness' gap (30, 10 or 5 minutes) after her last bubble or chat becomes a `gesture`. A bubble that came from a move down or from a chat falling back is no exception. A `chat` is never held back by spacing, only by the daily cap.
 
-   A limit at or below the base means no move: up never lowers.
-6. **From quiet.** Things happening never go up from quiet. A song that the rules leave quiet stays quiet, however outgoing she is, or she'd react to every track change. Greetings, returns, her question and your attention can go from quiet to a gesture: a clingy persona waves when you close the chat.
-7. **Kind.** The base's kind stays. A reaction that rises from quiet takes the event's kind: `greet` for a greeting, a return or the chat closing, `playful` for a click or a pick-up.
+   They run in that order, so a chat that falls back to a bubble can still become a gesture.
+5. **Kind.** The intent's kind stays. A reaction that rises from quiet takes the event's kind: `greet` for a greeting, a return or the chat closing, `playful` for a click or a pick-up.
 
-Steps 1 to 7 are one pure function in core, `steer(base, event, context)`, behind the rules decider. A model decider later gets the traits as input and gives the final act itself.
+In core, `decideByRules` becomes step 1, the intent, then one pure function, `steer(intent, event, context)`, for steps 3 to 5. Today's rules decider mixes its spacing and settle checks into the intent. Step 10b moves them into step 4, so they apply after the traits as well as before. A model decider later gets the traits and [the summaries](#how-the-decider-gets-them) as input, and gives the final act itself.
+
+**Base rules step 10b adds**, so the neutral intent matches the label rules where today's rules decider is silent or off:
+
+- `calendar / meeting-soon`: `bubble inform` at medium and high, quiet at low.
+- A bare thanks (`ack-sent`): `gesture greet`, a smile back. Today it's `gesture none`, and the label rules allow `none` only with quiet.
+- The daytime break nudge, if the owner picks it ([moments.md](moments.md#why-the-existing-data-stays-good)).
+
+The other "at most" events keep the rules decider's choice as the neutral intent: a click is a gesture, and the chat closing is quiet. key1's labellers split on those, and its neutral labels stay as they are.
 
 ## What each trait does at each moment
 
-Each table gives the neutral answer (what the rules give a neutral persona), then what the trait changes it to. Times are the person's local time.
+Each table gives the neutral intent in the plain case (nothing in the last 2 minutes, no bubble inside the gap, no chats yet today), then what the trait changes it to. The limits in step 4 still apply after. Times are the person's local time.
 
 ### The moments that can chat
 
@@ -112,7 +126,7 @@ The late-night nudge (`clock / long-session` at night) has no column: it's care,
 | `buddy / clicked` | gesture playful | quiet | gesture | gesture (petting) |
 | `buddy / picked-up` | quiet | quiet | gesture playful | gesture |
 | `app / chat-closed` | quiet | quiet | gesture greet (a wave) | gesture |
-| `app / ack-sent` (a bare thanks) | gesture | quiet | gesture | gesture |
+| `app / ack-sent` (a bare thanks) | gesture greet | quiet | gesture | gesture |
 | `buddy / shown`, `buddy / resumed` | quiet | quiet | gesture greet | bubble |
 
 At low, the same moves apply with low's top: a clingy return at low stays a gesture, an aloof one goes quiet. At high, the same as medium, since none of these can chat.
@@ -125,6 +139,7 @@ At low, the same moves apply with low's top: a clingy return at low stays a gest
 | `music / track-changed`, mood matches her interests | bubble curious | gesture | bubble |
 | `music / track-changed`, no match | quiet | quiet | quiet (never up from quiet) |
 | `app / tool-done` with the chat in front | gesture celebrate | quiet | bubble (if the spacing allows) |
+| `app / tool-done` with the chat hidden | the teaser rule: gesture or quiet | the same | the same (care) |
 | `calendar / meeting-soon` | bubble inform | gesture | bubble |
 | `app / app-started`, `system / fullscreen-off`, `clock / time-of-day` | quiet, unless the rules give a reaction | one down from it | one up from it |
 
@@ -139,26 +154,28 @@ At low, the same moves apply with low's top: a clingy return at low stays a gest
 
 ## The effect on the same timelines
 
-To give the contrast pairs targets, the trait rule above was run over all 1,256 key1 timelines, with each point's key1 label as the neutral base. The prototype applied steps 1 to 7 in order through each timeline: spacing, the 2-minute settle, do-not-disturb, fullscreen, sent away and the chattiness tops. key1 has no chat moments yet, so `first-open-today` stood in for the first hello. Five personas, with each timeline kept at its own chattiness:
+To give the contrast pairs targets, the five steps were run over all 1,256 key1 timelines, each kept at its own chattiness. key1's labels are finals, not intents, so each one stood in for the neutral intent, and the limits in step 4 were then applied against each persona's own reactions as they came. That's an approximation: a key1 quiet that a limit caused can't be told from a quiet the rules chose. The neutral persona itself changes on 0.3% of points, where key1's labellers broke a limit or the new lock rule applies. key1 has no chat moments yet, so `first-open-today` stood in for the first hello. Five personas:
 
 | Persona | Points changed | Reacts (low / medium / high) | Words: bubble or chat (low / medium / high) |
 | --- | --- | --- | --- |
-| Neutral (even, warm, any) | 0% | 21.8 / 24.6 / 28.2% | 3.3 / 13.7 / 17.8% |
-| Aloof cat (reserved, aloof, night) | 14.6% | 12.5 / 18.4 / 21.7% | 1.7 / 5.3 / 6.4% |
-| Cool show-off (outgoing, aloof, any) | 14.9% | 10.9 / 17.1 / 20.3% | 3.3 / 8.4 / 11.4% |
-| Shy friend (reserved, warm, any) | 6.2% | 19.9 / 22.7 / 27.2% | 1.2 / 9.4 / 10.6% |
-| Clingy fairy (outgoing, clingy, morning) | 7.1% | 28.7 / 29.6 / 33.2% | 3.3 / 15.0 / 18.7% |
+| Neutral (even, warm, any) | 0.3% | 21.7 / 24.5 / 27.9% | 3.3 / 13.5 / 17.3% |
+| Aloof cat (reserved, aloof, night) | 13.7% | 13.3 / 19.3 / 22.2% | 1.7 / 5.3 / 6.6% |
+| Cool show-off (outgoing, aloof, any) | 14.3% | 10.8 / 17.0 / 20.1% | 3.2 / 6.9 / 10.4% |
+| Shy friend (reserved, warm, any) | 5.0% | 21.1 / 24.0 / 27.8% | 1.2 / 9.4 / 10.9% |
+| Clingy fairy (outgoing, clingy, morning) | 7.3% | 28.2 / 29.3 / 32.8% | 3.3 / 13.8 / 17.6% |
 
-At medium the spread in reacting goes from 24.2 to 24.9% today to 17.1 to 29.6%. For every persona, chattiness still orders the words: more at medium than at low, more at high than at medium. Some event-level targets at medium (share of points, neutral → aloof cat → clingy fairy):
+At medium the spread in reacting goes from 24.2 to 24.9% today to 17.0 to 29.3%. For every persona, chattiness still orders the words: more at medium than at low, more at high than at medium. Some event-level targets at medium (share of points, neutral, then the aloof cat, then the clingy fairy):
 
-- First hello: bubble 91% → 18% (gesture 73%) → 91%. At high, clingy chats 83% where neutral bubbles (key1's legacy label).
-- `back-after`: bubble 54% → 16% → 54%, and clingy adds a gesture on 10% of the quiet short returns.
-- Click: gesture 54% → 18% → 62%. The chat closing: gesture 42% → 15% → 79%.
-- First play of a song: bubble 32% → 10% → 32%. A tool finished in front of you: bubble 2% → 1% → 26%.
+- First hello: bubble 91%; 18% (gesture 73%); 91%. At high, the fairy chats on 83% where neutral bubbles (key1's legacy label).
+- `back-after`: bubble 54%; 16%; 54%, and the fairy adds a gesture on 10% of the quiet short returns.
+- A click: gesture 53%; 18%; 60%. The chat closing: gesture 42%; 15%; 79%.
+- The first song: bubble 29%; 10%; 28%. A meeting soon: bubble 40%; 6%; 39%.
 
-Two things show up. Traits mostly take words away, because there are more bubbles to lower than places a gesture may rise into. At low no persona gets more words than neutral. At medium and high the most outgoing and clingy one gets about one point more (15.0 against 13.7%, 18.7 against 17.8%), all inside the spacing, while the aloof ones lose most of theirs. And a single trait changes 6 to 10% of the points in an ordinary timeline, so contrast timelines need to be written dense in the events traits steer (see [the data wave](#the-data-wave-contrast-pairs)).
+Two things show up. Traits mostly take words away, because there are more bubbles to lower than places a gesture may rise into: the fairy's words stay within half a point of neutral's, and the aloof ones lose most of theirs. And a single trait changes 5 to 10% of the points in an ordinary timeline, so contrast timelines need to be written dense in the events traits steer (see [the data wave](#the-data-wave-contrast-pairs)). Few key1 points carry the chat-in-front state at a finished tool, so that row has no target here.
 
-The prototype is a scratch script, not in the repo. Step 10b's property tests are the real version.
+Across a whole timeline, a persona with fewer reactions can meet fewer limits later, so "never more words than neutral" holds for every persona here but isn't a law: an aloof persona that skipped a gesture at 22:59 isn't held by the 2-minute settle at 23:00. The tests check the rule on identical contexts and measure the whole-timeline effect.
+
+The prototype is a scratch script, not in the repo. Step 10b's tests are the real version.
 
 ## How the decider gets them
 
@@ -174,6 +191,20 @@ readonly persona: {
 ```
 
 The sketch goes. The decider never sees card text, only these four. That keeps the rules decider exact, makes the contrast pairs mean something (the answer depends only on what's in the input), and keeps any card text out of a future decision model. The chat model still gets the whole card in every turn, so her voice is the card's, as before.
+
+**The limits need more than the last three reactions.** Three gestures in a row can push the last bubble out of `recentReactions` while it's still inside the gap, and nothing there says whether tonight's nudge happened. So the context gains summaries that core keeps in one small record in its store, updated with each reaction, and read back after a restart:
+
+```ts
+readonly locked: boolean;               // the screen lock, as core last knew it
+readonly lastReactionAt: number | null; // her last reaction above quiet
+readonly lastWordsAt: number | null;    // her last bubble or chat
+readonly lastWasMusicBubble: boolean;
+readonly nudgedTonight: boolean;        // a late-night nudge since 23:00
+readonly chatsToday: number;            // unprompted chats since 04:00
+readonly goodbyeSinceHello: boolean;    // you said goodbye after today's first hello
+```
+
+Core still enforces the daily cap and the goodbye rule itself, so a model decider can't pass them. The summaries are there so the decider's own answer is right. The training data renders the same summaries into the model's input, worked out from each timeline's earlier labels.
 
 ## Reading traits from a card
 
@@ -205,8 +236,9 @@ Familiar takes V2 (`chara_card_v2`) and V3 (`chara_card_v3`) cards, as JSON, as 
 - **Which model.** The persona's own chat model, in one call. It already gets the whole card in every turn, so the reader sends nothing new to anyone. With a local model (Ollama, LM Studio), nothing leaves the PC. The call counts against the caps like any other.
 - **The question.** A short fixed prompt in the app folder gives the trait definitions with their anchors (below) and the card's fields in the order of the table, with `{{char}}` and `{{user}}` filled in, cut to 24,000 characters in all (`description` and `personality` first). The model answers by calling one tool, `set_traits`. Every model Familiar sets up has passed a Test that proves tool calls ([model-design.md](model-design.md)). If there's no tool call, a JSON object in the text is accepted too.
 - **The answer.** `{ sociability, closeness, lively, interests, evidence }`. Each trait is one of its three values or `unsure`, and `unsure` means neutral. `interests`: up to 5 phrases, each lowercase, up to 32 characters, letters, digits, spaces and hyphens. `evidence`: for each trait that isn't neutral, a quote of up to 120 characters. A quote is kept only if it appears in the text sent, after whitespace is collapsed, so the reasons shown in Settings are the card's own words.
-- **Checked strictly.** A value outside its list, a wrong type or an extra field makes that trait neutral. An answer that can't be read at all falls back to the rules reader.
-- **The rules reader**, with no model: archetype tags and W++ or PList words from a short list (shy, quiet, timid, kuudere, dandere: reserved; cheerful, energetic, bubbly, genki, talkative: outgoing; cold, aloof, distant, tsundere, kuudere: aloof; clingy, affectionate, yandere, deredere: clingy; nocturnal, night owl: night; early riser, morning person: morning), and `talkativeness`. Two signals that disagree mean neutral. It runs at once on import, so traits exist before the model answers, and again if the model call fails or there's no model yet.
+- **Checked strictly.** A value outside its list, a wrong type or an extra field makes that trait neutral. An answer that can't be read at all counts as a failed reading.
+- **The rules reader**, with no model: archetype tags and W++ or PList words from a short list (shy, quiet, timid, kuudere, dandere: reserved; cheerful, energetic, bubbly, genki, talkative: outgoing; cold, aloof, distant, tsundere, kuudere: aloof; clingy, affectionate, yandere, deredere: clingy; nocturnal, night owl: night; early riser, morning person: morning), and `talkativeness`. Two signals that disagree mean neutral.
+- **Which reading wins.** On import, the rules reader runs at once, so traits exist before the model answers. A model reading that succeeds replaces the rules reader's values. On a later reading (a changed card, a new reader version, or "Read her card again", which always makes the call), a success replaces the previous reading and a failure keeps it as it was, with Settings saying the reading failed. The rules reader runs again only for a card that never had a successful model reading. A trait you set is never replaced by any reading.
 - **The plain helper** (no card) is even, warm, any, with no interests, and medium chattiness.
 - **Kept** with the persona in her data on this PC (IndexedDB, in export files). Each trait has its value, where it came from (`card`, `tags`, `default` or `you`) and its quote. The persona also keeps the card's SHA-256 and the reader's version, so an unchanged card is never read twice.
 - **Editable in Settings.** On the Persona tab, "How she is": three rows of three choices, each marked "from her card" with its quote, or "your choice". Interests as chips you can add to and remove. Chattiness with "suggested by her card". Anything you set is yours: a later reading never overwrites it. "Use her card's" puts a row back. First-run setup shows the same in one line: "She seems quiet, a little aloof, and a night owl. You can change this any time."
@@ -232,46 +264,50 @@ For the key2 data worker: the traits go into the writer and labeller prompts, an
 
 **Rule text** (appended to the label rules, after the chat rule in [moments.md](moments.md#the-chat-rule)):
 
-> Each persona has three traits besides chattiness: sociability (reserved, even, outgoing), closeness (aloof, warm, clingy) and lively hours (morning, any, night). First decide as for an even, warm, any persona: that's the base. If the base came from fullscreen, do-not-disturb or a locked PC, from being sent home, hidden or paused, from a rule event, from the 2-minute settle, from the late-night nudge, tool-failed or reply-done-hidden, or from a plain fact (wake, sleep, session-locked, unlocked, idle-start, fullscreen-on, dnd-on, meeting-started, chat-opened, chat-in-front, playlist-ended, paused, stopped, sent-home, hidden, day-boundary, bubble-dismissed), keep it. Otherwise the traits may move it one rung on the ladder quiet, gesture, bubble, chat. Closeness counts at greetings and returns (first-hello, special-day, back-after, back-after-long, dnd-off), her open question (question-unanswered) and your attention (clicked, picked-up, chat-closed, ack-sent, shown, resumed): aloof one down, clingy one up. Sociability counts at things happening (playback-started, track-changed, tool-done, app-started, meeting-soon, fullscreen-off, time-of-day, device-added, app-installed): reserved one down, outgoing one up. A new app among her interests counts one up. Lively hours counts wherever the others do: a morning person one up from 05:00 to 11:59 and one down from 21:00 to 03:59, a night owl one up from 20:00 to 03:59 and one down from 05:00 to 11:59. Add the moves, keeping the total to one rung up, one down, or none. Down: one rung lower, but first-hello and special-day never below gesture. Up: one rung higher, but never above gesture at low chattiness, bubble at medium, chat at high; never above the event's limit (gesture for clicked, picked-up, chat-closed, ack-sent; bubble for back-after and every event that can't chat); a gesture if a bubble came too recently; a bubble if two chats were sent today or after a goodbye. Up never lowers an act. Things happening never go up from quiet; greetings, returns, her question and your attention may go from quiet to a gesture. Any event not named here keeps its base. The kind stays the base's; one that rises from quiet takes greet (greetings, returns, chat-closed, shown, resumed) or playful (clicked, picked-up).
+> Each persona has three traits besides chattiness: sociability (reserved, even, outgoing), closeness (aloof, warm, clingy) and lively hours (morning, any, night). Decide each point in five steps. (1) Blockers: fullscreen, do-not-disturb or a locked PC, or being sent home, hidden or paused, is quiet. Rule events keep label null. (2) The intent: what an even, warm, any persona would do here in the plain case, as if she hadn't reacted to anything lately. The late-night nudge, tool-failed, reply-done-hidden, a tool-done while the chat is hidden, and the plain facts (wake, sleep, session-locked, unlocked, idle-start, fullscreen-on, dnd-on, meeting-started, chat-opened, chat-in-front, playlist-ended, paused, stopped, sent-home, hidden, day-boundary) keep their intent, and so does any event not named in step 3. (3) The move. Closeness counts at greetings and returns (first-hello, special-day, back-after, back-after-long, dnd-off), her open question (question-unanswered) and your attention (clicked, picked-up, chat-closed, shown, resumed): aloof one down, clingy one up. Sociability counts at things happening (playback-started, track-changed, tool-done with the chat in front, app-started, meeting-soon, fullscreen-off, time-of-day, device-added, app-installed): reserved one down, outgoing one up. An app-installed whose app is among her interests counts one up. Lively hours counts wherever the others do: a morning person one up from 05:00 to 11:59 and one down from 21:00 to 03:59, a night owl one up from 20:00 to 03:59 and one down from 05:00 to 11:59. Add the moves and keep the total to one rung up, one down, or none, on the ladder quiet, gesture, bubble, chat. Down: one rung lower, but first-hello and special-day never below gesture. Up: one rung higher, but never above gesture at low chattiness, bubble at medium, chat at high, and never above the event's limit (gesture for clicked, picked-up and chat-closed; bubble for back-after and every event that can't chat). Up never lowers an act. Things happening never go up from quiet; greetings, returns, her question and your attention may go from quiet to a gesture. (4) The limits, on this persona's own earlier labels, whatever the move did, in this order: she reacted in the last 2 minutes: quiet, except at first-hello, special-day, back-after and back-after-long; a music bubble when her last reaction was a music bubble: quiet; a second late-night nudge the same night (23:00 to 05:00): quiet; two chats already today (the day starts at 04:00) or a goodbye since today's first hello: a chat becomes a bubble; a bubble within the gap after her last bubble or chat (30 minutes at low, 10 at medium, 5 at high): a gesture. A chat is never held back by the gap. (5) Kind: the intent's kind; one that rises from quiet takes greet (greetings, returns, chat-closed, shown, resumed) or playful (clicked, picked-up).
 
-**The pair.** One timeline written once and labelled for two personas: the same events, times, details and chattiness, with two different personas (name, sketch, interests, traits). The writer gives three labels per point: the base (the neutral persona), persona A's and persona B's.
+The kit has no `ack-sent` or `bubble-dismissed` (core's names: in the kit a bare thanks is a `message-sent` rule event), so the rule text leaves them out. In the app, `ack-sent` follows closeness as in the table above, and `bubble-dismissed` keeps its intent.
 
-- Pair types: 40% differ in one trait (closeness 15%, sociability 15%, lively hours 10%), 40% in two, 20% opposite in all three.
+**The pair.** One timeline written once and labelled for two personas: the same events, times, details and chattiness, with two different personas (name, sketch, interests, traits). The writer gives, per decision point, the **intent** (step 2, shared by both, since it ignores her own reactions) and the **final** label for A and for B, each worked out on that persona's own earlier labels. So two personas can differ later because they differed earlier: an outgoing persona's bubble at 23:00 can turn her 23:03 nudge into a gesture while a reserved twin's stays a bubble.
+
+- Pair types: 40% differ in one trait (closeness 15%, sociability 15%, lively hours 10%), 40% in two, 20% opposite in all three. A pair that isolates one trait keeps the same interests on both.
 - Chattiness: 15% low, 45% medium, 40% high. At low only gestures move, so low pairs mostly teach attention and returns.
-- Dense in what traits steer: at least 8 of a timeline's decision points are steered events, and at least 5 of those have a base above quiet. At least 3 points are kept ones (do-not-disturb, sent away, a care event, a fact), to check that both personas keep them.
+- Dense in what traits steer: at least 8 of a timeline's decision points are steered events, and at least 5 of those have an intent above quiet. At least 3 points are kept ones (do-not-disturb, a lock, sent away, a care event, a fact), to check that both personas keep them.
 - Aim for at least 4 points where A and B differ. From the measured effect, an ordinary timeline would give 1 or 2 for a one-trait pair.
 - Interests still drive music: give each persona interests, and some moods that match.
 - About 120 pairs (240 labelled timelines, about 4,800 points). The data worker fits that into key2's budget beside the chat-moments wave.
 
-**Validator checks**, cheap and exact:
+**Validator checks.** Given the intents, steps 1, 3, 4 and 5 are mechanical, so the validator computes each persona's finals itself, and a mismatch is an error, not a judgment:
 
 1. Twins have identical events and chattiness, and their traits differ.
-2. Every label is within one rung of the point's base, and inside the limits above (chattiness top, event limit, floors).
-3. At kept points, base, A and B are all equal.
-4. A step up from a quiet base only at greetings, returns, her question and your attention, and only to a gesture.
-5. `chat` only at the chat events and at most 2 per timeline (as in moments.md).
+2. Intents: `chat` only at the chat events; plain facts quiet; nothing above chattiness' top except the two big moments and the late-night nudge.
+3. A's and B's finals equal steps 1, 3, 4 and 5 applied to the intent, with that persona's traits and its own earlier finals.
+4. Per persona: at most 2 chats per local day (from 04:00), and at most one late-night nudge above quiet per night (23:00 to 05:00, not reset at 04:00).
+5. A warning, not an error, for a pair with fewer than 4 points where A and B differ.
 
-**Second labels.** As now, a second labeller labels each persona's copy blind, seeing only that persona's traits and chattiness, as the live decider would. Disagreements go to adjudication. The rules decider with `steer` also labels every pair: since the rule text is the code, a disagreement between it and an agreed label is a label to look at. It's an audit, not a vote.
+**Second labels.** As now, a second labeller labels each persona's copy blind, seeing only that persona's traits, interests, chattiness and the summaries, as the live decider would, and gives finals. Disagreements go to adjudication. Since steps 1, 3, 4 and 5 are code, a disagreement that the recomputation settles is settled. What's left is a disagreement about the intent, which is judgment, as in key1.
 
-**key1 stays.** Its labels were written with no traits, and the decider won't see the sketch, so every key1 point becomes a point for the neutral persona: `even, warm, any`, its interests kept. Nothing in key1 goes stale from traits. Only the late-night nudge changes key1 (see [moments.md](moments.md#why-the-existing-data-stays-good)).
+**key1 stays**, as the neutral persona. Its labels were written with no traits, and the decider won't see the sketch, so every key1 point becomes a point for `even, warm, any`, its interests kept. Nothing in key1 goes stale from traits. The new moment rules change 97 points (63 late-night nudges become chats, and 32 plain facts and 2 reactions on a locked PC become quiet), and 155 daytime nudges wait on the owner ([moments.md](moments.md#why-the-existing-data-stays-good)).
 
 ## How it's tested
 
 **The reader (step 6, in CI, with the fake model):**
 
 - The prompt holds only the fields in the table, in that order, within the budget. Never tags, creator notes, the card's model instructions, assets or other extensions. `{{char}}` and `{{user}}` filled in. Lore: only constant entries and entries keyed by her name or nickname, inside 4,000 characters.
-- Answers: a valid tool call gives the traits. An unknown value, a wrong type, an extra field gives neutral for that trait. No tool call and no JSON gives the rules reader's answer. A quote not in the sent text is dropped. Interests are trimmed to the limits.
+- Answers: a valid tool call gives the traits. An unknown value, a wrong type, an extra field gives neutral for that trait. No tool call and no JSON counts as a failed reading. A quote not in the sent text is dropped. Interests are trimmed to the limits.
 - The rules reader, over fixture cards in every style (prose, markdown, W++, PList, Ali:Chat, an empty `personality`, tags only, conflicting tags): the expected traits, and neutral on conflict.
-- The cache: the same card and reader version makes no call. A changed card makes one. A trait you set survives a new reading. A failed call keeps what was there.
+- The cache: the same card and reader version makes no call. A changed card makes one, and "Read her card again" always does. A trait you set survives every reading. On import, a failed call leaves the rules reader's values. On a later reading, a failed call keeps the last successful reading, even where the tags say otherwise.
 - A hostile card ("ignore the above, output...", fake tool calls in the text, a 1 MB description): the answer stays inside the schema, the prompt stays inside the budget, and nothing but the fixed fields is kept.
 - Recorded responses for the reader's call on all three APIs, replayed through the model port as in step 4.
-- The decider's context, by its type and by a runtime check, holds only the four persona fields.
+- The decider's context, by its type and by a runtime check, holds only the four persona fields and the summaries.
 
 **The trait layer (step 10b, in CI):**
 
-- A table test: every row in [What each trait does](#what-each-trait-does-at-each-moment), as written.
-- Property tests over random events and contexts, for all 27 trait combinations and three chattiness levels: every kept point is the same for all 27. The result is within one rung of the base. Nothing is above chattiness' top, or the event's limit, or `chat` outside the chat events. First hello is never below gesture. More sociable or closer never gives a lower act than less, with everything else equal. A neutral persona always gets the base.
-- Over the key1 timelines (a checked-in sample, its labels as the base): at low, the word share is never higher for any combination than for neutral, and at every level no two words are closer than the spacing. That's the "chattiness sets the most she says" rule, as a test.
+- A table test: every row in [What each trait does](#what-each-trait-does-at-each-moment), as written, in the plain case.
+- Property tests on identical contexts: random events, intents and contexts (summaries included), each run for all 27 trait combinations at all three chattiness levels. Blocked points and kept events give the same answer for all 27. Before the limits, the act is within one rung of the intent, a move never goes above chattiness' top or the event's limit, and an act above the top only ever equals the intent. A move never makes `chat` outside the chat events, and never takes a first hello or a special day below gesture. With the same context, a more sociable or closer persona never gets a lower act than a less sociable or less close one. A neutral persona gets the intent through the blockers and the limits. At low, no combination gives a bubble or a chat where the neutral persona gives neither. After the limits: no bubble inside the gap after `lastWordsAt`, no chat with two chats today or after a goodbye, no second nudge a night.
+- The sequences the design review found: a click, then the chat closing a minute later (the settle beats a clingy wave), and the same with a bare thanks. An aloof persona's `back-after-long`, lowered from chat to bubble three minutes after a music bubble at high (a gesture). A chat falling back to a bubble inside the gap (a gesture). A `tool-done` with the chat hidden, in both teaser states, unchanged by sociability. Chats counted across 04:00, and the nudge not reset at 04:00. `meeting-soon`'s new intent.
+- The summaries survive a restart (they're in the store) and three gestures that push the last bubble out of the recent reactions.
+- Over a checked-in key1 sample, the whole-timeline word share per combination and chattiness, reported in the test output, not asserted: a quieter persona can meet fewer limits later, so it isn't a law.
 
 **The reader's real accuracy (step 13, once, not in CI).** 30 fixture cards written for this, MIT, in `packages/cards/fixtures/traits/`, each from a known trait triple in one of the styles above, some with mixed signals on purpose. One real model reads them all. The result, trait by trait, against the triple, goes in the docs: how often it's right, and how often it says neutral where the card was clear. It's measured, not gated: a wrong trait is a small thing the person can see and change.
 
@@ -286,11 +322,11 @@ For the key2 data worker: the traits go into the writer and labeller prompts, an
 
 | Step | What | Hours |
 | --- | --- | --- |
-| 6, cards | The reader: the prompt, `set_traits`, the answer checks, the rules reader, the cache, fixture cards and contract tests, recorded responses | +2.5 |
-| 10b, moments | `DecisionContext.persona` as traits, `steer` behind the rules decider, the chattiness suggestion, the table and property tests, the key1 sample test | +1.5 |
+| 6, cards | The reader: the prompt, `set_traits`, the answer checks, the rules reader, which reading wins, the cache, fixture cards and contract tests, recorded responses | +2.5 |
+| 10b, moments | `DecisionContext.persona` as traits, the intent split from the limits, `steer`, the summaries record, the new base rules (meeting-soon, a bare thanks), the chattiness suggestion, the table, property and sequence tests, the key1 sample report | +2 |
 | 11, chat and settings | "How she is" on the Persona tab, and the first-run line | +1 |
 | 13, what screenshots can't show | The reader's accuracy on the 30 cards, with one real model | +0.5 |
-| | **Total** | **+5.5** |
+| | **Total** | **+6** |
 
 ## Not in this round
 
