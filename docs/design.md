@@ -114,7 +114,7 @@ When you send only an acknowledgement, such as "thanks", "ok", "got it" or a thu
 
 ## The capability matrix
 
-One list (step 9) feeds the Settings tab and the docs page. Each row: what she can do, through what, its status, and what it reads. The moments' rows, settled 2026-11-16:
+One list (step 9) feeds the Settings tab and the docs page. Each row: what she can do, through what, its status, and what it reads. The moments' rows, settled 2026-11-16, and the prerequisites check's:
 
 | She can | Through | Status | What it reads, and where it goes |
 | --- | --- | --- | --- |
@@ -133,6 +133,7 @@ One list (step 9) feeds the Settings tab and the docs page. Each row: what she c
 | Notice a new device | The exe's device arrival, the class only | Later tier, opt-in, off by default (owner, 2026-11-16: "opt-in is fine"). Needs a new exe | A class from a fixed list (game controller, headset, webcam...). Never a name or serial number. Devices already seen are kept as hashes on this PC, never exported, never sent anywhere |
 | Notice a known app, such as Steam or Blender | The exe checks the installed apps against a small known-app list | Later tier, opt-in, off by default (owner, 2026-11-16). Needs a new exe | Only matches from the list reach her. The full list of your apps never leaves the exe and is never sent anywhere |
 | A 3D portrait | The portrait view with a VRM model | Later tier | The model file you pick stays in her data |
+| Tell you whether Node.js, Python's uv or Docker is installed, before you add a server that needs one | The exe's `program_find`, which looks a name up the way a server start would | Part 1: step 7 asks through a port and shows "Checked when you press Test" until the pre-release native pass adds the command | Found or not found, nothing else. Only five fixed names (`node`, `npx`, `uv`, `uvx`, `docker`), never another program, and never a path |
 | Ask how it went when do-not-disturb ends | Not planned: a reminder does it ("ask me how it went at 3") | Covered by reminders, step 8 | |
 
 ## Build order
@@ -141,13 +142,15 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 
 **Her personality and the owner's four calls, 2026-11-16.** Traits read from the card ([persona-traits.md](persona-traits.md)): 2.5 in step 6 for the reader, 2 in step 10b for the decider and its summaries, 1 in step 11 for Settings, 0.5 in step 13 for the reader's real accuracy. The owner's calls on the moments: the screen lock and the tray's pinned check in the pre-release native pass (0.5 and 1), the lock as arrival and away in step 10b (0.25), the daytime break nudge in step 10b (0.25, owner: "daytime break nudge, sure"), and in step 11b the tray bubble replacing the notification and the card's own emotion pictures (0.25 net). Part 1 goes from 146 to 154.25.
 
+**Two exe items from step 7, 2026-11-16** (lead). `program_find`, for the prerequisites check, in the pre-release native pass (0.5). And JSON-escaped redaction of secrets, carried from step 4 and shown again by step 7's review: folded into the native pass's redaction work, so no new hours. Part 1 goes from 154.25 to 154.75.
+
 **Moments and the portrait, 2026-11-16.** Two steps added for the owner's moments and her portrait, and half an hour more for the matrix's rows: part 1 goes from 132.5 to 146. Lettered so the later steps keep their numbers.
 
 **Re-estimated 2026-11-15, after step 3.** Step 3 took 38.25: the accepted 33.75, 3 more rework hours the lead approved, and 1.5 for the last batch of six review fixes. Its review rounds on security code took about as much work as the build itself, and they found races in concurrent code more than in rules. Steps 4, 5 and 7 build the same kind of code: the model layer streams over the guarded fetch, the turn loop resumes a durable journal after a kill, and the MCP client restarts servers under time limits. So each gets a rework row of a third of its build: 1.75, 2.75 and 3.5. Less than step 3's, because the hard parts they stand on (the fetch's single owner, the actor per setup, the gate) now exist and are proven. The other steps are app logic with ordinary tests, and step 14's review hours cover them. Part 1 goes from 120 to 132.5.
 
 | # | Step | Done when | Hours |
 | --- | --- | --- | --- |
-| | **Part 1: Familiar on its own** | | **154.25** |
+| | **Part 1: Familiar on its own** | | **154.75** |
 | 1 | Repo, workspace, CI, fake model, fake MCP server | Typecheck and tests green on CI | 3 |
 | 2 | Spikes: pi-durable in a Tauri webview, pi-ai bundling, the installed exe starting a local MCP server | A yes or no on each, written down | 5 |
 | 3 | Tauri shell ([shell-design.md](shell-design.md)): the app loaded from a folder beside the exe, its origin and WebView2 data folder pinned, persistent storage asked for, windows and capabilities, the egress closure, the native confirms, tray, keys typed in Settings, notifications, hotkey, server starts with Windows' own dialog and a job, the guarded fetch | Every security check passes on the Windows runner | 38.25 |
@@ -161,7 +164,7 @@ Hours are a working estimate, not calendar time. Part 1 is re-estimated once the
 | 10b | Moments ([moments.md](moments.md)): the presence coordinator and its holds, the six events, the lock as arrival and away, the goodbye check, the holiday list and memory dates, the unprompted turn and its resume rule, the daily cap, the decider's chat rule with the late-night chat, the daytime break nudge. Her traits in the decider: the intent split from the limits, `steer`, the summaries record, the new base rules | With a fake clock and fake system signals: one moment at a time, one hello a day, held through do-not-disturb and a lock (and an unreadable lock), one follow-up per question, never after a goodbye, never past two a day. The trait table, property and sequence tests | 8.5 |
 | 11 | Chat window, first-run setup, settings with "How she is", the Trusted Types rule on every page | Headless screenshots, light and dark | 11.25 |
 | 11b | Her portrait: the view and its place, expressions and their fallbacks (the card's own emotion pictures included), the bubble, its events, and the tray bubble when the icon is pinned | Headless screenshots, light and dark, of every kind with a full and a one-picture set. A click, a double-click and a drag send the right events. No tray bubble unless `tray_pinned()` says pinned | 7.25 |
-| – | Pre-release native pass: the WebSocket to Desktop Buddies and its pairing token, against Desktop Buddies' settled protocol. The screen lock in `system()`, and `tray_pinned()`. Then the exe settles | Its security checks pass on the runner | 2.75 |
+| – | Pre-release native pass: the WebSocket to Desktop Buddies and its pairing token, against Desktop Buddies' settled protocol. The screen lock in `system()`, `tray_pinned()` and `program_find`. Redaction that also matches each secret's JSON-escaped form. Then the exe settles | Its security checks pass on the runner, `security.mcp.secret-json-escaped` among them | 3.25 |
 | 12 | Packaging: the zip, the per-user installer and the draft release, an uninstaller that keeps data unless you tick the box. A winget manifest for the public flip | The installer runs on a real PC with Smart App Control on, and a local server runs there | 4 |
 | 13 | What screenshots can't show: data through an update, a reinstall and a winget upgrade, a write surviving a hard kill, sleep and wake, a lock and unlock, the pinned check with the real icon (pinned, dragged to the overflow, after Explorer restarts), notification buttons, local servers under Smart App Control. The trait reader's accuracy with one real model | Checked on the runner and once on a real PC. That last check gates the release | 8.5 |
 | 14 | Codex reviews and fixes, spread over the steps | No open P1 or P2 | 8 |
