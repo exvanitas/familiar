@@ -1,0 +1,47 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "scan-depth",
+      "entries": [
+        {
+          "keys": [
+            "lantern"
+          ],
+          "content": "Lantern lore.",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 0,
+          "extensions": {}
+        },
+        {
+          "keys": [
+            "compass"
+          ],
+          "content": "Compass lore.",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 1,
+          "extensions": {}
+        }
+      ],
+      "scan_depth": 2
+    }
+  }
+}

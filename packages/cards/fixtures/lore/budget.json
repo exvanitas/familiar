@@ -1,0 +1,82 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "budget",
+      "entries": [
+        {
+          "keys": [
+            "rain"
+          ],
+          "content": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "enabled": true,
+          "insertion_order": 5,
+          "id": 0,
+          "extensions": {},
+          "priority": 1
+        },
+        {
+          "keys": [
+            "rain"
+          ],
+          "content": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+          "enabled": true,
+          "insertion_order": 10,
+          "id": 1,
+          "extensions": {},
+          "priority": 0
+        },
+        {
+          "keys": [
+            "rain"
+          ],
+          "content": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 2,
+          "extensions": {},
+          "priority": 0
+        },
+        {
+          "keys": [
+            "rain"
+          ],
+          "content": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+          "enabled": true,
+          "insertion_order": 5,
+          "id": 3,
+          "extensions": {},
+          "priority": 9
+        },
+        {
+          "keys": [
+            "rain"
+          ],
+          "content": "EEEEEE",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 4,
+          "extensions": {},
+          "priority": 0
+        }
+      ],
+      "token_budget": 100
+    }
+  }
+}

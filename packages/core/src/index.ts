@@ -39,3 +39,8 @@ export { retryable, waitBefore, withRetries } from './model/retry.ts';
 export type { RetryOptions } from './model/retry.ts';
 
 export * from './journal/index.ts';
+
+export { MAX_ANSWER_CHARS, oneJsonObject, READER_MAX_OUTPUT_TOKENS, readTraits } from './traits/read-traits.ts';
+export type { ReadTraitsOptions, TraitFailure, TraitsResult } from './traits/read-traits.ts';
+export { memoryTraitCache } from './traits/cache.ts';
+export type { TraitCache } from './traits/cache.ts';

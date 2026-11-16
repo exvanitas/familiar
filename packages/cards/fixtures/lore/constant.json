@@ -1,0 +1,54 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "constant",
+      "entries": [
+        {
+          "keys": [],
+          "content": "Always here.",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 0,
+          "extensions": {},
+          "constant": true
+        },
+        {
+          "keys": [
+            "kettle"
+          ],
+          "content": "The kettle whistles in C sharp.",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 1,
+          "extensions": {}
+        },
+        {
+          "keys": [],
+          "content": "Off and constant.",
+          "enabled": false,
+          "insertion_order": 2,
+          "id": 2,
+          "extensions": {},
+          "constant": true
+        }
+      ]
+    }
+  }
+}

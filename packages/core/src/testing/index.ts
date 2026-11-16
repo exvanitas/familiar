@@ -14,3 +14,5 @@ export {
   modelPortContract
 } from './model-contract.ts';
 export type { ContractCase, ContractScenario, ModelPortHarness } from './model-contract.ts';
+export { CONTRACT_READING, traitCacheContract } from './trait-cache-contract.ts';
+export type { TraitCacheCase } from './trait-cache-contract.ts';

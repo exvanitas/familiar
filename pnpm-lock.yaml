@@ -27,12 +27,27 @@ importers:
         specifier: workspace:*
         version: link:../../packages/core
     devDependencies:
+      '@familiar/cards':
+        specifier: workspace:*
+        version: link:../../packages/cards
       '@types/node':
         specifier: 22.20.5
         version: 22.20.5
       esbuild:
         specifier: 0.28.2
         version: 0.28.2
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: 4.1.12
+        version: 4.1.12(@types/node@22.20.5)(vite@8.3.8(@types/node@22.20.5)(esbuild@0.28.2))
+
+  packages/cards:
+    devDependencies:
+      '@types/node':
+        specifier: 22.20.5
+        version: 22.20.5
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -51,6 +66,9 @@ importers:
       '@earendil-works/pi-durable':
         specifier: 1.5.2
         version: 1.5.2(@aws-sdk/credential-provider-node@3.972.97)(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(@smithy/signature-v4@5.7.5)(esbuild@0.28.2)(zod@4.6.7)
+      '@familiar/cards':
+        specifier: workspace:*
+        version: link:../cards
     devDependencies:
       '@types/node':
         specifier: 22.20.5

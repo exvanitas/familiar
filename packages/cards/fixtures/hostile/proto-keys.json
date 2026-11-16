@@ -1,0 +1,24 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "__proto__": { "polluted": true },
+  "data": {
+    "__proto__": { "isAdmin": true },
+    "constructor": "x",
+    "name": "Hex",
+    "description": "A card with poisoned keys.",
+    "tags": ["a"],
+    "extensions": {
+      "__proto__": { "polluted": true },
+      "constructor": { "prototype": { "polluted": true } },
+      "safe": { "__proto__": { "deep": true }, "ok": 1 }
+    },
+    "creator_notes_multilingual": { "__proto__": "x", "en": "fine" },
+    "character_book": {
+      "__proto__": { "polluted": true },
+      "entries": [
+        { "keys": ["a"], "content": "b", "enabled": true, "insertion_order": 0, "extensions": { "__proto__": { "polluted": true } } }
+      ]
+    }
+  }
+}
