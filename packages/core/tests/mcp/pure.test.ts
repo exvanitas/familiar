@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { canonicalJson, sha256 } from '../../src/mcp/hash.ts';
-import { CHECKED_AT_TEST, checkPrerequisites, prerequisiteOf } from '../../src/mcp/prerequisites.ts';
+import { CHECKED_AT_TEST, checkPrerequisites, FINDABLE, prerequisiteOf } from '../../src/mcp/prerequisites.ts';
 import { modelNames, outcomeText, toolChanges, toolFingerprint } from '../../src/mcp/server-tools.ts';
 import { resultText } from '../../src/mcp/session.ts';
 import { secretValueProblem, setupFingerprint, touchesAMarker, type LocalSetup } from '../../src/mcp/setup.ts';
@@ -165,11 +165,15 @@ describe('prerequisites', () => {
   });
 
   it('with a finder: found, or not with where to get it', async () => {
-    const rows = await checkPrerequisites({ find: async p => (p === 'npx' ? 'found' : p === 'docker' ? 'missing' : 'unknown') });
-    expect(rows.map(r => r.found)).toEqual(['found', 'unknown', 'missing']);
+    const rows = await checkPrerequisites({ find: async p => (p === 'npx' ? 'found' : p === 'docker' ? 'not-found' : 'unknown') });
+    expect(rows.map(r => r.found)).toEqual(['found', 'unknown', 'not-found']);
     expect(rows[2]!.words).toMatch(/Docker isn't installed.*Docker Desktop/);
     expect(prerequisiteOf('C:\\Program Files\\nodejs\\npx.cmd')?.id).toBe('node');
     expect(prerequisiteOf('uvx.exe')?.id).toBe('uv');
     expect(prerequisiteOf('python')).toBeUndefined();
+    // Only the fixed names are ever asked about.
+    const asked: string[] = [];
+    await checkPrerequisites({ find: async p => { asked.push(p); return 'unknown'; } });
+    expect([...new Set(asked)].sort()).toEqual([...FINDABLE].sort());
   });
 });

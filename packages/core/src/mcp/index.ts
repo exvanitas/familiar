@@ -8,8 +8,8 @@ export { CALL_MS, CALL_MS_MAX, CALL_MS_MIN, createMachine, DEFAULT_LIMITS, INIT_
 export type { Effect, Input, Limits, Machine, Phase } from './machine.ts';
 export { localDraft, parsePaste, remoteDraft } from './paste.ts';
 export type { Draft, DraftOptions, LocalForm, PasteResult, RemoteForm } from './paste.ts';
-export { CHECKED_AT_TEST, checkPrerequisites, PREREQUISITES, prerequisiteOf } from './prerequisites.ts';
-export type { Found, Prerequisite, PrerequisiteRow, ProgramFinder } from './prerequisites.ts';
+export { CHECKED_AT_TEST, checkPrerequisites, FINDABLE, PREREQUISITES, prerequisiteOf } from './prerequisites.ts';
+export type { Findable, Found, Prerequisite, PrerequisiteRow, ProgramFinder } from './prerequisites.ts';
 export { kindOf } from './process.ts';
 export type { ProcessError, ProcessEvent, ProcessPort, ProcessSetup } from './process.ts';
 export { ProcessTransport } from './process-transport.ts';

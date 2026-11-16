@@ -2,19 +2,27 @@
 // program without starting it needs the exe, which has no such command yet (`program_find`, planned for
 // the pre-release native pass). Until then there's no finder, and each row says it's checked when the
 // person presses Test, where a missing program comes back as not-found with the same words.
+//
+// The exe command will take only these names and answer only found or not-found, never a path, so the
+// port is shaped the same way.
 
-export type Found = 'found' | 'missing' | 'unknown';
+/** The only programs the finder can be asked about. */
+export const FINDABLE = ['node', 'npx', 'uv', 'uvx', 'docker'] as const;
+export type Findable = (typeof FINDABLE)[number];
+
+/** `unknown` until the exe has the command, or when it couldn't answer. */
+export type Found = 'found' | 'not-found' | 'unknown';
 
 /** Looks a program up the way the exe would start it, without starting it. */
 export interface ProgramFinder {
-  find(program: string): Promise<Found>;
+  find(program: Findable): Promise<Found>;
 }
 
 export interface Prerequisite {
   readonly id: 'node' | 'uv' | 'docker';
   readonly name: string;
   /** The programs that show it's there. */
-  readonly programs: readonly string[];
+  readonly programs: readonly Findable[];
   /** What it's for, in plain words. */
   readonly for: string;
   /** Where to get it. */
@@ -43,10 +51,10 @@ export async function checkPrerequisites(finder?: ProgramFinder): Promise<Prereq
       for (const program of p.programs) {
         const f = await finder.find(program).catch((): Found => 'unknown');
         if (f === 'found') { found = 'found'; break; }
-        if (f === 'missing') found = 'missing';
+        if (f === 'not-found') found = 'not-found';
       }
     }
-    const words = found === 'found' ? `${p.name} is installed. ${p.for}` : found === 'missing' ? `${p.name} isn't installed. ${p.for} ${p.get}` : `${p.name}: ${CHECKED_AT_TEST} ${p.for}`;
+    const words = found === 'found' ? `${p.name} is installed. ${p.for}` : found === 'not-found' ? `${p.name} isn't installed. ${p.for} ${p.get}` : `${p.name}: ${CHECKED_AT_TEST} ${p.for}`;
     rows.push({ prerequisite: p, found, words });
   }
   return rows;
@@ -55,5 +63,5 @@ export async function checkPrerequisites(finder?: ProgramFinder): Promise<Prereq
 /** Which prerequisite a program needs, if it's one of them. */
 export function prerequisiteOf(program: string): Prerequisite | undefined {
   const name = (program.split(/[\\/]/).pop() ?? program).toLowerCase().replace(/\.(exe|cmd|bat)$/, '');
-  return PREREQUISITES.find(p => p.programs.includes(name));
+  return PREREQUISITES.find(p => (p.programs as readonly string[]).includes(name));
 }

@@ -88,7 +88,9 @@ A start the person makes isn't a restart. If the first run of a start fails (the
 
 The MCP protocol itself is the official TypeScript SDK's `Client`, pinned at 1.32.2 in core's `package.json`. Core imports only its browser-safe entry points: the client, the Streamable HTTP and SSE client transports, and the types. `tests/portable.test.ts` lists them, and `tests/mcp/bundle.test.ts` bundles them for the browser with esbuild and fails on any Node built-in. Two things in the SDK don't suit the webview, and both are replaced:
 
-- **Its JSON Schema checker** (Ajv) compiles code with `new Function`, which the app's CSP forbids. The client is given a checker of its own instead, which accepts any structured result. A server's results are text the model reads, never trusted data, so nothing depends on their shape.
+- **Its JSON Schema checker** (Ajv) compiles code with `new Function` for any tool with an output schema, and the app's CSP forbids eval and `new Function` in every page. The client is given a checker of its own instead, which accepts any structured result. A server's results are text the model reads, never trusted data, so nothing depends on their shape.
+
+**With code generation off.** `tests/mcp/no-eval.test.ts` runs the client in a child Node started with `--disallow-code-generation-from-strings`, which refuses eval and `new Function` as the CSP does (the child checks that it does). Against the fake server: initialize, list the tools, one call, a tool error and a refused call. Then a tool with an output schema, over the SDK's in-memory transport, lists and answers. With the SDK's own Ajv checker put back, that last part fails, so the test proves the replacement is needed and enough. zod probes for eval once and falls back. On the runner, the `proc-mcp` checks run the same client in the real core page, under the real CSP, so anything that still needs code generation fails there too.
 - **Its stdio transport** needs Node. Local servers get a transport of Familiar's own.
 
 ### Local: over the exe
@@ -189,7 +191,7 @@ A saved server is `mcp.server.<id>`, version 1: the setup (never a secret's valu
 | The exe refused the setup | Each of `unsafe-path`, `unsafe-argument`, `duplicate-setting`, `unsafe-secret`, `invalid`, `busy`, `start-failed` and `revoked` in its own words. The exe's message isn't shown |
 | A remote server refused or couldn't be reached | The guarded fetch's kind (`no-key`, `not-saved`, `insecure`, `blocked-address`, `redirect-refused`, `tls`, `timeout`, `network` and the rest), or the HTTP status: 401 and 403 say the key was refused, 404 that nothing answered there |
 
-**Prerequisites.** `checkPrerequisites(finder)` gives a row for each of Node.js, Python's uv and Docker: found or not, what it's for, and where to get it. Finding a program without starting it needs the exe, which has no such command. So the check takes a `ProgramFinder` port, and without one every row says "Checked when you press Test", where a missing program comes back as `not-found` with the same words. The command (`program_find`, looking a name up as `server_start` resolves it, and touching nothing else) is for the pre-release native pass.
+**Prerequisites.** `checkPrerequisites(finder)` gives a row for each of Node.js, Python's uv and Docker: found or not, what it's for, and where to get it. Finding a program without starting it needs the exe, which has no such command. So the check takes a `ProgramFinder` port, shaped as the command will be: it takes only a name from a fixed list (`node`, `npx`, `uv`, `uvx`, `docker`), and answers only `found`, `not-found` or `unknown`, never a path. Without a finder every row is `unknown` and says "Checked when you press Test", where a missing program comes back as `not-found` with the same words. The command (`program_find`, looking one of those names up as `server_start` resolves a program, and touching nothing else) is for the pre-release native pass.
 
 ## Starting with the app, and removing
 
@@ -208,6 +210,7 @@ Core's tests, in Node:
 - `tests/mcp/paste.test.ts` and `tests/mcp/pure.test.ts`: the paste shapes, secrets, the exe's limits, remote headers and addresses, the unpinned flag, model names, fingerprints (SHA-256 against node:crypto), the marker rule, plain words, result text, prerequisites.
 - `tests/settings-store.test.ts`: the settings store contract on memory and IndexedDB, and every IndexedDB transaction strict.
 - `tests/mcp/bundle.test.ts`: the client bundles for the browser with no Node built-in and no stub.
+- `tests/mcp/no-eval.test.ts`: the client with code generation from strings off, as above.
 
 On the Windows runner, through the real exe: the `proc-mcp` phase (`apps/desktop/shell-check/mcp-checks.ts`) runs core's client over the desktop ports against the fake server, with the driver answering the exe's dialog. Its six ids are in the security inventory, so the gate requires each: `mcp.add`, `mcp.call`, `mcp.crash-mid-call`, `mcp.changed-tool`, `mcp.secret-blanked` and `mcp.remove`. The secret is a key the driver types into Settings, which the page never learns.
 
@@ -225,5 +228,5 @@ On the Windows runner, through the real exe: the `proc-mcp` phase (`apps/desktop
 - **A remote server's quiet stream.** The guarded fetch ends a read that's quiet past its idle limit. The desktop ports give server addresses the exe's cap of 15 minutes, and the SDK opens the stream again after.
 - **A stop whose run never closes.** After 5 s the machine counts it closed. If the exe still holds that run, the next start is `busy`, which comes back as a failure in plain words rather than a second run.
 - **The handshake's deadline** is 120 s by default, for a first `npx` run that downloads its package. A slow network can need more, and the person can set up to 5 minutes.
-- **zod's eval probe.** The SDK checks messages with zod, which tries `new Function` once to decide whether it may compile, and falls back when the CSP refuses. The refusal shows as one CSP report in the page. Ajv isn't used at all (above).
+- **zod's eval probe.** The SDK checks messages with zod, which tries `new Function` once to decide whether it may compile, and falls back when it's refused (shown in Node with code generation off). In the page the refusal may show as one CSP report. Ajv isn't used at all (above).
 - **The process port contract** runs on the Node adapter only. The runner's checks cover the desktop adapter end to end through the client, but not case by case, since the contract's secret case needs a value the page knows and only Settings may store one.
