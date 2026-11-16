@@ -101,6 +101,12 @@ const handlers: Record<string, (args: never) => unknown> = {
   },
   /* A key made here and written at once, for the removal checks; never returned. */
   'make-key': (ref: string) => shell.secretSet(ref, 'fk' + rand(30)).then(() => 'ok', e => 'failed:' + JSON.stringify(e)),
+  /* A key holding a quote, which JSON escapes as \" (step 7's known gap): stored, and only its last ten
+     characters returned, so core can search for them without ever holding the key. */
+  'make-quoted-key': (ref: string) => {
+    const tail = rand(10);
+    return shell.secretSet(ref, `fk"${rand(12)}${tail}`).then(() => ({ tail }), e => ({ error: JSON.stringify(e) }));
+  },
   'clip-ready': (text: string) => { clip = text; return 'ready'; },
   'clip-result': () => (document.getElementById('clip') as HTMLElement).dataset.result ?? 'no click',
   violations: () => [...violations],

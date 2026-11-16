@@ -10,9 +10,13 @@ describe('the MCP checks on the runner', () => {
   const ids = [...src.matchAll(/check\('(security|check)\.([a-z0-9.-]+)'/g)].map(m => `${m[1]}.${m[2]}`);
   const inventory = (JSON.parse(read('security-inventory.json')) as { ids: string[] }).ids;
 
-  it('reports six security ids, each in the inventory', () => {
-    expect(ids).toEqual(['security.mcp.add', 'security.mcp.call', 'security.mcp.crash-mid-call', 'security.mcp.changed-tool', 'security.mcp.secret-blanked', 'security.mcp.remove']);
-    for (const id of ids) expect(inventory).toContain(id.replace(/^security\./, ''));
+  it('reports six security ids, each in the inventory, and the known gap as a declared check', () => {
+    expect(ids).toEqual(['security.mcp.add', 'security.mcp.call', 'security.mcp.crash-mid-call', 'security.mcp.changed-tool', 'security.mcp.secret-blanked', 'security.mcp.remove', 'check.mcp.secret-json-escaped']);
+    for (const id of ids.filter(i => i.startsWith('security.'))) expect(inventory).toContain(id.replace(/^security\./, ''));
+    const checks = (JSON.parse(read('checks.json')) as { ids: string[] }).ids;
+    expect(checks).toContain('mcp.secret-json-escaped');
+    // Until the native pass, a leak is reported as a SKIP marked KNOWN GAP, never a PASS.
+    expect(src).toMatch(/if \(leaked\) skip\(`KNOWN GAP: /);
   });
 
   it('runs in the proc-mcp phase, which the driver starts', () => {

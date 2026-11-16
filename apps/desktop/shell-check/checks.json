@@ -38,6 +38,7 @@
     "toast.app-id",
     "persist.notified",
     "autostart",
-    "model.contract"
+    "model.contract",
+    "mcp.secret-json-escaped"
   ]
 }

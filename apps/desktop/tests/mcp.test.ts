@@ -2,7 +2,7 @@
    with the exe's own limits and lists; these tests read shell-core's source and fail if the two drift. */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { KEY_HEADERS, KEY_PLACEHOLDER, MAX_ARGS, MAX_SECRETS, MAX_SETTINGS, MAX_SETUP_BYTES, SETTING_PREFIXES_THAT_RUN, SETTINGS_THAT_RUN } from '@familiar/core';
+import { DEVICES, INVISIBLE, KEY_HEADERS, KEY_PLACEHOLDER, MAX_ARGS, MAX_SECRETS, MAX_SETTINGS, MAX_SETUP_BYTES, SETTING_PREFIXES_THAT_RUN, SETTINGS_THAT_RUN } from '@familiar/core';
 import { desktopMcpPorts, desktopProcessPort, SERVER_IDLE_MS } from '../src/mcp.ts';
 import { PLACEHOLDER } from '../src/net.ts';
 import type { AddressSpec, NetSpec, Setup, Shell } from '../src/shell.ts';
@@ -33,6 +33,16 @@ describe("core's copy of the exe's rules", () => {
     expect(MAX_SETTINGS).toBe(number(setup, 'MAX_SETTINGS'));
     expect(MAX_SECRETS).toBe(number(setup, 'MAX_SECRETS'));
     expect(MAX_SETUP_BYTES).toBe(number(setup, 'MAX_SETUP_BYTES'));
+  });
+
+  it('the invisible characters and device names paths refuse', () => {
+    const confirm = rust('confirm.rs');
+    const ranges = [...(/pub const INVISIBLE: \[\(char, char\); \d+\] = \[([\s\S]*?)\];/.exec(confirm)![1]!).matchAll(/\('\\u\{([0-9A-Fa-f]+)\}', '\\u\{([0-9A-Fa-f]+)\}'\)/g)].map(m => [parseInt(m[1]!, 16), parseInt(m[2]!, 16)]);
+    expect(ranges.length).toBe(16);
+    expect(INVISIBLE.map(r => [...r])).toEqual(ranges);
+    const paths = rust('paths.rs');
+    const devices = [...(/const DEVICES: \[&str; \d+\] = \[([\s\S]*?)\];/.exec(paths)![1]!).matchAll(/"([^"]*)"/g)].map(m => m[1]!.replace(/\\u\{([0-9a-f]+)\}/g, (_, h: string) => String.fromCodePoint(parseInt(h, 16))));
+    expect([...DEVICES]).toEqual(devices);
   });
 
   it('the key placeholder and the headers it is swapped in', () => {

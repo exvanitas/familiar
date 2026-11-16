@@ -1,29 +1,36 @@
 /* The MCP client through the real exe, in a phase of its own (proc-mcp): core's McpClient over the
    desktop ports (src/mcp.ts), against tools/fake-mcp-server started as `node main.ts`, with the driver
-   answering the exe's dialog. The checks run in order on one server, each building on the last:
+   answering the exe's dialog. It runs in the real core page under the real CSP, so anything in the client
+   that still needs eval fails here too. The checks run in order on one server, each building on the last:
 
    - security.mcp.add: a pasted setup, its secret's key typed into Settings by the driver (the page never
      learns it), Test asks once and lists the tools, the saved setup holds no secret value, and the
      second start asks nothing.
    - security.mcp.call: a call and its outside-content mark, Stop and a deadline answered at once with
-     the cancellation sent, and the server still answering after.
+     the cancellation sent, a call already stopped writing nothing, and the server still answering after.
    - security.mcp.crash-mid-call: a call that crashes the server is answered interrupted and was sent
      once; the approved setup restarts with no dialog.
-   - security.mcp.changed-tool: the same server with --variant b: the exe asks again, Test shows echo as
-     the one changed tool, and no "always" holds for the new setup.
+   - security.mcp.changed-tool: the running server changes echo (set_variant) and says its tools changed.
+     Through the gate, echo goes back to ask and the other tools keep their "always"; the wrapper made
+     before the change can't send; the new one can.
    - security.mcp.secret-blanked: print_secret, from the key typed into Settings, comes back [hidden]
      in the reply, the model's text and every line core saw, and nothing core keeps holds it.
    - security.mcp.remove: a call in flight is interrupted, the secret, the saved setup and every node
-     process go, and the approval with them: the same setup asks again. */
-import { McpClient, openSettingsStore, parsePaste, systemClock, toolPolicies, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
+     process go, and the approval with them: the exact same launch, secret name included and its key
+     typed in again, shows the dialog again.
+   - check.mcp.secret-json-escaped, a measurement of a known gap: a key holding a quote comes back from
+     JSON output as \", which the exe's literal blanking misses. SKIP with "KNOWN GAP" until the
+     pre-release native pass blanks escaped forms too; PASS once it does. */
+import { gateFor, McpClient, openSettingsStore, parsePaste, systemClock, toolPolicies, choiceKey, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
 import { desktopMcpPorts } from '../src/mcp.ts';
-import { check, fail, ok, rand, shell, sleep, step, until } from './common.ts';
+import { check, fail, ok, rand, shell, skip, sleep, step, until } from './common.ts';
 import { dialog, START, type Ctx, type Paths } from './procs.ts';
 
 interface Typed { head: string; tail: string; length: number }
 
 const noWrites: ToolStep = { id: 'mcp-check', write: async () => fail('a server tool made a built-in write') };
 const run = (t: ServerTool | undefined, args: object) => (t ? t.run(args, noWrites) : Promise.reject(new Error('no such tool')));
+const TOOLS = 10;
 
 export async function mcpChecks(ctx: Ctx): Promise<void> {
   const p = await step<Paths>('proc-paths', {}, 120000);
@@ -44,9 +51,29 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   const tool = (name: string) => client.tools().find(t => t.serverName === name);
   const fake = (args: string[] = []) => JSON.stringify({ mcpServers: { 'Fake server': { command: 'node', args: [p.mainTs, ...args], env: { FAKE_SECRET: 'typed-later' } } } });
   let id = '';
-  let typed: Typed | undefined;
-  const leaks = (texts: string[]) => (typed ? texts.filter(t => t.includes(typed!.head) || t.includes(typed!.tail)).length : 0);
+  const typed: Typed[] = [];
+  const leaks = (texts: string[]) => texts.filter(t => typed.some(k => t.includes(k.head) || t.includes(k.tail))).length;
   const need = () => { if (!id) fail('the server was never added'); };
+
+  /** Settings stores a key the driver types for `ref`: the page never learns it. */
+  async function enterKey(ref: string): Promise<Typed> {
+    await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
+    await ctx.up('settings');
+    await ctx.ask('settings', 'paste-ready');
+    const k = await step<Typed>('type-key', { title: 'Familiar check settings', long: false });
+    const saved = await ctx.ask<string>('settings', 'save-key', ref);
+    await shell.windowCtl('settings', 'close');
+    if (saved !== 'ok') fail('Settings could not save the key: ' + saved);
+    typed.push(k);
+    return k;
+  }
+
+  /** Test, with the driver approving the dialog. */
+  async function testApproved(sid: string) {
+    const testing = client.test(sid);
+    const d = await dialog('approve', START);
+    return { d, report: await testing };
+  }
 
   await check('security.mcp.add', async () => {
     const { drafts, problems } = parsePaste(fake(), { newId: () => 'mcp-' + rand(8), defaultCwd: p.repo });
@@ -54,23 +81,14 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(problems.length === 0 && draft && draft.problems.length === 0, 'the paste: ' + [...problems, ...(draft?.problems ?? [])].join('; '));
     const added = await client.add(draft!);
     ok(added.secretRefs.length === 1 && added.secretRefs[0] === `server:${added.id}:FAKE_SECRET`, 'secret refs: ' + added.secretRefs.join());
-    // The key goes in through Settings, typed by the driver: the page never learns it.
-    await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
-    await ctx.up('settings');
-    await ctx.ask('settings', 'paste-ready');
-    typed = await step<Typed>('type-key', { title: 'Familiar check settings', long: false });
-    const saved = await ctx.ask<string>('settings', 'save-key', added.secretRefs[0]);
-    ok(saved === 'ok', 'Settings could not save the key: ' + saved);
-    await shell.windowCtl('settings', 'close');
+    const k = await enterKey(added.secretRefs[0]!);
     id = added.id;
 
-    const testing = client.test(id);
-    const d = await dialog('approve', START);
-    const report = await testing;
+    const { d, report } = await testApproved(id);
     ok(d.shown, 'Test of a new setup showed no dialog');
     ok(d.text.includes('FAKE_SECRET (kept in Credential Manager)'), 'the dialog does not name the secret as kept in Credential Manager');
     if (!report.ok) return fail('Test: ' + report.failure.words);
-    ok(report.tools.length === 9 && report.tools.every(t => t.fresh), `Test listed ${report.tools.length} tools, ${report.tools.filter(t => t.fresh).length} fresh`);
+    ok(report.tools.length === TOOLS && report.tools.every(t => t.fresh), `Test listed ${report.tools.length} tools, ${report.tools.filter(t => t.fresh).length} fresh`);
     ok(client.get(id)?.phase === 'stopped', 'Test left the server running: ' + client.get(id)?.phase);
     const record = JSON.stringify(await store.get(`mcp.server.${id}`));
     ok(record.includes('FAKE_SECRET') && !record.includes('typed-later') && leaks([record]) === 0, 'the saved setup holds a secret value');
@@ -81,7 +99,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const started = await starting;
     ok(!again.shown, 'the approved setup asked again');
     ok(started.kind === 'ready', 'the second start: ' + JSON.stringify(started));
-    return `pasted, the ${typed.length}-character key typed into Settings, Test asked once (the dialog named FAKE_SECRET as kept in Credential Manager) and listed ${report.tools.length} tools, the saved setup holds no secret value, the second start asked nothing`;
+    return `pasted, the ${k.length}-character key typed into Settings, Test asked once (the dialog named FAKE_SECRET as kept in Credential Manager) and listed ${report.tools.length} tools, the saved setup holds no secret value, the second start asked nothing`;
   });
 
   await check('security.mcp.call', async () => {
@@ -102,9 +120,16 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const lateMs = Date.now() - t1;
     ok(late.kind === 'timed-out' && lateMs < 2500, `a 1 s deadline: ${late.kind} in ${lateMs} ms`);
     await until(() => cancels() === 2, 5000, 'the cancellation after the deadline');
+    // A call stopped before it was made writes nothing at all.
+    const before = written.length;
+    const already = new AbortController();
+    already.abort();
+    const never = await client.call(id, 'add_note', { text: 'never' }, { signal: already.signal });
+    await sleep(300);
+    ok(never.kind === 'stopped' && written.length === before, `a call already stopped: ${never.kind}, ${written.length - before} lines written`);
     const after = await client.call(id, 'echo', { text: 'still here' });
     ok(after.kind === 'result' && after.text === 'still here', 'after: ' + JSON.stringify(after));
-    return `echo marked as outside content; Stop answered in ${stopMs} ms and a 1 s deadline in ${lateMs} ms, each sending notifications/cancelled; the server answered after`;
+    return `echo marked as outside content; Stop answered in ${stopMs} ms and a 1 s deadline in ${lateMs} ms, each sending notifications/cancelled; a call already stopped wrote nothing; the server answered after`;
   });
 
   await check('security.mcp.crash-mid-call', async () => {
@@ -127,24 +152,27 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   await check('security.mcp.changed-tool', async () => {
     need();
     const before = client.tools();
-    const always = Object.fromEntries(before.map(t => [t.name, { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
-    ok(Object.keys(toolPolicies(before, always)).length === before.length, '"always" did not hold before the change');
-    await client.stop(id);
-    const { drafts } = parsePaste(fake(['--variant', 'b']), { newId: () => 'unused', defaultCwd: p.repo });
-    await client.edit(id, drafts[0]!);
-    const testing = client.test(id);
-    const d = await dialog('approve', START);
-    const report = await testing;
-    ok(d.shown, 'the changed arguments did not ask again');
-    if (!report.ok) return fail('Test: ' + report.failure.words);
-    ok(JSON.stringify(report.changes.changed) === '["echo"]', 'changed: ' + report.changes.changed.join());
-    ok(JSON.stringify(report.tools.filter(t => t.fresh).map(t => t.name)) === '["echo"]', 'fresh: ' + report.tools.filter(t => t.fresh).map(t => t.name).join());
-    ok((await client.start(id)).kind === 'ready', 'the start after the change');
+    const always = Object.fromEntries(before.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
+    const gate = (tools: ServerTool[], t: ServerTool) => gateFor(t.name, t, { perTool: toolPolicies(tools, always) });
+    ok(before.every(t => gate(before, t) === 'allow'), '"always" did not hold before the change');
+    const oldEcho = before.find(t => t.serverName === 'echo')!;
+    // The running server changes echo, and says its tools changed. Same setup, no new start.
+    const switched = await client.call(id, 'set_variant', { variant: 'b' });
+    ok(switched.kind === 'result', 'set_variant: ' + JSON.stringify(switched));
+    await until(() => tool('echo')?.fingerprint !== oldEcho.fingerprint, 10_000, 'the new tool list');
     const after = client.tools();
-    ok(Object.keys(toolPolicies(after, always)).length === 0, 'an "always" still held for the new setup');
-    const echo = await client.call(id, 'echo', { text: 'quiet' });
-    ok(echo.kind === 'result' && echo.text === 'QUIET', 'variant b echo: ' + JSON.stringify(echo));
-    return '--variant b asked again; Test showed echo as the one changed tool; no "always" held for the new setup';
+    const newEcho = after.find(t => t.serverName === 'echo')!;
+    ok(newEcho.setupFingerprint === oldEcho.setupFingerprint, 'the setup changed too, so this would prove nothing about tools');
+    ok(gate(after, newEcho) === 'ask', 'the changed echo did not go back to ask: ' + gate(after, newEcho));
+    const others = after.filter(t => t.serverName !== 'echo');
+    ok(others.every(t => gate(after, t) === 'allow'), 'another tool lost its "always"');
+    // The wrapper made before the change can't send; the new one can.
+    const echoes = sent('echo');
+    const old = await run(oldEcho, { text: 'old' }).then(() => 'ran', (e: Error) => e.message);
+    ok(/changed since it was offered, so Familiar didn't send the call/.test(old) && sent('echo') === echoes, `the old wrapper: ${old}; echo sent ${sent('echo') - echoes} more times`);
+    const fresh = await run(newEcho, { text: 'quiet' });
+    ok(fresh.endsWith('\nQUIET'), 'the new wrapper: ' + fresh.slice(-40));
+    return `echo changed on the running server: through the gate it asks again while the other ${others.length} tools keep "always"; the old wrapper was refused before sending; the new one answered`;
   });
 
   await check('security.mcp.secret-blanked', async () => {
@@ -157,7 +185,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const kept = [JSON.stringify(client.list()), JSON.stringify(await store.get(`mcp.server.${id}`))];
     const n = leaks([...heard, model, ...kept]);
     ok(n === 0, `${n} texts carry the key`);
-    return `the key typed into Settings came back [hidden] in the reply, the model's text and all ${heard.length} lines core heard; nothing core keeps holds it`;
+    return `the key typed into Settings came back [hidden] in the reply, the model's text and all ${heard.length} lines core heard; nothing core keeps holds it. Literal copies only: see check.mcp.secret-json-escaped`;
   });
 
   await check('security.mcp.remove', async () => {
@@ -176,15 +204,35 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     await sleep(1000);
     const left = await step<{ count: number }>('node-children');
     ok(left.count === 0, `${left.count} node processes left`);
-    // The approval went too: the same setup id, added again without its secret (now gone), asks.
-    const plain = JSON.stringify({ mcpServers: { 'Fake server': { command: 'node', args: [p.mainTs, '--variant', 'b'] } } });
-    const { drafts } = parsePaste(plain, { newId: () => id, defaultCwd: p.repo });
-    await client.add(drafts[0]!);
-    const testing = client.test(id);
-    const d = await dialog('refuse', START);
-    const report = await testing;
-    ok(d.shown && !report.ok && report.failure.kind === 'declined', `after removal: dialog ${d.shown}, ${JSON.stringify(report)}`);
-    await client.remove(id);
-    return 'the call in flight was interrupted; the secret, the saved setup and every node process went; the same setup asked again';
+    // The approval went too: the exact same launch, its secret name included and a key typed in again,
+    // shows the dialog. Had the approval survived, it would start with none.
+    const { drafts } = parsePaste(fake(), { newId: () => id, defaultCwd: p.repo });
+    const again = await client.add(drafts[0]!);
+    await enterKey(again.secretRefs[0]!);
+    const { d, report } = await testApproved(id);
+    ok(d.shown && report.ok, `the same launch after removal: dialog ${d.shown}, ${report.ok ? 'started' : report.failure.words}`);
+    ok((await client.remove(id)).kind === 'removed', 'the second removal');
+    return 'the call in flight was interrupted; the secret, the saved setup and every node process went; the exact same launch, key typed in again, asked again';
+  });
+
+  await check('check.mcp.secret-json-escaped', async () => {
+    // A second server, whose key holds a quote. The page learns only the key's last ten characters.
+    const { drafts } = parsePaste(fake(), { newId: () => 'mcp-q-' + rand(6), defaultCwd: p.repo });
+    const added = await client.add(drafts[0]!);
+    await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
+    await ctx.up('settings');
+    const made = await ctx.ask<{ tail?: string; error?: string }>('settings', 'make-quoted-key', added.secretRefs[0]);
+    await shell.windowCtl('settings', 'close');
+    if (!made.tail) return fail('Settings could not store the key: ' + made.error);
+    const { d, report } = await testApproved(added.id);
+    ok(d.shown && report.ok, 'the quoted-key server did not start');
+    await client.start(added.id);
+    const r = await client.call(added.id, 'print_secret', {});
+    await sleep(300);
+    const texts = [JSON.stringify(r), ...heard];
+    await client.remove(added.id);
+    const leaked = texts.filter(t => t.includes(made.tail!)).length;
+    if (leaked) skip(`KNOWN GAP: a key holding a quote came back JSON-escaped and unblanked in ${leaked} texts; the pre-release native pass blanks escaped forms`);
+    return 'a key holding a quote came back blanked: the known gap is closed';
   });
 }
