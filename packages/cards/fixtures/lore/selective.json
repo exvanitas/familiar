@@ -1,0 +1,67 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "selective",
+      "entries": [
+        {
+          "keys": [
+            "bell"
+          ],
+          "content": "The bell rings at noon.",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 0,
+          "extensions": {},
+          "selective": true,
+          "secondary_keys": [
+            "tower",
+            "steeple"
+          ]
+        },
+        {
+          "keys": [
+            "bell"
+          ],
+          "content": "Any bell at all.",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 1,
+          "extensions": {},
+          "selective": false,
+          "secondary_keys": [
+            "tower"
+          ]
+        },
+        {
+          "keys": [
+            "bell"
+          ],
+          "content": "Selective with no secondary keys acts plain.",
+          "enabled": true,
+          "insertion_order": 2,
+          "id": 2,
+          "extensions": {},
+          "selective": true,
+          "secondary_keys": []
+        }
+      ]
+    }
+  }
+}

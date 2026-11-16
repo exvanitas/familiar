@@ -1,0 +1,159 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "regex",
+      "entries": [
+        {
+          "keys": [
+            "/\\bfox(es)?\\b/i"
+          ],
+          "content": "Foxes visit the yard at dusk.",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 0,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "^moon"
+          ],
+          "content": "A bare pattern, matched as written.",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 1,
+          "extensions": {},
+          "use_regex": true,
+          "case_sensitive": true
+        },
+        {
+          "keys": [
+            "/(a+)+$/"
+          ],
+          "content": "A nested repeat: safe here, since the matcher never backtracks.",
+          "enabled": true,
+          "insertion_order": 2,
+          "id": 2,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/(\\w+)\\s\\1/"
+          ],
+          "content": "Refused: backreference.",
+          "enabled": true,
+          "insertion_order": 3,
+          "id": 3,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/(cat|cats)*/"
+          ],
+          "content": "A repeated alternation: safe here too.",
+          "enabled": true,
+          "insertion_order": 4,
+          "id": 4,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/[unclosed/"
+          ],
+          "content": "Refused: doesn't compile.",
+          "enabled": true,
+          "insertion_order": 5,
+          "id": 5,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/"
+          ],
+          "content": "Refused: too long.",
+          "enabled": true,
+          "insertion_order": 6,
+          "id": 6,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/owl/g"
+          ],
+          "content": "The g flag is dropped.",
+          "enabled": true,
+          "insertion_order": 7,
+          "id": 7,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/owl/x"
+          ],
+          "content": "Refused: unknown flag.",
+          "enabled": true,
+          "insertion_order": 8,
+          "id": 8,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "fox"
+          ],
+          "content": "use_regex off: the key is plain text, so (es)? means nothing.",
+          "enabled": true,
+          "insertion_order": 9,
+          "id": 9,
+          "extensions": {},
+          "use_regex": false
+        },
+        {
+          "keys": [
+            "/a(?=b)/"
+          ],
+          "content": "Refused: lookahead.",
+          "enabled": true,
+          "insertion_order": 10,
+          "id": 10,
+          "extensions": {},
+          "use_regex": true
+        },
+        {
+          "keys": [
+            "/\\p{L}/"
+          ],
+          "content": "Refused: Unicode property escape.",
+          "enabled": true,
+          "insertion_order": 11,
+          "id": 11,
+          "extensions": {},
+          "use_regex": true
+        }
+      ]
+    }
+  }
+}

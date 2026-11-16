@@ -12,7 +12,8 @@ const NODE_BUILTINS = [
 ];
 
 // A package goes here only once it's checked to run without Node or Tauri (the MCP SDK's client parts, in step 7).
-const ALLOWED_PACKAGES: readonly string[] = [];
+// @familiar/cards has its own portability test: no imports but its own files.
+const ALLOWED_PACKAGES: readonly string[] = ['@familiar/cards'];
 // Exact entry points only. The pi-durable spike bundled each of these for the browser with no Node
 // built-ins (spikes/pi-durable-web/RESULT.md); their /node entries and pi-ai's root reach Node.
 const ALLOWED_ENTRIES: readonly string[] = [

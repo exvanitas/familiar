@@ -1,0 +1,28 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "2.0",
+  "data": {
+    "name": "Quill Marrow",
+    "description": "{{char}} is an inventor.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "Hello.",
+    "mes_example": "",
+    "creator_notes": "Invented for Familiar's tests. MIT.",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [
+      "shy",
+      "energetic",
+      "cold",
+      "clingy",
+      "nocturnal"
+    ],
+    "creator": "",
+    "character_version": "",
+    "extensions": {
+      "talkativeness": 0.5
+    }
+  }
+}

@@ -3,7 +3,7 @@
    replaced by a note of what they held. */
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { answer, keyOf } from '../../shell-check/model-recordings.ts';
+import { answer, keyOf, type Recording } from '../../shell-check/model-recordings.ts';
 
 export interface Seen {
   readonly method: string;
@@ -28,7 +28,11 @@ const read = (req: IncomingMessage) =>
     req.on('error', fail);
   });
 
-export async function startModelServer(extra?: (path: string) => { status: number; body: string } | undefined): Promise<ModelServer> {
+/** `extra` answers plain JSON for its paths; `more` answers further recordings (trait-recordings.ts) before the contract's own. */
+export async function startModelServer(
+  extra?: (path: string) => { status: number; body: string } | undefined,
+  more?: (path: string) => Recording | undefined
+): Promise<ModelServer> {
   const seen: Seen[] = [];
   const server = createServer((req, res) => {
     void (async () => {
@@ -39,7 +43,7 @@ export async function startModelServer(extra?: (path: string) => { status: numbe
       seen.push({ method: req.method ?? '', path: req.url ?? '/', headers, body, key });
       const own = extra?.(path);
       if (own) return void res.writeHead(own.status, { 'content-type': 'application/json' }).end(own.body);
-      const r = answer(path, body, key);
+      const r = more?.(path) ?? answer(path, body, key);
       if (!r) return void res.writeHead(404, { 'content-type': 'text/plain' }).end(`no recording for ${path}`);
       res.writeHead(r.status, r.headers);
       let closed = false;

@@ -1,0 +1,60 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "case",
+      "entries": [
+        {
+          "keys": [
+            "Rook"
+          ],
+          "content": "Case-sensitive: only Rook, not rook.",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 0,
+          "extensions": {},
+          "case_sensitive": true
+        },
+        {
+          "keys": [
+            "Rook"
+          ],
+          "content": "Case-insensitive: any rook.",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 1,
+          "extensions": {},
+          "case_sensitive": false
+        },
+        {
+          "keys": [
+            "/^Rook/"
+          ],
+          "content": "Regex, case-sensitive.",
+          "enabled": true,
+          "insertion_order": 2,
+          "id": 2,
+          "extensions": {},
+          "use_regex": true,
+          "case_sensitive": true
+        }
+      ]
+    }
+  }
+}

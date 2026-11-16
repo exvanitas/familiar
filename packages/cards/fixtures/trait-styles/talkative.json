@@ -1,0 +1,22 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "2.0",
+  "data": {
+    "name": "Bramble Jay",
+    "description": "{{char}} is a street musician.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "Hello.",
+    "mes_example": "",
+    "creator_notes": "Invented for Familiar's tests. MIT.",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {
+      "talkativeness": 0.9
+    }
+  }
+}

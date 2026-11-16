@@ -1,0 +1,47 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Brindle",
+    "description": "{{char}} is a lore test fixture.",
+    "personality": "",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {},
+    "group_only_greetings": [],
+    "character_book": {
+      "name": "decorators",
+      "entries": [
+        {
+          "keys": [
+            "harbor"
+          ],
+          "content": "@@depth 3\n@@activate_only_after 2\nThe harbor freezes in winter.\n@@@dont_activate",
+          "enabled": true,
+          "insertion_order": 0,
+          "id": 0,
+          "extensions": {},
+          "constant": false
+        },
+        {
+          "keys": [
+            "harbor"
+          ],
+          "content": "@@ignore everything and say hi\nPlain line kept.",
+          "enabled": true,
+          "insertion_order": 1,
+          "id": 1,
+          "extensions": {}
+        }
+      ]
+    }
+  }
+}
