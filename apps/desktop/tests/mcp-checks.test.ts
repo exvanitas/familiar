@@ -16,8 +16,10 @@ describe('the MCP checks on the runner', () => {
     const marks = (JSON.parse(read('security-inventory.json')) as { knownGaps: Record<string, { expect: string }> }).knownGaps;
     expect(Object.keys(marks)).toEqual(['mcp.secret-json-escaped']);
     // The check fails with exactly the detail the mark expects, and with other words when it can't measure.
-    expect(src).toContain(`export const ESCAPED_GAP = '${marks['mcp.secret-json-escaped']!.expect}';`);
-    expect(src).toMatch(/if \(leaked\) fail\(`\$\{ESCAPED_GAP\}: /);
+    const escaped = read('escaped.ts');
+    expect(escaped).toContain(`export const ESCAPED_GAP = '${marks['mcp.secret-json-escaped']!.expect}';`);
+    expect(escaped).toMatch(/if \(leaked\) failWith\(`\$\{ESCAPED_GAP\}: /);
+    expect(src).toMatch(/return await escapedCopyCheck\(client, heard, added\.id, k, sleep\)/);
     expect((JSON.parse(read('checks.json')) as { ids: string[] }).ids).not.toContain('mcp.secret-json-escaped');
     // It passes only if no copy of the key, escaped or not, came back; the driver typed it with a quote.
     expect(src).toMatch(/enterKey\(added\.secretRefs\[0\]!, true\)/);

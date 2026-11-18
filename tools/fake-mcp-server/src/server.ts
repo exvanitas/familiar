@@ -68,6 +68,7 @@ export function fakeTools(variant: Variant = 'a'): Tool[] {
     { name: 'crash', description: 'Exits the server in the middle of the call.', inputSchema: noInput },
     { name: 'print_secret', description: `Prints its ${SECRET_ENV} setting, in its answer and its log.`, inputSchema: noInput, annotations: { readOnlyHint: true } },
     { name: 'list_env', description: 'Lists the names, not the values, of the settings it was started with.', inputSchema: noInput, annotations: { readOnlyHint: true } },
+    { name: 'secret_shape', description: `Says how long its ${SECRET_ENV} setting is and whether it holds a quote, never the value.`, inputSchema: noInput, annotations: { readOnlyHint: true } },
     {
       name: 'spawn_tree',
       description: 'Starts a long-lived child process, which starts a grandchild, which later starts one more, each carrying the token on its command line, and returns the first three process ids.',
@@ -137,6 +138,10 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
         log('crashing on purpose');
         options.crash?.();
         return new Promise<never>(() => {});
+      case 'secret_shape': {
+        const secret = env[SECRET_ENV] ?? '';
+        return text(`length=${[...secret].length} quote=${secret.includes('"')}`);
+      }
       case 'print_secret': {
         const secret = env[SECRET_ENV] ?? '(not set)';
         log(`the secret is ${secret}`);

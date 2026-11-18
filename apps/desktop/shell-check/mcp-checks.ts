@@ -33,16 +33,15 @@ import { desktopMcpPorts } from '../src/mcp.ts';
 import { reason } from '../src/shell.ts';
 import { check, fail, ok, rand, shell, sleep, step, until } from './common.ts';
 import { dialog, START, type Ctx, type Paths } from './procs.ts';
+import { escapedCopyCheck } from './escaped.ts';
 
 interface Typed { head: string; tail: string; length: number }
 
 const noWrites: ToolStep = { id: 'mcp-check', write: async () => fail('a server tool made a built-in write') };
 // Each call goes through `send` with a decision, as the journal's gate would mint after a Yes.
 const run = (t: ServerTool | undefined, args: object) => (t ? runWithYes(t, args, noWrites) : Promise.reject(new Error('no such tool')));
-const TOOLS = 10;
-/** The detail security.mcp.secret-json-escaped fails with while its known gap is open, as its mark in
-    security-inventory.json expects. */
-export const ESCAPED_GAP = 'an escaped copy came back';
+const TOOLS = 11;
+export { ESCAPED_GAP } from './escaped.ts';
 
 export async function mcpChecks(ctx: Ctx): Promise<void> {
   const p = await step<Paths>('proc-paths', {}, 120000);
@@ -74,7 +73,8 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     await shell.viewOpen({ label: 'settings', title: 'Familiar check settings', width: 420, height: 300 });
     try {
       await ctx.up('settings');
-      await ctx.ask('settings', 'paste-ready');
+      const focused = await ctx.ask<boolean>('settings', 'paste-ready');
+      if (focused !== true) fail("Settings' key field didn't take the focus, so the typed key can't be the one stored");
       const k = await step<Typed>('type-key', { title: 'Familiar check settings', long: false, quote });
       const saved = await ctx.ask<string>('settings', 'save-key', ref);
       if (saved !== 'ok') fail('Settings could not save the key: ' + saved);
@@ -295,19 +295,15 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     // last ten characters, which JSON leaves as they are.
     const { drafts } = parsePaste(fake(), { newId: () => 'mcp-q-' + rand(6), defaultCwd: p.repo });
     const added = await client.add(drafts[0]!);
-    const k = await enterKey(added.secretRefs[0]!, true);
-    const { d, report } = await testApproved(added.id);
-    ok(d.shown && report.ok, 'the quoted-key server did not start');
-    await client.start(added.id);
-    const from = heard.length;
-    const r = await callWithYes(client, added.id, 'print_secret', {});
-    await sleep(300);
-    const texts = [JSON.stringify(r), ...heard.slice(from)];
-    await client.remove(added.id);
-    const leaked = texts.filter(t => t.includes(k.head) || t.includes(k.tail)).length;
-    // Exactly the known gap's expected words when the escaped copy comes back; anything else that fails
-    // here (the server didn't start, Settings couldn't store the key) has other words, and fails the gate.
-    if (leaked) fail(`${ESCAPED_GAP}: in ${leaked} texts, unblanked; the pre-release native pass blanks escaped forms`);
-    return 'a key holding a quote came back blanked in its JSON-escaped form too';
+    try {
+      const k = await enterKey(added.secretRefs[0]!, true);
+      const { d, report } = await testApproved(added.id);
+      ok(d.shown && report.ok, 'the quoted-key server did not start');
+      // Measured, then judged (escaped.ts): the known gap's exact words only when the escaped copy came
+      // back; the server not Ready, another key stored or the reply never heard each have other words.
+      return await escapedCopyCheck(client, heard, added.id, k, sleep);
+    } finally {
+      await client.remove(added.id).catch(() => {});
+    }
   });
 }

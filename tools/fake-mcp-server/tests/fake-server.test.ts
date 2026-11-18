@@ -71,6 +71,7 @@ describe('the fake MCP server over stdio', () => {
       ['crash', false],
       ['print_secret', true],
       ['list_env', true],
+      ['secret_shape', true],
       ['spawn_tree', false],
       ['set_variant', false],
       ['read_page', true]
@@ -122,6 +123,11 @@ describe('the fake MCP server over stdio', () => {
     const s = await startStdio([], { [SECRET_ENV]: 'swordfish-123' });
     expect(textOf(await call(s, 'print_secret'))).toContain('swordfish-123');
     await expect.poll(s.stderr).toContain('the secret is swordfish-123');
+  });
+
+  it('says the shape of its secret, never the value', async () => {
+    const s = await startStdio([], { [SECRET_ENV]: 'ab"cd' });
+    expect(textOf(await call(s, 'secret_shape'))).toBe('length=5 quote=true');
   });
 
   it('lists the names of its settings, never their values', async () => {

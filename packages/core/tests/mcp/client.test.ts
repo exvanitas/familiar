@@ -94,7 +94,7 @@ describe('the MCP client, local, against the fake server', () => {
     expect(report.ok).toBe(true);
     if (!report.ok) return;
     expect(report.tools.map(t => t.name)).toContain('echo');
-    expect(report.tools).toHaveLength(10);
+    expect(report.tools).toHaveLength(11);
     expect(report.tools.every(t => t.fresh && /^[0-9a-f]{64}$/.test(t.fingerprint))).toBe(true);
     // Test stops it again, since it wasn't running.
     expect(w.client.get(id)?.phase).toBe('stopped');

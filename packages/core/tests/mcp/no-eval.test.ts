@@ -18,7 +18,7 @@ describe('the MCP client with eval off', () => {
     expect(r.error).toBeUndefined();
     expect(r.start).toBe('ready');
     expect(r.tools).toContain('echo');
-    expect(r.tools).toHaveLength(10);
+    expect(r.tools).toHaveLength(11);
     expect(r.echo).toEqual({ kind: 'result', text: 'no eval', isError: false });
     expect(r.fail).toMatchObject({ kind: 'result', isError: true });
     // A tool the server doesn't offer is never sent.
