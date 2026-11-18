@@ -4,7 +4,7 @@
 // line never does. An upgrade of pi-durable must recheck these against its new spec first.
 
 import { readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { IDBFactory } from 'fake-indexeddb';
 import { build } from 'esbuild';
@@ -100,7 +100,8 @@ async function coreSources(): Promise<{ file: string; code: string }[]> {
   return Object.keys(r.metafile.inputs)
     .filter((i) => !i.includes('node_modules'))
     .map((i) => {
-      const file = relative(src, join(process.cwd(), i));
+      // Forward slashes on every platform: on Windows `relative` gives `journal\journal.ts`.
+      const file = relative(src, join(process.cwd(), i)).split(sep).join('/');
       const text = readFileSync(join(process.cwd(), i), 'utf8');
       // Comments out: block comments, then line comments not inside a string (a rough cut, enough here).
       const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1');
