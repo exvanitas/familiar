@@ -836,8 +836,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
   const onLive = (live: any) => {
     const wasRunning = !!lastLive?.run;
     // Named mutations only: the old shape's question kept from the run's end, and RETHINK's automatic
-    // placement after an error.
-    if (wasRunning && !live?.run && live?.runFailure) {
+    // placement after an error. Behind the build flag, so the app build reads nothing here.
+    if (__FAMILIAR_MUTATIONS__ && wasRunning && !live?.run && live?.runFailure) {
       void viewNow().then((v) => {
         if (v.state === 'question') atEnd = v.question;
       });
