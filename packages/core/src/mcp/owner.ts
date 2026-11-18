@@ -76,28 +76,43 @@ const no = (words: string): Outcome => ({ ok: false, words });
 
 /* ---------- B6: the exe's address identity ---------- */
 
-/**
- * A URL as the exe normalizes it (shell-core address.rs `normalize`): scheme and host lower case, the host
- * as punycode, one trailing dot dropped, the default port dropped, no trailing slash. WHATWG `URL` does
- * the first parts as Rust's `url` crate does; the trailing dot and slashes are done here.
- */
 /** A removed server's id stays its tombstone's for good: never saved again, so nothing of it carries over. */
 export const REMOVED_ID_WORDS = 'A removed server had this id, and ids are never used again. Add it as a new server.';
 
+/** The exe's longest address, in bytes (address.rs `MAX_URL`). */
+const MAX_URL = 2048;
+
+/**
+ * A URL as the exe normalizes it (shell-core address.rs `normalize`), or undefined for one it refuses.
+ * Refused: empty or over 2048 bytes, a control character or a space anywhere, a scheme other than http,
+ * https or ws, user info, a query or a fragment (an empty `?` or `#` too), no host, an encoded dot or
+ * slash in the path, and a literal address the exe never reaches. Otherwise: scheme and host lower case,
+ * the host as punycode, one trailing dot dropped, the default port dropped, no trailing slash. WHATWG
+ * `URL` parses as Rust's `url` crate does; the rest is done here. One corpus checks both sides
+ * (shell-core/fixtures/address-identity.json).
+ */
 export function addressIdentity(url: string): string | undefined {
+  if (!url || new TextEncoder().encode(url).length > MAX_URL || /[\u0000-\u001f\u007f-\u009f ]/.test(url)) return undefined;
   let u: URL;
   try {
     u = new URL(url);
   } catch {
     return undefined;
   }
+  const scheme = u.protocol.slice(0, -1);
+  if (scheme !== 'http' && scheme !== 'https' && scheme !== 'ws') return undefined;
+  // `search` and `hash` are empty for a bare `?` or `#`, which the serialized form keeps.
+  if (u.username || u.password || u.search || u.hash || u.href.includes('?') || u.href.includes('#')) return undefined;
   let host = u.hostname;
-  if (!literalClass(host) && !host.startsWith('[')) {
+  const literal = literalClass(host);
+  if (literal === 'refused') return undefined;
+  if (!literal && !host.startsWith('[')) {
     if (host.endsWith('.')) host = host.slice(0, -1);
     if (host === '' || host.endsWith('.')) return undefined;
   }
   const path = u.pathname.replace(/\/+$/, '');
-  return `${u.protocol.slice(0, -1)}://${host}${u.port ? `:${u.port}` : ''}${path}`;
+  if (/%2e|%2f|%5c/i.test(path)) return undefined;
+  return `${scheme}://${host}${u.port ? `:${u.port}` : ''}${path}`;
 }
 
 /* ---------- 5.9: keys ---------- */

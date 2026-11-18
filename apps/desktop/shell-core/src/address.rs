@@ -378,6 +378,26 @@ mod tests {
         }
     }
 
+    /// The corpus core's `addressIdentity` runs too (apps/desktop/tests/mcp.test.ts): a rule changed
+    /// here alone, or there alone, fails one of the two.
+    #[test]
+    fn the_shared_identity_corpus() {
+        let text = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/address-identity.json"));
+        let corpus: serde_json::Value = serde_json::from_str(text).expect("the corpus is JSON");
+        let accept = corpus["accept"].as_array().expect("an accept list");
+        let refuse = corpus["refuse"].as_array().expect("a refuse list");
+        assert!(accept.len() > 10 && refuse.len() > 10);
+        for pair in accept {
+            let input = pair[0].as_str().expect("an input");
+            let want = pair[1].as_str().expect("an identity");
+            assert_eq!(normalize(input).map(|n| n.url), Ok(want.to_string()), "{input:?}");
+        }
+        for input in refuse {
+            let input = input.as_str().expect("an input");
+            assert!(normalize(input).is_err(), "{input:?}");
+        }
+    }
+
     #[test]
     fn the_normal_form_is_a_fixed_point() {
         for s in ["https://xn--bcher-kva.example/v1", "http://[::1]:8080", "http://10.0.0.5:1234/a/b", "https://example.com"] {

@@ -114,4 +114,21 @@ describe("core's address identity matches the exe's normalize (B6)", () => {
     expect(addressIdentity('https://H.Example.:443/mcp//')).toBe('https://h.example/mcp');
     expect(addressIdentity('http://localhost.:3000/')).toBe('http://localhost:3000');
   });
+
+  // One corpus for both sides: shell-core's `normalize` runs the same file in its own unit test
+  // (address.rs, `the_shared_identity_corpus`), so a rule changed on one side alone fails a build.
+  it('the shared corpus: core accepts what the exe accepts, with the same identity, and refuses what it refuses', async () => {
+    const { addressIdentity } = await import('@familiar/core');
+    const corpus = JSON.parse(readFileSync(new URL('../shell-core/fixtures/address-identity.json', import.meta.url), 'utf8')) as { accept: [string, string][]; refuse: string[] };
+    expect(corpus.accept.length).toBeGreaterThan(10);
+    expect(corpus.refuse.length).toBeGreaterThan(10);
+    const wrong = [
+      ...corpus.accept.filter(([input, want]) => addressIdentity(input) !== want).map(([input, want]) => `${JSON.stringify(input)} gave ${JSON.stringify(addressIdentity(input))}, the exe gives ${want}`),
+      ...corpus.refuse.filter((input) => addressIdentity(input) !== undefined).map((input) => `${JSON.stringify(input)} gave ${addressIdentity(input)}, the exe refuses it`)
+    ];
+    expect(wrong).toEqual([]);
+    // The exe's length bound, in bytes.
+    expect(addressIdentity(`https://example.com/${'a'.repeat(2048)}`)).toBeUndefined();
+    expect(number(rust('address.rs'), 'MAX_URL')).toBe(2048);
+  });
 });
