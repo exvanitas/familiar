@@ -197,6 +197,28 @@ describe('5.2 and 5.3: repair in a fresh start', () => {
     expect(two.tombstones().l1).toEqual({ key: 'files' });
     expect(t.log.filter((l) => l === 'forget l1')).toHaveLength(1);
   });
+
+  it("the sweep never removes the address of a saved record it can't read, and a removal that fails leaves repair unfinished", async () => {
+    const store = memorySettingsStore();
+    const t = ports(store);
+    const one = await Owner.open(t.p);
+    expect(await one.add(remote('r1'))).toEqual({ ok: true });
+    // The record loses a field: unreadable, but its address is still its own (removing it deletes the key).
+    const doc = await stored(store);
+    delete doc.servers.r1.tools;
+    await store.put(OWNER_KEY, { v: 1, value: doc });
+    const two = await Owner.open(t.p);
+    expect(two.unreadableServers()).toEqual(['r1']);
+    expect(await two.repair()).toEqual({ ok: true });
+    expect([...t.addresses.keys()]).toEqual(['addr-1']);
+    // A true orphan whose removal fails: repair says so.
+    t.addresses.set('orphan', 'https://o.example/mcp');
+    const three = await Owner.open({ ...t.p, addresses: { ...t.p.addresses, remove: async () => { throw new Error('exe busy'); } } });
+    expect(await three.repair()).toMatchObject({ ok: false });
+    // One already gone (the exe's not-saved) counts as removed.
+    const four = await Owner.open({ ...t.p, addresses: { ...t.p.addresses, remove: async () => { throw { kind: 'not-saved', message: 'no such address' }; } } });
+    expect(await four.repair()).toEqual({ ok: true });
+  });
 });
 
 describe('5.1: failing closed', () => {

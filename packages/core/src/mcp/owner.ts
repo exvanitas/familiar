@@ -501,8 +501,23 @@ export class Owner {
         }
       }
       if (this.ports.addresses.list) {
-        const owned = new Set(this.servers().flatMap((s) => (s.setup.kind === 'remote' && s.setup.address ? [s.setup.address] : [])));
-        for (const a of await this.ports.addresses.list()) if (a.kind === 'server' && !owned.has(a.id)) await this.ports.addresses.remove(a.id).catch(() => {});
+        // Owned by any saved record that names it, read raw: a record that's unreadable otherwise still
+        // owns its address, whose removal would delete its key for good.
+        const owned = new Set(
+          Object.values(this.doc.servers).flatMap((v) => {
+            const address = isObj(v) && isObj(v.setup) ? v.setup.address : undefined;
+            return typeof address === 'string' ? [address] : [];
+          })
+        );
+        let swept = true;
+        for (const a of await this.ports.addresses.list()) {
+          if (a.kind !== 'server' || owned.has(a.id)) continue;
+          // Gone already (the exe's not-saved) is removed; any other failure leaves repair unfinished.
+          await this.ports.addresses.remove(a.id).catch((e: unknown) => {
+            if (!notSaved(e)) swept = false;
+          });
+        }
+        if (!swept) return no("Repair didn't finish: an address no server uses couldn't be removed. Familiar tries again at its next start.");
       }
       return ok;
     } finally {
