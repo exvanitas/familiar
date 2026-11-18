@@ -216,35 +216,37 @@ describe('2.2 to 2.4: questions, answers and the queue', () => {
 /* ---------- interrupted steps: one question per task ---------- */
 
 describe('2.2: several interrupted steps in one round make one question (S7)', () => {
-  it('two server calls cut off in two lives, then a kill: one question lists both, and one Run again settles both', async () => {
+  // Two built-in effects: a recovered run never gets server tools (2.7), so its second server call would be
+  // refused, not cut off. Effects are cut off the same way.
+  it('two effects cut off in two lives, then a kill: one question lists both, and one Yes settles both', async () => {
     const world = nodeWorld();
     const script = (r: ModelRequest): FakeReply => {
       const u = lastUser(r);
-      if (u === 'Ask twice.' && !hasTool(r)) return { toolCalls: [{ id: 'q1', name: 'server_lookup', arguments: { q: 'one' } }, { id: 'q2', name: 'server_lookup', arguments: { q: 'two' } }] };
-      if (u.startsWith('Run ')) return { text: 'Both again.' };
+      if (u === 'Ask twice.' && !hasTool(r)) return { toolCalls: [{ id: 'q1', name: 'send_message', arguments: { to: 'one', text: 'hi' } }, { id: 'q2', name: 'send_message', arguments: { to: 'two', text: 'hi' } }] };
+      if (u.startsWith('Yes, do it now')) return { text: 'Both again.' };
       return { text: 'done' };
     };
-    // Life n holds the n-th server call: life 1 the first, life 2 the second (the first is interrupted there).
-    const o = (life: number): OpenOptions => ({ script, hang: (n) => n === 'server_lookup' && world.counters.get('starts:server_lookup') === life });
+    // Life n holds the n-th effect: life 1 the first, life 2 the second (the first is cut off there).
+    const o = (life: number): OpenOptions => ({ script, hang: (n) => n === 'send_message' && world.counters.get('starts:send_message') === life });
     const one = await openFor(envOf(world, 1), await world.open('s7'), o(1));
     void one.journal.send('Ask twice.', 'a');
-    await until(async () => world.counters.get('hung:server_lookup') >= 1, 'first call held');
+    await until(async () => world.counters.get('hung:send_message') >= 1, 'first call held');
     one.journal.kill();
     const two = await openFor(envOf(world, 2), await world.open('s7'), o(2));
-    await until(async () => world.counters.get('hung:server_lookup') >= 2, 'second call held');
+    await until(async () => world.counters.get('hung:send_message') >= 2, 'second call held');
     two.journal.kill();
     const three = await openFor(envOf(world, 3), await world.open('s7'), o(3));
     const a = await three.journal.send('Ask twice.', 'a');
     if (!a.replied) throw new Error('ack');
     const end = await a.turn.wait();
-    expect(end).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
+    expect(end).toMatchObject({ status: 'asks', question: { kind: 'redo' } });
     if (end.status !== 'asks') return;
-    expect(end.question.steps?.map((s) => s.tool)).toEqual(['server_lookup', 'server_lookup']);
-    expect(end.question.steps?.map((s) => (s.arguments as any).q)).toEqual(['one', 'two']);
+    expect(end.question.steps?.map((s) => s.tool)).toEqual(['send_message', 'send_message']);
+    expect(end.question.steps?.map((s) => (s.arguments as any).to)).toEqual(['one', 'two']);
     expect(await three.journal.questions()).toHaveLength(1);
     const again = await three.journal.answer(end.question.id, true, 'again');
     expect(await again!.wait()).toMatchObject({ status: 'answered' });
-    expect(three.model.requests.some((r) => lastUser(r) === 'Run server_lookup again. Run server_lookup again.')).toBe(true);
+    expect(three.model.requests.some((r) => lastUser(r) === 'Yes, do it now: sending a message to one. Yes, do it now: sending a message to two.')).toBe(true);
     expect(await three.journal.questions()).toEqual([]);
     expect(await three.journal.answer(end.question.id, false, 'skip-late')).toMatchObject({ id: again!.id });
     await three.journal.close();
@@ -384,5 +386,34 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
     const r = await run([]);
     expect(r.cards).toEqual([]);
     expect(r.ran[0]).toMatchObject({ by: 'always', outside: false });
+  });
+});
+
+/* ---------- 2.7: the recovered-run gate ---------- */
+
+describe('2.7: a run recovered after a restart never gets server tools', () => {
+  it('its server call is refused in words and never starts; the next message\'s run can call it', async () => {
+    const world = nodeWorld();
+    const never = new Promise<void>(() => {});
+    const script = (life: number) => (r: ModelRequest): FakeReply => {
+      const u = lastUser(r);
+      if (r.messages.at(-1)?.role === 'tool') return { text: 'Noted.' };
+      // Life 1 holds the reply, so the run is live when the app dies.
+      if (life === 1) return { text: 'x', pause: { afterEvents: 0, until: never } };
+      return { toolCalls: [{ id: `r-${u}`, name: 'server_read', arguments: { q: u } }] };
+    };
+    const one = await openFor(envOf(world, 1), await world.open('recovered'), { script: script(1) });
+    void one.journal.send('Read it.', 'a');
+    await until(async () => one.model.requests.length > 0, 'the reply under way');
+    one.journal.kill();
+    const two = await openFor(envOf(world, 2), await world.open('recovered'), { script: script(2) });
+    const a = await two.journal.send('Read it.', 'a');
+    if (a.replied) expect(await a.turn.wait()).toMatchObject({ status: 'answered', text: 'Noted.' });
+    expect(world.counters.get('starts:server_read')).toBe(0);
+    expect(two.model.requests.some((r) => r.messages.some((m) => m.role === 'tool' && /resumed after a restart, so server tools aren't used in it/.test(m.content)))).toBe(true);
+    const b = await two.journal.send('Read again.', 'b');
+    if (b.replied) await b.turn.wait();
+    expect(world.counters.get('starts:server_read')).toBe(1);
+    await two.journal.close();
   });
 });

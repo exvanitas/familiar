@@ -219,6 +219,8 @@ const ConsentDoc = defineJournalDoc<{ cards: Record<string, ConsentCard & { answ
 const AckEntry = 'familiar.ack';
 const NoticeEntry = 'familiar.notice';
 
+const RECOVERED_WORDS = "This turn was resumed after a restart, so server tools aren't used in it. They work again from your next message.";
+
 const STOPPED_WORDS = 'Not done: the app closed while this was running, and it was not run again. The person was asked whether to do it now.';
 
 const ReminderEntry = 'familiar.reminder';
@@ -457,6 +459,11 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     while (sent.order.length > 256) delete sent.byRequest[sent.order.shift()!];
   };
 
+  /** The run live when this journal opened (2.7), and the current run's identity. */
+  let recovered: string | undefined;
+  const identityOf = (live: any): string | undefined => (live?.run ? String(live.run.inputs?.[0] ?? `first:${live.run.first}`) : undefined);
+  const runIdentity = async () => identityOf(await harness.snapshot(LiveDoc, rootId, ctx));
+
   /** The view (view.ts) from committed state. */
   const viewNow = async (): Promise<RunView> =>
     runView(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(InterruptionsDoc, ctx), await harness.snapshot(AnswersDoc, ctx), stepCap);
@@ -499,6 +506,9 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     const refused = await bounded(api);
     if (refused) return refused;
     const tool = tools.get(call.name);
+    // The recovered-run gate (2.7): a run that was live when this journal opened is never given server
+    // tools. pi-durable can't give a recovered run its own registry, so it would call with today's.
+    if (tool?.kind === 'server' && recovered !== undefined && (await runIdentity()) === recovered) return RECOVERED_WORDS;
     const id = String(api.taskId);
     // A tool cut off by a close waits for the person: Run again, or skip. Until then, and for the
     // rest of the turn after a skip, a call the model makes to it again doesn't run.
@@ -841,6 +851,9 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     return ids;
   }, ctx);
   for (const id of staleCompactions) await harness.abortTask(id, ctx);
+  // The run live at open, if any, by an identity that holds across its generations (B4): noted before any
+  // task can run, in memory only.
+  recovered = identityOf(await harness.snapshot(LiveDoc, rootId, ctx));
 
   harness.resume();
 
