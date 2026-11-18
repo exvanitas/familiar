@@ -15,7 +15,30 @@ export interface Named {
   readonly expect?: (r: import('./wire.ts').WireRun) => string | undefined;
 }
 
+/** S11: Stop during the walk, or while Ready, then a call; nothing reaches the stopping run after Stop. */
+function stopFence(where: 'local' | 'remote', during: 'walk' | 'ready'): Named {
+  return {
+    name: `S11 Stop ${during === 'walk' ? 'during a walk' : 'while Ready'}, ${where}`,
+    options: {
+      mode: { ...quiet, where, pages: 3, idlePings: where === 'local' ? 0.9 : 0, sse: 0.5 },
+      schedule: (d) => {
+        const listing = () => d.exe.log.some((x) => x.body?.method === 'tools/list' && (x.kind === 'write' ? x.end !== undefined : x.head !== undefined));
+        d.when(during, during === 'walk' ? listing : () => d.ready(), () => {
+          d.stop();
+          // A call tried in the same step, before the Stop has finished: refused, nothing sent.
+          d.call('echo');
+        });
+      }
+    },
+    expect: (r) => (r.evidence.some((e) => e.what === 'stop') ? undefined : 'no Stop made')
+  };
+}
+
 export const SCHEDULES: Named[] = [
+  stopFence('local', 'walk'),
+  stopFence('local', 'ready'),
+  stopFence('remote', 'walk'),
+  stopFence('remote', 'ready'),
   {
     // S1: the card opens with F1; the catalog changes to F2 while it's shown; then the Yes. No handoff.
     name: 'S1 a fingerprint change while a card is shown',

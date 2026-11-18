@@ -171,6 +171,20 @@ export const H2: Check = (r) => {
     }
   }
   for (const [id, n] of pongs) if (n > 1) problems.push(`H2: ${n} pongs for ${id}`);
+  // Nothing is admitted to a run after its Stop: no request, notification or idle ping's pong of that run
+  // starts once the Stop was made (a pong or cancel of an exchange already live may still go).
+  for (const e of r.evidence) {
+    if (e.what !== 'stop') continue;
+    const address = r.server.mode.where === 'remote' ? `addr-${(e.server ?? 's1').slice(1)}` : 'local';
+    const before = r.exe.log.filter((x) => x.server === address && x.seq < e.seq);
+    const epoch = before.at(-1)?.epoch;
+    if (epoch === undefined) continue;
+    for (const x of r.exe.log) {
+      if (x.server !== address || x.epoch !== epoch || x.seq < e.seq || !x.body) continue;
+      const opener = (x.body.method !== undefined && x.body.method !== 'notifications/cancelled') || (x.kind === 'write' && isPong(x.body) && localPongKey(r, x) === `idle:${x.body.id}`);
+      if (opener) problems.push(`H2: ${x.body.method ?? `the pong for ${x.body.id}`} sent to a run after its Stop (step ${e.step})`);
+    }
+  }
   return problems.slice(0, 3);
 };
 

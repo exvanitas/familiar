@@ -17,7 +17,7 @@ interface Control {
   readonly named?: string;
 }
 
-const named = (prefix: string): WireOptions => SCHEDULES.find((s) => s.name.startsWith(`${prefix} `))!.options;
+const named = (prefix: string): WireOptions => SCHEDULES.find((s) => s.name === prefix || s.name.startsWith(`${prefix} `))!.options;
 
 const remote: Partial<Mode> = { where: 'remote' };
 const local: Partial<Mode> = { where: 'local' };
@@ -61,7 +61,9 @@ const CONTROLS: Control[] = [
   { mutation: 'cancel-pongs-at-drain', check: 'H13', named: 'S2' },
   { mutation: 'rehandshake-every-404', check: 'H14', named: 'S3' },
   { mutation: 'no-detach', check: 'H4', named: 'S8', build: 'pass' },
-  { mutation: 'no-server-cap', check: 'H5', named: 'S10' }
+  { mutation: 'no-server-cap', check: 'H5', named: 'S10' },
+  { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop during a walk, local' },
+  { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' }
 ];
 
 const MAX_SEEDS = 150;

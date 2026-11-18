@@ -111,6 +111,8 @@ interface Run {
   ended: boolean;
   /** A local run's process has exited (the exe said so). */
   exited?: boolean;
+  /** Stop has begun: set synchronously before Stop awaits anything, so no exchange is admitted after it. */
+  closing?: boolean;
   nextId: number;
   /** Re-handshakes since the last exchange that completed without a 404. */
   dropped: number;
@@ -243,6 +245,12 @@ export class ServerLink {
   async stop(): Promise<void> {
     const run = this.run;
     if (!run || run.ended) return;
+    // The fence, before any await: a local Stop waits for the exe and the exit, and nothing may be
+    // admitted to the stopping server meanwhile (a walk's next page, a call, an idle ping's pong).
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'))) {
+      run.closing = true;
+      run.ready = false;
+    }
     // The run's end answers a call in flight "interrupted, it may have partly run" (3.11).
     if (run.target.where === 'local' && run.process !== undefined) {
       // Waits for the exe's answer and the exit, with no deadline of its own (5.4).
@@ -298,7 +306,7 @@ export class ServerLink {
    */
   handoff(name: string, canonicalArguments: string, signal: AbortSignal, ms: number): Promise<CallOutcome> | undefined {
     const run = this.run;
-    if (!run || run.ended || !run.ready || run.stale || this.busy) return undefined;
+    if (!run || run.ended || run.closing || !run.ready || run.stale || this.busy) return undefined;
     // Modern remote: the headers come from the same decision as the body, in this same step (3.6).
     let extra: (readonly [string, string])[] | undefined;
     if (run.era === 'modern' && run.target.where === 'remote') {
@@ -329,7 +337,7 @@ export class ServerLink {
   /** Whether the run offers this tool with this fingerprint, catalog fresh. */
   offers(run: string, tool: string, fingerprint: string): boolean {
     const r = this.run;
-    return !!r && r.id === run && !r.ended && r.ready && !r.stale && r.tools.some((t) => t.name === tool && t.fingerprint === fingerprint);
+    return !!r && r.id === run && !r.ended && !r.closing && r.ready && !r.stale && r.tools.some((t) => t.name === tool && t.fingerprint === fingerprint);
   }
 
   private callOutcome(run: Run, o: Outcome): CallOutcome {
@@ -478,7 +486,7 @@ export class ServerLink {
     for (;;) {
       if (!this.early(kind)) await Promise.race([this.drained(), deadline.over]);
       if (deadline.expired) return { end: { t: 'timeout' } };
-      if (run.ended) return { end: { t: 'run-ended' } };
+      if (run.ended || run.closing) return { end: { t: 'run-ended' } };
       const started = this.exchangeNow(run, kind, requestId, body, method);
       if (started) return started;
     }
@@ -493,6 +501,7 @@ export class ServerLink {
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
   private exchangeNow(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, method?: string, extra?: readonly (readonly [string, string])[]): Promise<Outcome> | undefined {
     if (this.busy && !this.early(kind)) return undefined;
+    if (run.ended || run.closing) return Promise.resolve({ end: { t: 'run-ended' } });
     let resolve!: (o: Outcome) => void;
     const promise = new Promise<Outcome>((r) => (resolve = r));
     const n = this.slot.next;
@@ -750,7 +759,7 @@ export class ServerLink {
         const n = mine.n;
         queueMicrotask(() => this.input({ t: 'ping', n, id: m.id }));
       } else if (mine) this.input({ t: 'ping', n: mine.n, id: m.id });
-      else if (!remote && !this.busy) this.idlePing(run, m.id);
+      else if (!remote && !this.busy && !run.closing) this.idlePing(run, m.id);
       else if (ex && ex.phase === 'draining' && !remote) this.input({ t: 'ping', n: ex.n, id: m.id });
       return false;
     }
@@ -778,7 +787,7 @@ export class ServerLink {
    * page or a call has completed since, or a failed re-handshake, ends the run.
    */
   private sessionDropped(run: Run): void {
-    if (run.ended) return;
+    if (run.ended || run.closing) return;
     if ((run.dropped > 0 || !run.ready) && !(__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) {
       this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
       return;
