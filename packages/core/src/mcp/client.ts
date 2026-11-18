@@ -1,27 +1,24 @@
-// The MCP client: every saved server with its actor, and what the app does with them. Add, Test, start,
-// stop, remove, the tools for a turn, and reviewing tools. Only the person adds, changes or removes a
-// server, in Settings; nothing here is reachable from a tool or from anything a model reads.
+// The MCP client: every saved server with its runtime, and what the app does with them. Add, Test, start,
+// stop, remove, the tools for a turn, reviewing tools, and `send`, the only way a call reaches a server.
+// Only the person adds, changes or removes a server, in Settings; nothing here is reachable from a tool or
+// from anything a model reads.
 //
 // Secrets: Settings puts a draft's secret values straight into Credential Manager (`secret_set` is a
 // Settings command). Core keeps only their names, and deletes them when the server is removed.
 
 import type { JournalClock } from '../journal/journal.ts';
 import type { SettingsStore } from '../settings/store.ts';
-import { ServerActor, type ServerView } from './actor.ts';
+import { canonicalArguments, markUsed, usable, type CardFacts, type ToolDecision } from './decision.ts';
 import type { PathRules } from './native-rules.ts';
-import { DEFAULT_LIMITS, INIT_MS_MAX, INIT_MS_MIN, type Limits, type Phase } from './machine.ts';
 import type { Draft } from './paste.ts';
 import type { ProcessPort } from './process.ts';
-import { ProcessTransport } from './process-transport.ts';
-import { RemoteTransport, type FetchLike } from './remote.ts';
-import { addServer, deleteServer, fresh, loadServers, saveServer, type SavedServer, type SavedTool, type ServerLimits } from './saved.ts';
-import type { Expect } from './machine.ts';
-import type { AllowedBy } from '../journal/tools.ts';
+import { ServerRuntime, type Phase } from './runtime.ts';
+import { fresh, loadServers, type SavedServer, type SavedTool, type ServerLimits } from './saved.ts';
 import { choiceKey, modelNames, serverTool, toolChanges, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
-import { openSession, type Session, type SessionEvents } from './session.ts';
-import { processSetupOf, remoteTargetOf, secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
+import { secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 import { unpinned, type Unpinned } from './unpinned.ts';
+import type { LinkLimits, NetPort } from './wire/link.ts';
 
 /** Saved addresses: the exe's `address_add` (which asks the person) and `address_remove` (which deletes
     the address's key). */
@@ -35,27 +32,29 @@ export interface SecretPort {
   delete(ref: string): Promise<void>;
 }
 
+/** A call's time limit when the server's record names none, and its bounds. */
+export const CALL_MS = 60_000;
+export const CALL_MS_MIN = 1_000;
+export const CALL_MS_MAX = 15 * 60_000;
+
 export interface McpClientOptions {
   readonly store: SettingsStore;
   readonly processes: ProcessPort;
-  /** The fetch for a saved address: in the app, the guarded fetch. */
-  readonly fetchFor: (address: string) => FetchLike;
+  /** The exe's net_fetch, net_read and net_cancel. */
+  readonly net: NetPort;
   readonly addresses: AddressPort;
   readonly secrets: SecretPort;
   readonly clock: Pick<JournalClock, 'now' | 'setTimer'>;
-  /** Overrides for every server's limits, for tests. */
-  readonly limits?: Partial<Limits>;
+  /** Overrides for every server's link limits, for tests. */
+  readonly limits?: Partial<LinkLimits>;
   /** How setups' paths are checked: Windows' rules unless a test says otherwise. */
   readonly paths?: PathRules;
   /** Hears that a server's state, tools or failure changed. */
   readonly onChange?: (id: string) => void;
   /** A new incarnation for an added server. Random by default; tests pass their own. */
   readonly newIncarnation?: () => string;
-  /** Opens one run: the real session over a process or a fetch unless a test gives its own. */
-  readonly connect?: (setup: ServerSetup, events: SessionEvents) => Session;
-  /** The person's choices, keyed by `choiceKey` (step 8 keeps them). Read again when a wrapper's call is
-      sent, by the wrapper's own identity: a "never" refuses it, and a call the gate let through on an
-      "always" is refused unless that "always" still stands for exactly this tool and setup. */
+  /** The person's choices, keyed by `choiceKey` (step 8 keeps them). `send` reads them, with the revoke
+      overlay on top, in its synchronous check. */
   readonly choices?: () => Readonly<Record<string, ToolChoice>>;
 }
 
@@ -80,17 +79,10 @@ export type TestReport =
   | { readonly ok: true; readonly tools: readonly TestedTool[]; readonly changes: ToolChanges; readonly unpinned?: Unpinned }
   | { readonly ok: false; readonly failure: Failure };
 
-interface Entry {
-  /** The actor owns the whole record and every change to it, the add and the removal included. */
-  readonly actor: ServerActor<SavedServer>;
-  /** What the record was loaded or added with: writes are numbered on from its revision. */
-  readonly baseRev: number;
-}
-
 const randomIncarnation = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, '0')).join('');
 
 /** An address as compared for sharing: one saved address can't serve two servers, since removing either
-    would remove the other's address and key. */
+    would remove the other's address and key. (Phase 4 replaces this with the exe's own identity.) */
 function sameAddress(a: string, b: string): boolean {
   try {
     const x = new URL(a), y = new URL(b);
@@ -101,8 +93,9 @@ function sameAddress(a: string, b: string): boolean {
 }
 
 export class McpClient {
-  private readonly entries = new Map<string, Entry>();
-
+  private readonly entries = new Map<string, ServerRuntime>();
+  /** Revokes that hold at once, whatever the store is doing: "never" for a tool, or "always" withdrawn. */
+  private readonly overlay = new Map<string, 'ask' | 'never'>();
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions) {
@@ -116,54 +109,51 @@ export class McpClient {
     return c;
   }
 
-  /** Starting with the app: every enabled server starts. Approved ones start with no dialog. */
-  startEnabled(): void {
-    for (const e of this.entries.values()) if (e.actor.setup.enabled) void e.actor.start();
+  /** Starting with the app: every enabled server starts, one admitted start at a time. */
+  startEnabled(): Promise<void> {
+    return (async () => {
+      for (const e of [...this.entries.values()]) if (e.setup.enabled) await e.start();
+    })();
   }
 
   list(): ServerStatus[] {
-    return [...this.entries.values()].filter(e => e.actor.view.phase !== 'adding').map(e => this.status(e));
+    return [...this.entries.values()].filter(e => e.phase !== 'adding' && e.phase !== 'removed').map(e => this.status(e));
   }
 
   get(id: string): ServerStatus | undefined {
     const e = this.entries.get(id);
-    return e && e.actor.view.phase !== 'adding' ? this.status(e) : undefined;
+    return e && e.phase !== 'adding' && e.phase !== 'removed' ? this.status(e) : undefined;
   }
 
   /**
    * Adds a draft as a server, stopped and not yet enabled. Its entry is held from the first moment, with
    * its address, so a second add of the same id or address is refused while this one runs, the exe's
-   * dialog included. The actor owns the add: a remote server's address is added first (the dialog), then
-   * the first record is written where nothing is saved. Returns the refs Settings must store the draft's
-   * secret values under. The draft's values never pass through here.
+   * dialog included. Returns the refs Settings must store the draft's secret values under.
    */
   async add(draft: Pick<Draft, 'setup' | 'problems'>): Promise<{ id: string; secretRefs: string[] }> {
     const problems = [...draft.problems, ...setupProblems(draft.setup, this.o.paths)];
     if (problems.length) throw new Error(problems[0]);
     const setup = draft.setup;
-    if (this.entries.has(setup.id)) throw new Error('A server with this id is already saved.');
+    const held = this.entries.get(setup.id);
+    if (held && held.phase !== 'removed') throw new Error('A server with this id is already saved.');
     if (setup.kind === 'remote') {
       const other = this.sharing(setup.id, s => s.kind === 'remote' && sameAddress(s.url, setup.url));
       if (other) throw new Error(`Another server, ${other.label}, already uses this address. Familiar keeps one server per address.`);
     }
     const record: SavedServer = { setup, enabled: false, limits: {}, tools: [], incarnation: (this.o.newIncarnation ?? randomIncarnation)(), rev: 0 };
     const entry = this.track(record, true);
-    const r = await entry.actor.register();
-    if (r.kind !== 'added') throw new Error(r.kind === 'failed' ? r.failure.words : r.kind === 'refused' ? r.words : 'The server could not be added.');
-    return { id: setup.id, secretRefs: secretRefs(entry.actor.setup.setup) };
+    const r = await entry.register(address => this.sharing(setup.id, s => s.kind === 'remote' && s.address === address)?.label);
+    if (r.kind !== 'added') {
+      if (this.entries.get(setup.id) === entry) this.entries.delete(setup.id);
+      throw new Error(r.kind === 'failed' ? r.failure.words : r.kind === 'refused' ? r.words : 'The server could not be added.');
+    }
+    return { id: setup.id, secretRefs: secretRefs(entry.setup.setup) };
   }
 
-  /**
-   * Changes a stopped server's setup, keeping its id, so its tools' review carries over and a changed
-   * tool shows as changed. The actor admits it (only while stopped or down), writes it, then deletes the
-   * secrets it dropped, all owned by the actor: it counts once saved, and the server takes no other
-   * change until the deletes land. A start made meanwhile waits for it. A new command, folder, setting or
-   * version asks in the exe's dialog at the next start, and puts every tool back to ask. A remote
-   * server's address can't change here: that's a new address, with its own approval and key.
-   */
+  /** Changes a stopped server's setup, keeping its id. A remote server's address can't change here. */
   async edit(id: string, draft: Pick<Draft, 'setup' | 'problems'>): Promise<{ secretRefs: string[] }> {
     const e = this.entry(id);
-    const before = e.actor.setup.setup;
+    const before = e.setup.setup;
     let setup: ServerSetup = { ...draft.setup, id } as ServerSetup;
     const problems = [...draft.problems, ...setupProblems(setup, this.o.paths)];
     if (problems.length) throw new Error(problems[0]);
@@ -173,41 +163,38 @@ export class McpClient {
       setup = { ...setup, url: before.url, ...(before.address ? { address: before.address } : {}) };
     }
     const next = setup;
-    const r = await e.actor.edit(rec => ({ ...rec, setup: next }));
+    const r = await e.edit(rec => ({ ...rec, setup: next }));
     if (r.kind !== 'edited') throw new Error(r.kind === 'failed' ? r.failure.words : r.kind === 'refused' ? r.words : 'The server was removed.');
     return { secretRefs: secretRefs(next) };
   }
 
-  start(id: string): Promise<Reply> { return this.entry(id).actor.start(); }
-  stop(id: string): Promise<Reply> { return this.entry(id).actor.stop(); }
+  start(id: string): Promise<Reply> { return this.entry(id).start(); }
+  stop(id: string): Promise<Reply> { return this.entry(id).stop(); }
 
-  /** Stops it, removes its approval or address, its secrets and its saved setup. A call in flight is
-      answered `interrupted`. The actor owns the removal until it lands, past its deadline too: until then
-      the id and its address stay taken. A failed removal can be tried again. */
+  /** Stops it (awaited), then removes its approval or address, its secrets and its saved setup. */
   async remove(id: string): Promise<Reply> {
-    return this.entry(id).actor.remove();
+    const e = this.entry(id);
+    const r = await e.remove();
+    if (r.kind === 'removed' && this.entries.get(id) === e) this.entries.delete(id);
+    return r;
   }
 
-  /** Starts it if it isn't running (the exe asks if the setup is new or changed), lists its tools, and
-      stops it again if it wasn't running before. Every failure comes back in plain words. */
+  /** Test runs only while the server is Stopped: an admitted start, the tool list, then a stop. */
   async test(id: string): Promise<TestReport> {
     const e = this.entry(id);
-    // Running or on its way up (starting with the app, or restarting): Test leaves it so.
-    const before = e.actor.view.phase;
-    const wasUp = before !== 'stopped' && before !== 'down';
-    const r = await e.actor.start();
+    if (e.phase !== 'stopped' && e.phase !== 'failed') return { ok: false, failure: { kind: 'busy', words: 'Stop the server to test it. Test never disturbs a running server.' } };
+    const r = await e.start();
     if (r.kind !== 'ready') {
-      const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: r.kind === 'removed' ? 'The server was removed.' : 'The server was stopped before it was ready.' };
+      e.settle();
+      const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: 'The server was stopped before it was ready.' };
       return { ok: false, failure };
     }
-    const meta = e.actor.pendingSetup;
-    const saved = new Map(meta.tools.map(t => [t.name, t]));
-    const tools = e.actor.view.tools.map(t => ({ ...t, fresh: fresh(saved.get(t.name), t.fingerprint) }));
-    if (!wasUp) await e.actor.stop();
-    const setup = e.actor.setup.setup;
+    const saved = new Map(e.setup.tools.map(t => [t.name, t]));
+    const tools = e.tools.map(t => ({ ...t, fresh: fresh(saved.get(t.name), t.fingerprint) }));
+    await e.stop();
+    const setup = e.setup.setup;
     const flag = setup.kind === 'local' ? unpinned(setup.program, setup.args) : undefined;
-    // Changes against what the person reviewed.
-    const reviewed = meta.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
+    const reviewed = e.setup.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
     return { ok: true, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}) };
   }
 
@@ -220,26 +207,30 @@ export class McpClient {
     return this.update(id, r => ({ ...r, enabled }));
   }
 
-  /** A call's deadline applies from the next call; the handshake's from the next start of the app. */
+  /** A call's time limit applies from the next call; the handshake's from the next start. */
   setLimits(id: string, limits: ServerLimits): Promise<void> {
     return this.update(id, r => ({ ...r, limits }));
   }
 
-  /** The tools a turn may offer the model: those of every Ready server, each bound to the tool as listed
-      and the setup its run started from. Every model name is unique. */
+  /** A tightening holds at once, in memory, whatever the owner is doing: "always" back to ask, or anything
+      to never. Saving it is the caller's (Settings), after. */
+  revoke(serverId: string, tool: string, to: 'ask' | 'never'): void {
+    const key = choiceKey(serverId, tool);
+    if (this.overlay.get(key) === 'never') return;
+    this.overlay.set(key, to);
+  }
+
+  /** The tools a turn may offer the model: those of every Ready server, bound to the run they came from. */
   tools(): ServerTool[] {
-    const ready = [...this.entries.values()].flatMap(e => {
-      const run = e.actor.runSetup;
-      return e.actor.view.phase === 'ready' && run ? [{ e, setup: run.setup }] : [];
-    });
-    const names = modelNames(ready.map(({ e, setup }) => ({ id: setup.id, label: setup.label, tools: e.actor.view.tools })));
+    const ready = [...this.entries.values()].flatMap(e => (e.phase === 'ready' && e.run ? [e] : []));
+    const names = modelNames(ready.map(e => ({ id: e.setup.setup.id, label: e.setup.setup.label, tools: e.tools })));
     const out: ServerTool[] = [];
     const taken = new Set<string>();
-    for (const { e, setup } of ready) {
+    for (const e of ready) {
+      const setup = e.setup.setup;
       const server = { id: setup.id, label: setup.label };
-      const setupFp = setupFingerprint(setup);
-      const saved = new Map(e.actor.pendingSetup.tools.map(t => [t.name, t]));
-      for (const listed of e.actor.view.tools) {
+      const saved = new Map(e.setup.tools.map(t => [t.name, t]));
+      for (const listed of e.tools) {
         const modelName = names.get(server.id)?.get(listed.name);
         if (!modelName || taken.has(modelName.toLowerCase())) continue;
         taken.add(modelName.toLowerCase());
@@ -247,152 +238,107 @@ export class McpClient {
           server,
           listed,
           modelName,
-          setupFingerprint: setupFp,
+          setupFingerprint: setupFingerprint(setup),
           fresh: fresh(saved.get(listed.name), listed.fingerprint),
-          call: (tool, args, options) => this.call(server.id, tool, args, options)
+          facts: args => this.facts(server.id, listed.name, args),
+          send: (decision, signal) => this.send(decision, signal)
         }));
       }
     }
     return out;
   }
 
-  /** One call, under the server's own deadline unless the caller gives one. With `expect`, it's sent only
-      if the server still offers exactly that tool, from that setup, and only if the person's choice for
-      this identity still allows it at the moment it's sent. */
-  call(id: string, tool: string, args: unknown, options: { ms?: number; signal?: AbortSignal; expect?: Expect; allowedBy?: AllowedBy } = {}): Promise<CallOutcome> {
-    const e = this.entries.get(id);
-    if (!e || e.actor.view.phase === 'adding') return Promise.resolve({ kind: 'error', reason: 'removed', words: 'The server was removed.' });
-    const ms = options.ms ?? e.actor.setup.limits.callMs;
-    const expect = options.expect;
-    const admit = expect ? () => this.admit(id, tool, expect, options.allowedBy) : undefined;
-    return e.actor.call(tool, args, { ...(ms !== undefined ? { ms } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(expect ? { expect } : {}), ...(admit ? { admit } : {}) });
+  /** What a card for this call shows, read from the server's run now. */
+  facts(serverId: string, tool: string, args: unknown): CardFacts | undefined {
+    const e = this.entries.get(serverId);
+    const run = e?.run;
+    const listed = e?.tools.find(t => t.name === tool);
+    const canon = canonicalArguments(args);
+    if (!e || !run || !listed || !canon) return undefined;
+    return { server: serverId, tool, run: run.id, launch: run.launch, fingerprint: listed.fingerprint, ...canon };
   }
 
-  /** The person's choice for a wrapper's identity, read at the send. "Never" refuses whatever let the
-      call through. A call let through on "always" needs that "always" still to stand for exactly this
-      tool and setup; one the person said yes to needs only the tool unchanged, which the actor checks. */
-  private admit(id: string, tool: string, expect: Expect, allowedBy: AllowedBy | undefined): string | undefined {
-    const choice = this.o.choices?.()[choiceKey(id, tool)];
-    if (choice?.policy === 'deny') return `You chose never to run ${tool} on this server, so Familiar didn't send the call.`;
-    if (allowedBy === 'always' && !(choice?.policy === 'allow' && choice.fingerprint === expect.tool && choice.setupFingerprint === expect.setup)) {
-      return `Your "always" for ${tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`;
+  /**
+   * The only way a call reaches a server (3.6). In one synchronous step, with no await: it refuses unless
+   * the decision is genuine, unused and its signal not aborted; its server's run is Ready, the run and
+   * launch it was minted for; the catalog is fresh and offers the tool with its fingerprint; the person's
+   * choice, with the revoke overlay, still allows it ("always" still "always" for these fingerprints and no
+   * outside content; a Yes not turned to "never"); and the exchange slot is Idle. Then it marks the decision
+   * used, builds the body from the decision alone, and hands it off.
+   */
+  send(decision: ToolDecision, signal: AbortSignal): Promise<CallOutcome> {
+    const refuse = (reason: Extract<CallOutcome, { kind: 'error' }>['reason'], words: string): Promise<CallOutcome> => Promise.resolve({ kind: 'error', reason, words });
+    if (!usable(decision)) return refuse('changed', 'That call had no consent of its own, or it was used already, so it was not sent.');
+    if (signal.aborted) return Promise.resolve({ kind: 'stopped' });
+    const e = this.entries.get(decision.server);
+    const run = e?.run;
+    if (!e || !run) return refuse('not-running', 'The server is not running.');
+    if (run.id !== decision.run || run.launch !== decision.launch) return refuse('changed', 'The server restarted since this call was allowed, so it was not sent.');
+    if (!e.link.offers(run.id, decision.tool, decision.fingerprint)) return refuse('changed', 'The tool changed since it was allowed, so it was not sent. It will ask again.');
+    const key = choiceKey(decision.server, decision.tool);
+    const choice = this.o.choices?.()[key];
+    const overlay = this.overlay.get(key);
+    if (choice?.policy === 'deny' || overlay === 'never') return refuse('changed', `You chose never to run ${decision.tool} on this server, so Familiar didn't send the call.`);
+    if (decision.by === 'always' && (decision.outside || overlay === 'ask' || !(choice?.policy === 'allow' && choice.fingerprint === decision.fingerprint && choice.setupFingerprint === decision.launch))) {
+      return refuse('changed', `Your "always" for ${decision.tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`);
     }
-    return undefined;
+    if (e.link.busy) return refuse('busy', 'The server is busy with another request. Try again in a moment.');
+    const ms = Math.min(CALL_MS_MAX, Math.max(CALL_MS_MIN, e.setup.limits.callMs ?? CALL_MS));
+    markUsed(decision);
+    const sent = e.link.handoff(decision.tool, decision.canonical, signal, ms);
+    return sent ?? refuse('busy', 'The server is busy with another request. Try again in a moment.');
   }
 
-  /** The record as the actor last committed it: what the store should hold once things are quiet. */
+  /** The record as last committed. */
   record(id: string): SavedServer | undefined {
     const e = this.entries.get(id);
-    return e && e.actor.view.phase !== 'adding' ? e.actor.setup : undefined;
-  }
-
-  /** Callers waiting on a server, of every kind. Bounded by the actor's admission caps. */
-  waiting(id: string): number {
-    return this.entries.get(id)?.actor.waiting ?? 0;
+    return e && e.phase !== 'adding' && e.phase !== 'removed' ? e.setup : undefined;
   }
 
   private async update(id: string, change: (r: SavedServer) => SavedServer): Promise<void> {
-    const r = await this.entry(id).actor.update(change);
+    const r = await this.entry(id).update(change);
     if (r.kind !== 'edited') throw new Error(r.kind === 'failed' ? r.failure.words : r.kind === 'refused' ? r.words : 'The server was removed.');
   }
 
-  /** Another entry, added or being added, whose setup matches. */
+  /** Another entry whose setup matches. */
   private sharing(self: string, match: (s: ServerSetup) => boolean): ServerSetup | undefined {
-    for (const [id, e] of this.entries) if (id !== self && match(e.actor.pendingSetup.setup)) return e.actor.pendingSetup.setup;
+    for (const [id, e] of this.entries) if (id !== self && e.phase !== 'removed' && match(e.setup.setup)) return e.setup.setup;
     return undefined;
   }
 
-  private entry(id: string): Entry {
+  private entry(id: string): ServerRuntime {
     const e = this.entries.get(id);
-    if (!e || e.actor.view.phase === 'adding') throw new Error('No server is saved with that id.');
+    if (!e || e.phase === 'adding' || e.phase === 'removed') throw new Error('No server is saved with that id.');
     return e;
   }
 
-  private status(e: Entry): ServerStatus {
-    const v = e.actor.view;
-    const r = e.actor.setup;
+  private status(e: ServerRuntime): ServerStatus {
+    const r = e.setup;
     const s = r.setup;
     const flag = s.kind === 'local' ? unpinned(s.program, s.args) : undefined;
-    return { id: s.id, label: s.label, kind: s.kind, enabled: r.enabled, phase: v.phase, ...(v.failure ? { failure: v.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: e.actor.pendingSetup.tools };
+    return { id: s.id, label: s.label, kind: s.kind, enabled: r.enabled, phase: e.phase, ...(e.failure ? { failure: e.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: r.tools };
   }
 
-  private track(saved: SavedServer, adding: boolean): Entry {
-    const initMs = saved.limits.initMs === undefined ? undefined : Math.min(INIT_MS_MAX, Math.max(INIT_MS_MIN, saved.limits.initMs));
-    const limits: Limits = { ...DEFAULT_LIMITS, ...(initMs !== undefined ? { initMs } : {}), ...this.o.limits };
+  private track(saved: SavedServer, adding: boolean): ServerRuntime {
     const id = saved.setup.id;
-    const baseRev = saved.rev;
-    const entry: Entry = {
-      baseRev,
-      actor: new ServerActor<SavedServer>({
-        setup: saved,
-        adding,
-        clock: this.o.clock,
-        limits,
-        fingerprint: r => setupFingerprint(r.setup),
-        open: (events, r) => {
-          if (this.o.connect) return this.o.connect(r.setup, events);
-          const setup = r.setup;
-          const transport = setup.kind === 'local' ? new ProcessTransport(this.o.processes, processSetupOf(setup)) : new RemoteTransport(remoteTargetOf(setup), this.o.fetchFor(setup.address ?? ''));
-          return openSession(transport, events, { initMs: limits.initMs });
-        },
-        // Fenced in the store's own transaction: same incarnation, a higher revision.
-        save: async (r, n) => {
-          if (!(await saveServer(this.o.store, { ...r, rev: baseRev + n }))) throw new Error('A newer record is saved.');
-        },
-        cleanup: async (before, after) => {
-          for (const ref of secretRefs(before.setup).filter(x => !secretRefs(after.setup).includes(x))) await this.o.secrets.delete(ref);
-        },
-        register: r => this.register(r),
-        forget: r => this.forget(r),
-        onChange: view => this.changed(id, entry, view)
-      })
-    };
+    const entry: ServerRuntime = new ServerRuntime(
+      saved,
+      adding,
+      { store: this.o.store, processes: this.o.processes, net: this.o.net, addresses: this.o.addresses, secrets: this.o.secrets, clock: this.o.clock, ...(this.o.limits ? { limits: this.o.limits } : {}) },
+      () => this.o.onChange?.(id),
+      tools => this.listed(entry, tools)
+    );
     this.entries.set(id, entry);
     return entry;
   }
 
-  /** The add's own effects, owned by the actor: the address (the exe's dialog), then the first record,
-      written only where nothing is saved. An address the exe gives that another server holds is never
-      removed here: it's that server's. */
-  private async register(r: SavedServer): Promise<SavedServer> {
-    let setup = r.setup;
-    if (setup.kind === 'remote') {
-      const address = await this.o.addresses.add({ url: setup.url, label: setup.label });
-      const other = this.sharing(setup.id, s => s.kind === 'remote' && s.address === address.id);
-      if (other) throw new Error(`Another server, ${other.label}, already uses this address. Familiar keeps one server per address.`);
-      setup = { ...setup, address: address.id };
-    }
-    const added = { ...r, setup };
-    if (!(await addServer(this.o.store, added))) throw new Error('A server with this id is already saved.');
-    return added;
-  }
-
-  /** What removing a server removes, in an order a retry can repeat. The record is deleted only if it's
-      still this incarnation's. */
-  private async forget(r: SavedServer): Promise<void> {
-    const setup = r.setup;
-    if (setup.kind === 'local') {
-      await this.o.processes.forget(setup.id);
-      for (const ref of secretRefs(setup)) await this.o.secrets.delete(ref);
-    } else if (setup.address) {
-      await this.o.addresses.remove(setup.address);
-    }
-    await deleteServer(this.o.store, setup.id, r.incarnation);
-  }
-
-  /** A changed tool list is written as a change no one waits for. What the person reviewed is kept, so a
-      changed tool shows as changed. A server removed, or whose add failed, leaves the client. */
-  private changed(id: string, e: Entry, view: ServerView): void {
-    if (view.phase === 'removed') {
-      if (this.entries.get(id) === e) this.entries.delete(id);
-    } else if (view.phase === 'ready') {
-      const before = new Map(e.actor.pendingSetup.tools.map(t => [t.name, t]));
-      const tools: SavedTool[] = view.tools.map(t => {
-        const reviewed = before.get(t.name)?.reviewed;
-        return { name: t.name, fingerprint: t.fingerprint, ...(reviewed ? { reviewed } : {}) };
-      });
-      if (JSON.stringify(tools) !== JSON.stringify(e.actor.pendingSetup.tools)) e.actor.touch(r => ({ ...r, tools }));
-    }
-    this.o.onChange?.(id);
+  /** A run's tool list is saved as the tools last seen; what the person reviewed is kept. */
+  private listed(e: ServerRuntime, now: readonly ListedTool[]): void {
+    const before = new Map(e.setup.tools.map(t => [t.name, t]));
+    const tools: SavedTool[] = now.map(t => {
+      const reviewed = before.get(t.name)?.reviewed;
+      return { name: t.name, fingerprint: t.fingerprint, ...(reviewed ? { reviewed } : {}) };
+    });
+    if (JSON.stringify(tools) !== JSON.stringify(e.setup.tools)) e.touch(r => ({ ...r, tools }));
   }
 }

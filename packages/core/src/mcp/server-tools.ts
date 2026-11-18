@@ -3,11 +3,11 @@
 // never run again after a restart, and it says which server it called. What it returns is outside
 // content: the server's word, never the person's.
 
-import type { AllowedBy, FamiliarTool, ToolStep } from '../journal/tools.ts';
+import type { FamiliarTool, ToolStep } from '../journal/tools.ts';
 import type { ToolPolicy } from '../journal/gate.ts';
 import { effectiveDescription } from './catalog.ts';
 import { sha256 } from './hash.ts';
-import type { Expect } from './machine.ts';
+import type { CardFacts, ToolDecision } from './decision.ts';
 import type { CallOutcome, ListedTool } from './types.ts';
 
 export { toolFingerprint } from './catalog.ts';
@@ -120,9 +120,13 @@ export interface ServerTool extends FamiliarTool {
   readonly setupFingerprint: string;
   /** New or changed since the person last reviewed it. */
   readonly fresh: boolean;
+  /** The facts a card shows and a decision binds to, read from the server's run now. Undefined when the
+      server isn't Ready or no longer offers this tool, or the arguments aren't plain JSON. */
+  readonly consent: { facts(args: unknown): CardFacts | undefined };
 }
 
-export type Caller = (tool: string, args: unknown, options: { signal?: AbortSignal; expect: Expect; allowedBy?: AllowedBy }) => Promise<CallOutcome>;
+/** The client's send: the only way a call reaches a server, with a gate-minted decision. */
+export type Sender = (decision: ToolDecision, signal: AbortSignal) => Promise<CallOutcome>;
 
 const MAX_DESCRIPTION = 2000;
 
@@ -132,9 +136,10 @@ export function serverTool(input: {
   modelName: string;
   setupFingerprint: string;
   fresh: boolean;
-  call: Caller;
+  facts: (args: unknown) => CardFacts | undefined;
+  send: Sender;
 }): ServerTool {
-  const { server, listed, call } = input;
+  const { server, listed, send } = input;
   const description = effectiveDescription(listed).slice(0, MAX_DESCRIPTION);
   const schema = listed.inputSchema && listed.inputSchema.type === 'object' ? listed.inputSchema : { type: 'object', properties: {} };
   return {
@@ -151,13 +156,13 @@ export function serverTool(input: {
     fingerprint: listed.fingerprint,
     setupFingerprint: input.setupFingerprint,
     fresh: input.fresh,
+    consent: { facts: input.facts },
     doing: () => `calling ${listed.name} on ${server.label}`,
-    async run(args: unknown, step: ToolStep): Promise<string> {
-      // Sent only if the server still offers exactly this tool, from the same setup: an old wrapper can't
-      // call a tool that changed under it.
-      const expect = { setup: input.setupFingerprint, tool: listed.fingerprint };
-      // How the gate let it through goes with it, and is checked again when it's sent.
-      const outcome = await call(listed.name, args, { expect, ...(step.signal ? { signal: step.signal } : {}), ...(step.allowedBy ? { allowedBy: step.allowedBy } : {}) });
+    async run(_args: unknown, step: ToolStep): Promise<string> {
+      // The call is the gate's decision, minted in this execute from the card's stored facts or a standing
+      // "always": its body is built from the decision, never from these arguments.
+      if (!step.decision) throw new Error(`No consent was given for this call, so Familiar didn't send it.`);
+      const outcome = await send(step.decision as ToolDecision, step.signal ?? new AbortController().signal);
       return outcomeText(server.label, listed.name, outcome);
     }
   };

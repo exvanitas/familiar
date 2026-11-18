@@ -11,6 +11,7 @@
 
 import type { Context } from '@earendil-works/chord/context';
 import { defineDoc, defineTool } from '@earendil-works/pi-durable';
+import { mintDecision, type CardFacts } from '../mcp/decision.ts';
 import type { JsonValue } from '../model/port.ts';
 import type { JsonSchema } from '../model/port.ts';
 
@@ -41,6 +42,8 @@ export interface ToolStep {
    * they said yes to this call (`asked`). A server tool checks it again when the call is sent.
    */
   readonly allowedBy?: AllowedBy;
+  /** For a tool bound to consent (a server's tool): the decision the gate minted for this call. */
+  readonly decision?: unknown;
   /**
    * A built-in write. `change` runs in one commit with the step's receipt, so the write is all made or
    * not made, and a rerun of the step gets the first run's value back without changing anything. Writes
@@ -63,6 +66,9 @@ export interface FamiliarTool {
   readonly readOnlyHint?: boolean;
   /** What it does, in a few plain words for the question after a restart: "saving a note". */
   doing(args: unknown): string;
+  /** Bound to consent at the call (a server's tool): the facts a card shows and a decision binds to,
+      read now. Undefined: the call can't be bound (not running, not offered, not plain JSON). */
+  readonly consent?: { facts(args: unknown): CardFacts | undefined };
   /** The text the model gets back. A throw becomes an error result. */
   run(args: unknown, step: ToolStep): Promise<string>;
 }
@@ -84,7 +90,15 @@ const ReceiptDoc = defineDoc<{ writes: any[] }>({
 export type AllowedBy = 'always' | 'asked';
 
 /** The consent gate, as the tool's own execute sees it: a reason not to run, or how the call was allowed. */
-export type Gate = (call: { readonly name: string; readonly arguments: unknown }, api: any, context: Context) => Promise<{ refused: string } | { allowedBy: AllowedBy }>;
+/** How the gate let a call through: by "always" or the person's Yes, with the card's facts for a tool
+    bound to consent, and whether the request carried outside content. */
+export interface Allowed {
+  readonly allowedBy: AllowedBy;
+  readonly facts?: CardFacts;
+  readonly outside?: boolean;
+}
+
+export type Gate = (call: { readonly name: string; readonly arguments: unknown }, api: any, context: Context) => Promise<{ refused: string } | Allowed>;
 
 export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
   return defineTool({
@@ -97,11 +111,20 @@ export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
       // write, run again) never passes `beforeTool`, so it's checked here against today's policy.
       const verdict = await gate?.({ name: tool.name, arguments: args }, api, context);
       if (verdict && 'refused' in verdict) return { isError: true, output: [{ type: 'text', text: verdict.refused }] };
+      // The gate mints here, inside the execute, from the facts it checked: a tool bound to consent gets
+      // its one-use decision, or nothing runs.
+      let decision: unknown;
+      if (tool.consent) {
+        const facts = verdict?.facts;
+        decision = facts && verdict ? mintDecision(facts, String(api.taskId), verdict.allowedBy, verdict.outside ?? true) : undefined;
+        if (!decision) return { isError: true, output: [{ type: 'text', text: 'Familiar had no consent it could bind to this exact call, so it was not sent.' }] };
+      }
       let writes = 0;
       const step: ToolStep = {
         id: String(api.taskId),
         signal: context?.abortSignal,
         ...(verdict ? { allowedBy: verdict.allowedBy } : {}),
+        ...(decision ? { decision } : {}),
         write: async (change) => {
           if (tool.kind !== 'write') throw new Error(`${tool.name} is not a built-in write, so it can't write.`);
           const index = writes++;

@@ -9,6 +9,9 @@ import { memorySettingsStore, type SettingsStore } from '../../src/settings/stor
 import { nodeWorld, type NodeWorld } from '../journal/node-env.ts';
 import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
+import { nodeNetPort } from './node-net.ts';
+import { callWithYes } from '../../src/testing/consent.ts';
+import type { ConsentCard } from '../../src/index.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
 afterEach(async () => {
@@ -18,10 +21,10 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => boolean | void; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
-  const client = await McpClient.open({ paths: testPaths, store, processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock, ...(extra.choices ? { choices: extra.choices } : {}) });
+  const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock, ...(extra.choices ? { choices: extra.choices } : {}) });
   let serverId = id;
   if (!serverId) {
     const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: testPaths });
@@ -34,7 +37,7 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
 }
 
 /** A journal over the given wrappers: the tools a turn loop holds until it's opened again. */
-async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: () => boolean | void; storeName?: string } = {}) {
+async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; storeName?: string } = {}) {
   const model = createFakeModel(script);
   const journal = await openJournal({
     store: await world.open(extra.storeName ?? 'mcp-kill'),
@@ -45,7 +48,7 @@ async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: Model
     tools,
     clock: systemClock,
     wake: { wakeAt: () => {} },
-    consent: { ask: () => Promise.resolve(extra.ask?.() ?? true) },
+    consent: { ask: (card) => Promise.resolve(extra.ask?.(card) ?? true) },
     ...(extra.policy ? { policy: extra.policy } : {}),
     presence: { report: () => {} },
     persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
@@ -91,10 +94,10 @@ describe('a server tool in the turn loop', () => {
     await two.journal.close();
   });
 
-  it('a tool changed on the running server: the gate asks again, and the old wrapper never sends (r19 #15)', async () => {
+  it('"always" runs a call only while the conversation holds no outside content; after a server result, and a changed tool, it asks, with the facts read now (G12, r19 #15)', async () => {
     const world = nodeWorld();
     const store = memorySettingsStore();
-    let asks = 0;
+    const cards: ConsentCard[] = [];
     let choices: Record<string, ToolChoice> = {};
     const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
     const script = (r: ModelRequest): FakeReply => {
@@ -102,54 +105,45 @@ describe('a server tool in the turn loop', () => {
       if (last?.role === 'tool') return { text: 'Done.' };
       return { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'Fake_server__echo', arguments: { text: 'hi' } }] };
     };
-    let client!: McpClient;
     // The gate's policy comes from the wrappers the turn loop holds, each by its own identity.
     let held: ServerTool[] = [];
     const policy = () => ({ perTool: toolPolicies(held, choices) });
-    // The client reads the same choices again at the send.
-    const one = await life(world, store, undefined, script, { policy, ask: () => { asks++; }, storeName: 'mcp-consent', choices: () => choices });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-consent', choices: () => choices });
     held = one.tools;
-    client = one.client;
+    const client: McpClient = one.client;
     const echo = client.tools().find(t => t.serverName === 'echo')!;
     choices = { [choiceKey(echo.server.id, 'echo')]: { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
 
-    // "Always": it runs without asking.
+    // "Always", and nothing outside in the conversation yet: it runs without asking.
     const t1 = await one.journal.send('Echo something.', 'turn-1');
     if (!t1.replied) throw new Error('not replied');
     await one.journal.turn(t1.turn.id).wait();
-    expect(asks).toBe(0);
+    expect(cards).toEqual([]);
     expect(echoCalls(one.port)).toBe(1);
 
     // The server changes echo while it runs.
-    await client.call(one.serverId, 'set_variant', { variant: 'b' });
+    await callWithYes(client, one.serverId, 'set_variant', { variant: 'b' });
     for (let i = 0; i < 200 && client.tools().find(t => t.serverName === 'echo')!.fingerprint === echo.fingerprint; i++) await sleep(10);
+    const changed = client.tools().find(t => t.serverName === 'echo')!;
 
-    // The same turn loop, with the old wrapper: its "always" was for exactly that wrapper, so the gate
-    // doesn't ask, but the actor refuses it before sending, since the server no longer offers it.
+    // The conversation now holds the server's result: "always" doesn't apply, the card offers no Always,
+    // and it shows the tool as the server offers it now.
     const t2 = await one.journal.send('Echo something again.', 'turn-2');
     if (!t2.replied) throw new Error('not replied');
     await one.journal.turn(t2.turn.id).wait();
-    expect(echoCalls(one.port)).toBe(1);
-    expect(JSON.stringify(await one.journal.transcript())).toMatch(/echo changed since it was offered, so Familiar didn't send the call/);
-    await one.journal.close();
-
-    // A turn loop given the current wrappers: the changed echo has no "always", so the gate asks again,
-    // and once the person says yes it's sent.
-    held = client.tools();
-    const two = await turnLoop(world, held, script, { policy, ask: () => { asks++; }, storeName: 'mcp-consent-2' });
-    const t3 = await two.journal.send('Echo something once more.', 'turn-3');
-    if (!t3.replied) throw new Error('not replied');
-    await two.journal.turn(t3.turn.id).wait();
-    expect(asks).toBe(1);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.always).toBe(false);
+    expect(cards[0]!.facts).toMatchObject({ server: one.serverId, tool: 'echo', fingerprint: changed.fingerprint });
+    expect(cards[0]!.presentation).toMatch(/^[0-9a-z]+$/);
     expect(echoCalls(one.port)).toBe(2);
-    await two.journal.close();
+    await one.journal.close();
   });
 
   it("r20 #1: a turn's saved wrapper from z is never allowed by a's \"always\", whatever names the servers have now", async () => {
     const world = nodeWorld();
     const port = nodeProcessPort();
     cleanups.push(() => port.closeAll());
-    const client = await McpClient.open({ paths: testPaths, store: memorySettingsStore(), processes: port, fetchFor: () => fetch, addresses: { add: async () => ({ id: 'x' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
+    const client = await McpClient.open({ paths: testPaths, store: memorySettingsStore(), processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'x' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
     const add = async (id: string) => {
       const { drafts } = parsePaste(JSON.stringify({ mcpServers: { Same: { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => id, defaultCwd: REPO, paths: testPaths });
       await client.add(drafts[0]!);

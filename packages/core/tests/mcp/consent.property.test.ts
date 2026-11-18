@@ -45,7 +45,8 @@ function run(seed: number, build: PolicyBuilder): string[] {
       modelName: names.get(s.id)!.get(name)!,
       setupFingerprint: s.setup,
       fresh: false,
-      call: async () => ({ kind: 'result', text: '', isError: false })
+      facts: () => undefined,
+      send: async () => ({ kind: 'result', text: '', isError: false })
     })));
   };
   const turns: ServerTool[][] = [wrappers(ready)];

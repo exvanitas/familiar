@@ -22,17 +22,11 @@ const ALLOWED_ENTRIES: readonly string[] = [
   '@earendil-works/chord/context',
   '@earendil-works/pi-ai/models',
   '@earendil-works/pi-ai/utils/event-stream',
-  '@earendil-works/pi-ai/utils/transcript',
-  // The MCP SDK's client parts. tests/mcp/bundle.test.ts bundles them for the browser and finds no Node.
-  '@modelcontextprotocol/sdk/client/index.js',
-  '@modelcontextprotocol/sdk/client/streamableHttp.js',
-  '@modelcontextprotocol/sdk/shared/transport.js',
-  '@modelcontextprotocol/sdk/types.js',
-  '@modelcontextprotocol/sdk/validation/types.js'
+  '@earendil-works/pi-ai/utils/transcript'
 ];
-// Pinned exactly: pi-durable calls itself experimental, with API changes between releases, and the MCP SDK
-// is what speaks to every server.
-const PINNED = ['@earendil-works/pi-durable', '@earendil-works/pi-ai', '@earendil-works/chord', '@modelcontextprotocol/sdk'];
+// Pinned exactly: pi-durable calls itself experimental, with API changes between releases. No MCP SDK:
+// Familiar's own client speaks to every server (mcp/wire/).
+const PINNED = ['@earendil-works/pi-durable', '@earendil-works/pi-ai', '@earendil-works/chord'];
 
 function files(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((d) =>

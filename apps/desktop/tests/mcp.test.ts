@@ -64,8 +64,8 @@ describe('the desktop ports', () => {
       addressRemove: async (id: string) => { calls.push(['addressRemove', id]); },
       secretDelete: async (ref: string) => { calls.push(['secretDelete', ref]); },
       netFetch: async (spec: NetSpec) => { calls.push(['netFetch', spec]); return { status: 204, statusText: '', headers: [], url: spec.url, redirected: false }; },
-      netRead: async () => new Uint8Array(0),
-      netCancel: async () => {}
+      netRead: async (id: string) => { calls.push(['netRead', id]); return new Uint8Array(0); },
+      netCancel: async (id: string) => { calls.push(['netCancel', id]); }
     } as unknown as Shell;
     return { shell, calls };
   }
@@ -92,9 +92,12 @@ describe('the desktop ports', () => {
     expect(await ports.addresses.add({ url: 'https://mcp.example.test/mcp', label: 'R' })).toEqual({ id: 'a1' });
     await ports.addresses.remove('a1');
     await ports.secrets.delete('server:s1:T');
-    await ports.fetchFor('a1')('https://mcp.example.test/mcp', { method: 'POST', body: '{}' });
+    await ports.net.fetch({ id: 'r1', address: 'a1', url: 'https://mcp.example.test/mcp', method: 'POST', headers: [['content-type', 'application/json']], idleMs: SERVER_IDLE_MS }, new TextEncoder().encode('{}'));
+    await ports.net.read('r1');
+    await ports.net.cancel('r1');
     const spec = calls.find(c => c[0] === 'netFetch')![1] as NetSpec;
-    expect(spec).toMatchObject({ address: 'a1', url: 'https://mcp.example.test/mcp', idleMs: SERVER_IDLE_MS });
+    expect(spec).toMatchObject({ id: 'r1', address: 'a1', url: 'https://mcp.example.test/mcp', idleMs: SERVER_IDLE_MS });
+    expect(calls.filter(c => c[0] === 'netRead' || c[0] === 'netCancel').map(c => c[0])).toEqual(['netRead', 'netCancel']);
     expect(calls.slice(0, 3)).toEqual([['addressAdd', { kind: 'server', url: 'https://mcp.example.test/mcp', label: 'R' }], ['addressRemove', 'a1'], ['secretDelete', 'server:s1:T']]);
     expect('secretSet' in ports.secrets).toBe(false);
   });

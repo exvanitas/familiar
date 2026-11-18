@@ -2,7 +2,6 @@
 // bytes, every name once. The walk is iterative and stops at the first bound, so a list built to exhaust
 // the stack or the CPU fails as a plain failure instead. Then each tool gets its fingerprint.
 
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { canonicalJson, sha256 } from './hash.ts';
 import type { Failure, ListedTool } from './types.ts';
 
@@ -52,7 +51,12 @@ function boundedShape(value: unknown): 'ok' | 'depth' | 'nodes' {
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 
 /** The whole list, checked and fingerprinted, or a CatalogError. */
-export function checkTools(raw: readonly Tool[]): ListedTool[] {
+/** A tool as a server's list gives it, unchecked. */
+const readOnly = (a: unknown) => (a !== null && typeof a === 'object' ? (a as { readOnlyHint?: unknown }).readOnlyHint : undefined);
+
+export type RawTool = Readonly<Record<string, unknown>> & { readonly name?: unknown };
+
+export function checkTools(raw: readonly RawTool[]): ListedTool[] {
   if (raw.length > MAX_TOOLS) throw new CatalogError(`The server lists ${raw.length} tools. Familiar takes at most ${MAX_TOOLS}.`);
   const seen = new Set<string>();
   let total = 0;
@@ -61,6 +65,7 @@ export function checkTools(raw: readonly Tool[]): ListedTool[] {
     if (typeof t.name !== 'string' || t.name.length === 0 || t.name.length > MAX_TOOL_NAME) throw new CatalogError(`The server lists a tool with a name Familiar can't use.`);
     if (seen.has(t.name)) throw new CatalogError(`The server lists two tools named ${t.name.slice(0, 64)}, so Familiar can't tell them apart.`);
     seen.add(t.name);
+    if (t.inputSchema === null || typeof t.inputSchema !== 'object' || Array.isArray(t.inputSchema)) throw new CatalogError(`The tool ${t.name.slice(0, 64)} has no input schema object.`);
     const shape = boundedShape(t.inputSchema);
     if (shape !== 'ok') throw new CatalogError(`The tool ${t.name.slice(0, 64)} has inputs ${shape === 'depth' ? `nested deeper than ${MAX_SCHEMA_DEPTH} levels` : `with more than ${MAX_SCHEMA_NODES} parts`}, more than Familiar takes.`);
     const tool: Omit<ListedTool, 'fingerprint'> = {
@@ -68,7 +73,7 @@ export function checkTools(raw: readonly Tool[]): ListedTool[] {
       ...(typeof t.title === 'string' ? { title: t.title } : {}),
       ...(typeof t.description === 'string' ? { description: t.description } : {}),
       inputSchema: (t.inputSchema ?? {}) as Record<string, unknown>,
-      ...(t.annotations?.readOnlyHint !== undefined ? { readOnlyHint: t.annotations.readOnlyHint === true } : {})
+      ...(readOnly(t.annotations) !== undefined ? { readOnlyHint: readOnly(t.annotations) === true } : {})
     };
     const size = bytes(canonicalJson(tool));
     if (size > MAX_TOOL_BYTES) throw new CatalogError(`The tool ${t.name.slice(0, 64)} is described in ${size} bytes. Familiar takes at most ${MAX_TOOL_BYTES} for one tool.`);

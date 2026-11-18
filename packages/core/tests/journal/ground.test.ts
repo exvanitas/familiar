@@ -320,3 +320,69 @@ describe('2.1: her line', () => {
 });
 
 void idle;
+
+/* ---------- 5.6: the outside record, and "always" ---------- */
+
+describe('5.6 and G12: "always" never acts on outside content, her remark included (T9)', () => {
+  async function run(sources: string[]) {
+    const { IDBFactory } = await import('fake-indexeddb');
+    const { openJournal, openJournalStore, decideByRules } = await import('../../src/index.ts');
+    const { createFakeModel } = await import('../../src/testing/index.ts');
+    const { memoryOwner } = await import('./node-env.ts');
+    const { sha256 } = await import('../../src/mcp/hash.ts');
+    const cards: any[] = [];
+    const ran: unknown[] = [];
+    const tool = {
+      name: 'srv__look',
+      description: 'A server tool.',
+      inputSchema: { type: 'object', properties: {} },
+      kind: 'server' as const,
+      doing: () => 'looking on the server',
+      consent: { facts: () => ({ server: 'srv', tool: 'look', run: 'r1', launch: 'L', fingerprint: 'F', canonical: '{}', hash: sha256('{}') }) },
+      run: async (_a: unknown, step: any) => {
+        ran.push(step.decision);
+        return 'looked';
+      }
+    };
+    const model = createFakeModel((r: ModelRequest) => (r.system === 'One line.' ? { text: 'I saw the forecast.' } : r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { toolCalls: [{ id: 'c1', name: 'srv__look', arguments: {} }] }));
+    const journal = await openJournal({
+      store: await openJournalStore(`t9-${Math.random()}`, { indexedDB: new IDBFactory() as any }),
+      owner: memoryOwner(),
+      model,
+      modelId: 'fake-1',
+      caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
+      tools: [tool as any],
+      policy: () => ({ perTool: { srv__look: 'allow' } }),
+      wake: { wakeAt: () => {} },
+      notifier: { notify: () => {} },
+      consent: { ask: async (card) => { cards.push(card); return true; } },
+      presence: { report: () => {} },
+      persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
+      decider: { decide: async (event, context) => decideByRules(event, context) },
+      ambient: () => ({ persona: { sketch: 'kind', interests: [] }, chattiness: 'medium', doNotDisturb: false, fullscreen: false, sentAway: false, chatInFront: true, teaserDue: false }),
+      resendDelayMs: 50
+    });
+    expect(await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say something.' }], sources })).toMatchObject({ visible: true });
+    const t = await journal.send('Look it up.', 'a');
+    if (t.replied) await t.turn.wait();
+    const outside: any = await journal.read(OutsideDoc);
+    await journal.close();
+    return { cards, ran, outside };
+  }
+
+  it('a remark made from a server result carries its source: the next request is outside, "always" asks, and the card offers no Always', async () => {
+    const r = await run(['server:weather']);
+    expect(r.cards).toHaveLength(1);
+    expect(r.cards[0]).toMatchObject({ always: false, facts: { server: 'srv', tool: 'look' } });
+    expect(r.ran).toHaveLength(1);
+    expect(r.ran[0]).toMatchObject({ by: 'asked', outside: true });
+    // The turn's requests have outside records naming the remark's source.
+    expect(Object.entries(r.outside.requests).filter(([k, v]: [string, any]) => k.startsWith('request:') && v.sources.includes('server:weather')).length).toBeGreaterThan(0);
+  });
+
+  it('the control: the same remark without sources leaves the conversation inside, and "always" runs it without asking', async () => {
+    const r = await run([]);
+    expect(r.cards).toEqual([]);
+    expect(r.ran[0]).toMatchObject({ by: 'always', outside: false });
+  });
+});

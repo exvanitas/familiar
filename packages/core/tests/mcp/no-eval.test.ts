@@ -1,5 +1,5 @@
-// The MCP client with code generation from strings off, as under the app's CSP: the SDK's schema checker
-// (Ajv) is replaced, and zod's probe for eval must fall back. A child Node runs no-eval-run.ts with
+// The MCP client with code generation from strings off, as under the app's CSP. With the SDK gone nothing
+// compiles a schema; this keeps the client honest about that. A child Node runs no-eval-run.ts with
 // --disallow-code-generation-from-strings. The runner's proc-mcp checks run the same client in the real
 // core page under the real CSP.
 import { execFile } from 'node:child_process';
@@ -19,8 +19,7 @@ describe('the MCP client with eval off', () => {
     expect(r.tools).toHaveLength(10);
     expect(r.echo).toEqual({ kind: 'result', text: 'no eval', isError: false });
     expect(r.fail).toMatchObject({ kind: 'result', isError: true });
-    expect(r.unknown).toMatchObject({ kind: 'error', reason: 'protocol' });
-    // A tool with an output schema lists and answers: nothing compiles code from its schema.
-    expect(r.structured).toEqual(['count', JSON.stringify({ kind: 'result', text: '{"n":3}', isError: false })]);
+    // A tool the server doesn't offer is never sent.
+    expect(r.unknown).toMatchObject({ kind: 'error' });
   });
 });

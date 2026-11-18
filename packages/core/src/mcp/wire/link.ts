@@ -99,6 +99,11 @@ interface Run {
   /** Re-handshakes since the last exchange that completed without a 404. */
   dropped: number;
   readonly last: LastOutput;
+  /** Why the run ended, once it has. */
+  failure?: Failure;
+  /** Resolves when the run has ended. */
+  readonly over: Promise<void>;
+  finish: () => void;
 }
 
 /** Per exchange: its waiter, and what the natives hold for it. */
@@ -154,7 +159,7 @@ export class ServerLink {
     return r && !r.ended ? { run: r.id, era: r.era, ready: r.ready, stale: r.stale, tools: r.tools, launch: r.launch, ...(r.sessionId ? { sessionId: r.sessionId } : {}), ...(r.version ? { version: r.version } : {}) } : undefined;
   }
   /** Resolves when the slot is next Idle. */
-  whenIdle(): Promise<void> {
+  drained(): Promise<void> {
     if (!this.busy) return Promise.resolve();
     return new Promise((r) => this.idle.push(r));
   }
@@ -168,7 +173,9 @@ export class ServerLink {
    */
   async start(target: Target, launch: string): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure }> {
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: 'legacy', tools: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput() };
+    let finish!: () => void;
+    const over = new Promise<void>((r) => (finish = r));
+    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: 'legacy', tools: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish };
     this.run = run;
     if (target.where === 'local') {
       const processes = this.ports.processes!;
@@ -209,10 +216,11 @@ export class ServerLink {
   async stop(): Promise<void> {
     const run = this.run;
     if (!run || run.ended) return;
-    const ex = this.slot.ex;
-    if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'stopped' } });
+    // The run's end answers a call in flight "interrupted, it may have partly run" (3.11).
     if (run.target.where === 'local' && run.process !== undefined) {
+      // Waits for the exe's answer and the exit, with no deadline of its own (5.4).
       await this.ports.processes!.stop(run.process).catch(() => {});
+      await run.over;
       return;
     }
     this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
@@ -359,7 +367,7 @@ export class ServerLink {
 
   /** One administrative exchange: waits for the slot to be Idle first (the walk's own pages, the handshake). */
   private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string): Promise<Outcome> {
-    await this.whenIdle();
+    await this.drained();
     if (run.ended) return { end: { t: 'run-ended' } };
     return this.exchangeNow(run, kind, requestId, body) ?? { end: { t: 'native', kind: 'busy' } };
   }
@@ -614,7 +622,7 @@ export class ServerLink {
     if (m.method === 'notifications/tools/list_changed' && run.era === 'legacy') {
       run.stale = true;
       // Idle: walk now; otherwise after the exchange that carried it.
-      if (run.ready) void this.whenIdle().then(() => (run.ended || !run.stale ? undefined : this.list()));
+      if (run.ready) void this.drained().then(() => (run.ended || !run.stale ? undefined : this.list()));
     }
     return false;
   }
@@ -653,7 +661,7 @@ export class ServerLink {
         if (ex && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'timeout' } });
       }, this.limits.startMs, { background: false });
       try {
-        await this.whenIdle();
+        await this.drained();
         const failure = run.ended ? undefined : await this.handshake(run, () => expired);
         if (run.ended) return;
         if (failure) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
@@ -674,6 +682,8 @@ export class ServerLink {
     if (run.ended) return;
     run.ended = true;
     run.ready = false;
+    run.failure = failure;
+    run.finish();
     const ex = this.slot.ex;
     if (ex && this.pending.get(ex.n)?.run === run) {
       if (ex.phase === 'live') this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
@@ -689,7 +699,7 @@ export class ServerLink {
   }
 
   private startWords(run: Run, end: End): Failure {
-    if (end.t === 'run-ended') return run.target.where === 'local' ? protocolFailure(run.last.text()) : { kind: 'exited', words: 'The connection to the server closed.' };
+    if (end.t === 'run-ended') return run.failure ?? (run.target.where === 'local' ? protocolFailure(run.last.text()) : { kind: 'exited', words: 'The connection to the server closed.' });
     if (end.t === 'timeout') return { kind: 'timed-out', words: "The server didn't finish starting in time." };
     if (end.t === 'native') return remoteFailure({ kind: end.kind });
     if (end.t === 'http') return remoteFailure({ code: end.status });

@@ -185,7 +185,7 @@ describe('3.3 to 3.8: the link, remote', () => {
     expect(net.log[0]!.headers['x-team']).toBe('blue');
     expect(net.log[1]!.headers).toMatchObject({ 'mcp-session-id': 'S1', 'mcp-protocol-version': '2025-11-25', accept: 'application/json, text/event-stream' });
     expect(net.log.every((x) => x.cancelled)).toBe(true);
-    await link.whenIdle();
+    await link.drained();
     const out = await link.handoff('look', '{"q":1}', new AbortController().signal, 5000);
     expect(out).toEqual({ kind: 'result', text: 'ran look', isError: false });
     expect(net.log.at(-1)!.body).toEqual({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'look', arguments: { q: 1 } } });
@@ -195,10 +195,10 @@ describe('3.3 to 3.8: the link, remote', () => {
     const net = remoteServer((body) => (body.method === 'tools/call' ? { status: 200, headers: [['content-type', 'text/event-stream']], chunks: [`data: ${JSON.stringify({ jsonrpc: '2.0', id: 'ping-1', method: 'ping' })}\n\ndata: ${JSON.stringify(textResult(body.id, 'ok'))}\n\n`] } : undefined));
     const link = new ServerLink('srv', { net: net.port }, realClock, ended);
     await link.start(remote, 'L1');
-    await link.whenIdle();
+    await link.drained();
     const out = await link.handoff('look', '{}', new AbortController().signal, 5000);
     expect(out).toMatchObject({ kind: 'result', text: 'ok' });
-    await link.whenIdle();
+    await link.drained();
     const pong = net.log.find((x) => x.body.id === 'ping-1' && 'result' in x.body);
     expect(pong?.body).toEqual({ jsonrpc: '2.0', id: 'ping-1', result: {} });
     expect(net.log.indexOf(pong!)).toBeGreaterThan(net.log.findIndex((x) => x.body.method === 'tools/call'));
@@ -211,7 +211,7 @@ describe('3.3 to 3.8: the link, remote', () => {
     const slow = { ...net.port, read: async (id: string) => { await held; return net.port.read(id); } };
     const link = new ServerLink('srv', { net: net.port }, realClock, ended);
     await link.start(remote, 'L1');
-    await link.whenIdle();
+    await link.drained();
     (link as any).ports = { net: slow };
     const first = link.handoff('look', '{}', new AbortController().signal, 5000);
     const sent = net.log.length;
@@ -226,13 +226,13 @@ describe('3.3 to 3.8: the link, remote', () => {
     const never = { ...net.port, read: async (id: string) => (net.log.find((x) => x.id === id)?.body.method === 'tools/call' ? new Promise<Uint8Array>(() => {}) : net.port.read(id)) };
     const link = new ServerLink('srv', { net: never }, realClock, ended);
     await link.start(remote, 'L1');
-    await link.whenIdle();
+    await link.drained();
     const stop = new AbortController();
     const out = link.handoff('look', '{}', stop.signal, 5000)!;
     await sleep(10);
     stop.abort();
     expect(await out).toEqual({ kind: 'stopped' });
-    await link.whenIdle();
+    await link.drained();
     expect(link.current?.ready).toBe(true);
     expect(net.log.at(-1)!.cancelled).toBe(true);
   });
@@ -254,14 +254,14 @@ describe('3.3 to 3.8: the link, remote', () => {
     });
     const link = new ServerLink('srv', { net: net.port }, realClock, ended);
     await link.start(remote, 'L1');
-    await link.whenIdle();
+    await link.drained();
     const out = await link.handoff('look', '{"x":1}', new AbortController().signal, 5000);
     expect(out).toMatchObject({ kind: 'error', words: expect.stringMatching(/ended its session/) });
     for (let i = 0; i < 100 && !link.current?.ready; i++) await sleep(5);
     const after = net.log.slice(net.log.findIndex((x) => x.body.method === 'tools/call') + 1).map((x) => [x.body.method, x.headers['mcp-session-id'] ?? null]);
     expect(after).toEqual([['initialize', null], ['notifications/initialized', 'S2'], ['tools/list', 'S2']]);
     expect(net.log.filter((x) => x.body.method === 'tools/call')).toHaveLength(1);
-    await link.whenIdle();
+    await link.drained();
     expect(await link.handoff('look', '{"x":1}', new AbortController().signal, 5000)).toMatchObject({ kind: 'result' });
   });
 
@@ -277,7 +277,7 @@ describe('3.3 to 3.8: the link, remote', () => {
     });
     const link = new ServerLink('srv', { net: net.port }, realClock, { ended: (_r, f) => endedRuns.push(f.words) });
     await link.start(remote, 'L1');
-    await link.whenIdle();
+    await link.drained();
     await link.handoff('look', '{}', new AbortController().signal, 5000);
     for (let i = 0; i < 100 && endedRuns.length === 0; i++) await sleep(5);
     expect(endedRuns).toEqual(['The server ended its session.']);
@@ -295,7 +295,7 @@ describe('3.3 to 3.8: the link, remote', () => {
       const net = remoteServer((body) => (body.method === 'tools/call' ? answer : undefined));
       const link = new ServerLink('srv', { net: net.port }, realClock, ended);
       await link.start(remote, 'L1');
-      await link.whenIdle();
+      await link.drained();
       const out = await link.handoff('look', '{}', new AbortController().signal, 5000);
       if (words === 'interrupted') expect(out).toEqual({ kind: 'interrupted' });
       else expect((out as any).words).toMatch(words as RegExp);
@@ -331,7 +331,7 @@ describe('3.9: the link, local', () => {
     const p = localServer();
     const link = new ServerLink('srv', { processes: p.port }, realClock, ended);
     expect(await link.start(local, 'L1')).toMatchObject({ ok: true });
-    await link.whenIdle();
+    await link.drained();
     expect(await link.handoff('look', '{}', new AbortController().signal, 5000)).toMatchObject({ kind: 'result', text: 'ran' });
     expect(p.writes.map((w) => w.method)).toEqual(['initialize', 'notifications/initialized', 'tools/list', 'tools/call']);
   });
@@ -341,7 +341,7 @@ describe('3.9: the link, local', () => {
     const p = localServer((msg) => (msg.method === 'tools/call' ? ((callId = msg.id), []) : undefined));
     const link = new ServerLink('srv', { processes: p.port }, realClock, ended);
     await link.start(local, 'L1');
-    await link.whenIdle();
+    await link.drained();
     const stop = new AbortController();
     const out = link.handoff('look', '{}', stop.signal, 5000)!;
     await sleep(5);
@@ -349,7 +349,7 @@ describe('3.9: the link, local', () => {
     expect(await out).toEqual({ kind: 'stopped' });
     expect(p.writes.at(-1)).toMatchObject({ method: 'notifications/cancelled', params: { requestId: callId } });
     p.emit({ t: 'out', line: JSON.stringify(textResult(callId, 'late')) });
-    await link.whenIdle();
+    await link.drained();
     expect(link.current?.ready).toBe(true);
   });
 
@@ -357,11 +357,11 @@ describe('3.9: the link, local', () => {
     const p = localServer((msg) => (msg.method === 'tools/call' ? [{ t: 'err', line: 'a stdout line over 4 MiB was dropped' }] : undefined));
     const link = new ServerLink('srv', { processes: p.port }, realClock, ended);
     await link.start(local, 'L1');
-    await link.whenIdle();
+    await link.drained();
     p.emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', id: 'i1', method: 'ping' }) });
     await sleep(5);
     expect(p.writes.at(-1)).toEqual({ jsonrpc: '2.0', id: 'i1', result: {} });
-    await link.whenIdle();
+    await link.drained();
     expect(link.busy).toBe(false);
     expect(await link.handoff('look', '{}', new AbortController().signal, 5000)).toMatchObject({ kind: 'error', words: 'The server sent a line too long.' });
   });
@@ -371,13 +371,13 @@ describe('3.9: the link, local', () => {
     const p = localServer((msg) => (msg.method === 'tools/call' ? [] : undefined));
     const link = new ServerLink('srv', { processes: p.port }, realClock, { ended: (_r, f) => ends.push(f.kind) });
     await link.start(local, 'L1');
-    await link.whenIdle();
+    await link.drained();
     const out = link.handoff('look', '{}', new AbortController().signal, 5000)!;
     await sleep(5);
     p.exit(1);
     expect(await out).toEqual({ kind: 'interrupted' });
     expect(ends).toEqual(['exited']);
-    await link.whenIdle();
+    await link.drained();
     expect(link.current).toBeUndefined();
   });
 
@@ -385,9 +385,9 @@ describe('3.9: the link, local', () => {
     const p = localServer((msg) => (msg.method === 'tools/call' ? [] : undefined));
     const link = new ServerLink('srv', { processes: p.port }, realClock, ended);
     await link.start(local, 'L1');
-    await link.whenIdle();
+    await link.drained();
     expect(await link.handoff('look', '{}', new AbortController().signal, 20)).toEqual({ kind: 'timed-out' });
-    await link.whenIdle();
+    await link.drained();
     expect(link.current?.ready).toBe(true);
   });
 });

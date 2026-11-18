@@ -24,6 +24,7 @@
      detail its mark in security-inventory.json expects. The gate reports that as KNOWN GAP in everyday
      runs and fails a release; any other failure of this check fails every run. */
 import { gateFor, McpClient, openSettingsStore, parsePaste, systemClock, toolPolicies, choiceKey, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
+import { callWithYes, runWithYes, yesFor } from '@familiar/core/testing';
 import { desktopMcpPorts } from '../src/mcp.ts';
 import { reason } from '../src/shell.ts';
 import { check, fail, ok, rand, shell, sleep, step, until } from './common.ts';
@@ -32,7 +33,8 @@ import { dialog, START, type Ctx, type Paths } from './procs.ts';
 interface Typed { head: string; tail: string; length: number }
 
 const noWrites: ToolStep = { id: 'mcp-check', write: async () => fail('a server tool made a built-in write') };
-const run = (t: ServerTool | undefined, args: object) => (t ? t.run(args, noWrites) : Promise.reject(new Error('no such tool')));
+// Each call goes through `send` with a decision, as the journal's gate would mint after a Yes.
+const run = (t: ServerTool | undefined, args: object) => (t ? runWithYes(t, args, noWrites) : Promise.reject(new Error('no such tool')));
 const TOOLS = 10;
 /** The detail security.mcp.secret-json-escaped fails with while its known gap is open, as its mark in
     security-inventory.json expects. */
@@ -51,7 +53,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
       ports.processes.start(setup, e => { if (e.t !== 'exit') heard.push(e.line); onEvent(e); }),
     write: (r: string, bytes: Uint8Array) => { written.push(new TextDecoder().decode(bytes)); return ports.processes.write(r, bytes); }
   };
-  const client = await McpClient.open({ store, ...ports, processes, clock: systemClock, limits: { backoffMs: 200 } });
+  const client = await McpClient.open({ store, ...ports, processes, clock: systemClock });
   const sent = (tool: string) => written.filter(l => l.includes('"tools/call"') && l.includes(`"name":"${tool}"`)).length;
   const cancels = () => written.filter(l => l.includes('notifications/cancelled')).length;
   const tool = (name: string) => client.tools().find(t => t.serverName === name);
@@ -121,7 +123,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const text = await run(tool('echo'), { text: 'hello' });
     ok(text.startsWith('[Outside content: what the MCP server "Fake server" returned from echo.') && text.endsWith('\nhello'), 'echo: ' + text.slice(0, 120));
     const stop = new AbortController();
-    const slow = client.call(id, 'slow', { ms: 30_000 }, { signal: stop.signal });
+    const slow = callWithYes(client, id, 'slow', { ms: 30_000 }, stop.signal);
     await until(() => sent('slow') === 1, 10_000, 'the slow call to be sent');
     const t0 = Date.now();
     stop.abort();
@@ -130,37 +132,43 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(stopped.kind === 'stopped' && stopMs < 500, `Stop: ${stopped.kind} in ${stopMs} ms`);
     await until(() => cancels() === 1, 5000, 'the cancellation after Stop');
     const t1 = Date.now();
-    const late = await client.call(id, 'slow', { ms: 30_000 }, { ms: 1000 });
+    await client.setLimits(id, { callMs: 1000 });
+    const late = await callWithYes(client, id, 'slow', { ms: 30_000 });
     const lateMs = Date.now() - t1;
+    await client.setLimits(id, {});
     ok(late.kind === 'timed-out' && lateMs < 2500, `a 1 s deadline: ${late.kind} in ${lateMs} ms`);
     await until(() => cancels() === 2, 5000, 'the cancellation after the deadline');
     // A call stopped before it was made writes nothing at all.
     const before = written.length;
     const already = new AbortController();
     already.abort();
-    const never = await client.call(id, 'add_note', { text: 'never' }, { signal: already.signal });
+    const never = await callWithYes(client, id, 'add_note', { text: 'never' }, already.signal);
     await sleep(300);
     ok(never.kind === 'stopped' && written.length === before, `a call already stopped: ${never.kind}, ${written.length - before} lines written`);
-    const after = await client.call(id, 'echo', { text: 'still here' });
+    const after = await callWithYes(client, id, 'echo', { text: 'still here' });
     ok(after.kind === 'result' && after.text === 'still here', 'after: ' + JSON.stringify(after));
     return `echo marked as outside content; Stop answered in ${stopMs} ms and a 1 s deadline in ${lateMs} ms, each sending notifications/cancelled; a call already stopped wrote nothing; the server answered after`;
   });
 
   await check('security.mcp.crash-mid-call', async () => {
     need();
-    const crashed = await client.call(id, 'crash', {});
+    const crashed = await callWithYes(client, id, 'crash', {});
     ok(crashed.kind === 'interrupted', 'the crash: ' + JSON.stringify(crashed));
-    // Approved, so the restart needs no dialog: an open one would hold it in Starting.
-    await until(() => client.get(id)?.phase === 'ready', 20_000, 'the restart');
+    // No automatic restart: Failed, with its last output, until the person presses Start. Approved, so the
+    // start needs no dialog: an open one would hold it in Starting.
+    await until(() => client.get(id)?.phase === 'failed', 20_000, 'Failed after the crash');
+    const restarted = client.start(id);
     const d = await dialog('none', START);
-    ok(!d.shown, 'the restart asked');
-    const after = await client.call(id, 'echo', { text: 'after the crash' });
+    ok(!d.shown, 'the start after the crash asked');
+    ok((await restarted).kind === 'ready', 'the start after the crash');
+    const after = await callWithYes(client, id, 'echo', { text: 'after the crash' });
     ok(after.kind === 'result' && after.text === 'after the crash', 'after: ' + JSON.stringify(after));
     ok(sent('crash') === 1, `crash was sent ${sent('crash')} times`);
     const words = await run(tool('crash'), {}).then(() => 'ran', (e: Error) => e.message);
     ok(/may have partly run\. Familiar did not send it again/.test(words), 'the model would read: ' + words);
-    await until(() => client.get(id)?.phase === 'ready', 20_000, 'the second restart');
-    return 'the crash was answered interrupted and sent once; the approved setup restarted with no dialog and answered';
+    await until(() => client.get(id)?.phase === 'failed', 20_000, 'Failed after the second crash');
+    ok((await client.start(id)).kind === 'ready', 'the start after the second crash');
+    return 'the crash was answered interrupted and sent once; the server stayed Failed until Start, which asked nothing, and answered';
   });
 
   await check('security.mcp.changed-tool', async () => {
@@ -170,8 +178,10 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const gate = (tools: ServerTool[], t: ServerTool) => gateFor(t.name, t, { perTool: toolPolicies(tools, always) });
     ok(before.every(t => gate(before, t) === 'allow'), '"always" did not hold before the change');
     const oldEcho = before.find(t => t.serverName === 'echo')!;
+    // A Yes given before the change, sent after it.
+    const oldYes = yesFor(client, id, 'echo', { text: 'old' })!;
     // The running server changes echo, and says its tools changed. Same setup, no new start.
-    const switched = await client.call(id, 'set_variant', { variant: 'b' });
+    const switched = await callWithYes(client, id, 'set_variant', { variant: 'b' });
     ok(switched.kind === 'result', 'set_variant: ' + JSON.stringify(switched));
     await until(() => tool('echo')?.fingerprint !== oldEcho.fingerprint, 10_000, 'the new tool list');
     const after = client.tools();
@@ -180,18 +190,18 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(gate(after, newEcho) === 'ask', 'the changed echo did not go back to ask: ' + gate(after, newEcho));
     const others = after.filter(t => t.serverName !== 'echo');
     ok(others.every(t => gate(after, t) === 'allow'), 'another tool lost its "always"');
-    // The wrapper made before the change can't send; the new one can.
+    // The Yes given before the change can't send; a new one can.
     const echoes = sent('echo');
-    const old = await run(oldEcho, { text: 'old' }).then(() => 'ran', (e: Error) => e.message);
-    ok(/changed since it was offered, so Familiar didn't send the call/.test(old) && sent('echo') === echoes, `the old wrapper: ${old}; echo sent ${sent('echo') - echoes} more times`);
+    const old = await client.send(oldYes, new AbortController().signal);
+    ok(old.kind === 'error' && /tool changed since it was allowed/.test(old.words) && sent('echo') === echoes, `the old Yes: ${JSON.stringify(old)}; echo sent ${sent('echo') - echoes} more times`);
     const fresh = await run(newEcho, { text: 'quiet' });
     ok(fresh.endsWith('\nQUIET'), 'the new wrapper: ' + fresh.slice(-40));
-    return `echo changed on the running server: through the gate it asks again while the other ${others.length} tools keep "always"; the old wrapper was refused before sending; the new one answered`;
+    return `echo changed on the running server: through the gate it asks again while the other ${others.length} tools keep "always"; a Yes given before the change was refused before sending; a new one answered`;
   });
 
   await check('security.mcp.secret-blanked', async () => {
     need();
-    const r = await client.call(id, 'print_secret', {});
+    const r = await callWithYes(client, id, 'print_secret', {});
     ok(r.kind === 'result' && r.text === 'The secret is [hidden].', 'the reply: ' + JSON.stringify(r).slice(0, 120));
     const model = await run(tool('print_secret'), {});
     await sleep(500);
@@ -205,7 +215,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   await check('security.mcp.remove', async () => {
     need();
     const slowBefore = sent('slow');
-    const slow = client.call(id, 'slow', { ms: 30_000 });
+    const slow = callWithYes(client, id, 'slow', { ms: 30_000 });
     await until(() => sent('slow') === slowBefore + 1, 10_000, 'the slow call to be sent');
     const removed = await client.remove(id);
     ok(removed.kind === 'removed', 'remove: ' + JSON.stringify(removed));
@@ -239,7 +249,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(d.shown && report.ok, 'the quoted-key server did not start');
     await client.start(added.id);
     const from = heard.length;
-    const r = await client.call(added.id, 'print_secret', {});
+    const r = await callWithYes(client, added.id, 'print_secret', {});
     await sleep(300);
     const texts = [JSON.stringify(r), ...heard.slice(from)];
     await client.remove(added.id);

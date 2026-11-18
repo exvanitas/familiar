@@ -42,8 +42,9 @@ import { admit, boundWords, type Budget } from './bounds.ts';
 import { finishTurn, openTurn, recordSubmission, turnKeyOf, turnOfInputs, TurnsDoc } from './turns.ts';
 import { oldestQueued, runView, type Answers, type Interruptions, type Question, type RunView } from './view.ts';
 import { gateFor, type GatePolicy } from './gate.ts';
-import type { FamiliarTool, JournalDocToken } from './tools.ts';
-import { defineJournalDoc, toDurableTool, type AllowedBy } from './tools.ts';
+import type { Allowed, FamiliarTool, JournalDocToken } from './tools.ts';
+import { defineJournalDoc, toDurableTool } from './tools.ts';
+import { sameFacts, type CardFacts } from '../mcp/decision.ts';
 
 const ctx = BACKGROUND_CONTEXT;
 const PROVIDER = 'familiar';
@@ -80,6 +81,15 @@ export interface ConsentCard {
   readonly askedAt: number;
   /** The turn the call belongs to. */
   readonly turn?: string;
+  /**
+   * This presentation's own one-use id: each showing of a card gets a fresh one, and when the facts
+   * change the old id is retired and the card asked again. An answer for a retired id answers nothing.
+   */
+  readonly presentation?: string;
+  /** For a server's tool: what the card shows and a Yes binds to, stored when the card is made. */
+  readonly facts?: CardFacts;
+  /** Whether the card may offer "Always": never while the conversation carries outside content. */
+  readonly always?: boolean;
 }
 
 export interface ConsentPort {
@@ -330,10 +340,53 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   // The caps count a turn as the tool-call bound does (bounds.ts): from your message, across every
   // "go on", by its id in the turn registry (turns.ts).
   const turnOf = async (): Promise<string> => turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
+  /**
+   * The sources of everything in the conversation's current context, newest first back to its start (the
+   * newest head marker): a server tool's result carries its server, her remark the sources it was made
+   * from. A context that starts at a compaction summary counts as outside if any request ever was, since a
+   * summary made while handling outside content carries it (5.6). A request is outside if this is not empty.
+   */
+  const contextSources = async (): Promise<string[]> => {
+    const out = new Set<string>();
+    let cursor: unknown;
+    for (let pages = 0; pages < 64; pages++) {
+      const page = await root.entries({ order: 'descending' }, 100, cursor, ctx);
+      for (const e of page.items) {
+        if (e.kind === RemarkEntry) for (const src of e.data?.sources ?? []) out.add(String(src));
+        const m = e.model?.[0];
+        if (m?.role === 'toolResult' && typeof m.toolName === 'string' && m.toolName.includes('__')) out.add(`server:${m.toolName.slice(0, m.toolName.indexOf('__'))}`);
+        if (e.head !== undefined || e.kind === 'pi.compaction') {
+          const records: any = await harness.snapshot(OutsideDoc, ctx);
+          if (Object.values(records?.requests ?? {}).some((r: any) => (r.sources ?? []).length > 0)) out.add('compacted');
+          return [...out].sort();
+        }
+      }
+      if (!page.next) break;
+      cursor = page.next;
+    }
+    return [...out].sort();
+  };
+  /** The outside record of each turn request, written before it's sent and never changed. */
+  const recordOutside = async (): Promise<void> => {
+    const sources = await contextSources();
+    const key = `request:${Math.random().toString(36).slice(2, 12)}`;
+    await harness.commit(async (tx: any) => {
+      const doc = await tx.doc(OutsideDoc);
+      doc.requests[key] = { sources, at: clock.now() };
+      keepNewest(doc.order, doc.requests, key);
+    }, ctx);
+  };
   const port = async (): Promise<ModelPort> => {
     const turn = await turnOf();
     const capped = cappedPort(options.model, caps!, () => ({ ...options.caps.call, turn, conversation: String(rootId) }));
-    return withRetries(capped, { ...options.retries, sleep });
+    const retried = withRetries(capped, { ...options.retries, sleep });
+    // The request's outside record goes first, then the request.
+    return {
+      async *stream(request, signal) {
+        await recordOutside();
+        yield* retried.stream(request, signal);
+      }
+    };
   };
   const { provider } = portProvider(port, { id: PROVIDER, modelId: options.modelId });
   const models = createModels();
@@ -438,11 +491,11 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
    * to this call. `beforeTool` runs it on every call, and each tool's own execute runs it again, for a call
    * recovered after a crash, which never passes `beforeTool`; the execute hands the tool how it was allowed.
    */
-  const gateCall = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<{ refused: string } | { allowedBy: AllowedBy }> => {
+  const gateCall = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<{ refused: string } | Allowed> => {
     const v = await gateWords(call, api, context);
-    return typeof v === 'string' ? { refused: v } : { allowedBy: v.allowedBy };
+    return typeof v === 'string' ? { refused: v } : v;
   };
-  const gateWords = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<string | { allowedBy: AllowedBy }> => {
+  const gateWords = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<string | Allowed> => {
     const refused = await bounded(api);
     if (refused) return refused;
     const tool = tools.get(call.name);
@@ -451,32 +504,68 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     // rest of the turn after a skip, a call the model makes to it again doesn't run.
     const parked = await parkedFor(call.name, id);
     if (parked) return parked;
-    const policy = gateFor(call.name, tool, options.policy?.());
+    let policy = gateFor(call.name, tool, options.policy?.());
     if (policy === 'deny') return `${call.name} is turned off.`;
-    if (policy === 'allow') return { allowedBy: 'always' };
-    const stored = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
-    if (stored?.answer) return stored.answer === 'allow' ? { allowedBy: 'asked' } : 'The person said no.';
+    // A server's tool is bound to the exact call: its facts are read from the server's run now.
+    const bound = tool?.consent !== undefined;
+    const factsNow = (): CardFacts | undefined => tool?.consent?.facts(call.arguments);
+    let facts = bound ? factsNow() : undefined;
+    if (bound && !facts) return `${call.name} can't be sent now: its server isn't running, it no longer offers this tool as it was, or the arguments aren't plain JSON.`;
+    // "Always" never acts on outside content (5.6): while the conversation carries any, it asks.
+    const outside = bound ? (await contextSources()).length > 0 : false;
+    if (policy === 'allow' && bound && outside) policy = 'ask';
+    if (policy === 'allow') return { allowedBy: 'always', ...(facts ? { facts, outside } : {}) };
+    const stored: (ConsentCard & { answer?: 'allow' | 'deny' }) | undefined = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
+    if (stored?.answer === 'deny') return 'The person said no.';
+    if (stored?.answer === 'allow') {
+      // A Yes covers only what its card showed: the stored facts must match this call now.
+      if (!bound) return { allowedBy: 'asked' };
+      if (stored.facts && facts && sameFacts(stored.facts, facts)) return { allowedBy: 'asked', facts: stored.facts, outside };
+    }
     const turn = turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
-    const card: ConsentCard = stored ?? { id, tool: call.name, arguments: call.arguments, doing: tool ? tool.doing(call.arguments) : `using ${call.name}`, askedAt: clock.now(), turn };
-    if (!stored) {
+    const signal: AbortSignal | undefined = context?.abortSignal;
+    // Each pass is one presentation with a fresh one-use id. When the facts change while it's shown, the
+    // id is retired and the card asked again with the new facts; a Yes to the old one mints nothing.
+    for (let pass = 0; pass < 8; pass++) {
+      const card: ConsentCard = {
+        id,
+        tool: call.name,
+        arguments: call.arguments,
+        doing: tool ? tool.doing(call.arguments) : `using ${call.name}`,
+        askedAt: stored?.askedAt ?? clock.now(),
+        turn,
+        presentation: Math.random().toString(36).slice(2, 14),
+        ...(facts ? { facts, always: !outside } : {})
+      };
       await harness.commit(async (tx: any) => {
         (await tx.doc(ConsentDoc)).cards[id] = card;
       }, ctx);
-    }
       // The wait observes the call's abort signal, so a close never hangs on an unanswered card. The card
       // stays in the journal, unanswered, and is asked again on the next open.
-      const signal: AbortSignal | undefined = context?.abortSignal;
       const ok = await new Promise<boolean | 'closed'>((resolve) => {
         if (signal?.aborted) return resolve('closed');
         signal?.addEventListener('abort', () => resolve('closed'), { once: true });
         options.consent.ask(card, signal).then(resolve, () => resolve(false));
       });
-    if (ok === 'closed') throw new Error('The journal closed while the card was open.');
-    await harness.commit(async (tx: any) => {
-      const doc = await tx.doc(ConsentDoc);
-      if (doc.cards[id]) doc.cards[id].answer = ok ? 'allow' : 'deny';
-    }, ctx);
-    return ok ? { allowedBy: 'asked' } : 'The person said no.';
+      if (ok === 'closed') throw new Error('The journal closed while the card was open.');
+      // The answer counts only for the presentation still current.
+      const current = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
+      if (current?.presentation !== card.presentation) return 'The card was answered after it was replaced, so nothing was sent.';
+      if (ok && bound) {
+        const now = factsNow();
+        if (!now || !sameFacts(now, card.facts!)) {
+          facts = now;
+          if (!facts) return `${call.name} changed or stopped while you were asked, so nothing was sent.`;
+          continue;
+        }
+      }
+      await harness.commit(async (tx: any) => {
+        const doc = await tx.doc(ConsentDoc);
+        if (doc.cards[id]?.presentation === card.presentation) doc.cards[id].answer = ok ? 'allow' : 'deny';
+      }, ctx);
+      return ok ? { allowedBy: 'asked', ...(card.facts ? { facts: card.facts, outside } : {}) } : 'The person said no.';
+    }
+    return `${call.name} kept changing while you were asked, so nothing was sent.`;
   };
 
   const consentHook = hook(ToolTask, {

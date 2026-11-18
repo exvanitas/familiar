@@ -184,3 +184,18 @@ describe('2.5 row 10: display-only writes', () => {
     await journal.close();
   });
 });
+
+/* ---------- 5.5: only the gate mints ---------- */
+
+describe('5.5: decisions are minted only by the gate', () => {
+  it("core's graph mints in one place, the journal's tool execute, and nothing in core but `send` marks one used", async () => {
+    const files = await coreSources();
+    expect(sitesOf(files, /\bmintDecision\(/).filter((s) => !s.startsWith('mcp/decision.ts: '))).toEqual([expect.stringMatching(/^journal\/tools\.ts: /)]);
+    expect(sitesOf(files, /\bmarkUsed\(/).filter((s) => !s.startsWith('mcp/decision.ts: '))).toEqual([expect.stringMatching(/^mcp\/client\.ts: /)]);
+    // The app's entry never reaches the test-only consent helpers.
+    expect(files.map((f) => f.file)).not.toContain('testing/consent.ts');
+    // A tools/call is framed only by the link's handoff, which only send reaches.
+    expect(sitesOf(files, /\bframeCall\(/).filter((s) => !s.startsWith('mcp/wire/framing.ts: '))).toEqual([expect.stringMatching(/^mcp\/wire\/link\.ts: /)]);
+    expect(sitesOf(files, /\.handoff\(/)).toEqual([expect.stringMatching(/^mcp\/client\.ts: /)]);
+  });
+});

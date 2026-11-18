@@ -20,3 +20,4 @@ export { processPortContract } from './process-contract.ts';
 export type { ProcessContractCase, ProcessPortHarness } from './process-contract.ts';
 export { settingsStoreContract } from './settings-contract.ts';
 export type { SettingsContractCase, SettingsStoreHarness } from './settings-contract.ts';
+export { callWithYes, runWithYes, yesFor } from './consent.ts';

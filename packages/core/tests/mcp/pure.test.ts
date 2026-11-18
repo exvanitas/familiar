@@ -8,7 +8,8 @@ import { modelNames, outcomeText, toolChanges, toolFingerprint } from '../../src
 import { CatalogError, checkTools, effectiveDescription } from '../../src/mcp/catalog.ts';
 import { posixPaths, windowsPaths } from '../../src/mcp/native-rules.ts';
 import { REPO, testPaths } from './fake.ts';
-import { resultText } from '../../src/mcp/session.ts';
+import { callResult, resultText as textOf } from '../../src/mcp/wire/parse.ts';
+const resultText = (r: Record<string, unknown>) => textOf(callResult(r));
 import { secretValueProblem, setupFingerprint, touchesAMarker, type LocalSetup } from '../../src/mcp/setup.ts';
 import { unpinned } from '../../src/mcp/unpinned.ts';
 import { remoteFailure, startFailure } from '../../src/mcp/words.ts';
