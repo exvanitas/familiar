@@ -983,7 +983,10 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const r = await tx.submissionByRequest(rootId, requestId);
         return r ? { id: String(r.id), type: String(r.type) } : undefined;
       }, ctx);
-      if (known) return known.type === 'write' ? { replied: false, decision: QUIET } : { replied: true, turn: turnFor(await harness.submission(Number(known.id), ctx)) };
+      // An ack known only to pi-durable: read its record again (the first read may have come before its
+      // commit), and while its winner is still deciding, wait for that decision. Quiet only once none is
+      // left to wait for.
+      if (known) return known.type === 'write' ? resultOf((await remembered(requestId)) ?? { kind: 'ack' }, requestId) : { replied: true, turn: turnFor(await harness.submission(Number(known.id), ctx)) };
       const at = clock.now();
       remember({ name: 'message-sent', at });
       if (!needsReply(text, await lastPersonaText(), { personaName: options.persona.name })) {
@@ -991,6 +994,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         // record come first, in one commit that checks the record inside it; only the send whose commit
         // wins decides the reaction, once.
         let won = false;
+        let mine: Decision | undefined;
         let decide!: (d: Decision) => void;
         const decided = new Promise<Decision>((r) => (decide = r));
         try {
@@ -1009,6 +1013,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
           );
           if (won) {
             const decision = await notice({ name: 'ack-sent', at });
+            mine = decision;
             decide(decision);
             await harness.commit(async (tx: any) => {
               const record = (await tx.doc(SentDoc)).byRequest[requestId];
@@ -1019,6 +1024,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
           decide(QUIET);
           if (won && deciding.get(requestId) === decided) deciding.delete(requestId);
         }
+        // The winner answers with its own decision, whether or not its record is still among the newest.
+        if (mine) return { replied: false, decision: mine };
         return resultOf((await remembered(requestId)) ?? { kind: 'ack' }, requestId);
       }
       lastChatAt = at;
@@ -1113,14 +1120,18 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       return sid ? turnFor(await harness.submission(Number(sid), ctx)) : undefined;
     },
     async queued() {
-      const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
-      if (live?.run) return undefined;
-      const inbox: any = await harness.snapshot(InboxDoc, rootId, ctx);
-      const first = (__FAMILIAR_MUTATIONS__ && mutant('per-message-send-now')) ? newestQueued(inbox) : oldestQueued(inbox);
-      if (!first) return undefined;
-      if ((await viewNow()).state === 'question') return undefined;
-      if (live?.runFailure && (__FAMILIAR_MUTATIONS__ && mutant('hide-send-now'))) return undefined;
-      return { submission: first, failure: live?.runFailure ? String(live.runFailure.taskId) : null };
+      // Every input read in one commit that writes nothing, so the offer is of one committed state: never
+      // a live run read before a placement and the inbox after it.
+      return harness.commit(async (tx: any): Promise<SendNowOffer | undefined> => {
+        const live = await tx.doc(LiveDoc, rootId);
+        if (live?.run) return undefined;
+        const inbox = await tx.doc(InboxDoc, rootId);
+        const first = (__FAMILIAR_MUTATIONS__ && mutant('per-message-send-now')) ? newestQueued(inbox) : oldestQueued(inbox);
+        if (!first) return undefined;
+        if ((await viewIn(tx)).state === 'question') return undefined;
+        if (live?.runFailure && (__FAMILIAR_MUTATIONS__ && mutant('hide-send-now'))) return undefined;
+        return { submission: first, failure: live?.runFailure ? String(live.runFailure.taskId) : null };
+      }, ctx);
     },
     async sendNow(offer, requestId) {
       const sid: string = await harness.commit(async (tx: any) => {
