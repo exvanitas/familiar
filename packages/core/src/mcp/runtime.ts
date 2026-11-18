@@ -41,12 +41,18 @@ export class ServerRuntime {
   /** Hears a run's tool list, with whether that run is still this server's run; settles once it's saved. */
   private readonly onListed: (tools: readonly ListedTool[], current: () => boolean) => Promise<void> | void;
 
+  /** The link's limits: one object the link reads at each use, set again from the record at each Start. */
+  private readonly limits: { -readonly [K in keyof LinkLimits]: LinkLimits[K] };
+  private readonly portLimits: Partial<LinkLimits> | undefined;
+
   constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean) => Promise<void> | void) {
     this.id = id;
     this.owner = owner;
     this.onChange = onChange;
     this.onListed = onListed;
-    const limits: LinkLimits = { ...LINK_LIMITS, ...linkLimitsOf(owner.server(id)), ...ports.limits };
+    this.portLimits = ports.limits;
+    const limits = { ...LINK_LIMITS, ...linkLimitsOf(owner.server(id)), ...ports.limits };
+    this.limits = limits;
     this.link = new ServerLink(id, { net: ports.net, processes: ports.processes }, ports.clock, {
       ended: (run, failure) => {
         if (run !== this.runId) return;
@@ -114,6 +120,8 @@ export class ServerRuntime {
     }
     const admitted = this.owner.admit('start', { start: true });
     if (!('release' in admitted)) return { kind: 'refused', words: admitted.ok ? '' : admitted.words };
+    // The committed record's limits, read in the same step: a handshake limit set since applies now.
+    Object.assign(this.limits, LINK_LIMITS, linkLimitsOf(record), this.portLimits);
     const mine = ++this.startToken;
     const current = () => this.startToken === mine && this.phaseNow === 'starting';
     let released = false;

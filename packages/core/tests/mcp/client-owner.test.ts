@@ -378,3 +378,22 @@ describe('5.5: a revoke holds until the person chooses again', () => {
     expect(gateFor('note_search', { name: 'note_search', kind: 'read' } as never, other.policy([]))).toBe('deny');
   });
 });
+
+describe("5.4: a server's limits apply from the next start", () => {
+  it('a changed handshake limit is the next Start\'s deadline', async () => {
+    const store = memorySettingsStore();
+    const delays: number[] = [];
+    const clock = { now: () => Date.now(), setTimer: (cb: () => void, ms: number, o: { background: boolean }) => (delays.push(ms), realClock.setTimer(cb, ms, o)) };
+    const client = await clientOf(store, speakingPort().port, { clock });
+    await client.add({ setup: local('l1'), problems: [] });
+    expect((await client.start('l1')).kind).toBe('ready');
+    expect(delays).toContain(60_000);
+    expect(delays).not.toContain(7_000);
+    await client.stop('l1');
+    await client.setLimits('l1', { initMs: 7_000 });
+    delays.length = 0;
+    expect((await client.start('l1')).kind).toBe('ready');
+    expect(delays).toContain(7_000);
+    expect(delays).not.toContain(60_000);
+  });
+});
