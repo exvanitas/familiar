@@ -2,12 +2,12 @@
 export { BUILT_IN, CALL_MS, CALL_MS_MAX, CALL_MS_MIN, McpClient } from './client.ts';
 export type { AddressPort, McpClientOptions, SecretPort, ServerStatus, TestedTool, TestReport } from './client.ts';
 export { canonicalJson, sha256 } from './hash.ts';
-export { ServerRuntime } from './runtime.ts';
-export type { Phase, RuntimePorts } from './runtime.ts';
+export type { Phase } from './runtime.ts';
 export { canonicalArguments, plainJson, sameFacts } from './decision.ts';
 export type { CardFacts, ToolDecision } from './decision.ts';
-export { LINK_LIMITS, MAX_PAGES, reservedHeader, ServerLink } from './wire/link.ts';
-export type { LinkClock, LinkEvents, LinkLimits, NetHead, NetPort, NetSpec, Target } from './wire/link.ts';
+// The wire (ServerLink, the exchange machine, framing) stays inside: only the client hands off a call.
+export { LINK_LIMITS, MAX_PAGES, reservedHeader } from './wire/link.ts';
+export type { LinkLimits, NetHead, NetPort, NetSpec } from './wire/link.ts';
 export { LEGACY_VERSIONS, MODERN_VERSION, OFFERED_VERSION } from './wire/framing.ts';
 export { MAX_RESULT_CHARS, resultText } from './wire/parse.ts';
 export { localDraft, parsePaste, remoteDraft } from './paste.ts';

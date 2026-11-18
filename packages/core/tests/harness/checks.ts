@@ -365,7 +365,12 @@ export const H14: Check = (r) => {
   const calls = r.server.arrivals.filter((a) => isCall(a.body) && !a.followed);
   const seen = new Map<string, number>();
   for (const a of calls) seen.set(tokenOf(a.body), (seen.get(tokenOf(a.body)) ?? 0) + 1);
-  for (const [t, n] of seen) if (n > 1) problems.push(`H14: ${t} reached the server ${n} times`);
+  // Two identical calls each answered on their own card may each go out once (T7 (j)): the count allowed
+  // is the number of separate Yes records for that call.
+  for (const [t, n] of seen) {
+    const yeses = r.evidence.filter((e) => e.what === 'yes' && e.token === t).length;
+    if (n > Math.max(1, yeses)) problems.push(`H14: ${t} reached the server ${n} times`);
+  }
   if (r.server.arrivals.some((a) => a.method === 'GET' && !a.followed)) problems.push('H14: a GET reached the server');
   // A redirected head is refused: the call it carried never comes back as a result.
   for (const x of r.exe.log) {
