@@ -850,7 +850,7 @@ The **pass build** adds P4's detach bound (1 s), the server cap, the refusal pas
 - **H4.** In the pass build, every `net_cancel` returns within its bound, even while a helper is held, and a held helper never keeps an exchange out of Idle past the bound. The pre-pass build records the same as a measured limitation.
 - **H5.** In the pass build, at saturation: with 24 server requests open (detached helpers among them), a model fetch is never refused `busy`.
 - **H6.** Both directions, against an independent history. From the commit log, the harness keeps its own record of each unanswered ending, from the submissions' own settlements, and of every run start after it. It never reads `runFailure` to judge `runFailure`. A question is due exactly when the latest ending has no run start after it and no answer. H6 fails if a question is shown that isn't due, or if one that is due isn't shown.
-- **H7.** Every run start in the store is in a commit that also holds one of these: your new message; an answer record whose commit's pre-state shows the question open; a Send now record whose pre-state shows its submission queued and oldest; or pi-durable's own boundary after an answered run. Nothing else, so a compaction boundary fails it.
+- **H7.** Every run start in the store is in a commit that also holds one of these: your new message; an answer record whose commit's pre-state shows the question open, under that question's task, from a click the driver's evidence shows was on that very question (its request id is the started submission's); a Send now record whose pre-state shows its submission queued and oldest; or pi-durable's own boundary: a new task of the same run (its first input and inputs unchanged), or the next run once every input of the earlier one has settled done. Nothing else, so a compaction boundary fails it.
 - **H8.** After every step: if the conversation is idle, the inbox isn't empty and no question is open, Send now is shown.
 - **H9.** Her line's entry is model-visible only if, in its commit, no run was live, the inbox was empty and `runFailure` was unset. Her line never appears in a commit that starts a run.
 - **H10.** A late response for an ended exchange's id never reaches a caller. Each result arrives exactly as the server wrote it, its multibyte text whole however the bytes were split, and no valid answer is read as invalid.
@@ -923,6 +923,8 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `question-at-end`: record the question when the run ends, the old shape | H6, H7 |
 | `after-failed-continue`: `afterFailedRun: "continue"` | H7 (the run it starts in the failure's own commit is no act of yours; H6 sees it on too few seeds to be its control) |
 | `split-answer`: split an answer's check from its `continue` | H7 |
+| `answer-any-question`: a late answer to an earlier question answers the one open now, recorded under the task clicked | H7 |
+| `answer-recorded-as-open`: the same, recorded under the open question's own task | H7 (the click's question isn't the one answered) |
 | `auto-placement`: place queued input automatically after an error | H7 |
 | `per-message-send-now` | H7 (its pre-state shows another submission oldest) |
 | `hide-send-now`: hide Send now after a fault | H8 |

@@ -100,17 +100,24 @@ export const H6: JCheck = (r) => {
 export const H7: JCheck = (r) => {
   const problems: string[] = [];
   const mine = new Set(r.evidence.filter((e) => e.what === 'send').map((e) => e.requestId));
+  // Each submission's latest status as of the commit being checked, from the submissions' own records.
+  const status = new Map<string, string>();
   for (const c of r.log) {
+    for (const s of c.submissions) status.set(s.id, s.status);
     if (!startsRun(c)) continue;
     // Your message, admitted in this very commit (a message closes an open question and places the
     // oldest queued input, which may be an earlier one), not one placed later from the queue on its own.
     if (c.submissions.some((s) => s.requestId !== undefined && mine.has(s.requestId) && !r.log.some((x) => x.seq < c.seq && x.submissions.some((y) => y.id === s.id)))) continue;
     // An answer recorded in this commit to the very question the independent history had due: its record
     // is under that ending's task. An answer recorded under another task starts nothing.
+    // And the answer is the one the person gave to that question: the driver's evidence of the click whose
+    // request id this commit's submission carries names that very question.
     const asked = c.answered.length ? due(r.log.filter((x) => x.seq < c.seq), c.seq - 1) : undefined;
-    if (asked && c.answered.includes(asked.task)) continue;
     if (c.answered.length) {
-      problems.push(`H7: commit ${c.seq} (step ${c.step}) started a run on an answer to ${c.answered.join(', ')}, ${asked ? `but the question due was run:${asked.task}` : 'with no question due'}`);
+      const click = r.evidence.find((e) => e.what === 'answer' && c.submissions.some((s) => s.requestId !== undefined && s.requestId === e.requestId));
+      if (asked && c.answered.includes(asked.task) && click?.question === `run:${asked.task}`) continue;
+      const why = !asked ? 'with no question due' : !c.answered.includes(asked.task) ? `but the question due was run:${asked.task}` : click ? `but the person clicked ${click.question}` : 'but no click of the person names it';
+      problems.push(`H7: commit ${c.seq} (step ${c.step}) started a run on an answer to ${c.answered.join(', ')}, ${why}`);
       continue;
     }
     // A Send now record (SendNowDoc.byRequest) written in this commit, which started something, and whose
@@ -122,8 +129,16 @@ export const H7: JCheck = (r) => {
       problems.push(`H7: commit ${c.seq} started a run from a Send now of ${now.submission}, which its pre-state doesn't show queued first`);
       continue;
     }
-    // pi-durable's own boundary: the previous run ended in this commit with nothing left unanswered.
-    if (c.livePre?.run && !c.submissions.some((s) => s.status === 'unanswered')) continue;
+    // pi-durable's own boundary, with nothing left unanswered in this commit: a new task of the same run
+    // (its first input and its inputs unchanged), or the next run once every input of the earlier one has
+    // settled done.
+    const pre = c.livePre?.run;
+    const post = c.livePost?.run;
+    if (pre && !c.submissions.some((s) => s.status === 'unanswered')) {
+      const sameRun = pre.first === post?.first && JSON.stringify(pre.inputs ?? null) === JSON.stringify(post?.inputs ?? null);
+      const settled = (pre.inputs ?? []).length > 0 && (pre.inputs as unknown[]).every((i) => status.get(String(i)) === 'done');
+      if (sameRun || settled) continue;
+    }
     problems.push(`H7: commit ${c.seq} (step ${c.step}) started a run on no act of yours`);
   }
   return problems.slice(0, 3);

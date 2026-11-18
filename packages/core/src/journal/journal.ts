@@ -1063,9 +1063,12 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         // Not open: a run is live, the failure names another task, or you moved on. Nothing changes. (The
         // old shape, a named mutation, answers the question it kept from the run's end instead.)
         const kept = atEnd?.id === id && !live?.run && (__FAMILIAR_MUTATIONS__ && mutant('question-at-end')) ? atEnd : undefined;
-        // (A named mutation answers whatever question is open, whichever one the answer was for.)
-        if (!kept && (view.state !== 'question' || (view.question.id !== id && !(__FAMILIAR_MUTATIONS__ && mutant('answer-any-question'))))) return '';
+        // (Two named mutations answer whatever question is open, whichever one the answer was for: one
+        // records it under the task clicked, the other under the open question's own task.)
+        const asOpen = view.state === 'question' && view.question.id !== id && (__FAMILIAR_MUTATIONS__ && mutant('answer-recorded-as-open'));
+        if (!kept && !asOpen && (view.state !== 'question' || (view.question.id !== id && !(__FAMILIAR_MUTATIONS__ && mutant('answer-any-question'))))) return '';
         const q = kept ?? (view as Extract<RunView, { state: 'question' }>).question;
+        const recordAs = asOpen ? q.id.slice('run:'.length) : task;
         const inbox = await tx.doc(InboxDoc, rootId);
         const registry = await tx.doc(TurnsDoc);
         const asked = q.turn ?? turnOfInputs(live.runFailure?.inputs ?? [], registry);
@@ -1101,14 +1104,14 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
           }
         }
         answers.order ??= [];
-        answers.byTask[task] = {
+        answers.byTask[recordAs] = {
           yes,
           kind: q.kind,
           turn: asked,
           ...(started ? { submission: started } : {}),
           ...(!yes && cutOff ? { tools: [...new Set((q.steps ?? []).map((s) => s.tool))] } : {})
         };
-        keepNewest(answers.order, answers.byTask, task);
+        keepNewest(answers.order, answers.byTask, recordAs);
         return started;
       }, ctx);
       if (splitLater) {
