@@ -254,9 +254,16 @@ export class JDriver {
 
   /** Lets the journal and pi-durable run until nothing moves (the model waits at its gate). */
   async settle(): Promise<void> {
-    for (let i = 0; i < 4; i++) {
+    // Until nothing has moved for three rounds in a row: no commit, no new model request. Adaptive, so a
+    // loaded machine waits longer rather than reading a half-settled state.
+    let quiet = 0;
+    let last = '';
+    for (let i = 0; i < 200 && quiet < 3; i++) {
       await settle();
       await new Promise((r) => setTimeout(r, 2));
+      const now = `${this.rec.log.length}:${this.pending.length}`;
+      quiet = now === last ? quiet + 1 : 0;
+      last = now;
     }
   }
 
