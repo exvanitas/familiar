@@ -31,6 +31,9 @@ export class ServerRuntime {
   private phaseNow: Phase = 'stopped';
   private failureNow: Failure | undefined;
   private runId: string | undefined;
+  /** The current start's token. A start's continuation acts only while its token is current: a Stop, or a
+      later start, makes it stale, so it can never take a later start's Starting for its own. */
+  private startToken = 0;
   readonly id: string;
   readonly link: ServerLink;
   private readonly owner: Owner;
@@ -106,6 +109,8 @@ export class ServerRuntime {
     }
     const admitted = this.owner.admit('start', { start: true });
     if (!('release' in admitted)) return { kind: 'refused', words: admitted.ok ? '' : admitted.words };
+    const mine = ++this.startToken;
+    const current = () => this.startToken === mine && this.phaseNow === 'starting';
     let released = false;
     const launched = () => {
       if (!released) {
@@ -120,7 +125,7 @@ export class ServerRuntime {
       r = await this.link.start(target, launch, { launched });
       // A modern-only stdio server that ended its process after refusing the legacy opening: one more start
       // of the same setup, readmitted by the owner, era fixed to modern (3.9).
-      if (!r.ok && r.relaunch === 'modern' && (this.phaseNow as Phase) === 'starting') {
+      if (!r.ok && r.relaunch === 'modern' && current()) {
         const again = this.owner.admit('start', { start: true });
         if (!('release' in again)) r = { ok: false as const, failure: { kind: 'busy' as const, words: 'Familiar is saving another change. Press Start again.' } };
         else if (this.owner.server(this.id) !== record && JSON.stringify(this.owner.server(this.id)?.setup) !== JSON.stringify(setup)) {
@@ -134,8 +139,10 @@ export class ServerRuntime {
     } finally {
       launched();
     }
-    if ((this.phaseNow as Phase) !== 'starting') {
-      if (r.ok) await this.link.stop();
+    if (!current()) {
+      // Stopped meanwhile. Its run, if it got one and it's still the link's, is ended here; a later
+      // start's run is never touched.
+      if (r.ok && this.link.current?.run === r.run) await this.link.stop();
       return { kind: 'stopped' };
     }
     if (!r.ok) {
@@ -155,6 +162,7 @@ export class ServerRuntime {
   async stop(): Promise<Reply> {
     if (this.phaseNow === 'stopped' || this.phaseNow === 'failed') return { kind: 'stopped' };
     if (this.phaseNow !== 'ready' && this.phaseNow !== 'starting') return { kind: 'refused', words: `It is ${this.phaseNow}.` };
+    this.startToken++;
     this.set('stopping');
     await this.link.stop();
     this.runId = undefined;
