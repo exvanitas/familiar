@@ -16,14 +16,15 @@
    - security.mcp.secret-blanked: print_secret, from the key typed into Settings, comes back [hidden]
      in the reply, the model's text and every line core saw, and nothing core keeps holds it.
    - security.mcp.remove: a call in flight is interrupted, the secret, the saved setup and every node
-     process go, and the approval with them: the exact same launch, secret name included and its key
-     typed in again, shows the dialog again.
+     process go. The old id is refused for good, in the tombstone's words; the exe asks again for the old
+     id's exact launch (its approval went with server_forget), and the same launch under a fresh id asks
+     too (approvals are per id, so that part shows only that content carries nothing across ids).
    - security.mcp.secret-json-escaped, a known gap: the driver types a key holding a quote into Settings,
      the fake server prints it, and it passes only if the JSON-escaped form (\") is blanked too. The
      exe blanks literal copies only, so it fails until the pre-release native pass, with exactly the
      detail its mark in security-inventory.json expects. The gate reports that as KNOWN GAP in everyday
      runs and fails a release; any other failure of this check fails every run. */
-import { gateFor, McpClient, openSettingsStore, parsePaste, systemClock, toolPolicies, choiceKey, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
+import { gateFor, McpClient, openSettingsStore, parsePaste, processSetupOf, REMOVED_ID_WORDS, systemClock, toolPolicies, choiceKey, type LocalSetup, type ProcessEvent, type ServerTool, type ToolStep } from '@familiar/core';
 import { callWithYes, runWithYes, yesFor } from '@familiar/core/testing';
 import { desktopMcpPorts } from '../src/mcp.ts';
 import { reason } from '../src/shell.ts';
@@ -215,6 +216,8 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   await check('security.mcp.remove', async () => {
     need();
     const slowBefore = sent('slow');
+    const old = client.owner.server(id)?.setup;
+    ok(old?.kind === 'local', 'the saved setup before removal');
     const slow = callWithYes(client, id, 'slow', { ms: 30_000 });
     await until(() => sent('slow') === slowBefore + 1, 10_000, 'the slow call to be sent');
     const removed = await client.remove(id);
@@ -228,15 +231,27 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     await sleep(1000);
     const left = await step<{ count: number }>('node-children');
     ok(left.count === 0, `${left.count} node processes left`);
-    // The approval went too: the exact same launch, its secret name included and a key typed in again,
-    // shows the dialog. Had the approval survived, it would start with none.
-    const { drafts } = parsePaste(fake(), { newId: () => id, defaultCwd: p.repo });
-    const again = await client.add(drafts[0]!);
+    // The id is its tombstone's for good: the same paste under the old id is refused, in its words.
+    const reused = parsePaste(fake(), { newId: () => id, defaultCwd: p.repo }).drafts[0]!;
+    const refused = await client.add(reused).then(() => 'added', (e: unknown) => reason(e));
+    ok(refused === REMOVED_ID_WORDS, 'the old id again: ' + refused);
+    // The old id's native approval went (server_forget): the exe asked again for its exact launch, started
+    // straight through the process port as no saved server can be now. Refused at the dialog, so nothing
+    // is approved or spawned. Had the approval survived, the exe would have gone on to the spawn unasked.
+    const asking = ports.processes.start(processSetupOf(old as LocalSetup), () => {}).then(() => 'started', (e: unknown) => reason(e));
+    const forgot = await dialog('refuse', START);
+    const outcome = await asking;
+    ok(forgot.shown, `the old id's exact launch started without asking (${outcome}): its approval survived the removal`);
+    // The same launch under a fresh id asks too. The exe keys approvals by setup id, so a fresh id would ask
+    // whatever had happened to the old one's: this shows only that a launch's content carries no approval
+    // from one id to another, not that the removal forgot anything (the step above shows that).
+    const fresh = parsePaste(fake(), { newId: () => 'mcp-' + rand(8), defaultCwd: p.repo }).drafts[0]!;
+    const again = await client.add(fresh);
     await enterKey(again.secretRefs[0]!);
-    const { d, report } = await testApproved(id);
-    ok(d.shown && report.ok, `the same launch after removal: dialog ${d.shown}, ${report.ok ? 'started' : report.failure.words}`);
-    ok((await client.remove(id)).kind === 'removed', 'the second removal');
-    return 'the call in flight was interrupted; the secret, the saved setup and every node process went; the exact same launch, key typed in again, asked again';
+    const { d, report } = await testApproved(again.id);
+    ok(d.shown && report.ok, `the same launch under a fresh id: dialog ${d.shown}, ${report.ok ? 'started' : report.failure.words}`);
+    ok((await client.remove(again.id)).kind === 'removed', 'the fresh id\'s removal');
+    return "the call in flight was interrupted; the secret, the saved setup and every node process went; the old id is refused for good; the exe asked again for the old id's exact launch (its approval was forgotten); the same launch under a fresh id asked too (approvals are per id)";
   });
 
   await check('security.mcp.secret-json-escaped', async () => {

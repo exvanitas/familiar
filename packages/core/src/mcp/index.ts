@@ -20,7 +20,7 @@ export { KEY_HEADERS, KEY_PLACEHOLDER, remoteHeaders } from './remote.ts';
 export type { RemoteTarget } from './remote.ts';
 export { fresh } from './saved.ts';
 export type { SavedTool, ServerLimits } from './saved.ts';
-export { addressIdentity, BUSY_WORDS, issueKey, keyBase, MAX_KEY, MAX_MODEL_NAME, modelName, Owner, OWNER_KEY, OWNER_VERSION, UNFINISHED_WORDS, WAITING_AFTER_MS, WAITING_WORDS } from './owner.ts';
+export { addressIdentity, BUSY_WORDS, REMOVED_ID_WORDS, issueKey, keyBase, MAX_KEY, MAX_MODEL_NAME, modelName, Owner, OWNER_KEY, OWNER_VERSION, UNFINISHED_WORDS, WAITING_AFTER_MS, WAITING_WORDS } from './owner.ts';
 export type { Mark, OwnedServer, OwnerPorts, Outcome, Tombstone } from './owner.ts';
 export { choiceKey, outcomeText, wrapperPolicy, outsideContent, serverTool, toolChanges, toolFingerprint, toolPolicies } from './server-tools.ts';
 export type { Sender, ServerTool, ToolChanges, ToolChoice } from './server-tools.ts';

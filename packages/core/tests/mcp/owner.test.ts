@@ -2,7 +2,7 @@
 // of each change with its one mark, the rollback, tombstones, repair in a fresh start, and failing closed.
 
 import { describe, expect, it } from 'vitest';
-import { addressIdentity, BUSY_WORDS, Owner, OWNER_KEY, UNFINISHED_WORDS, WAITING_WORDS, type OwnerPorts } from '../../src/mcp/owner.ts';
+import { addressIdentity, BUSY_WORDS, Owner, REMOVED_ID_WORDS, OWNER_KEY, UNFINISHED_WORDS, WAITING_WORDS, type OwnerPorts } from '../../src/mcp/owner.ts';
 import type { ServerSetup } from '../../src/mcp/setup.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 
@@ -124,7 +124,7 @@ describe('5.1: one durable effect at a time', () => {
     expect(owner.server('l1')).toBeUndefined();
     expect(owner.tombstones().l1).toEqual({ key: 'files' });
     expect(Object.keys(owner.choices())).toEqual([JSON.stringify(['l10', 'echo'])]);
-    expect(await owner.add(local('l1'))).toMatchObject({ ok: false, words: 'A server with this id is already saved.' });
+    expect(await owner.add(local('l1'))).toMatchObject({ ok: false, words: REMOVED_ID_WORDS });
     await owner.add(local('l2'));
     expect(owner.server('l2')!.key).toBe('files2');
   });

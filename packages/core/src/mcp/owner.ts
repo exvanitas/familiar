@@ -81,6 +81,9 @@ const no = (words: string): Outcome => ({ ok: false, words });
  * as punycode, one trailing dot dropped, the default port dropped, no trailing slash. WHATWG `URL` does
  * the first parts as Rust's `url` crate does; the trailing dot and slashes are done here.
  */
+/** A removed server's id stays its tombstone's for good: never saved again, so nothing of it carries over. */
+export const REMOVED_ID_WORDS = 'A removed server had this id, and ids are never used again. Add it as a new server.';
+
 export function addressIdentity(url: string): string | undefined {
   let u: URL;
   try {
@@ -276,7 +279,8 @@ export class Owner {
 
   /** Add, local or remote. The id must be new: never one saved or tombstoned. */
   async add(setup: ServerSetup): Promise<Outcome> {
-    if (this.doc.servers[setup.id] !== undefined || this.doc.tombstones[setup.id] !== undefined) return no('A server with this id is already saved.');
+    if (this.doc.servers[setup.id] !== undefined) return no('A server with this id is already saved.');
+    if (this.doc.tombstones[setup.id] !== undefined) return no(REMOVED_ID_WORDS);
     let identity: string | undefined;
     if (setup.kind === 'remote') {
       identity = addressIdentity(setup.url);

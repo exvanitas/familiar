@@ -80,6 +80,7 @@ describe('T1: the export list', () => {
         "OWNER_VERSION",
         "Owner",
         "PREREQUISITES",
+        "REMOVED_ID_WORDS",
         "SETTINGS_THAT_RUN",
         "SETTING_PREFIXES_THAT_RUN",
         "SSE_WORDS",
