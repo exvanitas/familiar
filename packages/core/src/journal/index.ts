@@ -18,3 +18,5 @@ export { admit, boundWords, emptyBudget, TOOL_CALLS_PER_REPLY, TOOL_CALLS_PER_TU
 export type { Bound, Budget } from './bounds.ts';
 export { BUILT_IN_READS, gateFor, RUN_WITHOUT_ASKING } from './gate.ts';
 export type { GatePolicy, ToolPolicy } from './gate.ts';
+export { buttonsOf, createCardDesk } from './desk.ts';
+export type { CardButton, CardDesk, DeskResult } from './desk.ts';

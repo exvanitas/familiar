@@ -11,7 +11,8 @@ import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
 import { nodeNetPort } from './node-net.ts';
 import { callWithYes } from '../../src/testing/consent.ts';
-import type { ConsentCard } from '../../src/index.ts';
+import { createCardDesk, type ConsentCard, type ConsentPort } from '../../src/index.ts';
+import { mutations } from '../../src/mutations.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
 afterEach(async () => {
@@ -21,7 +22,7 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
   const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
@@ -37,7 +38,7 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
 }
 
 /** A journal over the given wrappers: the tools a turn loop holds until it's opened again. */
-async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; storeName?: string } = {}) {
+async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string } = {}) {
   const model = createFakeModel(script);
   const journal = await openJournal({
     store: await world.open(extra.storeName ?? 'mcp-kill'),
@@ -48,7 +49,7 @@ async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: Model
     tools,
     clock: systemClock,
     wake: { wakeAt: () => {} },
-    consent: { ask: (card) => Promise.resolve(extra.ask?.(card) ?? true) },
+    consent: extra.consent ?? { ask: (card) => Promise.resolve(extra.ask?.(card) ?? true) },
     ...(extra.policy ? { policy: extra.policy } : {}),
     presence: { report: () => {} },
     persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
@@ -170,5 +171,46 @@ describe('a server tool in the turn loop', () => {
     expect(asks).toBe(1);
     expect(port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"'))).toEqual([]);
     await loop.journal.close();
+  });
+
+  it('T7 (i), S9: a duplicated Yes from the first card, arriving after the changed tool\'s card is shown, answers nothing', async () => {
+    for (const mutation of [undefined, 'answers-by-step'] as const) {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const world = nodeWorld();
+        const store = memorySettingsStore();
+        const desk = createCardDesk();
+        const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
+        const script = (r: ModelRequest): FakeReply => (r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'fakeserver__echo', arguments: { text: 'hi' } }] });
+        const one = await life(world, store, undefined, script, { consent: desk.port, storeName: `mcp-s9-${mutation ?? 'twin'}` });
+        void one.journal.send('Echo something.', 'turn-1');
+        const shown = async (n: number) => { for (let i = 0; i < 500 && desk.showing().length < n; i++) await sleep(10); return desk.showing(); };
+        const f1 = (await shown(1))[0]!.card;
+        // The server changes echo while F1's card is shown.
+        await callWithYes(one.client, one.serverId, 'set_variant', { variant: 'b' });
+        for (let i = 0; i < 200 && one.client.tools().find(t => t.serverName === 'echo')!.fingerprint === f1.facts!.fingerprint; i++) await sleep(10);
+        // The Yes to F1: the facts changed, so it sends nothing and F2's card is shown.
+        expect(desk.answer({ presentation: f1.presentation, button: 'yes' })).toMatchObject({ kind: 'answered', yes: true });
+        for (let i = 0; i < 500 && !desk.showing().some((s) => s.card.presentation !== f1.presentation); i++) await sleep(10);
+        const f2 = desk.showing()[0]!.card;
+        expect(f2.presentation).not.toBe(f1.presentation);
+        expect(f2.facts!.fingerprint).not.toBe(f1.facts!.fingerprint);
+        // The duplicated Yes from F1's card, as a double click or a resend would bring it.
+        const dup = desk.answer({ presentation: f1.presentation, button: 'yes' });
+        await sleep(200);
+        if (mutation === undefined) {
+          expect(dup).toEqual({ kind: 'ignored' });
+          expect(desk.showing().map((s) => s.card.presentation)).toEqual([f2.presentation]);
+          expect(echoCalls(one.port)).toBe(0);
+          desk.answer({ presentation: f2.presentation, button: 'skip' });
+        } else {
+          // The control: answers keyed by the card's step let F1's Yes answer F2's card, and echo goes out.
+          expect(echoCalls(one.port)).toBe(1);
+        }
+        await one.journal.close();
+      } finally {
+        mutations.clear();
+      }
+    }
   });
 });
