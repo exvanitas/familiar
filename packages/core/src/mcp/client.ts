@@ -331,7 +331,7 @@ export class McpClient {
     const run = rt?.run;
     if (!rt || !run || !record) return refuse('not-running', 'The server is not running.');
     if (run.id !== decision.run || run.launch !== decision.launch) return refuse('changed', 'The server restarted since this call was allowed, so it was not sent.');
-    if (!rt.link.offers(run.id, decision.tool, decision.fingerprint)) return refuse('changed', 'The tool changed since it was allowed, so it was not sent. It will ask again.');
+    if (!rt.link.offers(run.id, decision.tool, decision.fingerprint) && !(rt.link.offers(run.id, decision.tool, rt.link.current?.tools.find((t) => t.name === decision.tool)?.fingerprint ?? '') && mutant('ignore-fingerprint'))) return refuse('changed', 'The tool changed since it was allowed, so it was not sent. It will ask again.');
     const key = choiceKey(decision.server, decision.tool);
     const choice = this.owner.choices()[key];
     const overlay = this.overlay.get(key);
@@ -342,13 +342,16 @@ export class McpClient {
     const ms = Math.min(CALL_MS_MAX, Math.max(CALL_MS_MIN, record.limits.callMs ?? CALL_MS));
     // Named mutations: queue behind a live exchange, a gap between the checks and the handoff, or a body
     // from the model's own arguments instead of the decision's.
-    if (rt.link.busy && mutant('queue-call')) return rt.link.drained().then(() => (markUsed(decision), rt.link.handoff(decision.tool, decision.canonical, signal, ms) ?? refuse('busy', 'busy')));
+    const hand = (): Promise<CallOutcome> => {
+      const canonical = raw !== undefined && mutant('body-from-model-args') ? (canonicalArguments(raw)?.canonical ?? decision.canonical) : decision.canonical;
+      markUsed(decision);
+      const sent = rt.link.handoff(decision.tool, canonical, signal, ms);
+      return sent ?? refuse('busy', 'The server is busy with another request. Try again in a moment.');
+    };
+    if (rt.link.busy && mutant('queue-call')) return rt.link.drained().then(hand);
     if (rt.link.busy) return refuse('busy', 'The server is busy with another request. Try again in a moment.');
-    if (mutant('await-before-handoff')) return Promise.resolve().then(() => (markUsed(decision), rt.link.handoff(decision.tool, decision.canonical, signal, ms) ?? refuse('busy', 'busy')));
-    const canonical = raw !== undefined && mutant('body-from-model-args') ? (canonicalArguments(raw)?.canonical ?? decision.canonical) : decision.canonical;
-    markUsed(decision);
-    const sent = rt.link.handoff(decision.tool, canonical, signal, ms);
-    return sent ?? refuse('busy', 'The server is busy with another request. Try again in a moment.');
+    if (mutant('await-before-handoff')) return Promise.resolve().then(hand);
+    return hand();
   }
 
   private async update(id: string, change: (r: OwnedServerRecord) => OwnedServerRecord): Promise<void> {

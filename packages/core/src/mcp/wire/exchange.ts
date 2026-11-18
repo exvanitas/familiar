@@ -137,7 +137,7 @@ export function step(slot: Slot, input: Input): Step {
   const ex = slot.ex;
   switch (input.t) {
     case 'admit': {
-      if (ex && !(ex.phase === 'draining' && mutant('admit-while-draining'))) return { slot, effects: [{ t: 'busy' }] };
+      if (ex && !(ex.phase === 'draining' && (mutant('admit-while-draining') || (input.kind === 'list' && ex.kind === 'list' && mutant('page-before-drain'))))) return { slot, effects: [{ t: 'busy' }] };
       const n = slot.next;
       const handle = `${n}:req`;
       const fresh: Exchange = { n, kind: input.kind, where: input.where, era: input.era, ...(input.requestId !== undefined ? { requestId: input.requestId } : {}), phase: 'live', open: [handle], cancelled: [], pongsOut: [], pongsTotal: 0, answered: [] };
