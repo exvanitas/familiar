@@ -1,12 +1,15 @@
 // The journal facade: the turn loop on pi-durable. Everything pi-durable is behind these exports.
-export { openJournal, systemClock } from './journal.ts';
-export type { AmbientState, CapsSetup, ConsentCard, ConsentPort, Journal, JournalClock, JournalOptions, Question, SendResult, Turn, TurnEnd, Notification, NotifierPort, WakePort } from './journal.ts';
+export { AnswersDoc, InterruptionsDoc, journalSettings, openJournal, OutsideDoc, SendNowDoc, systemClock } from './journal.ts';
+export { TurnsDoc } from './turns.ts';
+export type { AmbientState, CapsSetup, ConsentCard, ConsentPort, Journal, JournalClock, JournalOptions, Question, Remark, RemarkPrompt, SendNowOffer, SendResult, Turn, TurnEnd, Notification, NotifierPort, WakePort } from './journal.ts';
 export { journalUsageStore, LedgerDoc } from './ledger.ts';
 export { webLockOwner } from './owner.ts';
 export type { OwnerLock, WebLocks } from './owner.ts';
 export { PRESENCE_TTL, presenceReporter, stateOf } from './presence.ts';
 export type { PresencePort, PresenceSnapshot, PresenceState } from './presence.ts';
-export { decodeModelError, encodeModelError, portProvider, toModelRequest } from './provider.ts';
+export { alternate, decodeModelError, encodeModelError, portProvider, toModelRequest } from './provider.ts';
+export { decodeFailure, oldestQueued, runView, stepsOf } from './view.ts';
+export type { AnswerRecord, InterruptedStep, RunView } from './view.ts';
 export { deleteJournalStore, NotStrict, openJournalStore, strictIndexedDB } from './store.ts';
 export type { JournalStore, JournalStoreOptions, StrictFactoryOptions } from './store.ts';
 export { defineJournalDoc, replayOf } from './tools.ts';

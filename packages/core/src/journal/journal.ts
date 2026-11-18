@@ -9,15 +9,27 @@
 //     receipt); a started built-in effect becomes a question, "Do it now?"; a started server tool is
 //     reported as interrupted, with Run again,
 //   - a consent card still open, and a wait for a wake time, are still there.
+//
+// Nothing here starts or places a run on its own. Every submission that can start one is your act, made in
+// one commit that reads pi-durable's state first: a message (`send`), an answer (`answer`), Send now
+// (`sendNow`). Her own line (`remark`) is model-visible only into a quiet chat, and never starts a run.
+// Questions are a view over pi-durable's `runFailure`, read live (view.ts). That holds only under these
+// pins, each with its test (tests/journal/pins.test.ts):
+//   - background compaction off (`backgroundTokens: 0`), no model overrides, no conversation `configure`,
+//     and any compaction task a journal made before the pin aborted at open, before `resume()`;
+//   - `afterFailedRun` left at "keep", the queue modes at "one-at-a-time", no `afterRun` or `onYield` hook,
+//     no reset, handoff, `terminate`, `compact`, conversation or submission abort, or raw submission;
+//   - exactly one extension, Familiar's own;
+//   - every write but her line display-only: the bound notice, the reminder line, `familiar.ack`.
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
-import { AssistantEntry, GenerationTask, Harness, LiveDoc, ToolTask, createRegistry, defineExtension, defineTask, hook } from '@earendil-works/pi-durable';
+import { AssistantEntry, GenerationTask, Harness, InboxDoc, LiveDoc, ToolTask, createRegistry, defineExtension, defineTask, hook } from '@earendil-works/pi-durable';
 import { needsReply } from '../decide/ack.ts';
 import type { Decision, DecisionContext, DecisionPort, PastReaction, PersonaEvent } from '../decide/port.ts';
 import type { CallInfo, CapsConfig, CapsOptions, Clock, Ledger } from '../model/caps.ts';
 import { cappedPort, createCaps, emptyLedger, extendTurn } from '../model/caps.ts';
-import type { ModelPort } from '../model/port.ts';
+import type { ChatMessage, ModelPort } from '../model/port.ts';
 import type { RetryOptions } from '../model/retry.ts';
 import { withRetries } from '../model/retry.ts';
 import { journalUsageStore, LedgerDoc } from './ledger.ts';
@@ -27,7 +39,8 @@ import { presenceReporter, stateOf } from './presence.ts';
 import { decodeModelError, portProvider } from './provider.ts';
 import type { JournalStore } from './store.ts';
 import { admit, boundWords, type Budget } from './bounds.ts';
-import { finishTurn, openTurn, turnKeyOf, TurnsDoc } from './turns.ts';
+import { finishTurn, openTurn, recordSubmission, turnKeyOf, turnOfInputs, TurnsDoc } from './turns.ts';
+import { oldestQueued, runView, type Answers, type Interruptions, type Question, type RunView } from './view.ts';
 import { gateFor, type GatePolicy } from './gate.ts';
 import type { FamiliarTool, JournalDocToken } from './tools.ts';
 import { defineJournalDoc, toDurableTool, type AllowedBy } from './tools.ts';
@@ -74,22 +87,28 @@ export interface ConsentPort {
   ask(card: ConsentCard, signal?: AbortSignal): Promise<boolean>;
 }
 
-/** Something the turn loop asks the person, in chat. */
-export interface Question {
-  readonly id: string;
-  /**
-   * `redo`: a built-in effect was cut off by a close and not run again ("Do it now?").
-   * `rerun`: a server tool was cut off and may have partially run (Run again).
-   * `steps`: the turn took its 8 tool steps and asks before going on.
-   * `cap`: a cap paused the turn; going on needs a cap with room, or tomorrow.
-   */
-  readonly kind: 'redo' | 'rerun' | 'steps' | 'cap';
+export type { Question } from './view.ts';
+
+/** Send now, as it was shown: the oldest queued message, and the stopped run it was shown after. */
+export interface SendNowOffer {
+  readonly submission: string;
+  /** `runFailure.taskId` when it was shown, or null for none. */
+  readonly failure: string | null;
+}
+
+/** What her line is made from: the prompt the decider built, and the sources of everything in it. */
+export interface RemarkPrompt {
+  readonly system: string;
+  readonly messages: readonly ChatMessage[];
+  /** Where the prompt's content came from (a server, say). Empty for her own words and yours. */
+  readonly sources?: readonly string[];
+}
+
+export interface Remark {
   readonly text: string;
-  readonly tool?: string;
-  readonly arguments?: unknown;
-  readonly pause?: string;
-  /** For `redo` and `rerun`: the turn the cut-off call belonged to. */
-  readonly turn?: string;
+  /** Her model sees it: written into a quiet chat. Otherwise it's shown only. */
+  readonly visible: boolean;
+  readonly sources: readonly string[];
 }
 
 /** What the decider sees that the loop doesn't know itself. */
@@ -165,10 +184,24 @@ export interface NotifierPort {
   notify(notification: Notification): void | Promise<void>;
 }
 
-const QuestionsDoc = defineJournalDoc<{ open: Record<string, Question>; dismissed: Record<string, true>; answered: Record<string, { yes: boolean; submission?: string; tool?: string; turn?: string }>; opened?: number }>(
-  'familiar.questions',
-  () => ({ open: {}, dismissed: {}, answered: {} })
-);
+/** One record per cut-off step, keyed by step id, under the run's task id (view.ts). */
+export const InterruptionsDoc = defineJournalDoc<Interruptions>('familiar.interruptions', () => ({ steps: {} }));
+/** One record per answered question, keyed by the stopped run's task id, written by the answer's commit. */
+export const AnswersDoc = defineJournalDoc<Answers>('familiar.answers', () => ({ byTask: {}, order: [] }));
+/** Each Send now by its request id: the submission it was shown for, and the continue it started. */
+export const SendNowDoc = defineJournalDoc<{ byRequest: Record<string, { submission: string; sent?: string }>; order: string[] }>('familiar.send-now', () => ({ byRequest: {}, order: [] }));
+/**
+ * The outside record: one per request Familiar makes outside a turn (her line), written before the
+ * request is sent and never changed. A request is outside if any of its input carries a source.
+ */
+export const OutsideDoc = defineJournalDoc<{ requests: Record<string, { sources: string[]; at: number }>; order: string[] }>('familiar.outside', () => ({ requests: {}, order: [] }));
+const RemarkEntry = 'familiar.remark';
+/** Records kept per document before the oldest go. */
+const KEEP_RECORDS = 256;
+const keepNewest = (order: string[], byKey: Record<string, unknown>, key: string) => {
+  if (!order.includes(key)) order.push(key);
+  while (order.length > KEEP_RECORDS) delete byKey[order.shift()!];
+};
 type SentRecord = { kind: 'turn'; submission: string } | { kind: 'ack'; decision: Decision };
 /** What each request id of a person's message did, so a resend gets the same result. */
 const SentDoc = defineJournalDoc<{ byRequest: Record<string, SentRecord>; order: string[] }>('familiar.sent', () => ({ byRequest: {}, order: [] }));
@@ -218,10 +251,27 @@ export interface Journal {
   turn(id: string): Turn;
   /** Open consent cards, as stored: the ones a restart left are here before they're asked again. */
   consents(): Promise<readonly ConsentCard[]>;
-  /** What the loop is asking you, in chat. */
+  /** What the loop is asking you, in chat: the view over how the newest run stopped. At most one. */
   questions(): Promise<readonly Question[]>;
-  /** Answers a question. Yes to `steps` or `cap` goes on with the turn; yes to `redo` or `rerun` asks her to do it again. */
+  /**
+   * Answers a question, in one commit that checks it's still open. Yes to `steps` or `cap` goes on with
+   * the turn; Yes to `redo` or `rerun` asks her to do every listed step again; No or Skip sends a queued
+   * message on, if there is one (Skip always goes on, without the calls). A question no longer open
+   * starts nothing: you get the earlier answer's turn, or nothing if you moved on.
+   */
   answer(id: string, yes: boolean, requestId: string): Promise<Turn | undefined>;
+  /** Send now, when it shows: nothing running, a message queued, no question open. */
+  queued(): Promise<SendNowOffer | undefined>;
+  /** Sends the oldest queued message on, if what the button was shown for still holds. */
+  sendNow(offer: SendNowOffer, requestId: string): Promise<Turn | undefined>;
+  /**
+   * Her own line: one model call with no tools, through the caps, then one commit. Model-visible only
+   * into a quiet chat (nothing running, nothing queued, no stopped run); otherwise shown only. Never starts
+   * a run. Undefined when the call failed or paused: she stays quiet.
+   */
+  remark(prompt: RemarkPrompt): Promise<Remark | undefined>;
+  /** The engine's setup, for the pin tests: installed extensions, hooks, settings. */
+  setup(): { readonly extensions: readonly string[]; readonly hooks: readonly { task: string; hooks: readonly string[] }[]; readonly settings: unknown };
   /** Parks a wait until `at` that survives a restart. */
   parkUntil(text: string, at: number): Promise<void>;
   /** Something happened that nobody asked about: the decider says whether and how she reacts. */
@@ -241,6 +291,17 @@ export interface Journal {
   kill(): void;
 }
 
+/**
+ * The Harness settings. Background compaction is off (B1: a background summary landing in an idle,
+ * failed conversation places your queued message and starts a run, which Familiar must never do). Blocking
+ * compaction stays: a long chat is summarized inside the turn. Everything else is pi-durable's default,
+ * `afterFailedRun: "keep"` and the one-at-a-time queue modes among them. No `modelOverrides`: an override
+ * that set `backgroundTokens` would turn it back on for that model.
+ */
+export function journalSettings(resendDelayMs = 2000) {
+  return { retry: { maxRetries: 2, baseDelayMs: resendDelayMs }, toolExecution: 'sequential' as const, compaction: { backgroundTokens: 0 } };
+}
+
 export async function openJournal(options: JournalOptions): Promise<Journal> {
   const clock = options.clock ?? systemClock;
   const owner = await options.owner.acquire(options.store.name);
@@ -248,6 +309,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   const gen = options.newGen?.() ?? Math.random().toString(36).slice(2, 10);
   const presence = presenceReporter(options.presence, options.persona.id, gen);
   const WakeAt = wakeAtTask(options.notifier);
+  const stepCap = options.stepCap ?? 8;
   let dead = false;
   let rootId: any;
   let harness: any;
@@ -325,8 +387,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         const registry = await tx.doc(TurnsDoc);
         const key = carry ? carryKey || registry.current || sid : sid;
         if (!carry) registry.current = sid;
-        if (registry.of[sid] === undefined) registry.of[sid] = key;
-        openTurn(registry, key, clock.now());
+        recordSubmission(registry, sid, key, clock.now());
       }
       await also?.(tx, sid);
       return sid;
@@ -343,26 +404,30 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     while (sent.order.length > 256) delete sent.byRequest[sent.order.shift()!];
   };
 
+  /** The view (view.ts) from committed state. */
+  const viewNow = async (): Promise<RunView> =>
+    runView(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(InterruptionsDoc, ctx), await harness.snapshot(AnswersDoc, ctx), stepCap);
+  /** The view inside a commit. */
+  const viewIn = async (tx: any): Promise<RunView> => runView(await tx.doc(LiveDoc, rootId), await tx.doc(InterruptionsDoc), await tx.doc(AnswersDoc), stepCap);
+
   /** Why a call of `name` waits for the person, if it does: an open interruption, or one skipped this turn. */
   const parkedFor = async (name: string, step: string): Promise<string | undefined> => {
-    const doc: any = await harness.snapshot(QuestionsDoc, ctx);
-    const open = Object.values(doc?.open ?? {}).find((q: any) => (q.kind === 'rerun' || q.kind === 'redo') && q.tool === name && q.id !== step);
-    if (open) return `${name} was cut off when the app closed. It waits for the person to choose Run again or skip.`;
+    const view = await viewNow();
+    if (view.state === 'question' && view.question.steps?.some((s) => s.tool === name && s.step !== step)) return `${name} was cut off when the app closed. It waits for the person to choose Run again or skip.`;
     const turn = turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
-    const skipped = Object.entries(doc?.answered ?? {}).some(([qid, a]: [string, any]) => !a.yes && a.tool === name && a.turn === turn && qid !== step);
+    const answers: any = await harness.snapshot(AnswersDoc, ctx);
+    const skipped = Object.values(answers?.byTask ?? {}).some((a: any) => !a.yes && a.turn === turn && (a.tools ?? []).includes(name));
     if (skipped) return `The person chose to skip ${name} in this turn.`;
     return undefined;
   };
-  // A round that left an interruption question ends its run: the model gets no chance to call the tool
-  // again on its own, and the turn waits for the person's answer. Read from the journal, so it holds
-  // after a restart. Only that run's task is stopped: messages you sent meanwhile stay queued, and go
-  // on with the person's answer.
+  // A round that left interruption records ends its run: the model gets no chance to call the tool again
+  // on its own, and the turn waits for the person's answer. Read from the journal, so it holds after a
+  // restart: a kill between the records and the abort resumes the round, and this runs again. Only that
+  // run's task is stopped: messages you sent meanwhile stay queued, and the question holds them.
   const parkHook = hook(GenerationTask, {
     afterTools: async (_assistant: unknown, _results: unknown, api: any) => {
-      const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
-      const steps = new Set((live?.tools ?? []).map((t: any) => String(t.taskId)));
-      const open: any = (await harness.snapshot(QuestionsDoc, ctx))?.open ?? {};
-      if (!Object.values(open).some((q: any) => (q.kind === 'rerun' || q.kind === 'redo') && steps.has(q.id))) return;
+      const records: any = await harness.snapshot(InterruptionsDoc, ctx);
+      if (!Object.values(records?.steps ?? {}).some((r: any) => r.task === String(api.taskId))) return;
       void harness.abortTask(api.taskId, ctx).catch((e: unknown) => report('park', e));
     }
   } as any);
@@ -423,17 +488,20 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       const id = String(api.taskId);
       const tool = tools.get(call.name);
       const interrupted = (result.diagnostics ?? []).some((d: any) => d.code === 'interrupted');
-      const turn = interrupted ? turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx)) : '';
       await harness.commit(async (tx: any) => {
         const consent = await tx.doc(ConsentDoc);
         if (consent.cards[id]) delete consent.cards[id];
         if (!interrupted || !tool) return;
-        const questions = await tx.doc(QuestionsDoc);
-        if (questions.dismissed[id] || questions.open[id]) return;
-        questions.open[id] =
+        // One record per interrupted step, under the task that runs this round: the task runFailure will
+        // name once the park hook stops it. Written again unchanged if a kill makes the round run again.
+        const records = await tx.doc(InterruptionsDoc);
+        if (records.steps[id]) return;
+        const live = await tx.doc(LiveDoc, rootId);
+        const turn = turnKeyOf(live, await tx.doc(TurnsDoc));
+        records.steps[id] =
           tool.kind === 'server'
-            ? { id, kind: 'rerun', tool: call.name, arguments: call.arguments, turn, text: `${call.name} was cut off when the app closed, and may have partially run.` }
-            : { id, kind: 'redo', tool: call.name, arguments: call.arguments, turn, text: `I was ${tool.doing(call.arguments)} when the app closed. Do it now?` };
+            ? { step: id, task: String(live?.run?.taskId ?? ''), kind: 'rerun', tool: call.name, arguments: call.arguments, turn, text: `${call.name} was cut off when the app closed, and may have partially run.` }
+            : { step: id, task: String(live?.run?.taskId ?? ''), kind: 'redo', tool: call.name, arguments: call.arguments, turn, text: `I was ${tool.doing(call.arguments)} when the app closed. Do it now?` };
       }, ctx);
       if (interrupted && tool?.kind === 'effect') return { ...result, output: [{ type: 'text', text: STOPPED_WORDS }] };
       return undefined;
@@ -470,6 +538,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     );
   };
 
+  const settings = journalSettings(options.resendDelayMs);
   try {
     harness = await Harness.open(
       options.store.storage,
@@ -477,7 +546,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         models,
         registry,
         identity: { attribution: null },
-        settings: { retry: { maxRetries: 2, baseDelayMs: options.resendDelayMs ?? 2000 }, toolExecution: 'sequential' },
+        settings,
         now: () => clock.now(),
         setTimer: (cb: () => void, ms: number, o: { background: boolean }) => clock.setTimer(cb, ms, o),
         onWake,
@@ -490,25 +559,37 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     throw error;
   }
   const root: any = await harness.root(ctx, {
-    agent: { model: { provider: PROVIDER, modelId: options.modelId }, instructions: options.persona.instructions, maxTurns: options.stepCap ?? 8 }
+    agent: { model: { provider: PROVIDER, modelId: options.modelId }, instructions: options.persona.instructions, maxTurns: stepCap }
   });
   rootId = root.id;
-  const usage = journalUsageStore(harness);
+  // The ledger keeps whole every turn something can still resume, read live in its own commit.
+  const usage = journalUsageStore(harness, async (tx) => [...(await liveResumable(tx))]);
   caps = createCaps(options.caps.config, usage, clock, options.caps.options);
 
-  /* ---------- questions from how the last run ended ---------- */
+  /* ---------- what can still resume, read live ---------- */
 
-  const failureQuestion = (live: any, dismissed: Record<string, true>): Question | undefined => {
-    const f = live?.runFailure;
-    if (!f || live?.run) return undefined;
-    const id = `run:${f.taskId}`;
-    if (dismissed[id]) return undefined;
-    if (f.reason === 'turn_limit') return { id, kind: 'steps', text: `I've taken ${options.stepCap ?? 8} steps on this. Shall I keep going?` };
-    const error = decodeModelError(f.detail);
-    if (f.reason === 'model_error' && error?.kind === 'paused') return { id, kind: 'cap', text: error.message, pause: error.pause };
-    return undefined;
+  /**
+   * The turns something can still resume, read in the caller's commit: a run in flight, an open question,
+   * an open consent card, a queued submission. Submissions are read with tx.submission, so the caller must
+   * have made no admission in this commit yet. Settled ones leave the registry's pending list.
+   */
+  const liveResumable = async (tx: any): Promise<Set<string>> => {
+    const registry = await tx.doc(TurnsDoc);
+    const live = await tx.doc(LiveDoc, rootId);
+    const out = new Set<string>();
+    if (live?.run) out.add(turnOfInputs(live.run.inputs ?? [], registry));
+    const view = runView(live, await tx.doc(InterruptionsDoc), await tx.doc(AnswersDoc), stepCap);
+    if (view.state === 'question') out.add(view.question.turn ?? turnOfInputs(live.runFailure?.inputs ?? [], registry));
+    for (const card of Object.values((await tx.doc(ConsentDoc)).cards) as any[]) if (!card.answer && card.turn) out.add(card.turn);
+    const still: string[] = [];
+    for (const sid of registry.pending ?? []) {
+      const status = (await tx.submission(Number(sid)))?.status;
+      if (status === 'queued') out.add(registry.of[sid] ?? sid);
+      if (status === 'queued' || status === 'placed') still.push(sid);
+    }
+    if ((registry.pending ?? []).length !== still.length) registry.pending = still;
+    return out;
   };
-  const failedRun = (live: any): boolean => !!live?.runFailure && !failureQuestion(live, {}) && !['aborted', 'reset', 'nothing_to_answer'].includes(live.runFailure.reason);
 
   /* ---------- the decision slot ---------- */
 
@@ -540,37 +621,44 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
 
   /* ---------- the state it reports ---------- */
 
+  // Presence reads committed state only: pi.live, the consent cards, and the view's own records.
   let consentOpen = false;
   let lastLive: any;
-  let dismissedNow: Record<string, true> = {};
-  let questionOpen = false;
-  const refresh = () => presence.update(stateOf({ live: lastLive, waiting: consentOpen || questionOpen || !!failureQuestion(lastLive, dismissedNow), failed: failedRun(lastLive) }));
+  let records: any;
+  let answered: any;
+  const refresh = () => {
+    const view = runView(lastLive, records, answered, stepCap);
+    presence.update(stateOf({ live: lastLive, waiting: consentOpen || view.state === 'question', failed: view.state === 'error' }));
+  };
   // Watches need their documents to exist.
   await harness.commit(async (tx: any) => {
     (await tx.doc(ConsentDoc)).opened = clock.now();
-    (await tx.doc(QuestionsDoc)).opened = clock.now();
+    (await tx.doc(InterruptionsDoc)).opened = clock.now();
+    (await tx.doc(AnswersDoc)).opened = clock.now();
   }, ctx);
   const liveWatch = await harness.watchDoc(LiveDoc, rootId, ctx);
   const consentWatch = await harness.watchDoc(ConsentDoc, ctx);
-  const questionsWatch = await harness.watchDoc(QuestionsDoc, ctx);
+  const recordsWatch = await harness.watchDoc(InterruptionsDoc, ctx);
+  const answersWatch = await harness.watchDoc(AnswersDoc, ctx);
   const seenTools = new Set<string>();
   let lastRunInputs: string[] = [];
   /**
-   * A run ended. A pause or the step cap leaves a question, recorded with its turn, and the turn stays
-   * open. Otherwise, with nothing left to resume it (no open question, no open card), the turn is
-   * finished. Only the run's own turn: a message queued meanwhile has its own, still open.
+   * A run ended. The turn's "finished" mark is a hint, for display and the 64-turn cap: it's set when
+   * nothing read live in this commit can resume the turn. Nothing about questions is recorded here: the
+   * question is pi-durable's record already. Interruption records no failure names any more are tidied.
    */
-  const endOfRun = async (inputs: string[], live: any) => {
+  const endOfRun = async (inputs: string[]) => {
     if (dead) return;
     await harness.commit(async (tx: any) => {
       const registry = await tx.doc(TurnsDoc);
-      const qs = await tx.doc(QuestionsDoc);
-      const cards = await tx.doc(ConsentDoc);
-      const turn = turnKeyOf({ run: { inputs: inputs.length ? inputs : (live?.runFailure?.inputs ?? []).map(String) } }, registry);
-      const q = failureQuestion(live, qs.dismissed);
-      if (q && !qs.open[q.id] && !qs.answered?.[q.id]) qs.open[q.id] = { ...q, turn };
-      const waiting = Object.values(qs.open).some((x: any) => x.turn === turn) || Object.values(cards.cards).some((c: any) => c.turn === turn && !c.answer);
-      if (!waiting) finishTurn(registry, turn, clock.now());
+      const live = await tx.doc(LiveDoc, rootId);
+      const resumable = await liveResumable(tx);
+      const turn = turnOfInputs(inputs.length ? inputs : (live?.runFailure?.inputs ?? []).map(String), registry);
+      if (!resumable.has(turn)) finishTurn(registry, turn, clock.now(), resumable);
+      const records = await tx.doc(InterruptionsDoc);
+      const keep = new Set([String(live?.runFailure?.taskId ?? ''), String(live?.run?.taskId ?? '')]);
+      const steps = Object.keys(records.steps);
+      if (steps.length > KEEP_RECORDS) for (const step of steps.slice(0, steps.length - KEEP_RECORDS)) if (!keep.has(records.steps[step].task)) delete records.steps[step];
     }, ctx);
   };
   const onLive = (live: any) => {
@@ -585,7 +673,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         if (!options.ambient().chatInFront) void notice({ name: 'tool-done', at: clock.now() }).catch((e) => report('decide', e));
       }
     }
-    if (wasRunning && !live?.run) void endOfRun(lastRunInputs, live).catch((e) => report('turns', e));
+    if (wasRunning && !live?.run) void endOfRun(lastRunInputs).catch((e) => report('turns', e));
     if (live?.run) lastRunInputs = (live.run.inputs ?? []).map(String);
     if (wasRunning && !live?.run) {
       lastChatAt = clock.now();
@@ -593,28 +681,32 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     }
   };
   const openCards = (doc: any) => Object.values(doc?.cards ?? {}).some((c: any) => !c.answer);
-  onLive(liveWatch.value);
+  records = recordsWatch.value;
+  answered = answersWatch.value;
   consentOpen = openCards(consentWatch.value);
-  dismissedNow = questionsWatch.value?.dismissed ?? {};
-  questionOpen = Object.keys(questionsWatch.value?.open ?? {}).length > 0;
-  refresh();
-  if (!liveWatch.value?.run && failureQuestion(liveWatch.value, dismissedNow)) await endOfRun([], liveWatch.value);
+  onLive(liveWatch.value);
   liveWatch.start(async (call: any) => call.kind === 'value' && onLive(call.value));
   consentWatch.start(async (call: any) => {
     if (call.kind !== 'value') return;
     consentOpen = openCards(call.value);
     refresh();
   });
-  questionsWatch.start(async (call: any) => {
+  recordsWatch.start(async (call: any) => {
     if (call.kind !== 'value') return;
-    dismissedNow = call.value?.dismissed ?? {};
-    questionOpen = Object.keys(call.value?.open ?? {}).length > 0;
+    records = call.value;
+    refresh();
+  });
+  answersWatch.start(async (call: any) => {
+    if (call.kind !== 'value') return;
+    answered = call.value;
     refresh();
   });
 
   /* ---------- turns ---------- */
 
   const entryText = (entry: any): { role?: string; text: string; error?: string } => {
+    // Her line: what she said, whether her model saw it or not.
+    if (entry?.kind === RemarkEntry) return { role: 'assistant', text: String(entry.data?.text ?? '') };
     const m = entry?.model?.[0];
     if (!m) return { text: typeof entry?.data?.text === 'string' ? entry.data.text : '' };
     const text = typeof m.content === 'string' ? m.content : (m.content ?? []).map((b: any) => (b.type === 'text' ? b.text : b.type === 'toolCall' ? `[${b.name} ${JSON.stringify(b.arguments)}]` : '')).join('');
@@ -624,6 +716,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   const lastPersonaText = async (): Promise<string | undefined> => {
     const page = await root.entries({ order: 'descending' }, 50, undefined, ctx);
     for (const e of page.items) {
+      if (e.kind === RemarkEntry) return entryText(e).text;
       const m = e.model?.[0];
       if (m?.role === 'assistant' && m.stopReason !== 'aborted' && m.stopReason !== 'error') return entryText(e).text;
     }
@@ -637,16 +730,28 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         const answer = settled.answer !== undefined ? await root.commit((tx: any) => tx.entry(AssistantEntry, settled.answer), ctx) : undefined;
         return { status: 'answered', text: answer ? entryText(answer).text : '' };
       }
+      const view = await viewNow();
+      if (view.state === 'question') return { status: 'asks', question: view.question };
       const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
-      const question = failureQuestion(live, {});
-      if (question) return { status: 'asks', question };
-      // A run ended to wait on a cut-off tool: the turn asks the person.
-      const interruption = (await questions()).find((q) => q.kind === 'redo' || q.kind === 'rerun');
-      if (interruption) return { status: 'asks', question: interruption };
       const error = decodeModelError(live?.runFailure?.detail);
-      return { status: 'failed', reason: String(settled.reason ?? live?.runFailure?.reason ?? 'unknown'), message: error?.message ?? String(live?.runFailure?.detail ?? '') };
+      return { status: 'failed', reason: String(settled.reason ?? live?.runFailure?.reason ?? 'unknown'), message: view.state === 'error' ? view.message : (error?.message ?? String(live?.runFailure?.detail ?? '')) };
     }
   });
+
+  // Background compaction is pinned off, but a journal made before the pin may hold a compaction task
+  // that would resume and place queued input. Abort each before anything is scheduled: opening and
+  // committing schedule nothing, and the abort handler runs once resume() starts the scheduler.
+  const staleCompactions = await harness.commit(async (tx: any) => {
+    const ids: unknown[] = [];
+    let cursor: any;
+    do {
+      const page = await tx.scanTasks({ conversationId: rootId, kind: 'pi.compaction' }, 100, cursor);
+      for (const t of page.items) if (t.state?.status !== 'terminal' && t.owner === undefined) ids.push(t.id);
+      cursor = page.next;
+    } while (cursor);
+    return ids;
+  }, ctx);
+  for (const id of staleCompactions) await harness.abortTask(id, ctx);
 
   harness.resume();
 
@@ -656,11 +761,12 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   };
 
   const questions = async (): Promise<readonly Question[]> => {
-    const doc: any = (await harness.snapshot(QuestionsDoc, ctx)) ?? { open: {}, dismissed: {} };
-    const fromRun = failureQuestion(await harness.snapshot(LiveDoc, rootId, ctx), doc.dismissed);
-    const open = Object.values(doc.open as Record<string, Question>);
-    return [...open, ...(fromRun && !open.some((q) => q.id === fromRun.id) && !doc.answered?.[fromRun.id] ? [fromRun] : [])];
+    const view = await viewNow();
+    return view.state === 'question' ? [view.question] : [];
   };
+  /** The words of a Yes to cut-off steps: one line per step, through the gate again. */
+  const againWords = (q: Question): string =>
+    (q.steps ?? []).map((s) => (s.kind === 'redo' ? `Yes, do it now: ${tools.get(s.tool)?.doing(s.arguments) ?? s.tool}.` : `Run ${s.tool} again.`)).join(' ');
 
   return {
     gen,
@@ -697,45 +803,142 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     },
     questions,
     async answer(id, yes, requestId) {
-      // Answered already, by this request or another: the same result again. Checked again inside the
-      // commit below, so two answers at once can't both act.
-      const given = (doc: any) => doc?.answered?.[id] as { submission?: string } | undefined;
-      const before = given(await harness.snapshot(QuestionsDoc, ctx));
-      if (before) return before.submission ? turnFor(await harness.submission(Number(before.submission), ctx)) : undefined;
-      const question = (await questions()).find((q) => q.id === id);
-      if (!question) return undefined;
-      const words = question.kind === 'redo' ? `Yes, do it now: ${tools.get(question.tool!)?.doing(question.arguments) ?? question.tool}.` : `Run ${question.tool} again.`;
-      // Skipping a cut-off tool lets the turn go on without it; the gate keeps that tool from running
-      // again in this turn. No to going on finishes the turn.
-      const skipInterrupted = !yes && (question.kind === 'redo' || question.kind === 'rerun');
-      const draft = skipInterrupted ? { type: 'continue', requestId } : !yes ? undefined : question.kind === 'steps' || question.kind === 'cap' ? { type: 'continue', requestId } : { type: 'input', content: words, requestId };
-      // The turn the question is about, from the question itself, or the paused run's inputs.
-      const asked = question.turn || turnKeyOf({ run: { inputs: ((await harness.snapshot(LiveDoc, rootId, ctx)) as any)?.runFailure?.inputs ?? [] } }, await harness.snapshot(TurnsDoc, ctx));
-      // The answer and what it starts are one commit, so a kill can't keep one without the other. A Yes at
-      // a turn-tokens pause gives the turn one more allowance, in the same commit, granted by this Yes once;
-      // a Yes never lifts a daily or dollar cap.
-      const submission = await submitInTurn(
-        draft,
-        true,
-        async (tx, sid) => {
-          if (yes && question.kind === 'cap' && question.pause === 'turn-tokens') {
-            const ledgerDoc = await tx.doc(LedgerDoc);
-            const ledger = { ...emptyLedger(), extensions: { ...(ledgerDoc.extensions ?? {}) }, granted: { ...(ledgerDoc.granted ?? {}) } };
-            if (extendTurn(ledger, asked, id)) {
-              ledgerDoc.extensions = ledger.extensions;
-              ledgerDoc.granted = ledger.granted;
-            }
+      if (!id.startsWith('run:')) return undefined;
+      const task = id.slice('run:'.length);
+      // One commit: read, check the question is still open, record the answer and admit what it starts.
+      // Every read comes before the admission; the answer and its submission are stored together or not
+      // at all, so a retry after a kill, or a second answer at the same moment, finds the first.
+      const sid: string = await harness.commit(async (tx: any) => {
+        const answers = await tx.doc(AnswersDoc);
+        const prior = answers.byTask[task];
+        if (prior) return prior.submission ?? '';
+        const live = await tx.doc(LiveDoc, rootId);
+        const view = runView(live, await tx.doc(InterruptionsDoc), answers, stepCap);
+        // Not open: a run is live, the failure names another task, or you moved on. Nothing changes.
+        if (view.state !== 'question' || view.question.id !== id) return '';
+        const q = view.question;
+        const inbox = await tx.doc(InboxDoc, rootId);
+        const registry = await tx.doc(TurnsDoc);
+        const asked = q.turn ?? turnOfInputs(live.runFailure?.inputs ?? [], registry);
+        const queued = oldestQueued(inbox);
+        const cutOff = q.kind === 'redo' || q.kind === 'rerun';
+        // Yes to cut-off steps: ask her to do them again. Yes otherwise, a Skip, or a No with a message
+        // queued: a continue, which places the oldest queued item first. A No with nothing queued: nothing.
+        const draft = yes && cutOff ? { type: 'input', content: againWords(q), requestId } : yes || cutOff || queued ? { type: 'continue', requestId } : undefined;
+        const started = draft ? String(await root.submit(tx, draft)) : '';
+        if (started) {
+          // The turn rule: a run belongs to the turn of the first input it places. A continue placing a
+          // queued item goes to that item's turn; anything else carries on the answered turn.
+          const turn = draft!.type === 'continue' && queued ? (registry.of[queued] ?? asked) : asked;
+          recordSubmission(registry, started, turn, clock.now());
+          if (turn !== asked) finishTurn(registry, asked, clock.now(), new Set([turn]));
+        } else {
+          finishTurn(registry, asked, clock.now());
+        }
+        // A Yes at a turn-tokens pause gives the turn one more allowance, granted by this Yes once.
+        // A Yes never lifts a daily or dollar cap.
+        if (yes && q.kind === 'cap' && q.pause === 'turn-tokens') {
+          const ledgerDoc = await tx.doc(LedgerDoc);
+          const ledger = { ...emptyLedger(), extensions: { ...(ledgerDoc.extensions ?? {}) }, granted: { ...(ledgerDoc.granted ?? {}) } };
+          if (extendTurn(ledger, asked, id)) {
+            ledgerDoc.extensions = ledger.extensions;
+            ledgerDoc.granted = ledger.granted;
           }
-          const doc = await tx.doc(QuestionsDoc);
-          delete doc.open[id];
-          doc.dismissed[id] = true;
-          doc.answered[id] = { yes, ...(sid ? { submission: sid } : {}), ...(question.tool ? { tool: question.tool } : {}), turn: asked };
-          if (!draft) finishTurn(await tx.doc(TurnsDoc), asked, clock.now());
-        },
-        asked,
-        { already: async (tx) => given(await tx.doc(QuestionsDoc))?.submission ?? (given(await tx.doc(QuestionsDoc)) ? '' : undefined) }
+        }
+        answers.order ??= [];
+        answers.byTask[task] = {
+          yes,
+          kind: q.kind,
+          turn: asked,
+          ...(started ? { submission: started } : {}),
+          ...(!yes && cutOff ? { tools: [...new Set((q.steps ?? []).map((s) => s.tool))] } : {})
+        };
+        keepNewest(answers.order, answers.byTask, task);
+        return started;
+      }, ctx);
+      return sid ? turnFor(await harness.submission(Number(sid), ctx)) : undefined;
+    },
+    async queued() {
+      const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
+      if (live?.run) return undefined;
+      const first = oldestQueued(await harness.snapshot(InboxDoc, rootId, ctx));
+      if (!first) return undefined;
+      if ((await viewNow()).state === 'question') return undefined;
+      return { submission: first, failure: live?.runFailure ? String(live.runFailure.taskId) : null };
+    },
+    async sendNow(offer, requestId) {
+      const sid: string = await harness.commit(async (tx: any) => {
+        const done = await tx.doc(SendNowDoc);
+        const prior = done.byRequest[requestId];
+        if (prior) return prior.sent ?? '';
+        // Read first: tx.submission can't read after the commit's admission.
+        const status = (await tx.submission(Number(offer.submission)))?.status;
+        const live = await tx.doc(LiveDoc, rootId);
+        const inbox = await tx.doc(InboxDoc, rootId);
+        const view = await viewIn(tx);
+        const failure = live?.runFailure ? String(live.runFailure.taskId) : null;
+        const holds = !live?.run && failure === offer.failure && view.state !== 'question' && status === 'queued' && oldestQueued(inbox) === offer.submission;
+        let sent = '';
+        if (holds) {
+          sent = String(await root.submit(tx, { type: 'continue', requestId }));
+          const registry = await tx.doc(TurnsDoc);
+          recordSubmission(registry, sent, registry.of[offer.submission] ?? offer.submission, clock.now());
+        }
+        done.byRequest[requestId] = { submission: offer.submission, ...(sent ? { sent } : {}) };
+        keepNewest(done.order, done.byRequest, requestId);
+        return sent;
+      }, ctx);
+      return sid ? turnFor(await harness.submission(Number(sid), ctx)) : undefined;
+    },
+    async remark(prompt) {
+      if (dead) return undefined;
+      const key = `moment:${Math.random().toString(36).slice(2, 12)}`;
+      const sources = [...new Set(prompt.sources ?? [])].sort();
+      // The outside record, before the request is sent.
+      await harness.commit(async (tx: any) => {
+        const doc = await tx.doc(OutsideDoc);
+        if (!doc.requests[key]) doc.requests[key] = { sources, at: clock.now() };
+        keepNewest(doc.order, doc.requests, key);
+      }, ctx);
+      // One request, no tools, through the caps under its own key: never resumable, so its reservation
+      // settles when the call returns, or becomes a spent record at its deadline if the app dies.
+      const capped = withRetries(
+        cappedPort(options.model, caps!, () => ({ ...options.caps.call, turn: key, conversation: String(rootId) })),
+        { ...options.retries, sleep }
       );
-      return submission ? turnFor(submission) : undefined;
+      let text = '';
+      try {
+        for await (const e of capped.stream({ model: options.modelId, system: prompt.system, messages: prompt.messages, tools: [] })) {
+          if (e.type === 'text') text += e.delta;
+          else if (e.type === 'error') return undefined;
+        }
+      } catch (error) {
+        report('remark', error);
+        return undefined;
+      }
+      text = text.trim();
+      if (!text || dead) return undefined;
+      // One commit: model-visible only into a quiet chat, read in this commit before the write's admission.
+      // A model-visible write into an idle chat with queued items would start them; after a failed run it
+      // would end the context in her words.
+      const visible: boolean = await harness.commit(async (tx: any) => {
+        const live = await tx.doc(LiveDoc, rootId);
+        const inbox = await tx.doc(InboxDoc, rootId);
+        const quiet = !live?.run && !live?.runFailure && (inbox?.items ?? []).length === 0;
+        const data = { text, sources, request: key };
+        const note = `[${options.persona.name} said this on her own, not in reply to a message: "${text}"]`;
+        await root.submit(tx, {
+          type: 'write',
+          entry: quiet ? { kind: RemarkEntry, data, model: [{ role: 'user', content: [{ type: 'text', text: note }], timestamp: clock.now() }] } : { kind: RemarkEntry, data }
+        });
+        return quiet;
+      }, ctx);
+      return { text, visible, sources };
+    },
+    setup() {
+      const installed: any[] = [...registry.snapshot().installed()];
+      const hooks = installed.flatMap((e) => (e.hooks ?? []).map((h: any) => ({ task: String(h.task), hooks: Object.keys(h.handlers ?? {}) })));
+      return { extensions: installed.map((e) => e.name), hooks, settings };
     },
     async parkUntil(text, at) {
       await root.commit((tx: any) => tx.createTask(WakeAt, { text, at }, { ownership: { kind: 'conversation' }, background: true }), ctx);
@@ -757,7 +960,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       presence.stop();
       cancelWake?.();
       try {
-        await Promise.allSettled([liveWatch.stop(), consentWatch.stop(), questionsWatch.stop()]);
+        await Promise.allSettled([liveWatch.stop(), consentWatch.stop(), recordsWatch.stop(), answersWatch.stop()]);
         await harness.close(ctx);
       } finally {
         owner.release();

@@ -79,6 +79,9 @@ describe('parking keeps the inbox', () => {
 });
 
 describe('the turn registry', () => {
+  // A message sent while a question is open closes it (pi-durable starts its run and removes runFailure),
+  // so B queues behind A while A runs. The question holds B; Run again then queues behind B, B runs
+  // its tools in its own turn, and A's Run again runs after, in A's turn.
   it("turn A parked at its 32nd call while turn B runs tools: when A resumes, its 33rd call is refused", async () => {
     const world = nodeWorld();
     const script = (r: ModelRequest): FakeReply => {
@@ -96,20 +99,25 @@ describe('the turn registry', () => {
       world,
       'registry-calls',
       (life) => ({ script, hang: (n) => life === 1 && n === 'server_lookup' }),
-      async (j) => void j.send('Turn A', 'a'),
+      async (j) => {
+        void j.send('Turn A', 'a');
+        while (world.counters.get('hung:server_lookup') < 1) await sleep(5);
+        await j.send('Turn B', 'b');
+      },
       () => world.counters.get('hung:server_lookup') >= 1
     );
     const a = await two.journal.send('Turn A', 'a');
     const parked = a.replied ? await a.turn.wait() : undefined;
     expect(parked).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
     expect(world.counters.get('starts:look')).toBe(31);
-    // B runs tools of its own.
+    // A resumes with Run again: B, queued first, runs its own tools first, in its own turn.
+    if (parked?.status !== 'asks') return;
+    const again = (await two.journal.answer(parked.question.id, true, 'again'))!;
     const b = await two.journal.send('Turn B', 'b');
     expect(b.replied && (await b.turn.wait())).toMatchObject({ status: 'answered', text: 'B done.' });
     expect(world.counters.get('starts:look')).toBe(34);
-    // A resumes: its 33rd call is refused, however many B made.
-    if (parked?.status !== 'asks') return;
-    expect(await (await two.journal.answer(parked.question.id, true, 'again'))!.wait()).toMatchObject({ status: 'answered', text: 'A done.' });
+    // Then A's Run again, in A's turn: its 33rd call is refused, however many B made.
+    expect(await again.wait()).toMatchObject({ status: 'answered', text: 'A done.' });
     expect(world.counters.get('starts:server_lookup')).toBe(1);
     expect(results([...one.model.requests, ...two.model.requests]).some((t) => t.includes('Familiar stopped after 32 tool calls in this turn.'))).toBe(true);
     await two.journal.close();
@@ -128,21 +136,27 @@ describe('the turn registry', () => {
       world,
       'registry-spend',
       (life) => ({ script, hang: (n) => life === 1 && n === 'server_lookup', caps: { maxTurnTokens: 5000 } }),
-      async (j) => void j.send('Turn A', 'a'),
+      async (j) => {
+        void j.send('Turn A', 'a');
+        while (world.counters.get('hung:server_lookup') < 1) await sleep(5);
+        await j.send('Turn B', 'b');
+      },
       () => world.counters.get('hung:server_lookup') >= 1
     );
     const a = await two.journal.send('Turn A', 'a');
     const parked = a.replied ? await a.turn.wait() : undefined;
     expect(parked).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
     two.clock.advance(31 * 24 * 60 * 60_000);
-    // B's calls tidy the ledger, a month on.
+    // A month on, Run again: B, queued first, runs and its calls tidy the ledger while A's Run again
+    // waits queued behind it. A's turn is kept whole because that queued submission is read live.
+    if (parked?.status !== 'asks') return;
+    const again = (await two.journal.answer(parked.question.id, true, 'again'))!;
     const b = await two.journal.send('Turn B', 'b');
     expect(b.replied && (await b.turn.wait())).toMatchObject({ status: 'answered' });
     const ledger = await two.journal.ledger();
     expect(ledger.records.length + Object.keys(ledger.turns).length).toBeGreaterThan(0);
-    // A resumes: what it spent a month ago still counts toward its turn cap.
-    if (parked?.status !== 'asks') return;
-    expect(await (await two.journal.answer(parked.question.id, true, 'again'))!.wait()).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'turn-tokens' } });
+    // A's Run again: what it spent a month ago still counts toward its turn cap.
+    expect(await again.wait()).toMatchObject({ status: 'asks', question: { kind: 'cap', pause: 'turn-tokens' } });
     await two.journal.close();
   });
 });

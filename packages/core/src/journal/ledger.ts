@@ -33,7 +33,13 @@ const plain = (value: unknown): Ledger => {
   return { records: l.records ?? [], open: l.open ?? [], turns: l.turns ?? {}, extensions: l.extensions ?? {}, granted: l.granted ?? {} };
 };
 
-export function journalUsageStore(host: LedgerHost): UsageStore {
+/**
+ * The turns that can still resume, read in the ledger's own commit. The journal passes its live read
+ * (pi.live, cards, queued submissions); without one, the registry's open marks stand in.
+ */
+export type ResumableRead = (tx: any) => Promise<readonly string[]>;
+
+export function journalUsageStore(host: LedgerHost, resumable: ResumableRead = async (tx) => resumableTurns(await tx.doc(TurnsDoc))): UsageStore {
   return {
     async update(change) {
       return host.commit(async (tx) => {
@@ -41,7 +47,7 @@ export function journalUsageStore(host: LedgerHost): UsageStore {
         const ledger = plain(doc);
         const before = JSON.stringify(ledger);
         // The turns that can still resume, read in this same commit, so tidy keeps them whole.
-        ledger.resumable = resumableTurns(await tx.doc(TurnsDoc));
+        ledger.resumable = [...(await resumable(tx))];
         // A throw rolls the commit back.
         const out = change(ledger);
         delete ledger.resumable;

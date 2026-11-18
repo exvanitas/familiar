@@ -82,10 +82,33 @@ export function toModelRequest(model: { id: string }, context: any, options: any
   return {
     model: model.id,
     system: getCurrentSystemPrompt(context.messages) ?? '',
-    messages,
+    messages: alternate(messages),
     tools,
     ...(options?.maxTokens ? { maxOutputTokens: options.maxTokens } : {})
   };
+}
+
+/**
+ * Merges consecutive messages of one role into one, so every endpoint sees alternating roles. Some chat
+ * templates (local models) refuse anything else, and pi-ai passes messages through as they are (B3).
+ * Her remark is a user-role note, so a note and your next message become one user message. Two
+ * assistant messages merge only when neither carries tool calls or replay state; tool results never merge.
+ */
+export function alternate(messages: readonly ChatMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const m of messages) {
+    const last = out[out.length - 1];
+    if (last?.role === 'user' && m.role === 'user') {
+      out[out.length - 1] = { role: 'user', content: `${last.content}\n\n${m.content}` };
+      continue;
+    }
+    if (last?.role === 'assistant' && m.role === 'assistant' && !last.toolCalls && !m.toolCalls && !last.replay && !m.replay) {
+      out[out.length - 1] = { role: 'assistant', content: `${last.content}\n\n${m.content}` };
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
 }
 
 export interface PortProviderOptions {
