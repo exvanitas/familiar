@@ -4,7 +4,7 @@
 import { build } from 'esbuild';
 import { cpSync, mkdirSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { APP_DEFINE } from './define.ts';
+import { APP_BUILD } from './define.ts';
 import { nodeStub } from './node-stub.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -12,7 +12,7 @@ const dist = `${root}dist`;
 rmSync(dist, { recursive: true, force: true });
 
 const bundle = (entryPoints: Record<string, string>, outdir: string) =>
-  build({ entryPoints, outdir, bundle: true, format: 'esm', target: 'chrome120', legalComments: 'none', logLevel: 'warning', define: APP_DEFINE, plugins: [nodeStub] });
+  build({ entryPoints, outdir, bundle: true, format: 'esm', target: 'chrome120', legalComments: 'none', logLevel: 'warning', ...APP_BUILD, plugins: [nodeStub] });
 
 mkdirSync(`${dist}/app`, { recursive: true });
 cpSync(`${root}app`, `${dist}/app`, { recursive: true });

@@ -351,14 +351,15 @@ export class ServerLink {
     // Modern remote: the headers come from the same decision as the body, in this same step (3.6).
     let extra: (readonly [string, string])[] | undefined;
     if (run.era === 'modern' && run.target.where === 'remote') {
-      const mirrored = run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('mirror-previous-call')) ? run.lastCall.args : canonicalArguments;
+      const mirrored = (__FAMILIAR_MUTATIONS__ && mutant('mirror-previous-call')) && run.lastCall ? run.lastCall.args : canonicalArguments;
       const params = paramHeaders(run.declarations.get(name) ?? [], JSON.parse(mirrored), this.headers(run, 'tools/call').length + 1);
       if (!params.ok) return Promise.resolve({ kind: 'error', reason: 'protocol', words: HEADER_WORDS });
       extra = [['Mcp-Name', name], ...params.headers];
     }
     const id = run.nextId++;
     const body = frameCall(id, name, canonicalArguments, run.era, run.target.where);
-    run.lastCall = { body, args: canonicalArguments };
+    // Kept only for named mutations (the test build): the app build drops it.
+    if (__FAMILIAR_MUTATIONS__) run.lastCall = { body, args: canonicalArguments };
     const outcome = this.exchangeNow(run, 'call', id, body, 'tools/call', extra);
     if (!outcome) return undefined;
     const n = this.slot.ex!.n;
@@ -398,7 +399,7 @@ export class ServerLink {
       if (run.era === 'modern') {
         const type = r.result?.resultType;
         if (type === 'input_required') {
-          if (run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('retry-after-input-required'))) {
+          if ((__FAMILIAR_MUTATIONS__ && mutant('retry-after-input-required')) && run.lastCall) {
             const again = run.lastCall.body;
             void this.drained().then(() => this.exchangeNow(run, 'call', run.nextId++, again, 'tools/call'));
           }
@@ -905,7 +906,7 @@ export class ServerLink {
       run.ready = false;
       run.stale = true;
     }
-    const resend = run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('resend-404-call')) ? run.lastCall.body : undefined;
+    const resend = (__FAMILIAR_MUTATIONS__ && mutant('resend-404-call')) && run.lastCall ? run.lastCall.body : undefined;
     if (!(__FAMILIAR_MUTATIONS__ && mutant('keep-old-session-id'))) delete run.sessionId;
     delete run.version;
     void (async () => {
