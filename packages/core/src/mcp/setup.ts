@@ -2,6 +2,7 @@
 // rules (shell-core's setup.rs, 5b and 5c in docs/shell-design.md), so a setup fails here, early, with
 // the same words, before anything reaches the exe.
 
+import { reservedHeader } from './wire/link.ts';
 import { canonicalJson, sha256 } from './hash.ts';
 import type { ProcessSetup } from './process.ts';
 import { literalClass, windowsPaths, type PathRules } from './native-rules.ts';
@@ -172,6 +173,7 @@ function remoteProblems(s: RemoteSetup): string[] {
     const low = name.toLowerCase();
     if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) p.push(`"${name}" isn't a header name.`);
     else if (DROPPED_HEADERS.includes(low) || low.startsWith('proxy-')) p.push(`Familiar doesn't send the ${name} header.`);
+    else if (reservedHeader(low)) p.push(`The ${name} header is Familiar's own to set, so a setup can't give it.`);
     else if (KEY_HEADERS.includes(low) || keyLike(name)) p.push(`The ${name} header looks like it carries a key. Familiar keeps a server's key in Credential Manager, in one of these headers only: Authorization, X-API-Key, Api-Key or X-Goog-Api-Key.`);
     if (/[\0\r\n]/.test(value)) p.push(`The ${name} header holds a line break.`);
     if (bytes(value) > MAX_HEADER_BYTES) p.push(`The ${name} header is larger than 8 KiB.`);

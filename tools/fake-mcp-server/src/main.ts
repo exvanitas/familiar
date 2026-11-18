@@ -7,14 +7,15 @@
 
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { createInterface } from 'node:readline';
 import { startHttp } from './http.ts';
-import { createFakeServer, type Variant } from './server.ts';
+import { createFakeServer, type Era, type Variant } from './server.ts';
 
 const { values } = parseArgs({
   options: {
     http: { type: 'string' },
-    variant: { type: 'string', default: 'a' }
+    variant: { type: 'string', default: 'a' },
+    era: { type: 'string', default: 'legacy' }
   }
 });
 
@@ -25,6 +26,7 @@ if (values.variant !== 'a' && values.variant !== 'b') {
 
 const options = {
   variant: values.variant as Variant,
+  era: values.era as Era,
   env: process.env,
   log: (line: string) => process.stderr.write(`${line}\n`),
   crash: () => process.exit(3),
@@ -56,5 +58,17 @@ if (values.http !== undefined) {
   const handle = await startHttp({ ...options, port });
   process.stdout.write(`READY ${handle.url}\n`);
 } else {
-  await createFakeServer(options).connect(new StdioServerTransport());
+  // stdio: one JSON-RPC message per line in, one per line out.
+  const server = createFakeServer(options);
+  const write = (m: object) => process.stdout.write(`${JSON.stringify(m)}\n`);
+  createInterface({ input: process.stdin }).on('line', (line) => {
+    let message: unknown;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return write({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+    }
+    void server.handle(message, write);
+  });
+  process.stdin.on('end', () => process.exit(0));
 }
