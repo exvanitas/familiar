@@ -1,4 +1,4 @@
-// The seeded wire harness: H1 to H3 and H10 to H14 over CI's seeds (500; FAMILIAR_SEEDS=20000 locally),
+// The seeded wire harness: H1 to H3 and H10 to H15 over CI's seeds (500; FAMILIAR_SEEDS=20000 locally),
 // the named schedules beside them (and H4, H5 in the pass build), and every check needing a witness.
 import { describe, expect, it } from 'vitest';
 import { PASS_CHECKS, PASS_WITNESSES, WIRE_CHECKS, WITNESSES, pongFates } from './checks.ts';
@@ -8,7 +8,7 @@ import { wireRun, type WireRun } from './wire.ts';
 const SEEDS = Number(process.env.FAMILIAR_SEEDS ?? 500);
 
 describe('the wire, under seeded interleavings', () => {
-  it(`holds H1 to H3 and H10 to H14 over ${SEEDS} seeds and the named schedules, each check with a witness`, async () => {
+  it(`holds H1 to H3 and H10 to H15 over ${SEEDS} seeds and the named schedules, each check with a witness`, async () => {
     const problems: string[] = [];
     const seen = new Set<string>();
     const fates: Record<string, number> = {};
