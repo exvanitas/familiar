@@ -367,9 +367,13 @@ export class ServerLink {
 
   /** One administrative exchange: waits for the slot to be Idle first (the walk's own pages, the handshake). */
   private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string): Promise<Outcome> {
-    await this.drained();
-    if (run.ended) return { end: { t: 'run-ended' } };
-    return this.exchangeNow(run, kind, requestId, body) ?? { end: { t: 'native', kind: 'busy' } };
+    // A local idle ping can take the slot between two of the walk's own steps: wait for it too.
+    for (;;) {
+      await this.drained();
+      if (run.ended) return { end: { t: 'run-ended' } };
+      const started = this.exchangeNow(run, kind, requestId, body);
+      if (started) return started;
+    }
   }
 
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
