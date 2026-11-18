@@ -13,6 +13,9 @@ const CONTROLS: [string, keyof typeof JOURNAL_CHECKS][] = [
   // A late answer to an earlier question answers the one open now: only H7's tie to the answered task
   // catches it.
   ['answer-any-question', 'H7'],
+  // The same late answer recorded under the open question's own task: only H7's tie to the question the
+  // person clicked (the driver's evidence) catches it.
+  ['answer-recorded-as-open', 'H7'],
   // DESIGN names H6 for this one. Here H6 catches it in about 1 seed in 60 and H7 in most (the run it starts
   // in the failure's own commit is on no act of yours), so the control is H7's.
   ['after-failed-continue', 'H7'],

@@ -287,6 +287,34 @@ describe('5.1: failing closed', () => {
     expect((await stored(store)).servers.bad).toEqual({ setup: { kind: 'weird' } });
   });
 
+  it("an Add never takes an unreadable server's address: not by the URL, and not by the id the exe gives back", async () => {
+    // The exe's dialog: one address id per URL, as the exe keeps one per identity.
+    const store = memorySettingsStore();
+    const t = ports(store);
+    const byUrl = new Map<string, string>();
+    const p: OwnerPorts = { ...t.p, addresses: { ...t.p.addresses, add: async (spec) => byUrl.get(spec.url) ? { id: byUrl.get(spec.url)! } : t.p.addresses.add(spec).then((a) => (byUrl.set(spec.url, a.id), a)) } };
+    const one = await Owner.open(p);
+    expect(await one.add(remote('A', 'https://a.example/mcp'))).toEqual({ ok: true });
+    expect(await one.add(remote('C', 'https://c.example/mcp'))).toEqual({ ok: true });
+    // A loses a header's shape, and C its URL: both unreadable, each still holding its address.
+    const doc = await stored(store);
+    doc.servers.A.setup.headers = [null];
+    doc.servers.C.setup.url = 42;
+    await store.put(OWNER_KEY, { v: 1, value: doc });
+    const two = await Owner.open(p);
+    expect(two.unreadableServers()).toEqual(['A', 'C']);
+    // By the URL: refused before any dialog.
+    expect(await two.add(remote('B', 'https://A.example:443/mcp/'))).toMatchObject({ ok: false, words: expect.stringMatching(/already uses this address/) });
+    // By the id the exe gives back for C's address (its URL can't be read here): refused, the address kept.
+    expect(await two.add(remote('D', 'https://c.example/mcp'))).toMatchObject({ ok: false, words: expect.stringMatching(/already uses this address/) });
+    expect(two.server('B')).toBeUndefined();
+    expect(two.server('D')).toBeUndefined();
+    expect([...t.addresses.keys()].sort()).toEqual(['addr-1', 'addr-2']);
+    const raw = await stored(store);
+    expect([raw.servers.A.setup.address, raw.servers.C.setup.address]).toEqual(['addr-1', 'addr-2']);
+    expect(two.mark).toBeUndefined();
+  });
+
   it('a record of another version: nothing loads, and nothing is written', async () => {
     const store = memorySettingsStore();
     await store.put(OWNER_KEY, { v: 2, value: { future: true } });

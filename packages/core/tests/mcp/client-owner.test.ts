@@ -26,14 +26,14 @@ const ownerPorts = (store: SettingsStore): OwnerPorts => ({
 });
 
 /** A process port where each server's runs answer the handshake and list `echo`. */
-function speakingPort(hold?: (id: string, msg: any) => Promise<void> | undefined) {
+function speakingPort(hold?: (id: string, msg: any) => Promise<void> | undefined, describe: () => string = () => 'the echo tool') {
   const starts: string[] = [];
   const procs = new Map<string, ReturnType<typeof fakeProcess>>();
   const runOf = new Map<string, string>();
   const port: ProcessPort = {
     async start(setup, onEvent) {
       starts.push(setup.id);
-      const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify(listResult(msg.id, ['echo']))] : []));
+      const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'echo', description: describe(), inputSchema: { type: 'object', properties: {} } }] } })] : []));
       procs.set(setup.id, fp);
       const { run } = await fp.port.start(setup, onEvent);
       const id = `${setup.id}-${starts.length}`;
@@ -137,6 +137,45 @@ describe('5.1: a saved setup, as the owner keeps it', () => {
     edited.args.push('--more');
     expect((owner.server('l1')!.setup as any).args).toEqual(['y.js']);
     expect(((await store.get(OWNER_KEY))!.value as any).servers.l1.setup.args).toEqual(['y.js']);
+  });
+
+  it("a remote draft changed while its address dialog is open changes nothing: the URL approved is the one saved, and an id changed to a saved server's overwrites nothing", async () => {
+    const remote = (id: string, url: string): ServerSetup => ({ kind: 'remote', id, label: `Remote ${id}`, url, transport: 'http', headers: [] });
+    for (const via of ['owner', 'client'] as const) {
+      const store = memorySettingsStore();
+      const asked: string[] = [];
+      let open!: () => void;
+      let release!: () => void;
+      const addresses = {
+        add: async ({ url }: { url: string }) => {
+          asked.push(url);
+          open();
+          await new Promise<void>((r) => (release = r));
+          return { id: `addr-${asked.length}` };
+        },
+        remove: async () => {},
+        list: async () => []
+      };
+      const client = await clientOf(store, speakingPort().port, { addresses });
+      await client.add({ setup: local('l1'), problems: [] });
+      const before = JSON.stringify(client.owner.server('l1'));
+      // The URL, then the id, changed while the dialog is open.
+      for (const change of ['url', 'id'] as const) {
+        const setup: any = remote(`r-${change}`, `https://${change}.example/mcp`);
+        const dialog = new Promise<void>((r) => (open = r));
+        const adding = via === 'owner' ? client.owner.add(setup) : client.add({ setup, problems: [] });
+        await dialog;
+        if (change === 'url') setup.url = 'https://other.example/mcp';
+        else setup.id = 'l1';
+        release();
+        const r: any = await adding;
+        if (via === 'owner') expect(r, `${via} ${change}`).toEqual({ ok: true });
+        else expect(r.id, `${via} ${change}`).toBe(`r-${change}`);
+        expect(client.owner.server(`r-${change}`)?.setup, `${via} ${change}`).toMatchObject({ id: `r-${change}`, url: `https://${change}.example/mcp`, address: `addr-${asked.length}` });
+        expect(JSON.stringify(client.owner.server('l1')), `${via} ${change}`).toBe(before);
+      }
+      expect(asked).toEqual(['https://url.example/mcp', 'https://id.example/mcp']);
+    }
   });
 });
 
@@ -277,6 +316,25 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
     expect((await clientOf(store, speakingPort().port)).policy([])).toEqual({ perTool: {} });
   });
 
+  it("the whole record unreadable (choices null, or a record of the next version): every built-in asks, never its default allow, and a revoke to never still denies", async () => {
+    const bad: [string, { v: number; value: unknown }][] = [
+      ['choices null', { v: OWNER_VERSION, value: { rev: 3, servers: {}, keys: [], tombstones: {}, choices: null } }],
+      ['the next version', { v: OWNER_VERSION + 1, value: { rev: 3, servers: {}, keys: [], tombstones: {}, choices: { [choiceKey(BUILT_IN, 'note_add')]: { policy: 'deny', fingerprint: '', setupFingerprint: '' } } } }]
+    ];
+    for (const [what, record] of bad) {
+      const store = memorySettingsStore();
+      await store.put(OWNER_KEY, record as never);
+      const client = await clientOf(store, speakingPort().port);
+      expect(client.owner.unreadable, what).toBe(true);
+      expect(gateFor('note_add', noteAdd, client.policy([])), what).toBe('ask');
+      expect(gateFor('note_search', look, client.policy([])), what).toBe('ask');
+      // A stricter overlay is kept: a revoke to never denies, though it can't be saved.
+      expect(await client.revoke(BUILT_IN, 'note_add', 'never'), what).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
+      expect(gateFor('note_add', noteAdd, client.policy([])), what).toBe('deny');
+      expect(gateFor('note_search', look, client.policy([])), what).toBe('ask');
+    }
+  });
+
   it('a revoke to Ask of a built-in holds as ask at once and is saved as ask, so a restart keeps it', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
@@ -292,6 +350,27 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
     expect(client.choices()[choiceKey(BUILT_IN, 'note_search')]).toMatchObject({ policy: 'ask' });
     const again = await clientOf(store, speakingPort().port);
     expect(gateFor('note_search', look, again.policy([]))).toBe('ask');
+  });
+
+  it('a revoke to Ask over a saved never, while a choice of allow is still saving: it answers not saved, or the reopen loads at least ask', async () => {
+    const base = memorySettingsStore();
+    let gate: (() => void) | undefined;
+    let hold = false;
+    const store: SettingsStore = { ...base, putIf: async (k, r, g) => (hold && (await new Promise<void>((res) => (gate = res))), base.putIf(k, r, g)) };
+    const client = await clientOf(store, speakingPort().port);
+    await client.choose(BUILT_IN, 'note_add', { policy: 'deny', fingerprint: '', setupFingerprint: '' });
+    hold = true;
+    const allowing = client.choose(BUILT_IN, 'note_add', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    await tick();
+    const revoked = await client.revoke(BUILT_IN, 'note_add', 'ask');
+    hold = false;
+    gate!();
+    await allowing;
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('ask');
+    const again = await clientOf(base, speakingPort().port);
+    // What a reopen loads is at least as strict as the last answer that said saved.
+    if (revoked.ok) expect(gateFor('note_add', noteAdd, again.policy([]))).not.toBe('allow');
+    else expect(revoked.words).toMatch(/not saved/);
   });
 
   it('a revoke the owner refuses holds for now and says it was not saved; a restart brings the saved choice back', async () => {
@@ -313,31 +392,77 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
 });
 
 describe('5.4: Mark reviewed marks what Test showed', () => {
-  for (const how of ['the report', 'names'] as const) {
-    it(`Test shows F1, the catalog moves to F2, then Mark reviewed (${how}): F2 is still unreviewed`, async () => {
-      const store = memorySettingsStore();
-      const client = await clientOf(store, speakingPort().port);
-      await client.add({ setup: local('l1'), problems: [] });
-      const report = await client.test('l1');
-      if (!report.ok) throw new Error('test failed');
-      const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
-      // A run lists echo changed before the person presses Mark reviewed.
-      await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F2' }]);
-      await client.markReviewed('l1', how === 'names' ? ['echo'] : report.tools);
-      expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F2', reviewed: f1 }]);
-      // Back at F1, what the person saw: reviewed.
-      await client.owner.seen('l1', [{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
-      expect(client.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
-    });
-  }
-
-  it('a name Test never showed is marked nothing', async () => {
+  it('Test shows F1, the catalog moves to F2, then Mark reviewed of that report: F2 is still unreviewed', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
     await client.add({ setup: local('l1'), problems: [] });
-    await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F1' }]);
-    await client.markReviewed('l1', ['echo']);
-    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F1' }]);
+    const report = await client.test('l1');
+    if (!report.ok) throw new Error('test failed');
+    const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
+    // A run lists echo changed before the person presses Mark reviewed.
+    await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F2' }]);
+    await client.markReviewed('l1', report.report, ['echo']);
+    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F2', reviewed: f1 }]);
+    // Back at F1, what the person saw: reviewed.
+    await client.owner.seen('l1', [{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+    expect(client.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+  });
+
+  it('two Tests, then Mark reviewed pressed on the first report: it marks what the first showed, and the second\'s tool stays unreviewed', async () => {
+    const store = memorySettingsStore();
+    let words = 'one';
+    const client = await clientOf(store, speakingPort(undefined, () => words).port);
+    await client.add({ setup: local('l1'), problems: [] });
+    const first = await client.test('l1');
+    if (!first.ok) throw new Error('test 1');
+    words = 'two';
+    const second = await client.test('l1');
+    if (!second.ok) throw new Error('test 2');
+    const [f1, f2] = [first.tools[0]!.fingerprint, second.tools[0]!.fingerprint];
+    expect(f1).not.toBe(f2);
+    expect(first.report).not.toBe(second.report);
+    await client.markReviewed('l1', first.report, ['echo']);
+    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f2, reviewed: f1 }]);
+  });
+
+  it("a report that core never issued, or another server's, marks nothing; a name the report didn't show is marked nothing", async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    await client.add({ setup: local('l1'), problems: [] });
+    await client.add({ setup: local('l2'), problems: [] });
+    const report = await client.test('l1');
+    if (!report.ok) throw new Error('test failed');
+    const other = await client.test('l2');
+    if (!other.ok) throw new Error('test failed');
+    const before = JSON.stringify(client.owner.server('l1')!.tools);
+    await expect(client.markReviewed('l1', 'never-issued', ['echo'])).rejects.toThrow(/Test again/);
+    await expect(client.markReviewed('l1', other.report, ['echo'])).rejects.toThrow(/Test again/);
+    expect(JSON.stringify(client.owner.server('l1')!.tools)).toBe(before);
+    await client.markReviewed('l1', report.report, ['other']);
+    expect(JSON.stringify(client.owner.server('l1')!.tools)).toBe(before);
+  });
+
+  it("Test's catalog write dropped while the owner was busy, then Mark reviewed, then a reopen: the tools Test showed are reviewed at what it showed", async () => {
+    const store = memorySettingsStore();
+    let busy: { release: () => void } | undefined;
+    let client!: McpClient;
+    // While the run lists its tools, another change holds the owner, so Test's catalog write is skipped.
+    client = await clientOf(store, speakingPort(async (_id, msg) => {
+      if (msg.method === 'tools/list' && !busy) {
+        const t = client.owner.admit('other');
+        if ('release' in t) busy = t;
+      }
+    }).port);
+    await client.add({ setup: local('l1'), problems: [] });
+    const report = await client.test('l1');
+    if (!report.ok) throw new Error('test failed');
+    expect(busy).toBeDefined();
+    busy!.release();
+    const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
+    expect(client.owner.server('l1')!.tools).toEqual([]);
+    await client.markReviewed('l1', report.report, ['echo']);
+    const again = await clientOf(store, speakingPort().port);
+    expect(again.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
   });
 });
 

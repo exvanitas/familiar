@@ -215,6 +215,38 @@ describe('2.2 to 2.4: questions, answers and the queue', () => {
 
 /* ---------- interrupted steps: one question per task ---------- */
 
+describe('2.4: Send now is read from one committed state', () => {
+  it("asked while a Send now's commit is being written: it answers as of that commit, never with the offer it just used", async () => {
+    const hold = gate();
+    const world = nodeWorld();
+    const store = await world.open(`ground-${Math.random()}`);
+    const { journal } = await openFor(envOf(world, 1), store, {
+      script: (r) => (lastUser(r) === 'A' ? { text: 'x', error: { kind: 'bad-request', message: 'The endpoint refused it.' }, pause: { afterEvents: 0, until: hold.until } } : { text: `answer to ${lastUser(r)}`, pause: { afterEvents: 0, until: new Promise<void>(() => {}) } })
+    });
+    const a = await journal.send('A', 'a');
+    await sleep(20);
+    await journal.send('B', 'b');
+    await journal.send('C', 'c');
+    hold.open();
+    if (a.replied) await a.turn.wait();
+    const offer = await journal.queued();
+    expect(offer).toBeDefined();
+    // As Send now's storage write lands, before the journal hears it, Send now is asked again.
+    let again: Promise<unknown> | undefined;
+    const write = store.storage.commit.bind(store.storage);
+    (store.storage as any).commit = async (...args: unknown[]) => {
+      const r = await (write as any)(...args);
+      again ??= journal.queued();
+      return r;
+    };
+    const sent = await journal.sendNow(offer!, 'go');
+    expect(sent).toBeDefined();
+    expect(again).toBeDefined();
+    expect(await again).toBeUndefined();
+    await journal.close();
+  });
+});
+
 describe('2.4: a bare acknowledgement, acted on once per request id', () => {
   it('two sends of one request id at once: one ack, one decision, and both get it', async () => {
     let decides = 0;
@@ -235,6 +267,27 @@ describe('2.4: a bare acknowledgement, acted on once per request id', () => {
     expect(decides).toBe(1);
     await journal.close();
   });
+
+  it("a resend while the first send is still deciding gets that decision, never a quiet one, even once its record has left the newest 256", async () => {
+    let decides = 0;
+    const held = gate();
+    const { journal } = await journalOf({
+      script: () => ({ text: 'Fine.' }),
+      // The first acknowledgement's decision waits; every later one is quiet at once.
+      decider: { decide: async () => (++decides === 1 ? (await held.until, { act: 'gesture', gesture: 'nod' } as any) : ({ act: 'quiet' } as any)) }
+    });
+    const first = journal.send('thanks', 'ack-0');
+    await until(async () => decides === 1, 'the first decision under way');
+    // Its record leaves the newest 256 while it decides; pi-durable still knows the request id.
+    for (let i = 1; i <= 260; i++) await journal.send('ok', `ack-${i}`);
+    const resent = journal.send('thanks', 'ack-0');
+    await sleep(20);
+    held.open();
+    const x = await first;
+    expect(x).toEqual({ replied: false, decision: { act: 'gesture', gesture: 'nod' } });
+    expect(await resent).toEqual(x);
+    await journal.close();
+  }, 120_000);
 
   it("a resend after 300 later requests isn't read again: an ack, with no new decision and no second entry", async () => {
     let decides = 0;

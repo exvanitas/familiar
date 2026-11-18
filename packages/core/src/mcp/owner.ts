@@ -320,16 +320,21 @@ export class Owner {
 
   /* ---------- the changes ---------- */
 
-  /** Add, local or remote. The id must be new: never one saved or tombstoned. */
-  async add(setup: ServerSetup): Promise<Outcome> {
+  /**
+   * Add, local or remote. The id must be new: never one saved or tombstoned. The setup is copied first,
+   * before any check or await, and only the copy is read: a caller changing its draft while the exe's
+   * dialog is open changes nothing approved or saved.
+   */
+  async add(draft: ServerSetup): Promise<Outcome> {
+    const setup = clone(draft);
     if (this.doc.servers[setup.id] !== undefined) return no('A server with this id is already saved.');
     if (this.doc.tombstones[setup.id] !== undefined) return no(REMOVED_ID_WORDS);
     let identity: string | undefined;
     if (setup.kind === 'remote') {
       identity = addressIdentity(setup.url);
       if (!identity) return no("That isn't a web address Familiar can use.");
-      const other = this.servers().find((s) => s.setup.kind === 'remote' && addressIdentity(s.setup.url) === identity);
-      if (other) return no(`Another server, ${other.setup.label}, already uses this address. Familiar keeps one server per address.`);
+      const other = this.rawSetups().find((s) => s.url !== undefined && addressIdentity(s.url) === identity);
+      if (other) return no(`Another server, ${other.label}, already uses this address. Familiar keeps one server per address.`);
     }
     const t = this.admit('add');
     if (!('release' in t)) return t;
@@ -351,10 +356,10 @@ export class Owner {
       }
       // The exe returns an identical saved address's id: if another server holds it, this add can't share it,
       // and the address is never removed here (it's that server's).
-      const holder = this.servers().find((s) => s.setup.kind === 'remote' && s.setup.address === address.id);
+      const holder = this.rawSetups().find((s) => s.address === address.id);
       if (holder) {
         await this.clearMark();
-        return no(`Another server, ${holder.setup.label}, already uses this address. Familiar keeps one server per address.`);
+        return no(`Another server, ${holder.label}, already uses this address. Familiar keeps one server per address.`);
       }
       const saved = { ...setup, address: address.id };
       if (await this.commit((d) => ((d.servers[setup.id] = record(saved)), d.keys.push(key), delete d.mark))) return ok;
@@ -365,6 +370,19 @@ export class Owner {
     } finally {
       t.release();
     }
+  }
+
+  /**
+   * Every saved record's address and URL, read raw, as repair reads them: a record unreadable otherwise
+   * still owns its address, and an Add must never share it (removing either would delete the other's key).
+   */
+  private rawSetups(): { readonly label: string; readonly url?: string; readonly address?: string }[] {
+    return Object.entries(this.doc.servers).flatMap(([id, v]) => {
+      const s = isObj(v) && isObj(v.setup) ? v.setup : undefined;
+      if (!s) return [];
+      const label = typeof s.label === 'string' ? s.label : id;
+      return [{ label, ...(typeof s.url === 'string' ? { url: s.url } : {}), ...(typeof s.address === 'string' ? { address: s.address } : {}) }];
+    });
   }
 
   private async clearMark(): Promise<void> {

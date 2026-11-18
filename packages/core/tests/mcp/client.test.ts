@@ -100,7 +100,7 @@ describe('the MCP client, local, against the fake server', () => {
     expect(w.client.get(id)?.phase).toBe('stopped');
     expect(w.port.asked).toBe(1);
 
-    await w.client.markReviewed(id, report.tools.map(t => t.name));
+    await w.client.markReviewed(id, report.report, report.tools.map(t => t.name));
     expect((await w.client.start(id)).kind).toBe('ready');
     // Approved once: the second start asked nothing.
     expect(w.port.asked).toBe(1);
@@ -174,7 +174,7 @@ describe('the MCP client, local, against the fake server', () => {
     const id = await addFake(w);
     const first = await w.client.test(id);
     if (!first.ok) throw new Error(first.failure.words);
-    await w.client.markReviewed(id, first.tools.map(t => t.name));
+    await w.client.markReviewed(id, first.report, first.tools.map(t => t.name));
     await w.client.start(id);
     const a = w.client.tools();
     // The person said "always" to every tool, for this exact tool and setup, keyed by server and tool.
