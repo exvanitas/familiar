@@ -78,6 +78,8 @@
     "mcp.changed-tool",
     "mcp.secret-blanked",
     "mcp.remove",
+    "mcp.legacy-transport",
+    "mcp.modern-transport",
     "mcp.secret-json-escaped"
   ],
   "knownGaps": {

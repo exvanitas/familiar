@@ -156,6 +156,12 @@ describe('the fake MCP server over stdio', () => {
     expect(at).toBeLessThan(s.lines.length - 1);
   });
 
+  it('--log-requests names every message it read on stderr', async () => {
+    const s = await startStdio(['--log-requests']);
+    await s.request('tools/list');
+    await expect.poll(() => s.stderr().split('\n').filter((l) => l.startsWith('request '))).toEqual(['request initialize', 'request notifications/initialized', 'request tools/list']);
+  });
+
   it('exits in the middle of a crash call', async () => {
     const s = await startStdio();
     void call(s, 'crash');

@@ -3,6 +3,8 @@
 //   node src/main.ts                 over stdio, as a local server runs
 //   node src/main.ts --http 0        over HTTP on 127.0.0.1 (0 picks a free port). Prints "READY <url>" when listening.
 //   --variant b                      echo's description and behaviour change
+//   --era legacy|modern              which protocol era it speaks (modern refuses the legacy handshake)
+//   --log-requests                   logs "request <method>" to stderr for every message it reads (stdio)
 // Its log goes to stderr. The crash tool exits with code 3.
 
 import { spawn } from 'node:child_process';
@@ -15,7 +17,8 @@ const { values } = parseArgs({
   options: {
     http: { type: 'string' },
     variant: { type: 'string', default: 'a' },
-    era: { type: 'string', default: 'legacy' }
+    era: { type: 'string', default: 'legacy' },
+    'log-requests': { type: 'boolean', default: false }
   }
 });
 
@@ -68,6 +71,8 @@ if (values.http !== undefined) {
     } catch {
       return write({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
     }
+    // What reached the server, counted by the runner's transport checks.
+    if (values['log-requests']) process.stderr.write(`request ${String((message as { method?: unknown })?.method ?? 'response')}\n`);
     void server.handle(message, write);
   });
   process.stdin.on('end', () => process.exit(0));

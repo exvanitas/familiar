@@ -19,6 +19,9 @@
      process go. The old id is refused for good, in the tombstone's words; the exe asks again for the old
      id's exact launch (its approval went with server_forget), and the same launch under a fresh id asks
      too (approvals are per id, so that part shows only that content carries nothing across ids).
+   - security.mcp.legacy-transport and security.mcp.modern-transport: a server of each era, approved once,
+     started and called through the real exe; the fake server logs every message it reads, and exactly
+     the era's handshake, one page and one call reach it.
    - security.mcp.secret-json-escaped, a known gap: the driver types a key holding a quote into Settings,
      the fake server prints it, and it passes only if the JSON-escaped form (\") is blanked too. The
      exe blanks literal copies only, so it fails until the pre-release native pass, with exactly the
@@ -252,6 +255,39 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(d.shown && report.ok, `the same launch under a fresh id: dialog ${d.shown}, ${report.ok ? 'started' : report.failure.words}`);
     ok((await client.remove(again.id)).kind === 'removed', 'the fresh id\'s removal');
     return "the call in flight was interrupted; the secret, the saved setup and every node process went; the old id is refused for good; the exe asked again for the old id's exact launch (its approval was forgotten); the same launch under a fresh id asked too (approvals are per id)";
+  });
+
+  /** One era's transport through the real exe, counted at the fake server: what reached it, in order. */
+  async function transport(era: 'legacy' | 'modern', expected: readonly string[]) {
+    const plain = JSON.stringify({ mcpServers: { [`Fake ${era}`]: { command: 'node', args: [p.mainTs, '--era', era, '--log-requests'] } } });
+    const { drafts } = parsePaste(plain, { newId: () => `mcp-${era}-` + rand(6), defaultCwd: p.repo });
+    const added = await client.add(drafts[0]!);
+    const { d, report } = await testApproved(added.id);
+    ok(d.shown && report.ok, `Test: dialog ${d.shown}, ${report.ok ? 'listed' : report.failure.words}`);
+    const from = heard.length;
+    const starting = client.start(added.id);
+    const again = await dialog('none', START);
+    const started = await starting;
+    ok(!again.shown && started.kind === 'ready', `the start: dialog ${again.shown}, ${JSON.stringify(started)}`);
+    const r = await callWithYes(client, added.id, 'echo', { text: era });
+    ok(r.kind === 'result' && r.text === era, 'echo: ' + JSON.stringify(r).slice(0, 120));
+    await sleep(300);
+    const seen = heard.slice(from).filter(l => l.startsWith('request ')).map(l => l.slice('request '.length));
+    ok(JSON.stringify(seen) === JSON.stringify(expected), `the server read ${JSON.stringify(seen)}`);
+    ok((await client.remove(added.id)).kind === 'removed', 'the removal');
+    return seen;
+  }
+
+  await check('security.mcp.legacy-transport', async () => {
+    const seen = await transport('legacy', ['initialize', 'notifications/initialized', 'tools/list', 'tools/call']);
+    return `a legacy server through the exe read exactly ${seen.join(', ')}: one handshake, one page, one call`;
+  });
+
+  await check('security.mcp.modern-transport', async () => {
+    // A modern-only server keeps its pipe after refusing the legacy opening (as the TypeScript SDK does):
+    // the list and the call go on the same run, with no initialized.
+    const seen = await transport('modern', ['initialize', 'tools/list', 'tools/call']);
+    return `a modern-only server through the exe read exactly ${seen.join(', ')}: the refused opening, then the modern list and call on the same pipe, no initialized`;
   });
 
   await check('security.mcp.secret-json-escaped', async () => {

@@ -10,8 +10,8 @@ describe('the MCP checks on the runner', () => {
   const ids = [...src.matchAll(/check\('(security|check)\.([a-z0-9.-]+)'/g)].map(m => `${m[1]}.${m[2]}`);
   const inventory = (JSON.parse(read('security-inventory.json')) as { ids: string[] }).ids;
 
-  it('reports seven security ids, each in the inventory, the escaped-key one marked as a known gap', () => {
-    expect(ids).toEqual(['security.mcp.add', 'security.mcp.call', 'security.mcp.crash-mid-call', 'security.mcp.changed-tool', 'security.mcp.secret-blanked', 'security.mcp.remove', 'security.mcp.secret-json-escaped']);
+  it('reports nine security ids, each in the inventory, the escaped-key one marked as a known gap', () => {
+    expect(ids).toEqual(['security.mcp.add', 'security.mcp.call', 'security.mcp.crash-mid-call', 'security.mcp.changed-tool', 'security.mcp.secret-blanked', 'security.mcp.remove', 'security.mcp.legacy-transport', 'security.mcp.modern-transport', 'security.mcp.secret-json-escaped']);
     for (const id of ids) expect(inventory).toContain(id.replace(/^security\./, ''));
     const marks = (JSON.parse(read('security-inventory.json')) as { knownGaps: Record<string, { expect: string }> }).knownGaps;
     expect(Object.keys(marks)).toEqual(['mcp.secret-json-escaped']);
