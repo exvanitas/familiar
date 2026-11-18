@@ -51,6 +51,50 @@ describe('B6: the exe\'s address identity', () => {
 });
 
 describe('5.1: one durable effect at a time', () => {
+  it("the catalog write is admitted like any effect: with its store write held, a choice is refused busy, not lost; while a choice is in flight, the catalog write is skipped", async () => {
+    const base = memorySettingsStore();
+    const gates: (() => void)[] = [];
+    let hold = false;
+    let inFlight = 0;
+    let most = 0;
+    const store: SettingsStore = {
+      ...base,
+      putIf: async (k, r, g) => {
+        inFlight++;
+        most = Math.max(most, inFlight);
+        try {
+          if (hold) await new Promise<void>((res) => gates.push(res));
+          return await base.putIf(k, r, g);
+        } finally {
+          inFlight--;
+        }
+      }
+    };
+    const owner = await Owner.open(ports(store).p);
+    expect(await owner.add(local('l1'))).toEqual({ ok: true });
+    hold = true;
+    const seen = owner.seen('l1', [{ name: 'echo', fingerprint: 'f1' }]);
+    const choice = owner.choose('l1', 'echo', { policy: 'allow', fingerprint: 'f1', setupFingerprint: 'x' });
+    await new Promise((r) => setTimeout(r, 5));
+    hold = false;
+    gates.splice(0).forEach((g) => g());
+    await seen;
+    expect(most).toBe(1);
+    expect(await choice).toEqual({ ok: false, words: BUSY_WORDS });
+    expect(owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'f1' }]);
+    // The other way round: the choice holds the owner, and the catalog write is skipped (re-derived at the
+    // next listing), never a second write on the same revision.
+    hold = true;
+    const second = owner.choose('l1', 'echo', { policy: 'allow', fingerprint: 'f1', setupFingerprint: 'x' });
+    await new Promise((r) => setTimeout(r, 1));
+    await owner.seen('l1', [{ name: 'echo', fingerprint: 'f2' }]);
+    hold = false;
+    gates.splice(0).forEach((g) => g());
+    expect(await second).toEqual({ ok: true });
+    expect(most).toBe(1);
+    expect(owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'f1' }]);
+  });
+
   it('a second change while one is in flight is refused at once, and changes nothing', async () => {
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));

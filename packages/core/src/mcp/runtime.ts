@@ -35,9 +35,10 @@ export class ServerRuntime {
   readonly link: ServerLink;
   private readonly owner: Owner;
   private readonly onChange: () => void;
-  private readonly onListed: (tools: readonly ListedTool[]) => void;
+  /** Hears a run's tool list, with whether that run is still this server's run; settles once it's saved. */
+  private readonly onListed: (tools: readonly ListedTool[], current: () => boolean) => Promise<void> | void;
 
-  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[]) => void) {
+  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean) => Promise<void> | void) {
     this.id = id;
     this.owner = owner;
     this.onChange = onChange;
@@ -51,7 +52,7 @@ export class ServerRuntime {
         this.set('failed', failure);
       },
       listed: (run, tools) => {
-        if (run === this.runId) this.onListed(tools);
+        if (run === this.runId) void this.onListed(tools, () => run === this.runId);
       }
     }, limits);
   }
@@ -129,9 +130,12 @@ export class ServerRuntime {
       this.set('failed', r.failure);
       return { kind: 'failed', failure: r.failure };
     }
-    this.runId = r.run;
+    const run = r.run;
+    this.runId = run;
     this.set('ready');
-    this.onListed(r.tools);
+    // The catalog write is an owner effect of its own (5.1): Ready is answered once it has settled, so the
+    // next start (startEnabled's, say) finds the owner free.
+    await this.onListed(r.tools, () => run === this.runId);
     return { kind: 'ready' };
   }
 

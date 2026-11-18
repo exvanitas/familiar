@@ -285,14 +285,26 @@ export class Owner {
     return written;
   }
 
-  /** A commit no effect owns: the tools a run listed, saved as the tools last seen. */
-  async seen(id: string, tools: readonly SavedTool[]): Promise<void> {
+  /**
+   * The catalog write: the tools a run listed, saved as the tools last seen. An effect like any other,
+   * admitted in the same synchronous step as `current` is checked (the listing's run is still the server's
+   * run). It's skipped, never queued, when the owner is busy or the run is gone: the list is re-derived at
+   * the next listing, and until then a tool missing from it only reads as unreviewed. Admitted while a mark
+   * is unfinished, like a start: it changes no setup.
+   */
+  async seen(id: string, tools: readonly SavedTool[], current: () => boolean = () => true): Promise<void> {
     const s = this.server(id);
-    if (!s || s.removing || JSON.stringify(s.tools) === JSON.stringify(tools)) return;
-    await this.commit((d) => {
-      const cur = readServer(d.servers[id]);
-      if (cur) d.servers[id] = { ...cur, tools } as unknown as JsonValue;
-    });
+    if (!s || s.removing || JSON.stringify(s.tools) === JSON.stringify(tools) || !current()) return;
+    const t = this.admit('seen', { start: true });
+    if (!('release' in t)) return;
+    try {
+      await this.commit((d) => {
+        const cur = readServer(d.servers[id]);
+        if (cur) d.servers[id] = { ...cur, tools } as unknown as JsonValue;
+      });
+    } finally {
+      t.release();
+    }
   }
 
   /* ---------- the changes ---------- */

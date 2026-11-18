@@ -113,7 +113,7 @@ export class McpClient {
         this.owner,
         { processes: this.o.processes, net: this.o.net, clock: this.o.clock, ...(this.o.limits ? { limits: this.o.limits } : {}) },
         () => this.o.onChange?.(id),
-        tools => void this.seen(id, tools)
+        (tools, current) => this.seen(id, tools, current)
       );
       this.runtimes.set(id, rt);
     }
@@ -359,8 +359,8 @@ export class McpClient {
     if (!r.ok) throw new Error(r.words);
   }
 
-  /** A run's tool list, saved as the tools last seen; what the person reviewed is kept. */
-  private async seen(id: string, now: readonly ListedTool[]): Promise<void> {
+  /** A run's tool list, saved as the tools last seen while its run is current; what the person reviewed is kept. */
+  private async seen(id: string, now: readonly ListedTool[], current: () => boolean): Promise<void> {
     const s = this.owner.server(id);
     if (!s) return;
     const before = new Map(s.tools.map(t => [t.name, t]));
@@ -368,7 +368,7 @@ export class McpClient {
       const reviewed = before.get(t.name)?.reviewed;
       return { name: t.name, fingerprint: t.fingerprint, ...(reviewed ? { reviewed } : {}) };
     });
-    await this.owner.seen(id, tools);
+    await this.owner.seen(id, tools, current);
   }
 }
 
