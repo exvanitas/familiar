@@ -35,6 +35,24 @@ function stopFence(where: 'local' | 'remote', during: 'walk' | 'ready'): Named {
 }
 
 export const SCHEDULES: Named[] = [
+  {
+    // F02: a call tried at every step while a dropped session is recovered: each refused, none sent.
+    name: 'S12 calls during a session recovery',
+    options: {
+      mode: { ...quiet, session404: 'once', sse: 0.5 },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('echo');
+          let tries = 0;
+          d.sched.onStep(() => {
+            const dropped = d.exe.log.some((x) => x.status === 404);
+            const relisted = d.exe.log.some((x) => x.epoch > 1 && x.body?.method === 'tools/list' && x.final !== undefined);
+            if (dropped && !relisted && tries++ < 40) d.sched.add({ label: 'act:call-in-recovery', rank: 0, fire: () => d.call('echo') });
+          });
+        })
+    },
+    expect: (r) => (r.evidence.filter((e) => e.what === 'call').length > 2 ? undefined : 'no call tried during the recovery')
+  },
   stopFence('local', 'walk'),
   stopFence('local', 'ready'),
   stopFence('remote', 'walk'),

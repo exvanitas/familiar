@@ -793,8 +793,10 @@ export class ServerLink {
       return;
     }
     run.dropped = 1;
-    run.ready = false;
-    run.stale = true;
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('ready-during-recovery'))) {
+      run.ready = false;
+      run.stale = true;
+    }
     const resend = run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('resend-404-call')) ? run.lastCall.body : undefined;
     if (!(__FAMILIAR_MUTATIONS__ && mutant('keep-old-session-id'))) delete run.sessionId;
     delete run.version;

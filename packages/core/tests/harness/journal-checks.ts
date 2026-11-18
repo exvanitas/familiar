@@ -75,7 +75,6 @@ export const H6: JCheck = (r) => {
 export const H7: JCheck = (r) => {
   const problems: string[] = [];
   const mine = new Set(r.evidence.filter((e) => e.what === 'send').map((e) => e.requestId));
-  const sendNows = r.evidence.filter((e) => e.what === 'send-now');
   for (const c of r.log) {
     if (!startsRun(c)) continue;
     // Your message, admitted in this very commit (a message closes an open question and places the
@@ -83,11 +82,13 @@ export const H7: JCheck = (r) => {
     if (c.submissions.some((s) => s.requestId !== undefined && mine.has(s.requestId) && !r.log.some((x) => x.seq < c.seq && x.submissions.some((y) => y.id === s.id)))) continue;
     // An answer recorded in this commit, while the independent history had its question due.
     if (c.answered.length && due(r.log.filter((x) => x.seq < c.seq), c.seq - 1)) continue;
-    // A Send now recorded in this commit, whose offered submission was the oldest queued before it.
-    if (c.sentNow.length) {
+    // A Send now record (SendNowDoc.byRequest) written in this commit, which started something, and whose
+    // offered submission the commit's pre-state shows queued, the oldest of the inbox.
+    const now = c.sentNow.find((x) => x.sent !== undefined);
+    if (now) {
       const oldest = (c.inboxPre?.items ?? []).find((i: any) => i.mode !== 'write');
-      if (oldest && sendNows.some((e) => c.sentNow.includes(e.requestId!) && e.offer?.submission === String(oldest.id))) continue;
-      problems.push(`H7: commit ${c.seq} started a run from a Send now whose submission wasn't the oldest queued`);
+      if (oldest && String(oldest.id) === now.submission) continue;
+      problems.push(`H7: commit ${c.seq} started a run from a Send now of ${now.submission}, which its pre-state doesn't show queued first`);
       continue;
     }
     // pi-durable's own boundary: the previous run ended in this commit with nothing left unanswered.
@@ -135,7 +136,7 @@ export const JOURNAL_WITNESSES: Record<string, (r: JRun) => boolean> = {
     return endings.some((x) => (x.reason === 'turn_limit' || x.interrupted) && r.log.some((c) => c.seq > x.seq && startsRun(c)));
   },
   'H7 a run started by an answer': (r) => r.log.some((c) => startsRun(c) && c.answered.length > 0),
-  'H7 a run started by Send now': (r) => r.log.some((c) => startsRun(c) && c.sentNow.length > 0),
+  'H7 a run started by Send now': (r) => r.log.some((c) => startsRun(c) && c.sentNow.some((x) => x.sent !== undefined)),
   'H8 Send now shown': (r) => r.evidence.some((e) => e.what === 'shown' && e.sendNow),
   'H9 her line, visible': (r) => r.log.some((c) => c.entries.some((e) => e.kind === 'familiar.remark' && e.model)),
   'H9 her line, display only': (r) => r.log.some((c) => c.entries.some((e) => e.kind === 'familiar.remark' && !e.model))

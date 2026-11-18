@@ -31,7 +31,9 @@ export interface JCommit {
   readonly docs: string[];
   /** Answer records this commit added (task ids), and Send now records (request ids). */
   readonly answered: string[];
-  readonly sentNow: string[];
+  /** Send now records (SendNowDoc.byRequest) this commit wrote: the request, the offered submission, and
+      what it started, if anything. */
+  readonly sentNow: { request: string; submission: string; sent?: string }[];
   /** Interruption records this commit added (step ids). */
   readonly interrupted: string[];
 }
@@ -79,7 +81,8 @@ function recorder() {
             }
             c.answered.push(...Object.keys(docOf('familiar.answers')?.byTask ?? {}).filter((k) => !answersPre.includes(k)));
             c.interrupted.push(...Object.keys(docOf('familiar.interruptions')?.steps ?? {}).filter((k) => !stepsPre.includes(k)));
-            c.sentNow.push(...Object.keys(docOf('familiar.send-now')?.byRequest ?? {}).filter((k) => !sentPre.includes(k)));
+            const byRequest = docOf('familiar.send-now')?.byRequest ?? {};
+            c.sentNow.push(...Object.keys(byRequest).filter((k) => !sentPre.includes(k)).map((k) => ({ request: k, submission: String(byRequest[k].submission), ...(byRequest[k].sent ? { sent: String(byRequest[k].sent) } : {}) })));
             (c as any).livePost = structuredClone(liveOf());
             (c as any).inboxPost = structuredClone(inboxOf());
             log.push(c);

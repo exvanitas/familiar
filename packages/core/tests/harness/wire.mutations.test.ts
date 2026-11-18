@@ -63,7 +63,8 @@ const CONTROLS: Control[] = [
   { mutation: 'no-detach', check: 'H4', named: 'S8', build: 'pass' },
   { mutation: 'no-server-cap', check: 'H5', named: 'S10' },
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop during a walk, local' },
-  { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' }
+  { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' },
+  { mutation: 'ready-during-recovery', check: 'H14', named: 'S12' }
 ];
 
 const MAX_SEEDS = 150;

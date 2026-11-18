@@ -404,6 +404,21 @@ export const H14: Check = (r) => {
     }
     if (next.headers['mcp-session-id'] !== undefined) problems.push('H14: the re-handshake carried the old session id');
   }
+  // While a session is being recovered, from the 404 until the re-handshake's tool list has come back, no
+  // call is handed off (F02).
+  for (let i = 0; i < recs.length; i++) {
+    if (recs[i]!.status !== 404) continue;
+    const listed = recs.find((x) => x.seq > recs[i]!.seq && x.body?.method === 'tools/list' && x.final !== undefined);
+    const until = listed ? Math.floor(listed.final! / 1000) : Infinity;
+    const during = recs.filter((x) => x.seq > recs[i]!.seq && isCall(x.body) && x.start < until && x.epoch === (recs.find((y) => y.seq > recs[i]!.seq && y.body?.method === 'initialize')?.epoch ?? -1));
+    if (during.length) problems.push(`H14: ${tokenOf(during[0]!.body)} handed off while the session was being recovered`);
+    // And refused as the run not being Ready, not only by the busy slot: the fence holds on its own.
+    // From the step after the 404's head (sessionDropped runs in that step) to the relisting's step.
+    const from = recs[i]!.head ?? Infinity;
+    const tried = r.evidence.filter((e) => e.what === 'call' && e.step > from && e.step < until).map((e) => e.token);
+    const busy = r.evidence.filter((e) => e.what === 'outcome' && tried.includes(e.token) && e.outcome?.kind === 'error' && e.outcome.reason === 'busy');
+    if (busy.length) problems.push(`H14: ${busy[0]!.token}, tried during the recovery, was refused only as busy: the run still said Ready`);
+  }
   // A 404 before any page or call has completed since the last re-handshake ends the run: nothing more is
   // sent until the person starts it again.
   for (let i = 0; i < recs.length; i++) {
