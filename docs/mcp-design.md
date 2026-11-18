@@ -681,6 +681,9 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **One immutable record per request**, written by core from the request's assembled input before it's sent. A missing or unreadable record counts as outside. The reply keeps its request's record key, and the gate reads the record of the request whose reply made the call, found by the call's id.
 - **Every entry carries its sources.** A server result carries its server, and so does an unreviewed tool's description. Any entry made while handling an outside request carries that request's sources: her replies, compaction summaries, notes and reminders written then, and her remark (2.1).
 - **Stored notes and reminders keep their sources**, and every read or delivery of them carries them. A request is outside if any entry in its assembled input carries a source. While it's outside, "always" doesn't apply, and a card offers no Always.
+- **"Always" follows the call's own request record**, not a rescan at the time of the call. A call is judged by the request whose reply made it: so a later call in the same round, after a server result came back, still gets "always" if its own request was clean, and the next request (which carries that result) is outside.
+- **A compaction keeps the taint.** The gate reads the kept range behind the newest summary too, and the record store keeps a durable "ever outside" flag, set by the first request with a source and never evicted. A summary made after it is outside, however many source-free requests have come since, so the 256-record cap can't drop the taint.
+- **An acknowledgement is decided once**, after its commit wins, so two sends of one request id run the decider once. One resent after its record has left the newest 256 gets a quiet decision: no new reaction, and never a second reply.
 
 ### 5.7 Messages from other windows, and reserved headers
 
