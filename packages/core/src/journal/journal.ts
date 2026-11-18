@@ -966,6 +966,12 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     const view = await viewNow();
     // The old shape, as a named mutation: the question recorded when the run ended, kept until answered.
     if (atEnd && (__FAMILIAR_MUTATIONS__ && mutant('question-at-end'))) return (await harness.snapshot(AnswersDoc, ctx))?.byTask?.[atEnd.id.slice(4)] ? [] : [atEnd];
+    // A named mutation: the open question shown under another identity (its run's first input, not the
+    // task that stopped), so what you answer isn't the question that's open.
+    if (view.state === 'question' && (__FAMILIAR_MUTATIONS__ && mutant('question-wrong-id'))) {
+      const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
+      return [{ ...view.question, id: `run:input-${String(live?.runFailure?.inputs?.[0] ?? '')}` }];
+    }
     return view.state === 'question' ? [view.question] : [];
   };
   /** The words of a Yes to cut-off steps: one line per step, through the gate again. */
@@ -997,7 +1003,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const decided = new Promise<Decision>((r) => (decide = r));
         try {
           await submitInTurn(
-            { type: 'write', entry: { kind: AckEntry, data: { text } }, requestId },
+            // (A named mutation gives the ack a head: a write that isn't display-only, 2.5 row 10.)
+          { type: 'write', entry: { kind: AckEntry, data: { text }, ...((__FAMILIAR_MUTATIONS__ && mutant('ack-head')) ? { head: 'self' } : {}) }, requestId },
             true,
             async (tx) => {
               // Noted as this commit wins, so an identical send that lost waits for this decision.
@@ -1057,7 +1064,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         // Not open: a run is live, the failure names another task, or you moved on. Nothing changes. (The
         // old shape, a named mutation, answers the question it kept from the run's end instead.)
         const kept = atEnd?.id === id && !live?.run && (__FAMILIAR_MUTATIONS__ && mutant('question-at-end')) ? atEnd : undefined;
-        if (!kept && (view.state !== 'question' || view.question.id !== id)) return '';
+        // (A named mutation answers whatever question is open, whichever one the answer was for.)
+        if (!kept && (view.state !== 'question' || (view.question.id !== id && !(__FAMILIAR_MUTATIONS__ && mutant('answer-any-question'))))) return '';
         const q = kept ?? (view as Extract<RunView, { state: 'question' }>).question;
         const inbox = await tx.doc(InboxDoc, rootId);
         const registry = await tx.doc(TurnsDoc);

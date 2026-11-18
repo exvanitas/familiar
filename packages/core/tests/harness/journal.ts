@@ -25,7 +25,7 @@ export interface JCommit {
   readonly livePost: any;
   readonly inboxPre: any;
   readonly inboxPost: any;
-  readonly submissions: { id: string; type: string; status: string; reason?: string; requestId?: string }[];
+  readonly submissions: { id: string; type: string; status: string; reason?: string; detail?: unknown; requestId?: string }[];
   readonly entries: { id: string; kind: string; model: boolean }[];
   /** Familiar's documents this commit wrote, by kind. */
   readonly docs: string[];
@@ -74,7 +74,8 @@ function recorder() {
                 const k = kinds.get(id);
                 if (k && !k.startsWith('pi.')) c.docs.push(k);
               } else if (w.type === 'submission') {
-                c.submissions.push({ id: String(w.value.id), type: w.value.type ?? w.value.draft?.type, status: w.value.status, reason: w.value.reason ?? w.value.settlement?.reason, requestId: w.value.requestId ?? w.value.draft?.requestId });
+                const detail = w.value.detail ?? w.value.settlement?.detail;
+                c.submissions.push({ id: String(w.value.id), type: w.value.type ?? w.value.draft?.type, status: w.value.status, reason: w.value.reason ?? w.value.settlement?.reason, ...(detail !== undefined ? { detail } : {}), requestId: w.value.requestId ?? w.value.draft?.requestId });
               } else if (w.type === 'entry') {
                 c.entries.push({ id: String(w.value.id), kind: w.value.kind, model: w.value.model !== undefined });
               }
@@ -152,9 +153,14 @@ export interface JOptions {
   readonly steps?: number;
   /** A named schedule in place of the random actions. */
   readonly schedule?: (d: JDriver) => Promise<void>;
+  /** The turn's token allowance, or false for none (a schedule that drives its own usage). */
+  readonly turnTokens?: number | false;
 }
 
 const STEP_CAP = 2;
+/** A turn's token allowance: a long turn pauses and asks (a cap question) in about half the seeds, and
+    leaves room for the rest (Send now, superseded questions) as often as with no cap. */
+const TURN_TOKENS = 4000;
 
 /** A read that doesn't come back in time counts as nothing shown, and is reported. */
 async function within<T>(p: Promise<T>, fallback: T, ms = 2000): Promise<T> {
@@ -170,7 +176,7 @@ async function within<T>(p: Promise<T>, fallback: T, ms = 2000): Promise<T> {
 /** One seeded run. */
 export async function journalRun(seed: number, options: JOptions = {}): Promise<JRun> {
   mutations.set(options.mutation ? [options.mutation] : []);
-  const d = new JDriver(seed, options.mutation);
+  const d = new JDriver(seed, options.mutation, options.turnTokens ?? TURN_TOKENS);
   try {
     await d.open();
     if (options.schedule) await options.schedule(d);
@@ -197,10 +203,13 @@ export class JDriver {
   private n = 0;
   private readonly seed: number;
 
-  constructor(seed: number, mutation?: string) {
+  private readonly turnTokens: number | false;
+
+  constructor(seed: number, mutation?: string, turnTokens: number | false = TURN_TOKENS) {
     this.seed = seed;
     this.rand = rng(seed);
     this.mutation = mutation;
+    this.turnTokens = turnTokens;
   }
 
   /** The model's reply, a function of the seed and the request alone, so a twin run gets the same. */
@@ -234,7 +243,7 @@ export class JDriver {
       owner: env.owner,
       model: gatedModel(this.pending, () => this.life),
       modelId: 'fake-1',
-      caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
+      caps: { config: { maxReplyTokens: 200, ...(this.turnTokens ? { maxTurnTokens: this.turnTokens } : {}) }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
       tools,
       clock: offsetClock(this.world.counters),
       wake: { wakeAt: () => {} },
@@ -327,8 +336,16 @@ export class JDriver {
     return this.evidence.filter((e) => e.what === 'shown').at(-1)?.questions?.[0];
   }
 
+  /** A question shown before the last one, as a late click or a resent answer would carry it. */
+  olderQuestion(): Question | undefined {
+    const last = this.shownQuestion()?.id;
+    const older = [...new Set(this.evidence.flatMap((e) => (e.what === 'shown' ? (e.questions ?? []) : [])).filter((q) => q.id !== last).map((q) => JSON.stringify(q)))].map((q) => JSON.parse(q) as Question);
+    return older.length ? older[Math.floor(this.rand() * older.length)] : undefined;
+  }
+
   async answer(yes = this.rand() < 0.7, question?: Question): Promise<boolean> {
-    const shown = question ?? this.shownQuestion();
+    // Now and then a late answer to a question shown earlier, which must answer nothing now.
+    const shown = question ?? (this.rand() < 0.2 ? this.olderQuestion() : undefined) ?? this.shownQuestion();
     if (!shown) return false;
     const requestId = `a${++this.n}`;
     this.rec.setStep(this.steps.length + 1);

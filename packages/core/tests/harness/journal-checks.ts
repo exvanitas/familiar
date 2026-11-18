@@ -17,6 +17,28 @@ interface Ending {
   readonly reason: string;
   /** An aborted run whose steps were cut off: the harness saw an interruption record written in its run. */
   readonly interrupted: boolean;
+  /** A model error that is a cap's pause, read from the settlement's own detail. */
+  readonly paused: boolean;
+  /** The task that held the run when it ended (pi.live before the ending commit): the question it asks is
+      `run:<task>`, and an answer to it is recorded under this task. */
+  readonly task: string;
+}
+
+/**
+ * Whether a settlement's detail is a cap's pause, read here on its own: Familiar's model errors are
+ * `familiar.model-error:` and hex JSON, after any compaction prefixes.
+ */
+function pausedDetail(detail: unknown): boolean {
+  let text = typeof detail === 'string' ? detail : '';
+  for (const prefix of ['Compaction failed: ', 'Summarization failed: ']) if (text.startsWith(prefix)) text = text.slice(prefix.length);
+  const m = /^familiar\.model-error:((?:[0-9a-f]{2})*)$/.exec(text);
+  if (!m) return false;
+  try {
+    const bytes = new Uint8Array(m[1]!.length / 2).map((_, i) => parseInt(m[1]!.slice(i * 2, i * 2 + 2), 16));
+    return JSON.parse(new TextDecoder().decode(bytes))?.kind === 'paused';
+  } catch {
+    return false;
+  }
 }
 
 function history(log: JCommit[], upTo: number) {
@@ -31,7 +53,7 @@ function history(log: JCommit[], upTo: number) {
     if (unanswered.length && endsRun(c)) {
       const reason = unanswered[0]!.reason ?? '';
       const interrupted = log.some((x) => x.seq >= lastStart && x.seq <= c.seq && x.interrupted.length > 0);
-      endings.push({ seq: c.seq, reason, interrupted });
+      endings.push({ seq: c.seq, reason, interrupted, paused: reason === 'model_error' && pausedDetail(unanswered[0]!.detail), task: String(c.livePre?.run?.taskId ?? '') });
     }
     if (startsRun(c)) {
       starts.push(c.seq);
@@ -51,13 +73,15 @@ export function due(log: JCommit[], upTo: number): Ending | undefined {
   const own = log.find((c) => c.seq === last.seq);
   if (own && own.livePost?.run) return undefined;
   if (answers.some((a) => a > last.seq)) return undefined;
-  // Which endings ask: the step cap, and a run whose steps were cut off. Your own Stop and an error don't.
+  // Which endings ask: the step cap, a cap's pause, and a run whose steps were cut off. Your own Stop and
+  // an error don't.
   if (last.reason === 'turn_limit') return last;
+  if (last.paused) return last;
   if (last.reason === 'aborted' && last.interrupted) return last;
   return undefined;
 }
 
-/** H6: a question is shown exactly when one is due, after every step. */
+/** H6: a question is shown exactly when one is due, after every step, and it's that ending's question. */
 export const H6: JCheck = (r) => {
   const problems: string[] = [];
   for (const e of r.evidence) {
@@ -66,6 +90,7 @@ export const H6: JCheck = (r) => {
     const shown = (e.questions ?? []).length > 0;
     if (shown && !d) problems.push(`H6: step ${e.step} shows "${e.questions![0]!.text.slice(0, 40)}", which isn't due`);
     if (!shown && d) problems.push(`H6: step ${e.step} shows no question, though the ending at commit ${d.seq} (${d.reason}) is due one`);
+    if (shown && d && e.questions![0]!.id !== `run:${d.task}`) problems.push(`H6: step ${e.step} shows question ${e.questions![0]!.id}, but the one due is run:${d.task} (commit ${d.seq}, ${d.reason})`);
   }
   return problems.slice(0, 3);
 };
@@ -80,8 +105,14 @@ export const H7: JCheck = (r) => {
     // Your message, admitted in this very commit (a message closes an open question and places the
     // oldest queued input, which may be an earlier one), not one placed later from the queue on its own.
     if (c.submissions.some((s) => s.requestId !== undefined && mine.has(s.requestId) && !r.log.some((x) => x.seq < c.seq && x.submissions.some((y) => y.id === s.id)))) continue;
-    // An answer recorded in this commit, while the independent history had its question due.
-    if (c.answered.length && due(r.log.filter((x) => x.seq < c.seq), c.seq - 1)) continue;
+    // An answer recorded in this commit to the very question the independent history had due: its record
+    // is under that ending's task. An answer recorded under another task starts nothing.
+    const asked = c.answered.length ? due(r.log.filter((x) => x.seq < c.seq), c.seq - 1) : undefined;
+    if (asked && c.answered.includes(asked.task)) continue;
+    if (c.answered.length) {
+      problems.push(`H7: commit ${c.seq} (step ${c.step}) started a run on an answer to ${c.answered.join(', ')}, ${asked ? `but the question due was run:${asked.task}` : 'with no question due'}`);
+      continue;
+    }
     // A Send now record (SendNowDoc.byRequest) written in this commit, which started something, and whose
     // offered submission the commit's pre-state shows queued, the oldest of the inbox.
     const now = c.sentNow.find((x) => x.sent !== undefined);
@@ -131,6 +162,12 @@ export const JOURNAL_CHECKS: Record<string, JCheck> = { H6, H7, H8, H9 };
 /** Each check's witness: a step where its condition was in play. */
 export const JOURNAL_WITNESSES: Record<string, (r: JRun) => boolean> = {
   'H6 a due question': (r) => r.evidence.some((e) => e.what === 'shown' && due(r.log, e.at ?? 0)),
+  'H6 a due pause': (r) => r.evidence.some((e) => e.what === 'shown' && due(r.log, e.at ?? 0)?.paused),
+  'H7 a late answer to an earlier question': (r) => {
+    const shown = new Map<string, number>();
+    for (const e of r.evidence) if (e.what === 'shown') for (const q of e.questions ?? []) if (!shown.has(q.id)) shown.set(q.id, e.step);
+    return r.evidence.some((e, i) => e.what === 'answer' && e.question !== undefined && r.evidence.slice(0, i).filter((x) => x.what === 'shown').at(-1)?.questions?.[0]?.id !== e.question);
+  },
   'H6 a superseded question': (r) => {
     const { endings } = history(r.log, Infinity);
     return endings.some((x) => (x.reason === 'turn_limit' || x.interrupted) && r.log.some((c) => c.seq > x.seq && startsRun(c)));

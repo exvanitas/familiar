@@ -8,11 +8,13 @@ import { join, relative, sep } from 'node:path';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { IDBFactory } from 'fake-indexeddb';
 import { build } from 'esbuild';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { decideByRules, journalSettings, openJournal, openJournalStore, type JournalStore } from '../../src/index.ts';
 import { createFakeModel } from '../../src/testing/index.ts';
 import { memoryOwner, nodeWorld } from './node-env.ts';
 import { openFor, type Env } from './scenarios.ts';
+import { mutations } from '../../src/mutations.ts';
 import { compactionWorld, isSummary, recordCommits, statusOf } from './pi-durable-world.ts';
 
 const ctx = BACKGROUND_CONTEXT;
@@ -109,12 +111,66 @@ async function coreSources(): Promise<{ file: string; code: string }[]> {
     });
 }
 
-// A line guarded by a named mutation switch (mutations.ts) is the harness's control, off in the app, and
-// isn't a call site; the last test below holds that nothing in core turns a switch on.
+/**
+ * The spans of code that run only under a named mutation switch (mutations.ts), off in the app: the branch
+ * a guard condition picks. A guard is an `&&` chain with `mutant(...)` or `__FAMILIAR_MUTATIONS__` as one
+ * of its conjuncts (false in the app, so the whole chain is). Guarded: an `if`'s then-branch, a
+ * conditional's true branch, and the right side of `guard && …`. Read from the parsed source, so a real
+ * call site sharing a line with a switch is still a call site.
+ */
+function mutationSpans(code: string): [number, number][] {
+  const sf = ts.createSourceFile('core.ts', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const strip = (e: ts.Expression): ts.Expression => (ts.isParenthesizedExpression(e) ? strip(e.expression) : e);
+  const guards = (e: ts.Expression): boolean => {
+    const x = strip(e);
+    if (ts.isBinaryExpression(x) && x.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) return guards(x.left) || guards(x.right);
+    if (ts.isIdentifier(x)) return x.text === '__FAMILIAR_MUTATIONS__';
+    return ts.isCallExpression(x) && ts.isIdentifier(x.expression) && x.expression.text === 'mutant';
+  };
+  const spans: [number, number][] = [];
+  const span = (n: ts.Node) => spans.push([n.getStart(sf), n.getEnd()]);
+  const walk = (n: ts.Node): void => {
+    if (ts.isIfStatement(n) && guards(n.expression)) span(n.thenStatement);
+    else if (ts.isConditionalExpression(n) && guards(n.condition)) span(n.whenTrue);
+    else if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && guards(n.left)) span(n.right);
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
+  return spans;
+}
+
+// A call site inside a mutation-only branch is the harness's control, off in the app, and isn't one; the
+// last test of the module graph holds that nothing in core turns a switch on. Each match counts once.
 const sitesOf = (files: { file: string; code: string }[], pattern: RegExp) =>
+  files.flatMap(({ file, code }) => {
+    const spans = mutationSpans(code);
+    const all = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`);
+    return [...code.matchAll(all)].flatMap((m) => {
+      const at = m.index ?? 0;
+      if (spans.some(([a, b]) => at >= a && at < b)) return [];
+      const line = code.slice(code.lastIndexOf('\n', at) + 1, code.indexOf('\n', at) < 0 ? code.length : code.indexOf('\n', at));
+      return [`${file}: ${line.trim()}`];
+    });
+  });
+
+/** The old scan, kept as the control below: it dropped every line that mentions a switch. */
+const lineSites = (files: { file: string; code: string }[], pattern: RegExp) =>
   files.flatMap(({ file, code }) => code.split('\n').flatMap((line) => (pattern.test(line) && !line.includes('mutant(') ? [`${file}: ${line.trim()}`] : [])));
 
 describe('2.5: the module graph', () => {
+  it('reads call sites, not lines: a real call on a line with a switch is found, and only the branch the switch guards is skipped', () => {
+    const code = [
+      "const a = (__FAMILIAR_MUTATIONS__ && mutant('m')) ? root.submit(x, ctx) : root.submit(y, ctx);",
+      "if ((__FAMILIAR_MUTATIONS__ && mutant('n'))) void root.submit(z, ctx);",
+      "const b = ready && (__FAMILIAR_MUTATIONS__ && mutant('o')) && root.submit(w, ctx);",
+      "if (!(__FAMILIAR_MUTATIONS__ && mutant('p'))) root.submit(v, ctx); // a negated switch guards nothing"
+    ].join('\n');
+    const files = [{ file: 'x.ts', code: code.replace(/\/\/.*$/gm, '') }];
+    expect(sitesOf(files, /root\.submit\(/)).toEqual(['x.ts: ' + code.split('\n')[0], 'x.ts: ' + code.split('\n')[3]!.replace(/\s*\/\/.*$/, '')]);
+    // The control: the old line scan misses both real sites.
+    expect(lineSites(files, /root\.submit\(/)).toEqual([]);
+  });
+
   it('pulls in the journal, and finds call sites in it (the scan can see)', async () => {
     const files = await coreSources();
     expect(files.map((f) => f.file)).toContain('journal/journal.ts');
@@ -169,9 +225,11 @@ describe('2.5: the module graph', () => {
 /* ---------- row 10: every write but her line is display-only ---------- */
 
 describe('2.5 row 10: display-only writes', () => {
-  it('the bound notice, the reminder line and familiar.ack carry no model, head or edits; only a visible remark does', async () => {
+  /** Runs every Familiar write once, and says what's wrong with them: empty when each is display-only. */
+  async function writesProblems(name: string): Promise<string[]> {
+    const problems: string[] = [];
     const world = nodeWorld();
-    const store = await world.open('pins-writes');
+    const store = await world.open(name);
     const log = recordCommits(store.storage);
     const env: Env = { life: 1, counters: world.counters, owner: world.owner, openStore: world.open, ready: () => {}, onTransaction: () => () => {} };
     const nine = Array.from({ length: 9 }, (_, i) => ({ id: `l${i}`, name: 'look', arguments: { what: String(i) } }));
@@ -186,10 +244,32 @@ describe('2.5 row 10: display-only writes', () => {
     expect(await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say hi.' }] })).toMatchObject({ visible: true });
     const writes = log.flatMap((c) => c.entries).filter((e) => e.kind.startsWith('familiar.'));
     expect(new Set(writes.map((e) => e.kind))).toEqual(new Set(['familiar.notice', 'familiar.ack', 'familiar.reminder', 'familiar.remark']));
-    expect(writes.filter((e) => e.model).map((e) => e.kind)).toEqual(['familiar.remark']);
+    // Only her visible line carries a model message; none carries a head or edits, hers included.
+    for (const e of writes) {
+      if (e.model && e.kind !== 'familiar.remark') problems.push(`${e.kind} carries a model message`);
+      if (e.head) problems.push(`${e.kind} carries a head`);
+      if (e.edits) problems.push(`${e.kind} carries edits`);
+    }
+    if (!writes.some((e) => e.kind === 'familiar.remark' && e.model)) problems.push('no visible remark was written, so the check saw nothing');
     // Each was a submission, never a raw append: its commit stored a write submission settled done.
-    for (const c of log.filter((x) => x.entries.some((e) => e.kind.startsWith('familiar.')))) expect(c.submissions.some((s) => s.type === 'write' && s.status === 'done')).toBe(true);
+    for (const c of log.filter((x) => x.entries.some((e) => e.kind.startsWith('familiar.')))) if (!c.submissions.some((s) => s.type === 'write' && s.status === 'done')) problems.push(`commit ${c.seq} appended a write with no write submission`);
     await journal.close();
+    return problems;
+  }
+
+  it('the bound notice, the reminder line and familiar.ack carry no model, head or edits; only a visible remark carries a model', async () => {
+    expect(await writesProblems('pins-writes')).toEqual([]);
+  });
+
+  it('the control: an ack written with a head fails the check', async () => {
+    mutations.set(['ack-head']);
+    try {
+      const problems = await writesProblems('pins-writes-mutant');
+      expect(mutations.hits('ack-head')).toBeGreaterThan(0);
+      expect(problems).toEqual(['familiar.ack carries a head']);
+    } finally {
+      mutations.clear();
+    }
   });
 });
 

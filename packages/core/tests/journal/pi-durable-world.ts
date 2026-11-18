@@ -28,7 +28,8 @@ export interface Commit {
   /** Submission records this commit wrote: id, type, status, reason. */
   readonly submissions: { id: string; type: string; status: string; reason?: string }[];
   /** Entries this commit appended: kind, and whether the model sees it. */
-  readonly entries: { id: string; kind: string; model: boolean }[];
+  /** Each appended entry, with whether it carries a model message, a context head, or context edits. */
+  readonly entries: { id: string; kind: string; model: boolean; head: boolean; edits: boolean }[];
   /** Tasks this commit wrote: id, name, status. */
   readonly tasks: { id: string; name: string; status: string }[];
 }
@@ -57,7 +58,7 @@ export function recordCommits(storage: any) {
           } else if (w.type === 'submission') {
             commit.submissions.push({ id: String(w.value.id), type: w.value.type ?? w.value.draft?.type, status: w.value.status, reason: w.value.reason ?? w.value.settlement?.reason });
           } else if (w.type === 'entry') {
-            commit.entries.push({ id: String(w.value.id), kind: w.value.kind, model: w.value.model !== undefined });
+            commit.entries.push({ id: String(w.value.id), kind: w.value.kind, model: w.value.model !== undefined, head: w.value.head !== undefined, edits: w.value.edits !== undefined });
           } else if (w.type === 'task') {
             commit.tasks.push({ id: String(w.value.id), name: w.value.kind, status: w.value.state?.status });
           }

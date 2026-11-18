@@ -8,6 +8,11 @@ import { journalRun } from './journal.ts';
 const CONTROLS: [string, keyof typeof JOURNAL_CHECKS][] = [
   ['question-at-end', 'H6'],
   ['question-at-end', 'H7'],
+  // Shown exactly when due, but under another identity: only H6's check of which question catches it.
+  ['question-wrong-id', 'H6'],
+  // A late answer to an earlier question answers the one open now: only H7's tie to the answered task
+  // catches it.
+  ['answer-any-question', 'H7'],
   // DESIGN names H6 for this one. Here H6 catches it in about 1 seed in 60 and H7 in most (the run it starts
   // in the failure's own commit is on no act of yours), so the control is H7's.
   ['after-failed-continue', 'H7'],

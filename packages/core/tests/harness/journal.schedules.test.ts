@@ -47,6 +47,8 @@ describe('the journal named schedules', () => {
       let summaries = 0;
       const r = await journalRun(1, {
         ...(mutation ? { mutation } : {}),
+        // Its own usage near the window: no turn cap, which would pause it before any summary.
+        turnTokens: false,
         schedule: async (d) => {
           // Every reply reports a context near the window, so the default policy would compact in the
           // background; B gets words; anything else is a tool round, to the cap.
