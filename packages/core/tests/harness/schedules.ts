@@ -229,10 +229,12 @@ export const SCHEDULES: Named[] = [
           for (const id of ids) d.call('slow', {}, false, id);
           d.when(`held:${k}`, () => d.exe.log.filter((x) => x.body?.method === 'tools/call').slice(before).every((x) => x.head !== undefined || x.refused), () => {
             d.stopAll();
-            d.when(`detached:${k}`, () => ids.every((id) => d.idle(id)), () => round(k + 1));
+            d.when(`detached:${k}`, () => ids.every(settled), () => round(k + 1));
           });
         };
-        d.when('all ready', () => ids.every((id) => d.idle(id)), () => round(0));
+        // A server whose start timed out (a timer picked early) is left out; the rest saturate.
+        const settled = (id: string) => d.idle(id) || d.client.get(id)?.phase === 'failed';
+        d.when('all ready', () => ids.every(settled), () => round(0));
       }
     },
     expect: (r) => (r.evidence.some((e) => e.what === 'model') ? undefined : 'no model fetch made')

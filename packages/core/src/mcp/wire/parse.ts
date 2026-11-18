@@ -5,6 +5,7 @@
 // session id aside, remote.ts).
 
 import type { RpcId } from './framing.ts';
+import { mutant } from '../../mutations.ts';
 import { legacyVersion } from './framing.ts';
 
 export const MAX_DEPTH = 64;
@@ -43,6 +44,12 @@ function depthOk(v: unknown, depth: number): boolean {
 }
 
 /** One JSON-RPC message from its text, or a throw of `Invalid`. */
+/** At most `n` code units, never ending in half a surrogate pair. */
+export function cutText(text: string, n: number): string {
+  const s = text.slice(0, n);
+  return /[\uD800-\uDBFF]$/.test(s) ? s.slice(0, -1) : s;
+}
+
 export function parseMessage(text: string, maxBytes = MAX_MESSAGE_BYTES): Inbound {
   if (text.length > maxBytes || bytes(text) > maxBytes) throw new Invalid('a message past its size bound');
   let v: unknown;
@@ -83,6 +90,7 @@ export function parseMessage(text: string, maxBytes = MAX_MESSAGE_BYTES): Inboun
  */
 export class EventStream {
   private readonly decoder = new TextDecoder();
+  private afterCr = false;
   private pending = '';
   private data: string[] = [];
   private eventBytes = 0;
@@ -101,12 +109,17 @@ export class EventStream {
     this.total += chunk.length;
     if (this.total > this.maxTotal) throw new Invalid('an exchange past 8 MiB');
     this.pending += this.decoder.decode(chunk, { stream: true });
+    // A CR that ended the last chunk was a line end at once; an LF that starts this one is its pair.
+    if (this.afterCr && this.pending.startsWith('\n')) this.pending = this.pending.slice(1);
+    this.afterCr = false;
     return this.lines();
   }
 
   /** At the stream's end: a last event without its blank line still counts. */
   end(): string[] {
     this.pending += this.decoder.decode();
+    if (this.afterCr && this.pending.startsWith('\n')) this.pending = this.pending.slice(1);
+    this.afterCr = false;
     const out = this.lines();
     if (this.pending) out.push(...this.line(this.pending));
     this.pending = '';
@@ -120,7 +133,11 @@ export class EventStream {
       const i = this.pending.search(/\r\n|\r|\n/);
       if (i < 0) break;
       const line = this.pending.slice(0, i);
-      this.pending = this.pending.slice(this.pending[i] === '\r' && this.pending[i + 1] === '\n' ? i + 2 : i + 1);
+      const crlf = this.pending[i] === '\r' && this.pending[i + 1] === '\n';
+      // A CR at the very end of what's come so far is a line end now, and remembered: an LF opening the
+      // next chunk is its pair, not an empty line.
+      if (this.pending[i] === '\r' && i === this.pending.length - 1 && !(__FAMILIAR_MUTATIONS__ && mutant('cr-forgets-pair'))) this.afterCr = true;
+      this.pending = this.pending.slice(crlf ? i + 2 : i + 1);
       out.push(...this.line(line));
     }
     if (this.eventBytes + this.pending.length > this.maxEvent) throw new Invalid('an event past 4 MiB');
@@ -159,10 +176,10 @@ export interface InitializeResult {
 
 /** The initialize answer: a supported version, tools among the capabilities, and the server's name. */
 export function initializeResult(r: Record<string, unknown>): InitializeResult {
-  if (!legacyVersion(r.protocolVersion)) throw new Invalid(`a protocol version Familiar doesn't speak: ${String(r.protocolVersion).slice(0, 40)}`);
+  if (!legacyVersion(r.protocolVersion)) throw new Invalid(`a protocol version Familiar doesn't speak: ${cutText(String(r.protocolVersion), 40)}`);
   if (!isObject(r.capabilities) || !isObject(r.capabilities.tools)) throw new Invalid('no tools capability');
   if (!isObject(r.serverInfo) || typeof r.serverInfo.name !== 'string') throw new Invalid('no server name');
-  return { protocolVersion: r.protocolVersion, serverName: r.serverInfo.name.slice(0, 200) };
+  return { protocolVersion: r.protocolVersion, serverName: cutText(r.serverInfo.name, 200) };
 }
 
 export interface ListPage {
@@ -191,7 +208,8 @@ export interface CallResult {
   readonly structuredContent?: Record<string, unknown>;
 }
 
-const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+// Whole quads, with the padding the length requires.
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 /** A tools/call result: content items each checked by their own kind, unknown kinds kept as "unsupported". */
 export function callResult(r: Record<string, unknown>, era: 'legacy' | 'modern' = 'legacy'): CallResult {
@@ -206,7 +224,7 @@ export function callResult(r: Record<string, unknown>, era: 'legacy' | 'modern' 
       case 'image':
       case 'audio':
         if (typeof c.data !== 'string' || !BASE64.test(c.data) || typeof c.mimeType !== 'string') throw new Invalid(`a bad ${c.type} item`);
-        return { type: c.type, mimeType: c.mimeType.slice(0, 100) };
+        return { type: c.type, mimeType: cutText(c.mimeType, 100) };
       case 'resource_link':
         if (typeof c.uri !== 'string' || typeof c.name !== 'string') throw new Invalid('a bad resource link');
         return { type: 'resource_link', uri: c.uri, name: c.name };

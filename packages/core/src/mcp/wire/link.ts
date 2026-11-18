@@ -17,7 +17,7 @@ import { emptySlot, step, type Effect, type End, type ExchangeKind, type Input, 
 import { frame, frameCall, LEGACY_VERSIONS, legacyVersion, MODERN_VERSION, type AdminMessage, type Era, type RpcId } from './framing.ts';
 import { HEADER_WORDS, paramHeaders, scanDeclarations, type HeaderDeclaration } from './headers.ts';
 import { mutant } from '../../mutations.ts';
-import { callResult, EventStream, initializeResult, Invalid, listResult, MAX_HANDSHAKE_BYTES, MAX_MESSAGE_BYTES, parseMessage, resultText, type Inbound } from './parse.ts';
+import { callResult, cutText, EventStream, initializeResult, Invalid, listResult, MAX_HANDSHAKE_BYTES, MAX_MESSAGE_BYTES, parseMessage, resultText, type Inbound } from './parse.ts';
 
 /** The exe's fetch, as core uses it: one request per id, its head, its body pulled, and its end. */
 export interface NetSpec {
@@ -393,7 +393,7 @@ export class ServerLink {
           return { kind: 'result', text: "The server asked for input Familiar can't give.", isError: true };
         }
         if (type === undefined) return { kind: 'error', reason: 'protocol', words: 'The server sent a result without its resultType, which the protocol requires.' };
-        if (type !== 'complete') return { kind: 'result', text: `The server sent a result Familiar can't use (${String(type).slice(0, 40)}).`, isError: true };
+        if (type !== 'complete') return { kind: 'result', text: `The server sent a result Familiar can't use (${shown(type)}).`, isError: true };
       }
       try {
         const result = callResult(r.result ?? {}, run.era);
@@ -508,7 +508,7 @@ export class ServerLink {
     const names = new Set<string>();
     for (const t of raw) {
       if (typeof t.name !== 'string') continue;
-      if (names.has(t.name)) return { failure: { kind: 'protocol', words: `The server lists two tools named ${t.name.slice(0, 64)}, so Familiar can't tell them apart.` } };
+      if (names.has(t.name)) return { failure: { kind: 'protocol', words: `The server lists two tools named ${cutText(t.name, 64)}, so Familiar can't tell them apart.` } };
       names.add(t.name);
     }
     // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
@@ -521,7 +521,7 @@ export class ServerLink {
       if (run.era === 'modern' && run.target.where === 'remote') {
         const scan = scanDeclarations(t.inputSchema);
         if (!scan.ok) {
-          notOffered.push({ name: String(t.name).slice(0, 128), reason: scan.reason });
+          notOffered.push({ name: cutText(String(t.name), 128), reason: scan.reason });
           continue;
         }
         if (typeof t.name === 'string') declarations.set(t.name, scan.declarations);
@@ -657,7 +657,10 @@ export class ServerLink {
     }
     let m: Inbound;
     try {
-      m = parseMessage(e.line, MAX_MESSAGE_BYTES);
+      // A local initialize's answer has the handshake's bound, as a remote one's does.
+      const ex = this.slot.ex;
+      const opening = ex && ex.phase === 'live' && ex.kind === 'initialize' && this.pending.get(ex.n)?.run === run;
+      m = parseMessage(e.line, opening ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES);
     } catch (err) {
       // Not JSON-RPC: kept as output while idle; it fails a live exchange.
       const ex = this.slot.ex;
@@ -750,6 +753,11 @@ export class ServerLink {
     }
     const small = p.kind === 'initialize' || !ok;
     const events = type.startsWith('text/event-stream') ? new EventStream(small ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES) : undefined;
+    // Only the two media types the transport allows; a body of any other type is never read as JSON.
+    if (!events && !type.startsWith('application/json')) return this.input({ t: 'terminal', n: p.n, end: ok ? { t: 'invalid', why: `a ${type.split(';')[0] || 'typeless'} answer` } : { t: 'http', status: head.status } });
+    // One decoder for the whole body, so a character split across reads comes out whole.
+    const decoder = new TextDecoder();
+    const status = !ok ? head.status : undefined;
     let json = '';
     try {
       for (;;) {
@@ -757,16 +765,17 @@ export class ServerLink {
         if (!live()) return;
         if (chunk.length === 0) break;
         if (events) {
-          for (const data of events.push(chunk)) if (this.remoteMessage(run, p, data)) return;
+          for (const data of events.push(chunk)) if (this.remoteMessage(run, p, data, status)) return;
         } else {
-          json += new TextDecoder().decode(chunk, { stream: true });
+          json += (__FAMILIAR_MUTATIONS__ && mutant('decoder-per-chunk')) ? new TextDecoder().decode(chunk, { stream: true }) : decoder.decode(chunk, { stream: true });
           if (json.length > (small ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES)) throw new Invalid('a response past its size bound');
         }
       }
       if (events) {
-        for (const data of events.end()) if (this.remoteMessage(run, p, data)) return;
-        return this.input({ t: 'terminal', n: p.n, end: { t: 'stream-ended' } });
+        for (const data of events.end()) if (this.remoteMessage(run, p, data, status)) return;
+        return this.input({ t: 'terminal', n: p.n, end: status !== undefined ? { t: 'http', status } : { t: 'stream-ended' } });
       }
+      json += decoder.decode();
       if (!ok && json.trim() === '') return this.input({ t: 'terminal', n: p.n, end: { t: 'http', status: head.status } });
       if (!this.remoteMessage(run, p, json, !ok ? head.status : undefined)) this.input({ t: 'terminal', n: p.n, end: ok ? { t: 'stream-ended' } : { t: 'http', status: head.status } });
     } catch (err) {
@@ -944,7 +953,7 @@ export function modernRefusal(error: { code: number; data?: unknown }): boolean 
 function refusedWords(error: { code: number; message: string; data?: unknown }): Failure {
   const supported = (error.data as { supported?: unknown } | undefined)?.supported;
   if (error.code === -32022 && Array.isArray(supported) && supported.every((v) => typeof v === 'string')) {
-    const list = (supported as string[]).slice(0, 8).map((v) => v.slice(0, 20)).join(', ');
+    const list = (supported as string[]).slice(0, 8).map((v) => cutText(v, 20)).join(', ');
     return { kind: 'protocol', words: `This server speaks MCP ${list} only; Familiar speaks ${LEGACY_VERSIONS[0]} to ${MODERN_VERSION}.` };
   }
   return { kind: 'protocol', words: `The server refused the handshake: ${error.message}` };
@@ -988,6 +997,18 @@ export function reservedHeader(name: string): boolean {
 /** A throw from reading a server's answers, as words: it ends the run like any invalid answer. */
 function unexpected(e: unknown): Failure {
   return { kind: 'protocol', words: `The server sent something Familiar couldn't handle (${e instanceof Error ? e.name : 'an error'}).` };
+}
+
+/** A value a server sent, for words: never converted by its own methods, and bounded. */
+function shown(v: unknown): string {
+  const text = typeof v === 'string' ? v : (() => {
+    try {
+      return JSON.stringify(v) ?? typeof v;
+    } catch {
+      return typeof v;
+    }
+  })();
+  return [...text].slice(0, 40).join('');
 }
 
 function kindText(e: unknown): string {

@@ -68,7 +68,9 @@ const CONTROLS: Control[] = [
   { mutation: 'publish-stale-walk', check: 'H3', named: 'S14 list_changed during the initial walk' },
   { mutation: 'era-change-on-recovery', check: 'H12', named: 'S15' },
   { mutation: 'end-on-refresh-404', check: 'H14', named: 'S16' },
-  { mutation: 'rearm-in-recovery', check: 'H14', named: 'S17' }
+  { mutation: 'rearm-in-recovery', check: 'H14', named: 'S17' },
+  { mutation: 'decoder-per-chunk', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 0, session404: 'none', redirect: 0, earlyEnd: 0 } },
+  { mutation: 'cr-forgets-pair', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 1, session404: 'none', redirect: 0, earlyEnd: 0 } }
 ];
 
 const MAX_SEEDS = 150;

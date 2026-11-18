@@ -264,13 +264,24 @@ function canonical(v: unknown): string {
   return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`).join(',')}}`;
 }
 
-/** H10: a late or stale response never reaches a caller: a call's result names its own token. */
-export const H10: Check = (r) =>
-  r.evidence
-    .filter((e) => e.what === 'outcome' && e.outcome?.kind === 'result' && !e.outcome.isError)
-    .filter((e) => !(e.outcome as { text: string }).text.includes(e.token!))
-    .map((e) => `H10: ${e.token} answered with another call's result: ${(e.outcome as { text: string }).text.slice(0, 40)}`)
-    .slice(0, 3);
+/** Whether the server wrote a well-formed answer to this call: an event stream, or a JSON body with its one
+    message (an empty JSON body is the server's own invalid answer). */
+function wroteValid(r: WireRun, token: string): boolean {
+  const rec = r.exe.log.find((x) => isCall(x.body) && tokenOf(x.body) === token);
+  return !!rec?.plan && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0);
+}
+
+/** H10: a late or stale response never reaches a caller: a call's result names its own token, and comes
+    through exactly as the server wrote it, its multibyte characters whole however the bytes were split. */
+export const H10: Check = (r) => {
+  const results = r.evidence.filter((e) => e.what === 'outcome' && e.outcome?.kind === 'result' && !e.outcome.isError);
+  return [
+    ...results.filter((e) => !(e.outcome as { text: string }).text.includes(e.token!)).map((e) => `H10: ${e.token} answered with another call's result: ${(e.outcome as { text: string }).text.slice(0, 40)}`),
+    ...results.filter((e) => (e.outcome as { text: string }).text.includes(e.token!) && !(e.outcome as { text: string }).text.includes('— café ✓ 𝄞')).map((e) => `H10: ${e.token}'s result came through changed: ${JSON.stringify((e.outcome as { text: string }).text.slice(-24))}`),
+    // The scripted server writes only valid answers: one read as invalid was split or decoded wrong.
+    ...r.evidence.filter((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && /couldn't read/.test(e.outcome.words) && wroteValid(r, e.token!)).map((e) => `H10: ${e.token}'s valid answer was read as invalid: ${(e.outcome as { words: string }).words.slice(0, 60)}`)
+  ].slice(0, 3);
+};
 
 /** The harness's own scan of a listed schema, for H11: declarations reached through properties only. */
 function declared(schema: any, path: string[] = []): { path: string[]; name: string }[] {
@@ -396,7 +407,9 @@ export function pongFates(r: WireRun): Record<string, number> {
 /** H4 (the pass build): every net_cancel returns within the detach bound, even while a helper is held. */
 export const H4: Check = (r) =>
   r.exe.log
-    .filter((x) => x.cancelAt !== undefined && (x.endAt === undefined ? r.sched.now - x.cancelAt! > DETACH_MS : x.endAt - x.cancelAt! > DETACH_MS))
+    // A helper the fake exe didn't hold ends at once, in steps; only a held one tests the bound (a timer
+    // the scheduler picked early can move the clock past any of them).
+    .filter((x) => x.held && x.cancelAt !== undefined && (x.endAt === undefined ? r.sched.now - x.cancelAt! > DETACH_MS : x.endAt - x.cancelAt! > DETACH_MS))
     .map((x) => `H4: net_cancel for request ${x.n} took ${x.endAt === undefined ? 'more than' : ''}${(x.endAt ?? r.sched.now) - x.cancelAt!} ms`)
     .slice(0, 3);
 

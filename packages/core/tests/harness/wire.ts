@@ -13,6 +13,24 @@ import type { CallOutcome } from '../../src/mcp/types.ts';
 import { Scheduler } from './sched.ts';
 
 const enc = new TextEncoder();
+/** The byte offsets by which each event can be dispatched: with CRLF line ends, the blank line's CR
+    already ends it, so its LF needn't have arrived. */
+const dispatchable = (events: readonly Uint8Array[], nl: string): number[] => {
+  let at = 0;
+  return events.map((e) => {
+    at += e.length;
+    return nl === '\r\n' ? at - 1 : at;
+  });
+};
+const concat = (parts: readonly Uint8Array[]): Uint8Array => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+};
 const MODERN = '2026-07-28';
 /** The exe's admission (4.1): 32 open requests in all, server requests at most 24 in the pass build. */
 export const EXE_TOTAL = 32;
@@ -197,7 +215,7 @@ export class ScriptedServer {
       if (modernReq && this.r() < 0.2) msgs.push({ jsonrpc: '2.0', id: 'stray', method: 'ping' }, { jsonrpc: '2.0', id: 'ask', method: 'sampling/createMessage', params: {} });
       if (!modernReq && this.r() < m.pingWithFinal) msgs.push(this.ping(on));
       const text = String(body.params?.arguments?.text ?? '');
-      const result = modernReq && this.r() < m.inputRequired ? { resultType: 'input_required', inputRequests: {} } : { content: [{ type: 'text', text: `ran ${body.params?.name} ${text}` }], ...complete };
+      const result = modernReq && this.r() < m.inputRequired ? { resultType: 'input_required', inputRequests: {} } : { content: [{ type: 'text', text: `ran ${body.params?.name} ${text} — café ✓ 𝄞` }], ...complete };
       if (this.r() >= m.earlyEnd) msgs.push({ jsonrpc: '2.0', id: body.id, result });
       if (!modernReq && this.r() < 0.1) msgs.push(this.ping(on, true));
       if (m.where === 'remote' && this.r() < m.redirect) return { status: this.r() < 0.5 ? 307 : 303, sse: false, messages: [], final: -1, location: '/elsewhere' };
@@ -296,7 +314,7 @@ export class FakeExe {
   /* ---------- net ---------- */
 
   net(): NetPort {
-    const streams = new Map<string, { rec: NativeRec; chunks: string[]; waiting?: { resolve: (b: Uint8Array) => void; reject: (e: unknown) => void } ; plan?: Plan }>();
+    const streams = new Map<string, { rec: NativeRec; chunks: Uint8Array[]; waiting?: { resolve: (b: Uint8Array) => void; reject: (e: unknown) => void } ; plan?: Plan }>();
     const fetch = (spec: NetSpec, body: Uint8Array): Promise<NetHead> =>
       new Promise((resolve, reject) => {
         const text = new TextDecoder().decode(body);
@@ -319,7 +337,7 @@ export class FakeExe {
         rec.held = this.sched.random() < this.server.mode.holdHelpers && (this.server.mode.holdWhich === 'any' || parsed?.method === 'tools/call');
         this.log.push(rec);
         this.peakServer = Math.max(this.peakServer, this.open('post'));
-        const st = { rec, chunks: [] as string[] } as { rec: NativeRec; chunks: string[]; waiting?: { resolve: (b: Uint8Array) => void; reject: (e: unknown) => void }; plan?: Plan };
+        const st = { rec, chunks: [] as Uint8Array[] } as { rec: NativeRec; chunks: Uint8Array[]; waiting?: { resolve: (b: Uint8Array) => void; reject: (e: unknown) => void }; plan?: Plan };
         streams.set(spec.id, st);
         (st as any).fail = reject;
         this.sched.add({
@@ -338,15 +356,24 @@ export class FakeExe {
             }
             st.plan = plan;
             rec.plan = plan;
-            const lines = plan.sse ? plan.messages.map((m) => `data: ${JSON.stringify(m)}\n\n`) : plan.messages.length ? [JSON.stringify(plan.messages[0])] : [];
-            const full = lines.join('');
+            // Bytes, as the exe hands them over: line ends CR, LF or CRLF (as a server may write them), and
+            // chunk boundaries anywhere, through a multibyte character or between a CR and its LF.
+            const nl = ['\n', '\r', '\r\n'][Math.floor(this.sched.random() * 3)]!;
+            // An event's data over two lines (JSON may break between tokens), so a line end split badly shows.
+            const event = (m: Msg) => {
+              const text = JSON.stringify(m);
+              const at = text.indexOf(',"');
+              return at < 0 ? `data: ${text}${nl}${nl}` : `data: ${text.slice(0, at + 1)}${nl}data: ${text.slice(at + 1)}${nl}${nl}`;
+            };
+            const lines = (plan.sse ? plan.messages.map(event) : plan.messages.length ? [JSON.stringify(plan.messages[0])] : []).map((l) => enc.encode(l));
+            const full = concat(lines);
             // Chunk boundaries anywhere (one chunk in S2's mode); a held call's stream says nothing.
             let i = 0;
             if (this.server.mode.hold && parsed?.method === 'tools/call' && parsed.params?.name === 'slow') {
               // A held call: its pings, if any, then nothing more.
-              const pings = plan.messages.filter((m) => m.method === 'ping').map((m) => `data: ${JSON.stringify(m)}\n\n`);
-              if (pings.length && plan.sse) st.chunks.push(pings.join(''));
-              (st as any).bounds = pings.reduce<number[]>((acc, l) => [...acc, (acc.at(-1) ?? 0) + l.length], []);
+              const pings = plan.messages.filter((m) => m.method === 'ping').map((m) => enc.encode(event(m)));
+              if (pings.length && plan.sse) st.chunks.push(concat(pings));
+              (st as any).bounds = dispatchable(pings, nl);
               (st as any).sent = 0;
               (st as any).holdMsgs = plan.messages.filter((m) => m.method === 'ping');
               i = full.length;
@@ -361,7 +388,7 @@ export class FakeExe {
               i += len;
             }
             if (!(st as any).holdMsgs) {
-              (st as any).bounds = lines.reduce<number[]>((acc, l) => [...acc, (acc.at(-1) ?? 0) + l.length], []);
+              (st as any).bounds = plan.sse ? dispatchable(lines, nl) : lines.reduce<number[]>((acc, l) => [...acc, (acc.at(-1) ?? 0) + l.length], []);
               (st as any).sent = 0;
             }
             this.sched.add({
@@ -416,7 +443,7 @@ export class FakeExe {
                   if (!held && k === plan.final && st.rec.final === undefined) st.rec.final = this.sched.step * 1000 + k;
                 }
               });
-              w.resolve(enc.encode(next));
+              w.resolve(next);
             }
           });
         }),

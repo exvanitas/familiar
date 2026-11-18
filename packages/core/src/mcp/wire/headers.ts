@@ -71,7 +71,29 @@ export function scanDeclarations(schema: unknown): ScanResult {
   const fault = visit(schema, [], true);
   if (fault) return { ok: false, reason: numberFault ?? fault };
   if (numberFault) return { ok: false, reason: numberFault };
+  // A declaration may not be a `$ref` target, nor inside one: another part of the schema could then carry
+  // the same argument under another path.
+  const refs = localRefs(schema);
+  for (const d of out) {
+    const pointer = `#${d.path.map((k) => `/properties/${k.replace(/~/g, '~0').replace(/\//g, '~1')}`).join('')}`;
+    if (refs.some((r) => pointer === r || pointer.startsWith(`${r}/`))) return { ok: false, reason: `${where(d.path)}: x-mcp-header may not sit on a $ref target` };
+  }
   return { ok: true, declarations: out };
+}
+
+/** Every local `$ref` (`#…`) anywhere in a schema, bounded by the schema's own bounds checked earlier. */
+function localRefs(schema: unknown): string[] {
+  const out: string[] = [];
+  const walk = (n: unknown): void => {
+    if (n === null || typeof n !== 'object') return;
+    if (Array.isArray(n)) return n.forEach(walk);
+    for (const [k, v] of Object.entries(n as Record<string, unknown>)) {
+      if (k === '$ref' && typeof v === 'string' && v.startsWith('#')) out.push(v === '#' ? '' : v);
+      else walk(v);
+    }
+  };
+  walk(schema);
+  return out.map((r) => (r === '' ? '#' : r));
 }
 
 /** Whether a string is well-formed UTF-16: a lone surrogate would turn into U+FFFD on the wire. */
@@ -115,6 +137,8 @@ function at(root: unknown, path: readonly string[]): unknown {
   let n = root;
   for (const k of path) {
     if (n === null || typeof n !== 'object' || Array.isArray(n)) return undefined;
+    // Own properties only: an omitted `constructor` mustn't resolve to an inherited function.
+    if (!Object.hasOwn(n as object, k)) return undefined;
     n = (n as Record<string, unknown>)[k];
   }
   return n;
