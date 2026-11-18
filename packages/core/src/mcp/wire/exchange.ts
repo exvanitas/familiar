@@ -156,6 +156,8 @@ export function step(slot: Slot, input: Input): Step {
       if (ex.answered.includes(input.id)) return { slot, effects: [] };
       // Sealed: no send of any kind. Locally that's departure 2; a remote stream is parsed no further.
       if (ex.phase !== 'live' && !(__FAMILIAR_MUTATIONS__ && mutant('pong-after-end'))) return { slot, effects: ex.where === 'local' ? [{ t: 'departure', n: ex.n, id: input.id, departure: 2 }] : [] };
+      // A named mutation: the first ping silently dropped, as if answered.
+      if (ex.pongsTotal === 0 && !ex.answered.length && (__FAMILIAR_MUTATIONS__ && mutant('drop-pong-before-flood'))) return { slot: { ...slot, ex: { ...ex, answered: [...ex.answered, input.id] } }, effects: [] };
       if (ex.pongsOut.length >= MAX_PONGS_OUT || ex.pongsTotal >= MAX_PONGS) {
         return terminate(slot, ex, { t: 'flood' }, [{ t: 'departure', n: ex.n, id: input.id, departure: 1 }]);
       }

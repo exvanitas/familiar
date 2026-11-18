@@ -61,6 +61,8 @@ const CONTROLS: Control[] = [
   { mutation: 'cancel-pongs-at-drain', check: 'H13', named: 'S2' },
   { mutation: 'rehandshake-every-404', check: 'H14', named: 'S3' },
   { mutation: 'no-detach', check: 'H4', named: 'S8', build: 'pass' },
+  { mutation: 'late-detach', check: 'H4', named: 'S8', build: 'pass' },
+  { mutation: 'drop-pong-before-flood', check: 'H13', mode: { where: 'remote', era: 'legacy', pings: 40, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1 } },
   { mutation: 'no-server-cap', check: 'H5', named: 'S10' },
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop during a walk, local' },
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' },

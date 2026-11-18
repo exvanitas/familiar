@@ -1,7 +1,8 @@
 // The independent checks (docs/mcp-design.md 7.2). Each reads only the fake exe's log, the fake server's
 // own record and the driver's evidence log, never the client's state.
 
-import { DETACH_MS, EXE_SERVER_CAP, INTERIM_WRITE_MS, type Evidence, type NativeRec, type WireRun } from './wire.ts';
+import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
+import type { Evidence, NativeRec, WireRun } from './wire.ts';
 
 export type Check = (r: WireRun) => string[];
 
@@ -93,7 +94,7 @@ export const H1: Check = (r) => {
   for (const x of r.exe.log) {
     if (x.kind !== 'write' || x.startAt === undefined) continue;
     const waited = (x.endAt ?? r.sched.now) - x.startAt;
-    if (waited > INTERIM_WRITE_MS + 1_000) problems.push(`H1: a local write pending ${waited} ms, past the interim bound`);
+    if (waited > CONTRACT_INTERIM_WRITE_MS + 1_000) problems.push(`H1: a local write pending ${waited} ms, past the interim bound`);
   }
   // A call refused busy never goes out afterwards.
   for (const e of r.evidence) {
@@ -378,7 +379,12 @@ export const H13: Check = (r) => {
     const post = r.exe.log.find((x) => x.kind === 'post' && x.delivered.has(p.id));
     if (post) {
       if (post.final !== undefined && post.delivered.get(p.id)! > post.final) continue; // departure 5
-      if (/too many pings/.test(words(tokenOf(post.body)))) continue; // departure 1
+      // Departure 1 covers the ping that flooded and those after it, never one before a ping that got a pong.
+      if (/too many pings/.test(words(tokenOf(post.body)))) {
+        const mine = post.delivered.get(p.id)!;
+        const laterAnswered = [...post.delivered].some(([id, d]) => d > mine && handed.has(id));
+        if (!laterAnswered) continue;
+      }
       problems.push(`H13: ping ${p.id} on request ${post.n} got no pong and no departure`);
       continue;
     }
@@ -416,7 +422,7 @@ export const H4: Check = (r) =>
   r.exe.log
     // A helper the fake exe didn't hold ends at once, in steps; only a held one tests the bound (a timer
     // the scheduler picked early can move the clock past any of them).
-    .filter((x) => x.held && x.cancelAt !== undefined && (x.endAt === undefined ? r.sched.now - x.cancelAt! > DETACH_MS : x.endAt - x.cancelAt! > DETACH_MS))
+    .filter((x) => x.held && x.cancelAt !== undefined && (x.endAt === undefined ? r.sched.now - x.cancelAt! > CONTRACT_DETACH_MS : x.endAt - x.cancelAt! > CONTRACT_DETACH_MS))
     .map((x) => `H4: net_cancel for request ${x.n} took ${x.endAt === undefined ? 'more than' : ''}${(x.endAt ?? r.sched.now) - x.cancelAt!} ms`)
     .slice(0, 3);
 
@@ -526,6 +532,6 @@ export const WITNESSES: Record<string, (r: WireRun) => boolean> = {
 };
 export const PASS_WITNESSES: Record<string, (r: WireRun) => boolean> = {
   'H4 a held helper detached': (r) => r.exe.log.some((x) => x.detached),
-  [`H5 a saturation (${EXE_SERVER_CAP} server requests open)`]: (r) => r.exe.peakServer >= EXE_SERVER_CAP && r.evidence.some((e) => e.what === 'model')
+  [`H5 a saturation (${CONTRACT_SERVER_CAP} server requests open)`]: (r) => r.exe.peakServer >= CONTRACT_SERVER_CAP && r.evidence.some((e) => e.what === 'model')
 };
 export type { Evidence };

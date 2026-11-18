@@ -36,7 +36,9 @@ const MODERN = '2026-07-28';
 export const EXE_TOTAL = 32;
 export const EXE_SERVER_CAP = 24;
 /** The pass build's detach bound for a held helper, and how long the harness holds one. */
-export const DETACH_MS = 2_000;
+export const DETACH_MS = 1_000;
+/** Past this many detached server helpers, the pass build refuses new server fetches busy. */
+export const EXE_DETACHED_SERVER_HELPERS = 8;
 /** The page's interim bound on a local write (4.3), as the contract gives it. */
 export const INTERIM_WRITE_MS = 10_000;
 export const HELPER_HELD_MS = 120_000;
@@ -308,6 +310,7 @@ export class FakeExe {
   private admits(kind: 'post' | 'model'): boolean {
     if (this.open() >= EXE_TOTAL) return false;
     if (kind === 'post' && this.build === 'pass' && !mutant('no-server-cap') && this.open('post') >= EXE_SERVER_CAP) return false;
+    if (kind === 'post' && this.build === 'pass' && this.log.filter((x) => x.kind === 'post' && x.detached && x.terminated === undefined).length >= EXE_DETACHED_SERVER_HELPERS) return false;
     return true;
   }
 
@@ -500,7 +503,7 @@ export class FakeExe {
           if (this.build === 'pass' && !mutant('no-detach')) this.sched.timer(() => {
             rec.detached = rec.end === undefined;
             returned();
-          }, DETACH_MS);
+          }, mutant('late-detach') ? DETACH_MS * 1.5 : DETACH_MS);
         })
     };
   }

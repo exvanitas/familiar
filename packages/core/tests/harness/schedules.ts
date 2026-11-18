@@ -230,26 +230,32 @@ export const SCHEDULES: Named[] = [
     expect: (r) => (r.evidence.filter((e) => e.what === 'start').length === 2 && r.exe.log.some((x) => x.held && x.cancelAsked !== undefined) ? undefined : 'no Stop and Start over a held cancel')
   },
   {
-    // S10: twelve servers each hold a call and a detached helper, then more, then chat fetches a model.
+    // S10: 8 server helpers detached and hung, then every one of 24 servers holds a call, then chat fetches
+    // a model. The server cap keeps the servers to 24 of the 32, detached helpers included.
     name: 'S10 server saturation, then a model fetch',
     options: {
       build: 'pass',
-      servers: 12,
+      servers: 24,
       mode: { ...quiet, hold: true, holdHelpers: 1, holdWhich: 'calls', sse: 1 },
       schedule: (d) => {
-        const ids = Array.from({ length: 12 }, (_, i) => `s${i + 1}`);
-        const round = (k: number): void => {
-          if (k === 3) return d.model();
-          const before = d.exe.log.filter((x) => x.body?.method === 'tools/call').length;
-          for (const id of ids) d.call('slow', {}, false, id);
-          d.when(`held:${k}`, () => d.exe.log.filter((x) => x.body?.method === 'tools/call').slice(before).every((x) => x.head !== undefined || x.refused), () => {
-            d.stopAll();
-            d.when(`detached:${k}`, () => ids.every(settled), () => round(k + 1));
-          });
-        };
+        const ids = Array.from({ length: 24 }, (_, i) => `s${i + 1}`);
         // A server whose start timed out (a timer picked early) is left out; the rest saturate.
         const settled = (id: string) => d.idle(id) || d.client.get(id)?.phase === 'failed';
-        d.when('all ready', () => ids.every(settled), () => round(0));
+        const headed = (from: number) => d.exe.log.filter((x) => x.body?.method === 'tools/call').slice(from).every((x) => x.head !== undefined || x.refused);
+        d.when('all ready', () => ids.every(settled), () => {
+          // Round one: 8 calls, stopped: their helpers are held and detached.
+          const before = d.exe.log.filter((x) => x.body?.method === 'tools/call').length;
+          for (const id of ids.slice(0, 8)) d.call('slow', {}, false, id);
+          d.when('held', () => headed(before), () => {
+            d.stopAll();
+            d.when('detached', () => ids.slice(0, 8).every(settled), () => {
+              // Round two: every server holds a call.
+              const from = d.exe.log.filter((x) => x.body?.method === 'tools/call').length;
+              for (const id of ids) d.call('slow', {}, false, id);
+              d.when('saturated', () => headed(from), () => d.model());
+            });
+          });
+        });
       }
     },
     expect: (r) => (r.evidence.some((e) => e.what === 'model') ? undefined : 'no model fetch made')
