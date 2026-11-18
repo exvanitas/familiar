@@ -1,9 +1,10 @@
-/* Build-start check B3 (the MCP rebuild, her line in 2.1): what reaches each preset's wire when her
-   remark sits in the conversation as a model-visible entry. Two shapes: an assistant message right
-   after her last reply (two assistant messages in a row), or a user-role note (two user messages in a
-   row, once you write). No network and no key: the fetch is a stub that records the body and refuses. */
+/* Her remark on each preset's wire (the MCP rebuild, 2.1 and build-start check B3). pi-ai passes
+   messages through as they are, so two of one role in a row reach the endpoint unmerged; some chat
+   templates refuse that. The decision: her remark is a user-role note, and core's request builder
+   merges same-role messages (`alternate`), so every preset sees alternating roles. No network and no
+   key: the fetch is a stub that records the body and refuses. */
 import { describe, expect, it } from 'vitest';
-import type { ModelRequest } from '@familiar/core';
+import { alternate, type ModelRequest } from '@familiar/core';
 import { createPiAiPort } from '../../src/model/pi-ai.ts';
 import { adapterOptions, PRESETS, type PresetId } from '../../src/model/presets.ts';
 
@@ -28,14 +29,15 @@ async function wireMessages(preset: PresetId, messages: ModelRequest['messages']
   return (body.messages as any[]).map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : (m.content ?? []).map((c: any) => c.text ?? c.type).join(' | ') }));
 }
 
+const alternates = (wire: { role: string }[]) => wire.filter(m => m.role !== 'system').every((m, i, all) => i === 0 || m.role !== all[i - 1]!.role);
+
 describe('B3: her remark on the wire', () => {
   for (const preset of PRESETS.map(p => p.id)) {
-    for (const [shape, messages] of Object.entries(shapes)) {
-      it(`${preset}, ${shape}`, async () => {
-        const wire = await wireMessages(preset, messages);
-        console.log(`B3 ${preset} / ${shape}: ${JSON.stringify(wire)}`);
-        expect(wire.length).toBeGreaterThan(0);
-      });
-    }
+    it(`${preset}: unmerged, either shape repeats a role; through alternate(), the note shape alternates`, async () => {
+      for (const messages of Object.values(shapes)) expect(alternates(await wireMessages(preset, messages))).toBe(false);
+      const wire = await wireMessages(preset, alternate(shapes['user-role note']!));
+      expect(alternates(wire)).toBe(true);
+      expect(wire.at(-1)!.content).toMatch(/kettle reminder is due.*\n\nThanks!$/s);
+    });
   }
 });
