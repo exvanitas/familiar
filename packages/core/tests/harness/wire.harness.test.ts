@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { WIRE_CHECKS } from './checks.ts';
 import { wireRun } from './wire.ts';
 
-const SEEDS = Number(process.env.FAMILIAR_SEEDS ?? 120);
+const SEEDS = Number(process.env.FAMILIAR_SEEDS ?? 500);
 
 describe('the wire, under seeded interleavings', () => {
   it(`holds H1 to H3 and H10 to H14 over ${SEEDS} seeds`, async () => {

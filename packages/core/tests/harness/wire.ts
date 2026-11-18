@@ -27,13 +27,15 @@ export interface Mode {
   readonly staleId: number;
   readonly listChanged: number;
   readonly pages: number;
-  readonly session404: 'none' | 'once' | 'twice' | 'always';
+  readonly session404: 'none' | 'once' | 'twice' | 'again' | 'always';
   readonly redirect: number;
   readonly idlePings: number;
   readonly stopReading: number;
   readonly inputRequired: number;
   /** Ping in the same chunk ahead of the final reply (S2). */
   readonly pingWithFinal: number;
+  /** A legacy server whose initialize fails for another reason (H12's control). */
+  readonly initError: number;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -54,6 +56,7 @@ export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
     stopReading: where === 'local' && r() < 0.1 ? 1 : 0,
     inputRequired: r() < 0.15 ? 0.5 : 0,
     pingWithFinal: r() < 0.3 ? 0.6 : 0,
+    initError: 0,
     ...over
   };
 }
@@ -107,6 +110,7 @@ export class ScriptedServer {
     const modernReq = body.params?._meta?.['io.modelcontextprotocol/protocolVersion'] === MODERN;
     const json = (messages: Msg[], status = 200, extra: Partial<Plan> = {}): Plan => ({ status, sse: messages.length > 1 || this.r() < m.sse, messages, final: messages.findIndex((x) => x.id === body.id && ('result' in x || 'error' in x)), ...extra });
     if (body.method === 'initialize') {
+      if (m.era === 'legacy' && this.r() < m.initError) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32603, message: 'internal error' } }]);
       if (m.era === 'modern') {
         const refusal = { jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: [MODERN], requested: body.params?.protocolVersion } } };
         return json([refusal], this.r() < 0.5 ? 400 : 200, { session: this.r() < 0.5 ? 'dead' : undefined } as Partial<Plan>);
@@ -117,7 +121,12 @@ export class ScriptedServer {
     }
     // A legacy session that ends: a 404 on a request carrying the old id.
     if (m.where === 'remote' && this.sessionIdNow && headers['mcp-session-id'] !== undefined) {
-      const drop = m.session404 === 'always' || (m.session404 === 'once' && this.drops === 0 && body.method === 'tools/call') || (m.session404 === 'twice' && this.drops < 2 && body.method !== 'notifications/initialized');
+      const drop =
+        m.session404 === 'always' ||
+        (m.session404 === 'once' && this.drops === 0 && body.method === 'tools/call') ||
+        (m.session404 === 'twice' && this.drops < 2 && body.method !== 'notifications/initialized') ||
+        // A call drops the session, then the first page after the re-handshake drops it again.
+        (m.session404 === 'again' && ((this.drops === 0 && body.method === 'tools/call') || (this.drops === 1 && body.method === 'tools/list')));
       if (drop && headers['mcp-session-id'] === this.sessionIdNow) {
         this.drops++;
         this.sessionIdNow = `S${++this.session}x`;
@@ -492,7 +501,9 @@ export class Driver {
     const stop = new AbortController();
     this.calls.set(token, stop);
     this.note({ what: 'call', token, tool });
-    const out = this.client.send(decision, stop.signal);
+    // The model's own arguments as the journal would pass them along: here they differ from the Yes, so a
+    // body built from them (a named mutation) shows.
+    const out = this.client.send(decision, stop.signal, { ...args, model: 'unchecked' });
     // A revoke landing right after the call, in the same task (H3's schedule for a gap before the handoff).
     if (revokeRightAfter) {
       this.client.revoke('s1', tool, 'never');

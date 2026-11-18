@@ -474,7 +474,7 @@ export class ServerLink {
     // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
     // past the step's deadline, whatever a server keeps sending.
     for (;;) {
-      await Promise.race([this.drained(), deadline.over]);
+      if (!(this.slot.ex?.phase === 'draining' && mutant('admit-while-draining'))) await Promise.race([this.drained(), deadline.over]);
       if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended) return { end: { t: 'run-ended' } };
       const started = this.exchangeNow(run, kind, requestId, body, method);
@@ -484,7 +484,7 @@ export class ServerLink {
 
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
   private exchangeNow(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, method?: string, extra?: readonly (readonly [string, string])[]): Promise<Outcome> | undefined {
-    if (this.busy) return undefined;
+    if (this.busy && !(this.slot.ex?.phase === 'draining' && mutant('admit-while-draining'))) return undefined;
     let resolve!: (o: Outcome) => void;
     const promise = new Promise<Outcome>((r) => (resolve = r));
     const n = this.slot.next;
@@ -769,7 +769,7 @@ export class ServerLink {
    */
   private sessionDropped(run: Run): void {
     if (run.ended) return;
-    if ((run.dropped > 0 && !mutant('rehandshake-every-404')) || !run.ready) {
+    if ((run.dropped > 0 || !run.ready) && !mutant('rehandshake-every-404')) {
       this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
       return;
     }
@@ -787,7 +787,11 @@ export class ServerLink {
         if (failure) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
         const listed = await this.walk(run, deadline);
         if (run.ended) return;
-        if (!('tools' in listed)) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
+        if (!('tools' in listed)) {
+          // The mutant's own re-handshake for the walk's 404 is already under way.
+          if (/ended its session/.test(listed.failure.words) && mutant('rehandshake-every-404')) return;
+          return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
+        }
         run.ready = true;
         this.events.listed?.(run.id, run.tools);
         if (resend) {

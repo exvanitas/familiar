@@ -23,7 +23,8 @@ function exchangeKey(r: WireRun, rec: NativeRec): string {
     const inFlight = [...r.exe.log].reverse().find((x) => x.kind === 'write' && x.epoch === rec.epoch && x.seq < rec.seq && x.body !== undefined && x.body.method !== 'notifications/cancelled' && (x.end ?? Infinity) > rec.start);
     if (inFlight) return exchangeKey(r, inFlight);
     const outstanding = [...r.exe.log].filter((x) => x.kind === 'write' && x.epoch === rec.epoch && x.seq < rec.seq && x.body?.id !== undefined && x.body?.method);
-    const open = outstanding.reverse().find((x) => (r.exe.responded.get(`${x.epoch}:${x.body!.id}`) ?? Infinity) > rec.start);
+    const cancelEnded = (id: unknown) => r.exe.log.some((y) => y.kind === 'write' && y.epoch === rec.epoch && y.body?.method === 'notifications/cancelled' && y.body.params?.requestId === id && (y.end ?? Infinity) <= rec.start);
+    const open = outstanding.reverse().find((x) => (r.exe.responded.get(`${x.epoch}:${x.body!.id}`) ?? Infinity) > rec.start && !cancelEnded(x.body!.id));
     return open ? `${rec.epoch}:${open.body!.id}` : `idle:${b.id}`;
   }
   if (b?.method === 'notifications/cancelled') return `${rec.epoch}:${b.params?.requestId}`;
@@ -50,6 +51,15 @@ export const H1: Check = (r) => {
     const n = recs.filter((x) => x.start <= s && (x.end ?? Infinity) > s).length;
     if (n > 3) problems.push(`H1: ${n} native requests open at step ${s}`);
   }
+  // Nothing waits in line: a call goes out in the step it's made, or is answered in that step (a queue
+  // would hand it off later, and never overlap, so overlap alone can't catch it).
+  for (const e of r.evidence) {
+    if (e.what !== 'call') continue;
+    const out = recs.find((x) => isCall(x.body) && tokenOf(x.body) === e.token);
+    const answered = r.evidence.find((o) => o.what === 'outcome' && o.token === e.token);
+    if (out && out.start !== e.step) problems.push(`H1: ${e.token} made at step ${e.step}, handed off at ${out.start}`);
+    if (!out && answered && answered.step !== e.step && answered.outcome?.kind === 'error') problems.push(`H1: ${e.token} refused only at step ${answered.step}, made at ${e.step}`);
+  }
   // A call refused busy never goes out afterwards.
   for (const e of r.evidence) {
     if (e.what !== 'outcome' || e.outcome?.kind !== 'error' || e.outcome.reason !== 'busy') continue;
@@ -75,7 +85,18 @@ export const H2: Check = (r) => {
         const carrier = r.exe.log.find((y) => y.delivered.has(String(b.id)));
         if (!carrier) problems.push(`H2: a pong for ${b.id}, a ping no stream carried`);
         else if (carrier.final !== undefined && carrier.delivered.get(String(b.id))! > carrier.final) problems.push(`H2: a pong for ${b.id}, which came after its stream's final response`);
-      } else if (!r.server.pings.some((p) => p.id === String(b.id)) && !String(b.id).startsWith('i')) problems.push(`H2: a pong for ${b.id}, never pinged`);
+      } else {
+        if (!r.server.pings.some((p) => p.id === String(b.id)) && !String(b.id).startsWith('i')) problems.push(`H2: a pong for ${b.id}, never pinged`);
+        // Locally, a pong goes out only while its exchange's request is live: not after its response, and
+        // not after its cancel (the exchange sealed: departure 2).
+        const key = exchangeKey(r, x);
+        const m = /^(\d+):(.+)$/.exec(key);
+        if (m) {
+          const responded = r.exe.responded.get(key);
+          if (responded !== undefined && responded < x.start) problems.push(`H2: a pong for ${b.id} after its exchange's response`);
+          if (r.exe.log.some((y) => y.kind === 'write' && y.epoch === x.epoch && y.body?.method === 'notifications/cancelled' && String(y.body.params?.requestId) === m[2] && y.seq < x.seq)) problems.push(`H2: a pong for ${b.id} after its exchange's cancel`);
+        }
+      }
       continue;
     }
     if (!kinds.has(b.method)) problems.push(`H2: a message of kind ${b.method}`);
@@ -174,9 +195,11 @@ export const H12: Check = (r) => {
     }
     if (r.server.mode.era !== 'modern') problems.push('H12: a run turned modern though the server never refused the legacy opening');
     const first = Math.min(...modern.map((x) => x.seq));
+    const opening = Math.min(...recs.map((x) => x.seq));
     for (const x of recs) {
+      if (x.body?.method === 'notifications/initialized') problems.push('H12: initialized on a modern run');
+      if (x.body?.method === 'initialize' && x.seq !== opening) problems.push('H12: initialize after a modern opening');
       if (x.seq <= first) continue;
-      if (x.body?.method === 'initialize' || x.body?.method === 'notifications/initialized') problems.push(`H12: ${x.body.method} on a modern run`);
       if (isPong(x.body)) problems.push('H12: a pong on a modern run');
       if (x.headers['mcp-session-id'] !== undefined) problems.push('H12: a session id on a modern run');
       if (x.kind === 'post' && x.body?.method === 'notifications/cancelled') problems.push('H12: a remote cancel on a modern run');
@@ -239,6 +262,19 @@ export const H14: Check = (r) => {
       continue;
     }
     if (next.headers['mcp-session-id'] !== undefined) problems.push('H14: the re-handshake carried the old session id');
+  }
+  // A 404 before any page or call has completed since the last re-handshake ends the run: nothing more is
+  // sent until the person starts it again.
+  for (let i = 0; i < recs.length; i++) {
+    if (recs[i]!.status !== 404) continue;
+    const prior = recs.slice(0, i).reverse().find((x) => x.status === 404);
+    if (!prior) continue;
+    const between = recs.filter((x) => x.seq > prior.seq && x.seq < recs[i]!.seq);
+    const completed = between.some((x) => (x.body?.method === 'tools/list' || x.body?.method === 'tools/call') && x.status === 200 && x.final !== undefined);
+    if (completed) continue;
+    const restart = r.evidence.find((e) => e.what === 'start' && e.seq > recs[i]!.seq);
+    const after = recs.filter((x) => x.seq > recs[i]!.seq && x.body && !isPong(x.body) && (!restart || x.seq < restart.seq));
+    if (after.length) problems.push(`H14: after a second 404 with nothing completed between, ${after[0]!.body!.method} was still sent`);
   }
   return problems.slice(0, 3);
 };
