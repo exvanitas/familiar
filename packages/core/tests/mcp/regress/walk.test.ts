@@ -89,3 +89,22 @@ describe('an oversized tool list', () => {
     expect(r.ok).toBe(false);
   });
 });
+
+describe("a modern remote run's fingerprints", () => {
+  it('cover the era and the header declarations: the same tool listed legacy has another fingerprint', async () => {
+    const schema = { type: 'object', properties: { region: { type: 'string', 'x-mcp-header': 'Region' } } };
+    const listed = (modern: boolean) =>
+      fakeNet((b) => {
+        if (b.method === 'initialize') return modern ? { ...json({ jsonrpc: '2.0', id: b.id, error: { code: -32022, message: 'x', data: { supported: ['2026-07-28'] } } }), status: 400 } : json(initResult(b.id));
+        if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+        return json({ jsonrpc: '2.0', id: b.id, result: { ...(modern ? { resultType: 'complete' } : {}), tools: [{ name: 'look', inputSchema: schema }] } });
+      });
+    const prints: string[] = [];
+    for (const modern of [false, true]) {
+      const link = new ServerLink('s', { net: listed(modern).port }, realClock, { ended: () => {} });
+      await link.start(remote, 'L');
+      prints.push(link.current!.tools[0]!.fingerprint);
+    }
+    expect(prints[0]).not.toBe(prints[1]);
+  });
+});

@@ -528,8 +528,8 @@ export class ServerLink {
       names.add(t.name);
     }
     // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
-    // rules isn't offered, and Test says why (3.5). The declarations come from the schema, which the
-    // fingerprint already covers.
+    // rules isn't offered, and Test says why (3.5). The tool's fingerprint covers its declarations and the
+    // era, since they change what goes on the wire: the same tool listed by a legacy run is another tool.
     const offered: Record<string, unknown>[] = [];
     const notOffered: { name: string; reason: string }[] = [];
     const declarations = new Map<string, readonly HeaderDeclaration[]>();
@@ -545,7 +545,7 @@ export class ServerLink {
       offered.push(t);
     }
     try {
-      return { tools: checkTools(offered as never), declarations, notOffered };
+      return { tools: checkTools(offered as never, run.era === 'modern' && run.target.where === 'remote' ? { declarations } : {}), declarations, notOffered };
     } catch (e) {
       if (e instanceof CatalogError) return { failure: e.failure };
       throw e;
