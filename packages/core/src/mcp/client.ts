@@ -281,6 +281,8 @@ export class McpClient {
   /**
    * The gate's policy for a turn (journal's `policy`): each server wrapper's from its own identity, and each
    * built-in's from the owner's choice under the built-in id, the revoke overlay on top. Read at each call.
+   * With the whole record unreadable no choice loads, and no built-in falls back to its default allow:
+   * every tool asks, and a revoke to never still denies (5.1).
    */
   policy(wrappers: readonly ServerTool[]): GatePolicy {
     const choices = this.owner.choices();
@@ -294,7 +296,7 @@ export class McpClient {
       const tool = builtInTool(key);
       if (tool !== undefined) this.tighten(perTool, tool, key);
     }
-    return { perTool };
+    return this.owner.unreadable ? { perTool, askAll: true } : { perTool };
   }
 
   /** The overlay on top: "never" denies; "ask" asks, explicitly, since a built-in's absent entry is its

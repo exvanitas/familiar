@@ -277,6 +277,25 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
     expect((await clientOf(store, speakingPort().port)).policy([])).toEqual({ perTool: {} });
   });
 
+  it("the whole record unreadable (choices null, or a record of the next version): every built-in asks, never its default allow, and a revoke to never still denies", async () => {
+    const bad: [string, { v: number; value: unknown }][] = [
+      ['choices null', { v: OWNER_VERSION, value: { rev: 3, servers: {}, keys: [], tombstones: {}, choices: null } }],
+      ['the next version', { v: OWNER_VERSION + 1, value: { rev: 3, servers: {}, keys: [], tombstones: {}, choices: { [choiceKey(BUILT_IN, 'note_add')]: { policy: 'deny', fingerprint: '', setupFingerprint: '' } } } }]
+    ];
+    for (const [what, record] of bad) {
+      const store = memorySettingsStore();
+      await store.put(OWNER_KEY, record as never);
+      const client = await clientOf(store, speakingPort().port);
+      expect(client.owner.unreadable, what).toBe(true);
+      expect(gateFor('note_add', noteAdd, client.policy([])), what).toBe('ask');
+      expect(gateFor('note_search', look, client.policy([])), what).toBe('ask');
+      // A stricter overlay is kept: a revoke to never denies, though it can't be saved.
+      expect(await client.revoke(BUILT_IN, 'note_add', 'never'), what).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
+      expect(gateFor('note_add', noteAdd, client.policy([])), what).toBe('deny');
+      expect(gateFor('note_search', look, client.policy([])), what).toBe('ask');
+    }
+  });
+
   it('a revoke to Ask of a built-in holds as ask at once and is saved as ask, so a restart keeps it', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);

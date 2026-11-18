@@ -631,7 +631,7 @@ If either unverified item turns out true (certificate fetches outside the saved 
 - **Fail closed:**
   - an unreadable choice loads as an explicit "ask" for its tool, never as empty, since an empty choice is a built-in's default, which for some is allow. That loosens a lost "never" to "ask", which still needs your Yes on a card for every call. It never loosens to "always";
   - an unreadable server record isn't started or overwritten;
-  - a record of another version loads nothing, and nothing is written;
+  - a record of another version, or one whose shape can't be read at all, loads nothing, and nothing is written. Then no choice loads, so no built-in falls back to its default allow: every tool asks, built-ins included, until a restart reads the record. A revoke to never still denies, from the overlay (5.5), though it can't be saved;
   - a missing secret stops the start, and the refusal lists all of the setup's secrets.
 
 #### Saved setups
@@ -673,6 +673,7 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **The canonical form** is one function, used by the card, the stored answer, the mint and the body (3.6): `JSON.stringify` of the parsed value with object keys sorted by plain string order at every level, arrays kept in order, `undefined` keys dropped, and `-0` written as `0`. A value outside plain JSON is refused before a card is made.
 - **Revokes hold at once.** A tightening (always to ask, anything to never) takes effect in an in-memory overlay that `send` reads synchronously, whatever the owner is doing. Its durable write is tried after. "Never" from either the overlay or the saved choice wins.
   - **"Ask" is saved as an explicit ask**, never as no choice. For a built-in that runs without asking, or a built-in read, no choice means its default, allow. The overlay's "ask" likewise sets ask.
+  - **With the whole record unreadable, built-ins ask.** No choice loads then, and the gate's policy says so (`askAll`), so a lost "never" or "ask" is never read as a built-in's default allow. Any stricter overlay stays on top: a "never" denies.
   - **A refused durable revoke is reported.** The revoke's answer is its durable write's outcome. If the owner refuses the write (busy, or a change's cleanup unfinished) or the store loses it, Settings is told: "Revoked for now, but not saved: it comes back when Familiar restarts. Try again." The overlay holds until then.
 - **Until step 8's choices UI**, the journal isn't fed the owner's choices, and every server tool asks.
 

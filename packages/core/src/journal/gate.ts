@@ -23,6 +23,9 @@ export const BUILT_IN_READS: readonly string[] = ['note_search', 'note_list', 'r
 export interface GatePolicy {
   /** The person's own choice per tool, from Settings. */
   readonly perTool?: Readonly<Record<string, ToolPolicy>>;
+  /** The person's saved choices couldn't be read at all: nothing runs without asking, built-ins included.
+      A "never" still denies. */
+  readonly askAll?: boolean;
 }
 
 /** What the gate does with one call of `name`. `tool` is undefined for a tool nobody knows. */
@@ -32,6 +35,6 @@ export function gateFor(name: string, tool: FamiliarTool | undefined, policy: Ga
   const builtIn = tool !== undefined && tool.kind !== 'server';
   const listed = builtIn && (RUN_WITHOUT_ASKING.includes(name) || (tool.kind === 'read' && BUILT_IN_READS.includes(name)));
   let p: ToolPolicy = chosen ?? (listed ? 'allow' : 'ask');
-  if (tool?.asks && p === 'allow') p = 'ask';
+  if ((tool?.asks || policy.askAll) && p === 'allow') p = 'ask';
   return p;
 }
