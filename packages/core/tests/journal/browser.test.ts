@@ -36,6 +36,7 @@ describe.runIf(chrome || required)('the journal in headless Chromium (real Index
       bundle: true,
       format: 'esm',
       platform: 'browser',
+      define: { __FAMILIAR_MUTATIONS__: 'false' },
       target: 'es2022',
       outfile: join(dir, 'page.js'),
       logLevel: 'warning'

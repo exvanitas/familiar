@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
+import { APP_DEFINE } from '../../scripts/define.ts';
 import { nodeStub } from '../../scripts/node-stub.ts';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -12,7 +13,7 @@ const FORBIDDEN = ['http-proxy-agent', 'https-proxy-agent', '@smithy/node-http-h
 describe('the model layer bundle', async () => {
   const r = await build({
     entryPoints: { model: `${root}src/model/index.ts` },
-    bundle: true, format: 'esm', target: 'chrome120', write: false, metafile: true, outdir: `${root}dist/probe`, logLevel: 'silent', plugins: [nodeStub]
+    bundle: true, format: 'esm', target: 'chrome120', write: false, metafile: true, outdir: `${root}dist/probe`, logLevel: 'silent', define: APP_DEFINE, plugins: [nodeStub]
   });
   const out = r.outputFiles.map(f => f.text).join('\n');
   const packages = new Set(Object.keys(r.metafile.inputs).flatMap(i => {

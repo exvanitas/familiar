@@ -331,7 +331,7 @@ export class McpClient {
     const run = rt?.run;
     if (!rt || !run || !record) return refuse('not-running', 'The server is not running.');
     if (run.id !== decision.run || run.launch !== decision.launch) return refuse('changed', 'The server restarted since this call was allowed, so it was not sent.');
-    if (!rt.link.offers(run.id, decision.tool, decision.fingerprint) && !(rt.link.offers(run.id, decision.tool, rt.link.current?.tools.find((t) => t.name === decision.tool)?.fingerprint ?? '') && mutant('ignore-fingerprint'))) return refuse('changed', 'The tool changed since it was allowed, so it was not sent. It will ask again.');
+    if (!rt.link.offers(run.id, decision.tool, decision.fingerprint) && !(rt.link.offers(run.id, decision.tool, rt.link.current?.tools.find((t) => t.name === decision.tool)?.fingerprint ?? '') && (__FAMILIAR_MUTATIONS__ && mutant('ignore-fingerprint')))) return refuse('changed', 'The tool changed since it was allowed, so it was not sent. It will ask again.');
     const key = choiceKey(decision.server, decision.tool);
     const choice = this.owner.choices()[key];
     const overlay = this.overlay.get(key);
@@ -343,14 +343,14 @@ export class McpClient {
     // Named mutations: queue behind a live exchange, a gap between the checks and the handoff, or a body
     // from the model's own arguments instead of the decision's.
     const hand = (): Promise<CallOutcome> => {
-      const canonical = raw !== undefined && mutant('body-from-model-args') ? (canonicalArguments(raw)?.canonical ?? decision.canonical) : decision.canonical;
+      const canonical = raw !== undefined && (__FAMILIAR_MUTATIONS__ && mutant('body-from-model-args')) ? (canonicalArguments(raw)?.canonical ?? decision.canonical) : decision.canonical;
       markUsed(decision);
       const sent = rt.link.handoff(decision.tool, canonical, signal, ms);
       return sent ?? refuse('busy', 'The server is busy with another request. Try again in a moment.');
     };
-    if (rt.link.busy && mutant('queue-call')) return rt.link.drained().then(hand);
+    if (rt.link.busy && (__FAMILIAR_MUTATIONS__ && mutant('queue-call'))) return rt.link.drained().then(hand);
     if (rt.link.busy) return refuse('busy', 'The server is busy with another request. Try again in a moment.');
-    if (mutant('await-before-handoff')) return Promise.resolve().then(hand);
+    if ((__FAMILIAR_MUTATIONS__ && mutant('await-before-handoff'))) return Promise.resolve().then(hand);
     return hand();
   }
 

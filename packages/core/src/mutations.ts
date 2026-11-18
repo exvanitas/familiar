@@ -3,12 +3,16 @@
 // a test turns it on; each time a switch changes behaviour it's counted, so a mutant that never changed
 // anything is caught as a broken control. Nothing in the app turns one on.
 
+/// <reference path="./build-flags.d.ts" />
+// Every call site is written `__FAMILIAR_MUTATIONS__ && mutant('name')`, so the app build, where the
+// constant is false, drops the branch and the name with it, and nothing here is left in the bundle.
+
 const on = new Set<string>();
 const hits = new Map<string, number>();
 
 /** True only when the test turned this mutation on; counted when it is. */
 export function mutant(name: string): boolean {
-  if (on.size === 0 || !on.has(name)) return false;
+  if (!__FAMILIAR_MUTATIONS__ || on.size === 0 || !on.has(name)) return false;
   hits.set(name, (hits.get(name) ?? 0) + 1);
   return true;
 }

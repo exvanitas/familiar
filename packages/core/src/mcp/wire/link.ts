@@ -194,7 +194,7 @@ export class ServerLink {
    * runs under one deadline; past it the local process is stopped, or the remote run ends.
    */
   async start(target: Target, launch: string, options: { readonly era?: Era; readonly launched?: () => void } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
-    if (this.busy && mutant('slot-per-run')) this.slot = emptySlot;
+    if (this.busy && (__FAMILIAR_MUTATIONS__ && mutant('slot-per-run'))) this.slot = emptySlot;
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
@@ -250,7 +250,7 @@ export class ServerLink {
       await run.over;
       return;
     }
-    if (mutant('delete-at-stop')) {
+    if ((__FAMILIAR_MUTATIONS__ && mutant('delete-at-stop'))) {
       const t = run.target as Extract<Target, { where: 'remote' }>;
       void this.ports.net!.fetch({ id: randomId(), address: t.address, url: t.url, method: 'DELETE' as 'POST', headers: this.headers(run, undefined) }, new Uint8Array(0)).catch(() => {});
     }
@@ -302,7 +302,7 @@ export class ServerLink {
     // Modern remote: the headers come from the same decision as the body, in this same step (3.6).
     let extra: (readonly [string, string])[] | undefined;
     if (run.era === 'modern' && run.target.where === 'remote') {
-      const mirrored = run.lastCall && mutant('mirror-previous-call') ? run.lastCall.args : canonicalArguments;
+      const mirrored = run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('mirror-previous-call')) ? run.lastCall.args : canonicalArguments;
       const params = paramHeaders(run.declarations.get(name) ?? [], JSON.parse(mirrored), this.headers(run, 'tools/call').length + 1);
       if (!params.ok) return Promise.resolve({ kind: 'error', reason: 'protocol', words: HEADER_WORDS });
       extra = [['Mcp-Name', name], ...params.headers];
@@ -316,7 +316,7 @@ export class ServerLink {
     const timer = this.clock.setTimer(() => this.input({ t: 'terminal', n, end: { t: 'timeout' } }), ms, { background: false });
     const onAbort = () => {
       this.input({ t: 'terminal', n, end: { t: 'stopped' } });
-      if (run.target.where === 'remote' && mutant('remote-cancel')) this.post(run, `${n}:cancel`, JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }), undefined);
+      if (run.target.where === 'remote' && (__FAMILIAR_MUTATIONS__ && mutant('remote-cancel'))) this.post(run, `${n}:cancel`, JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }), undefined);
     };
     signal.addEventListener('abort', onAbort, { once: true });
     return outcome.then((o) => {
@@ -349,7 +349,7 @@ export class ServerLink {
       if (run.era === 'modern') {
         const type = r.result?.resultType;
         if (type === 'input_required') {
-          if (run.lastCall && mutant('retry-after-input-required')) {
+          if (run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('retry-after-input-required'))) {
             const again = run.lastCall.body;
             void this.drained().then(() => this.exchangeNow(run, 'call', run.nextId++, again, 'tools/call'));
           }
@@ -391,12 +391,12 @@ export class ServerLink {
     if (r.error) {
       // The opening's classifier (3.3): a -32022 naming 2026-07-28 and no legacy version Familiar speaks
       // makes this run modern. There's no new exchange: no discover, no initialized, straight to the list.
-      if (modernRefusal(r.error) || mutant('modern-on-any-error')) {
+      if (modernRefusal(r.error) || (__FAMILIAR_MUTATIONS__ && mutant('modern-on-any-error'))) {
         run.era = 'modern';
-        if (init.offered !== undefined && mutant('session-id-on-modern')) run.sessionId = init.offered;
+        if (init.offered !== undefined && (__FAMILIAR_MUTATIONS__ && mutant('session-id-on-modern'))) run.sessionId = init.offered;
         else delete run.sessionId;
         // The mutant keeps sending initialized on a modern run.
-        if (mutant('initialized-on-modern')) await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where), deadline, 'notifications/initialized');
+        if ((__FAMILIAR_MUTATIONS__ && mutant('initialized-on-modern'))) await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where), deadline, 'notifications/initialized');
         return undefined;
       }
       return refusedWords(r.error);
@@ -487,7 +487,7 @@ export class ServerLink {
   /** Only under a named mutation: admitting before the slot has drained. */
   private early(kind: ExchangeKind): boolean {
     const ex = this.slot.ex;
-    return ex?.phase === 'draining' && (mutant('admit-while-draining') || (kind === 'list' && ex.kind === 'list' && mutant('page-before-drain')));
+    return ex?.phase === 'draining' && ((__FAMILIAR_MUTATIONS__ && mutant('admit-while-draining')) || (kind === 'list' && ex.kind === 'list' && (__FAMILIAR_MUTATIONS__ && mutant('page-before-drain'))));
   }
 
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
@@ -664,7 +664,7 @@ export class ServerLink {
   private async response(run: Run, p: Pending, id: string, head: NetHead): Promise<void> {
     const live = () => this.slot.ex?.n === p.n && this.slot.ex.phase === 'live';
     if (!live()) return;
-    if ((head.redirected || (head.status >= 300 && head.status < 400)) && !mutant('ignore-redirected')) return this.input({ t: 'terminal', n: p.n, end: { t: 'redirected', status: head.status } });
+    if ((head.redirected || (head.status >= 300 && head.status < 400)) && !(__FAMILIAR_MUTATIONS__ && mutant('ignore-redirected'))) return this.input({ t: 'terminal', n: p.n, end: { t: 'redirected', status: head.status } });
     if (head.status === 404 && p.carriedSession) return this.input({ t: 'terminal', n: p.n, end: { t: 'session-ended' } });
     const type = (head.headers.find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? '').toLowerCase();
     if (head.status === 202 && p.kind === 'initialized') return this.input({ t: 'completed', n: p.n });
@@ -733,7 +733,7 @@ export class ServerLink {
     const live = ex && ex.phase === 'live' ? this.pending.get(ex.n) : undefined;
     const mine = live && live.run === run && (!remote || live === on) ? live : undefined;
     if (m.t === 'response') {
-      if (!mine || mine.requestId === undefined || (m.id !== mine.requestId && !mutant('accept-any-response-id'))) return false;
+      if (!mine || mine.requestId === undefined || (m.id !== mine.requestId && !(__FAMILIAR_MUTATIONS__ && mutant('accept-any-response-id')))) return false;
       mine.response = m;
       if (mine.kind === 'initialize' && !m.error && mine.offeredSession !== undefined) run.sessionId = mine.offeredSession;
       this.input({ t: 'completed', n: mine.n });
@@ -741,12 +741,12 @@ export class ServerLink {
     }
     if (m.t === 'request') {
       // Only a legacy ping is answered; any other request gets no reply (Familiar declares no capabilities).
-      if (m.method === 'ping' && run.era === 'modern' && remote && on && mutant('answer-stray-ping-modern')) {
+      if (m.method === 'ping' && run.era === 'modern' && remote && on && (__FAMILIAR_MUTATIONS__ && mutant('answer-stray-ping-modern'))) {
         this.post(run, `${on.n}:pong:stray`, JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} }), undefined);
         return false;
       }
       if (m.method !== 'ping' || run.era !== 'legacy') return false;
-      if (mine && mutant('pong-in-microtask')) {
+      if (mine && (__FAMILIAR_MUTATIONS__ && mutant('pong-in-microtask'))) {
         const n = mine.n;
         queueMicrotask(() => this.input({ t: 'ping', n, id: m.id }));
       } else if (mine) this.input({ t: 'ping', n: mine.n, id: m.id });
@@ -779,15 +779,15 @@ export class ServerLink {
    */
   private sessionDropped(run: Run): void {
     if (run.ended) return;
-    if ((run.dropped > 0 || !run.ready) && !mutant('rehandshake-every-404')) {
+    if ((run.dropped > 0 || !run.ready) && !(__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) {
       this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
       return;
     }
     run.dropped = 1;
     run.ready = false;
     run.stale = true;
-    const resend = run.lastCall && mutant('resend-404-call') ? run.lastCall.body : undefined;
-    if (!mutant('keep-old-session-id')) delete run.sessionId;
+    const resend = run.lastCall && (__FAMILIAR_MUTATIONS__ && mutant('resend-404-call')) ? run.lastCall.body : undefined;
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('keep-old-session-id'))) delete run.sessionId;
     delete run.version;
     void (async () => {
       const { deadline, cancel } = this.deadline(run, this.limits.startMs);
@@ -799,7 +799,7 @@ export class ServerLink {
         if (run.ended) return;
         if (!('tools' in listed)) {
           // The mutant's own re-handshake for the walk's 404 is already under way.
-          if (/ended its session/.test(listed.failure.words) && mutant('rehandshake-every-404')) return;
+          if (/ended its session/.test(listed.failure.words) && (__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) return;
           return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
         }
         run.ready = true;

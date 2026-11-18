@@ -144,7 +144,7 @@ export function paramHeaders(declarations: readonly HeaderDeclaration[], args: u
     const name = `Mcp-Param-${d.name}`;
     const value = encodeValue(text);
     if (new TextEncoder().encode(`${name}: ${value}`).length > MAX_HEADER_BYTES) {
-      if (!mutant('truncate-header')) return { ok: false };
+      if (!(__FAMILIAR_MUTATIONS__ && mutant('truncate-header'))) return { ok: false };
       out.push([name, value.slice(0, MAX_HEADER_BYTES - name.length - 2)]);
       continue;
     }
