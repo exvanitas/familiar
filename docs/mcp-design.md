@@ -674,7 +674,7 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **Revokes hold at once.** A tightening (always to ask, anything to never) takes effect in an in-memory overlay that `send` reads synchronously, whatever the owner is doing. Its durable write is tried after. "Never" from either the overlay or the saved choice wins.
   - **"Ask" is saved as an explicit ask**, never as no choice. For a built-in that runs without asking, or a built-in read, no choice means its default, allow. The overlay's "ask" likewise sets ask.
   - **With the whole record unreadable, built-ins ask.** No choice loads then, and the gate's policy says so (`askAll`), so a lost "never" or "ask" is never read as a built-in's default allow. Any stricter overlay stays on top: a "never" denies.
-  - **A refused durable revoke is reported.** The revoke's answer is its durable write's outcome. If the owner refuses the write (busy, or a change's cleanup unfinished) or the store loses it, Settings is told: "Revoked for now, but not saved: it comes back when Familiar restarts. Try again." The overlay holds until then.
+  - **A refused durable revoke is reported.** The revoke's answer is its durable write's outcome. A revoke to Ask over a saved never writes nothing, since never stands, but answers saved only once the owner admits it: while another write is in flight (a choice of allow, say), the saved never may be about to change, and the answer is not saved. If the owner refuses the write (busy, or a change's cleanup unfinished) or the store loses it, Settings is told: "Revoked for now, but not saved: it comes back when Familiar restarts. Try again." The overlay holds until then.
 - **Until step 8's choices UI**, the journal isn't fed the owner's choices, and every server tool asks.
 
 ### 5.6 Outside sources, carried by each message
@@ -745,7 +745,7 @@ Each check names a test (T1 to T14), a harness check (H1 to H14), or the walk (W
 | G8 | No call without a gate-minted decision | Opaque, one-use decisions; `tools/call` is built only inside `send` (3.6, 5.5) | T1, T2 (drop the `WeakSet`; export a raw call); H3 |
 | G9 | The last check and the handoff are one synchronous step, and the body and its headers are the decision's | 3.6 | T2 (check, then an `await`, then hand off); H3 (an `await` before the handoff with a revoke in it; the body from the model's arguments); H11 (mirror `Mcp-Param-*` from another call's arguments; truncate an over-long header) |
 | G10 | A yes covers only what the card showed | The card's facts are stored when it's made (5.5) | T7 (h), and H3 under S1 (mint from the step id; ignore the fingerprint) |
-| G11 | A revoke holds at once | The overlay, read synchronously by `send` (5.5) | T2, T3 (the revoke waits for the owner) |
+| G11 | A revoke holds at once, and one answered saved is what a restart loads | The overlay, read synchronously by `send`; the revoke's answer is its write's, admitted by the owner (5.5) | T2, T3 (the revoke waits for the owner; `revoke-denied-shortcut`: a revoke to Ask over a saved never answered saved while an earlier choice's write is held) |
 | G12 | "Always" never acts on outside content | Each message's own sources, her line's included (5.6, 2.1) | T9 (a remark without sources); a reply stored with no sources; a summary recorded without its sources |
 | G13 | A client message carries no authority | Presentation id and button only; drafts validated by core (5.7) | T10 (accept a client's fingerprint; honour a button the card didn't offer) |
 | G14 | One exchange per server, cleanup included, across Stop and Start | The per-server slot and the barrier (3.1, 3.4) | H1 (free the slot at the response, before cleanup; admit while draining; send page n+1 before page n drains; key the slot per run, then Stop and Start during a drain, S8); W |
@@ -928,6 +928,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `hide-send-now`: hide Send now after a fault | H8 |
 | `remark-no-failure-check`: drop the `runFailure` check from her line | H9 |
 | `answers-by-step`: card answers keyed by step id, not presentation | T7 (i) |
+| `revoke-denied-shortcut`: a revoke to Ask over a saved never answered saved at once, without the owner's admission | T3's strictness at reopen |
 | `reply-sources-empty`: a reply, or her line's note, stored with no sources | G12, in `tests/journal/provenance.test.ts` |
 | `summary-sources-dropped`: the summarized set recorded without what the summary replaced | G12, in `tests/journal/provenance.test.ts` |
 
@@ -970,7 +971,7 @@ States are deduplicated exactly: a set of the canonical state's JSON, compared b
 | --- | --- | --- |
 | T1 | Types and exports: a `ToolDecision` can't be built or skipped; the client's export list is fixed | `tests/mcp/t-suite.test.ts` |
 | T2 | Decisions at the handoff: a cast object, another server's decision, an old fingerprint, a second use, an aborted signal, "never" after minting, and "always" revoked between mint and handoff each give zero handoffs; a revoke is scheduled at every point before `send`. A fresh decision hands off once | `tests/mcp/t-suite.test.ts` |
-| T3 | The owner property: seeded histories of adds, edits, removes and choices, each life cut off at a seeded point where every later port and store call hangs. After repair: no mark left, no unfinished tombstone, the exe's server addresses exactly the remote records', no id or key reused, every removed secret deleted | `tests/mcp/owner.property.test.ts` |
+| T3 | The owner property: seeded histories of adds, edits, removes, choices and revokes, driven through `McpClient`, each life cut off at a seeded point where every later port and store call hangs, with a choice or revoke now and then left unanswered while the next is made. After repair: no mark left, no unfinished tombstone, the exe's server addresses exactly the remote records', no id or key reused, every removed secret deleted. At each reopen, every key loads a choice at least as strict as the last choice or revoke answered saved, in the order they were made | `tests/mcp/owner.property.test.ts` |
 | T4 | One effect at a time, each change's steps and mark, the rollback, tombstones, repair in a fresh start, failing closed (an unreadable choice is "ask"; another version loads nothing), and the address identity: one record for a URL with and without `:443`; a rollback leaves an address it didn't create | `tests/mcp/owner.test.ts` |
 | T5 | The runtime, through the real client against the fake server: start, list, call, Stop, a deadline, a crash mid-call (Failed until Start, never resent), remove with a call in flight, plain words for failures; S13 | `tests/mcp/client.test.ts`, the harness |
 | T6 | Names over successive catalogs: random adds and removes of servers whose labels clash; `<key>__<tool>` maps to one server and tool for the whole history | `tests/mcp/names.property.test.ts` |

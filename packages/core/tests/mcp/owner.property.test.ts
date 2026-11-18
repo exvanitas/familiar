@@ -1,18 +1,29 @@
-// T3, the owner property (docs/mcp-design.md 5.1 to 5.3): seeded histories of adds, edits, removes and
-// choices, each life cut off at a seeded point where every port and store call after it hangs, as a killed
-// app's would. Store and native steps are held a turn now and then, and a run's catalog write (`seen`)
-// lands at seeded moments between and inside the changes, as runs listing their tools would. Each next
-// life repairs, then the invariants hold:
+// T3, the owner property (docs/mcp-design.md 5.1 to 5.3, 5.5): seeded histories of adds, edits, removes,
+// choices and revokes, driven through `McpClient` as Settings drives them, each life cut off at a seeded
+// point where every port and store call after it hangs, as a killed app's would. Store and native steps are
+// held a turn now and then, a run's catalog write (`seen`) lands at seeded moments between and inside the
+// changes, as runs listing their tools would, and now and then a choice or a revoke isn't awaited, so the
+// next one starts while its write is held. Each next life repairs, then the invariants hold:
 //   - no mark is left, and no tombstone is unfinished;
 //   - the exe's server addresses are exactly the ones remote records hold (no orphan, none missing);
 //   - an id or key, once removed, never comes back for another server;
 //   - a removed server's secrets were each deleted;
-//   - never two store writes in flight, and no change answered "not saved" (nothing else writes).
+//   - never two store writes in flight, and no change answered "not saved" (nothing else writes) but a
+//     revoke the owner refused while busy, which says so;
+//   - for every choice key, the reopen loads a choice at least as strict as the last change (a choice or a
+//     revoke) answered saved, in the order they were made. A change made after it and never answered is
+//     excused: it may have landed.
 import { describe, expect, it } from 'vitest';
-import { Owner, OWNER_KEY, type OwnerPorts } from '../../src/mcp/owner.ts';
+import { BUILT_IN, McpClient, REVOKE_NOT_SAVED } from '../../src/mcp/client.ts';
+import { mutations } from '../../src/mutations.ts';
+import { OWNER_KEY, type OwnerPorts } from '../../src/mcp/owner.ts';
+import type { ProcessPort } from '../../src/mcp/process.ts';
+import { choiceKey } from '../../src/mcp/server-tools.ts';
 import type { ServerSetup } from '../../src/mcp/setup.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 import { rng } from '../harness/sched.ts';
+import { REPO, testPaths } from './fake.ts';
+import { realClock } from './wire-fakes.ts';
 
 const never = new Promise<never>(() => {});
 
@@ -79,10 +90,28 @@ function ports(store: SettingsStore, exe: Exe, budget: Budget): OwnerPorts {
   };
 }
 
-const local = (id: string, secrets: string[]): ServerSetup => ({ kind: 'local', id, label: `Files ${id}`, program: 'npx', args: ['-y', 'files@1.0.0'], cwd: 'C:\\work', env: [], secrets });
+const local = (id: string, secrets: string[]): ServerSetup => ({ kind: 'local', id, label: `Files ${id}`, program: process.execPath, args: ['files.js'], cwd: REPO, env: [], secrets });
 const remote = (id: string, host: string): ServerSetup => ({ kind: 'remote', id, label: `Remote ${id}`, url: `https://${host}.example/mcp`, transport: 'http', headers: [] });
 
-const witness = { marks: 0, tombstones: 0, catalogWrites: 0, catalogWhileBusy: 0 };
+/** The client over the owner's ports: nothing here starts a server, so its process and net ports are never
+    used, save forget, which a removal calls. */
+function clientOf(p: OwnerPorts): Promise<McpClient> {
+  const processes: ProcessPort = { start: () => never, write: () => never, stop: () => never, forget: p.forget };
+  return McpClient.open({ store: p.store, processes, net: {} as never, addresses: p.addresses, secrets: p.secrets, clock: realClock, paths: testPaths });
+}
+
+/** How strict a policy is: no choice reads as a built-in's default allow, the loosest. */
+const RANK: Record<string, number> = { allow: 0, ask: 1, deny: 2 };
+type Strictness = 'allow' | 'ask' | 'deny';
+
+/** One choice or revoke, in the order made: what it asked for, and its answer once it has one. */
+interface ChoiceChange {
+  readonly at: Strictness;
+  readonly what: string;
+  answer?: 'saved' | 'not saved';
+}
+
+const witness = { marks: 0, tombstones: 0, catalogWrites: 0, catalogWhileBusy: 0, overlapping: 0, strictChecks: 0 };
 
 async function history(seed: number, repairs = true): Promise<string[]> {
   const r = rng(seed);
@@ -96,13 +125,28 @@ async function history(seed: number, repairs = true): Promise<string[]> {
   const secretsOf = new Map<string, string[]>();
   let ids = 0;
   let listed = 0;
+  // Every choice and revoke by key, across lives, in the order made.
+  const changes = new Map<string, ChoiceChange[]>();
+  let pending = 0;
   for (let life = 1; life <= 4; life++) {
     // Each life runs until its budget of port and store calls is spent, then hangs.
     const budget: Budget = { left: life === 4 ? Infinity : 5 + Math.floor(r() * 60), hold: () => r2() < 0.3, writes: { now: 0, most: 0 } };
-    const owner = await Promise.race([Owner.open(ports(store, exe, budget)).catch(() => undefined), new Promise<undefined>((res) => setTimeout(() => res(undefined), 20))]);
-    if (!owner) {
+    const client = await Promise.race([clientOf(ports(store, exe, budget)).catch(() => undefined), new Promise<undefined>((res) => setTimeout(() => res(undefined), 20))]);
+    if (!client) {
       budget.killed = true;
       continue; // the life died while opening
+    }
+    const owner = client.owner;
+    // The reopen loads, for every key, a choice at least as strict as the last change answered saved.
+    const loaded = owner.choices();
+    for (const [key, list] of changes) {
+      const last = list.map((c) => c.answer).lastIndexOf('saved');
+      if (last < 0 || list.slice(last + 1).some((c) => c.answer === undefined)) continue;
+      const [server] = JSON.parse(key) as [string, string];
+      if (server !== BUILT_IN && (!owner.server(server) || owner.server(server)!.removing || owner.tombstones()[server])) continue;
+      witness.strictChecks++;
+      const now = loaded[key]?.policy ?? 'allow';
+      if (RANK[now]! < RANK[list[last]!.at]!) problems.push(`life ${life}: ${key} loads ${now}, looser than ${list[last]!.what}, the last change answered saved`);
     }
     const before = (await store.get(OWNER_KEY))?.value as any;
     if (before?.mark) witness.marks++;
@@ -145,27 +189,65 @@ async function history(seed: number, repairs = true): Promise<string[]> {
       if ((v as { ok?: boolean } | undefined)?.ok === false && w && /not saved|could not be saved/.test(w)) problems.push(`life ${life}: a change answered "${w}" though nothing else writes`);
     };
     // Seeded changes, each awaited until the life hangs (a change still pending is cut off).
+    let sameKey: string | undefined;
     for (let k = 0; k < 8; k++) {
       const x = r();
       const servers = owner.servers();
       const when = r2();
       if (when < 0.2) catalog();
       let op: Promise<unknown>;
-      if (x < 0.35 || !servers.length) {
+      // After a change left unanswered, the next is often a choice or revoke on the same key.
+      const choosing = servers.length > 0 && (x >= 0.8 || (sameKey !== undefined && r() < 0.8));
+      if (!choosing && (x < 0.35 || !servers.length)) {
         const id = `s${++ids}`;
         const setup = r() < 0.5 ? remote(id, `h${Math.floor(r() * 3)}`) : local(id, r() < 0.5 ? ['TOKEN'] : []);
         if (setup.kind === 'local') secretsOf.set(id, setup.secrets.map((n) => `server:${id}:${n}`));
-        op = owner.add(setup);
-      } else if (x < 0.55) {
+        op = client.add({ setup, problems: [] }).then(() => ({ ok: true }), (e: Error) => ({ ok: false, words: e.message }));
+      } else if (!choosing && x < 0.55) {
         const s = servers[Math.floor(r() * servers.length)]!;
-        op = s.setup.kind === 'local' ? owner.edit(s.setup.id, { ...s.setup, label: `${s.setup.label}!`, secrets: r() < 0.5 ? [] : s.setup.secrets }, true) : owner.edit(s.setup.id, { ...s.setup, label: `${s.setup.label}!` }, true);
-      } else if (x < 0.8) {
+        const setup = s.setup.kind === 'local' ? { ...s.setup, label: `${s.setup.label}!`, secrets: r() < 0.5 ? [] : s.setup.secrets } : { ...s.setup, label: `${s.setup.label}!` };
+        op = client.edit(s.setup.id, { setup, problems: [] }).then(() => ({ ok: true }), (e: Error) => ({ ok: false, words: e.message }));
+      } else if (!choosing) {
         const s = servers[Math.floor(r() * servers.length)]!;
-        op = owner.remove(s.setup.id, async () => {});
+        op = client.remove(s.setup.id).then((v) => (v.kind === 'removed' ? { ok: true } : { ok: false, words: v.kind === 'failed' ? v.failure.words : v.kind }));
       } else {
+        // A choice or a revoke, on a built-in or a server's tool. Now and then it isn't awaited, so the next
+        // change starts while its write may be held; and that next change often takes the same key.
+        const onServer = r() < 0.4;
         const s = servers[Math.floor(r() * servers.length)]!;
-        op = owner.choose(s.setup.id, 'echo', r() < 0.5 ? { policy: 'deny', fingerprint: 'f', setupFingerprint: 'g' } : undefined);
+        const [server, tool] = onServer ? [s.setup.id, 'echo'] : [BUILT_IN, r() < 0.5 ? 'note_add' : 'note_search'];
+        const following = sameKey !== undefined && r() < 0.8;
+        const key = following ? sameKey! : choiceKey(server, tool);
+        const [ks, kt] = JSON.parse(key) as [string, string];
+        // A change that follows one left unanswered is most often a revoke, as a person taking back what
+        // they just chose would make it.
+        const list = changes.get(key) ?? [];
+        const y = following && r() < 0.7 ? 0.55 + r() * 0.45 : r();
+        const change: ChoiceChange =
+          y < 0.3 ? { at: 'allow', what: 'choose allow' } : y < 0.4 ? { at: 'ask', what: 'choose ask' } : y < 0.55 ? { at: 'deny', what: 'choose never' } : y < 0.85 ? { at: 'ask', what: 'revoke ask' } : { at: 'deny', what: 'revoke never' };
+        changes.set(key, list);
+        list.push(change);
+        if (pending) witness.overlapping++;
+        const made: Promise<{ ok: boolean; words?: string }> = change.what.startsWith('revoke')
+          ? client.revoke(ks, kt, change.at === 'deny' ? 'never' : 'ask')
+          : client.choose(ks, kt, { policy: change.at, fingerprint: 'f', setupFingerprint: 'g' }).then(
+              () => ({ ok: true }),
+              (e: Error) => ({ ok: false, words: e.message })
+            );
+        pending++;
+        op = made.then((v) => {
+          pending--;
+          change.answer = v.ok ? 'saved' : 'not saved';
+          // A revoke the owner refused says so; its own reason is busy or a change unfinished, never lost.
+          return v.ok || !change.what.startsWith('revoke') ? v : { ok: false, words: v.words?.startsWith(REVOKE_NOT_SAVED) ? v.words.slice(REVOKE_NOT_SAVED.length) : v.words };
+        });
+        sameKey = key;
+        if (r2() < 0.5) {
+          void op.then(notSaved);
+          continue;
+        }
       }
+      sameKey = undefined;
       if (when >= 0.2 && when < 0.45) catalog();
       else if (when >= 0.45 && when < 0.7) setTimeout(catalog, 0);
       const done = await Promise.race([op.then((v) => (notSaved(v), true), () => true), new Promise<boolean>((res) => setTimeout(() => res(false), 20))]);
@@ -183,7 +265,7 @@ async function history(seed: number, repairs = true): Promise<string[]> {
 describe('T3: the owner, across seeded histories with kills', () => {
   it('repairs to a clean state in every history, with nothing orphaned, reused or left undone', async () => {
     const problems: string[] = [];
-    for (let seed = 1; seed <= 300 && problems.length < 6; seed++) for (const p of await history(seed)) problems.push(`seed ${seed}: ${p}`);
+    for (let seed = 1; seed <= 400 && problems.length < 6; seed++) for (const p of await history(seed)) problems.push(`seed ${seed}: ${p}`);
     expect(problems).toEqual([]);
     // Witnesses: lives that began with a mark to roll back and with an unfinished tombstone.
     expect(witness.marks).toBeGreaterThan(0);
@@ -191,6 +273,30 @@ describe('T3: the owner, across seeded histories with kills', () => {
     // And catalog writes that landed, and ones that came while a change held the owner.
     expect(witness.catalogWrites).toBeGreaterThan(0);
     expect(witness.catalogWhileBusy).toBeGreaterThan(0);
+    // And changes made while an earlier one was unanswered, and reopens that checked a key's strictness.
+    expect(witness.overlapping).toBeGreaterThan(0);
+    expect(witness.strictChecks).toBeGreaterThan(0);
+  }, 300_000);
+
+  it("the control: a revoke to Ask over a saved never answered saved at once, while an earlier choice's write is held (the old shortcut), fails the strictness invariant on a seed where its twin passes", async () => {
+    const tried: string[] = [];
+    try {
+      // The defect needs a saved never, a choice of allow admitted and left unanswered, then a revoke to Ask
+      // on the same key: the first seed with all three is past 300.
+      for (let seed = 1; seed <= 1000; seed++) {
+        mutations.set(['revoke-denied-shortcut']);
+        const mutant = await history(seed);
+        const hits = mutations.hits('revoke-denied-shortcut');
+        mutations.clear();
+        if (!hits || !mutant.some((p) => /looser than/.test(p))) continue;
+        const twin = await history(seed);
+        tried.push(`seed ${seed}: twin ${twin.length ? `fails (${twin[0]})` : 'passes'}`);
+        if (!twin.length) return;
+      }
+    } finally {
+      mutations.clear();
+    }
+    expect.fail(`revoke-denied-shortcut: no seed where the strictness invariant fails only in the mutant (${tried.slice(0, 4).join('; ') || 'the switch never fired or the invariant never failed'})`);
   }, 300_000);
 
   it('the control: with no repair at start, the same histories leave marks, orphans or unfinished cleanup', async () => {

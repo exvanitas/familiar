@@ -313,6 +313,27 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
     expect(gateFor('note_search', look, again.policy([]))).toBe('ask');
   });
 
+  it('a revoke to Ask over a saved never, while a choice of allow is still saving: it answers not saved, or the reopen loads at least ask', async () => {
+    const base = memorySettingsStore();
+    let gate: (() => void) | undefined;
+    let hold = false;
+    const store: SettingsStore = { ...base, putIf: async (k, r, g) => (hold && (await new Promise<void>((res) => (gate = res))), base.putIf(k, r, g)) };
+    const client = await clientOf(store, speakingPort().port);
+    await client.choose(BUILT_IN, 'note_add', { policy: 'deny', fingerprint: '', setupFingerprint: '' });
+    hold = true;
+    const allowing = client.choose(BUILT_IN, 'note_add', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    await tick();
+    const revoked = await client.revoke(BUILT_IN, 'note_add', 'ask');
+    hold = false;
+    gate!();
+    await allowing;
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('ask');
+    const again = await clientOf(base, speakingPort().port);
+    // What a reopen loads is at least as strict as the last answer that said saved.
+    if (revoked.ok) expect(gateFor('note_add', noteAdd, again.policy([]))).not.toBe('allow');
+    else expect(revoked.words).toMatch(/not saved/);
+  });
+
   it('a revoke the owner refuses holds for now and says it was not saved; a restart brings the saved choice back', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);

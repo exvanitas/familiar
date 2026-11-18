@@ -324,8 +324,17 @@ export class McpClient {
     this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
     if (this.overlay.get(key) !== 'never') this.overlay.set(key, to);
     const cur = this.owner.choices()[key];
-    // Ask after never isn't a tightening: the saved never stands.
-    if (to === 'ask' && cur?.policy === 'deny') return { ok: true };
+    // Ask after never isn't a tightening: the saved never stands, and nothing is written. But only once
+    // the owner admits it: while another write is in flight (an earlier choice of allow, say), the saved
+    // never may be about to change, and the answer is not saved. (The old shortcut, answering ok at once
+    // from whatever was committed, is a named mutation.)
+    if (to === 'ask' && cur?.policy === 'deny') {
+      if (__FAMILIAR_MUTATIONS__ && mutant('revoke-denied-shortcut')) return { ok: true };
+      const t = this.owner.admit('choice');
+      if (!('release' in t)) return { ok: false, words: `${REVOKE_NOT_SAVED} ${t.ok ? '' : t.words}`.trim() };
+      t.release();
+      return { ok: true };
+    }
     const r = await this.owner.choose(serverId, tool, { policy: to === 'never' ? 'deny' : 'ask', fingerprint: cur?.fingerprint ?? '', setupFingerprint: cur?.setupFingerprint ?? '' }).catch((): Outcome => ({ ok: false, words: 'The store failed.' }));
     return r.ok ? r : { ok: false, words: `${REVOKE_NOT_SAVED} ${r.words}` };
   }
