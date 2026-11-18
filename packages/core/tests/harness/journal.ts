@@ -292,10 +292,21 @@ export class JDriver {
     this.rec.setStep(this.steps.length);
     await this.settle();
     if (this.firstHit === undefined && this.mutation && mutations.hits(this.mutation) > 0) this.firstHit = this.steps.length;
-    // What's shown now, read as the screen would.
-    const questions = await within(this.journal.questions(), []);
-    const sendNow = await within(this.journal.queued(), undefined);
-    this.evidence.push({ step: this.steps.length, what: 'shown', questions, sendNow, at: this.rec.log.at(-1)?.seq ?? 0 });
+    // What's shown now, read as the screen would, and the commit it was read at: read again until no
+    // commit landed during the reads (Send now's is a commit of its own, which waits for one under way),
+    // so the evidence names the state it shows.
+    const seq = () => this.rec.log.at(-1)?.seq ?? 0;
+    let questions: readonly Question[] = [];
+    let sendNow: SendNowOffer | undefined;
+    let at = seq();
+    for (let i = 0; i < 10; i++) {
+      const before = seq();
+      questions = await within(this.journal.questions(), []);
+      sendNow = await within(this.journal.queued(), undefined);
+      at = seq();
+      if (at === before) break;
+    }
+    this.evidence.push({ step: this.steps.length, what: 'shown', questions, sendNow, at });
   }
 
   /* ---------- the events ---------- */
