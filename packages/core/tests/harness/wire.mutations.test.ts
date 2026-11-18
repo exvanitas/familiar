@@ -69,6 +69,7 @@ const CONTROLS: Control[] = [
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' },
   { mutation: 'walk-beside-walk', check: 'H14', named: 'S26' },
   { mutation: 'media-prefix', check: 'H10', named: 'S21' },
+  { mutation: 'relaunch-on-answer', check: 'H12', named: 'S22' },
   { mutation: 'stop-before-exit', check: 'H2', named: 'S11 Stop during initialize, local' },
   { mutation: 'stop-twice', check: 'H2', named: 'S11 Stop during initialize, local' },
   { mutation: 'drop-pong-before-flood', check: 'H13', mode: { where: 'local', era: 'legacy', pings: 40, session404: 'none', redirect: 0, earlyEnd: 0 } },

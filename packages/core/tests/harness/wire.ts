@@ -607,22 +607,27 @@ export class FakeExe {
       p.flushing = true;
       this.sched.add({ label: `line:${run}`, fire: () => {
         p.flushing = false;
-        if (p.exited) return;
-        const line = p.out.shift()!;
-        try {
-          const m = JSON.parse(line);
-          if (m.id !== undefined && ('result' in m || 'error' in m)) this.responded.set(`${this.epoch}:${m.id}`, this.sched.step);
-          if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
-        } catch {
-          /* not JSON */
-        }
-        p.emit({ t: 'out', line });
+        if (p.exited || !p.out.length) return;
+        deliver(run, p.out.shift()!);
         flush(run);
       } });
+    };
+    const deliver = (run: string, line: string) => {
+      const p = live.get(run)!;
+      try {
+        const m = JSON.parse(line);
+        if (m.id !== undefined && ('result' in m || 'error' in m)) this.responded.set(`${this.epoch}:${m.id}`, this.sched.step);
+        if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
+      } catch {
+        /* not JSON */
+      }
+      p.emit({ t: 'out', line });
     };
     const exit = (run: string, code: number | null) => {
       const p = live.get(run);
       if (!p || p.exited) return;
+      // As the exe does: the output already written drains before the exit is reported.
+      while (p.out.length) deliver(run, p.out.shift()!);
       p.exited = true;
       this.exits.push({ epoch: p.epoch, step: this.sched.step });
       for (const w of p.writes.splice(0)) {

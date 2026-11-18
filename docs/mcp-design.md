@@ -480,8 +480,8 @@ The same POST through the guarded fetch, with these differences:
 - **stderr lines**, and stray stdout lines (3.10), are kept for the server's last output: the last 40 lines, at most 16 KiB.
 - **A modern stdio run** uses the same `_meta` envelope, with no headers and no mirroring. It keeps the `notifications/cancelled` write, which stdio sends in either era. There are no pings.
   - **A modern refusal on stdio takes one of two paths, chosen at run time.** Some servers keep the pipe after refusing and serve modern requests on it (the TypeScript SDK's `serveStdio`); others exit before their loop (an rmcp stdio binary). So after a modern refusal the client goes on to `tools/list`:
-    - **If the answer comes,** the run goes on.
-    - **If the run's `exit` arrives first,** the start makes one relaunch, with the era fixed to modern for that one start. The second `server_start` is readmitted through the owner (5.1), like any start: it rechecks the committed launch and the enabled flag in the admission step; if another durable effect is in flight it fails "busy", and you press Start; an approved setup with an unchanged form starts with no dialog.
+    - **If the answer comes,** the run goes on. An answer that refuses (a `-32022`, or any JSON-RPC error) is the server's word: the start fails, with no relaunch, even if the process exits after it.
+    - **If the run's `exit` arrives first,** with no answer to the list (a refused write, a closed pipe), the start makes one relaunch. A write refused before the exit is reported waits for the exit, within 2 s and the start's deadline. Only an actual exit counts: a run Familiar ended itself (the write bound) gets no relaunch. The relaunch has the era fixed to modern for that one start. The second `server_start` is readmitted through the owner (5.1), like any start: it rechecks the committed launch and the enabled flag in the admission step; if another durable effect is in flight it fails "busy", and you press Start; an approved setup with an unchanged form starts with no dialog.
 
     It's never a restart after a crash, and the era isn't saved: the next Start begins legacy-first again.
 
@@ -891,6 +891,8 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
 | `bound-offered-only`: the catalog bounds over offered tools only | `tests/mcp/regress/walk.test.ts` |
 | `declarations-in-order`: declarations hashed in the order found | `tests/mcp/regress/walk.test.ts` |
+| `relaunch-on-answer`: the stdio relaunch after a list answered with a refusal | H12 under S22; `tests/mcp/regress/relaunch.test.ts` |
+| `relaunch-races-exit`: no wait for an exit that lags a closed pipe | `tests/mcp/regress/relaunch.test.ts` |
 | `media-prefix`: a media type read by its prefix (`application/jsonp` as JSON) | H10 under S21 |
 | `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |

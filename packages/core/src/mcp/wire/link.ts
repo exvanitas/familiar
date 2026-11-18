@@ -265,15 +265,18 @@ export class ServerLink {
       const listed = await this.walk(run, deadline);
       if (!('tools' in listed)) {
         // A modern-only stdio server that ended its process after refusing (rmcp does, B2): one relaunch
-        // with the era fixed to modern, readmitted by the caller.
+        // with the era fixed to modern, readmitted by the caller. Only when the list got no answer (a
+        // refused write, a closed pipe): an answer, a refusal included, is the server's word and decides.
         // The pipe can close before the exe reports the exit: a write refused then is the pipe closing, so
-        // the exit is awaited, within 2 s and the start's deadline, before deciding.
-        if (refusedOnStdio && !run.ended && !deadline.expired && !(__FAMILIAR_MUTATIONS__ && mutant('relaunch-races-exit'))) {
+        // the exit is awaited, within 2 s and the start's deadline, before deciding. Only an actual exit
+        // counts: a run Familiar ended itself (the write bound's) is not a server that ended its process.
+        const answered = 'answered' in listed && listed.answered && !(__FAMILIAR_MUTATIONS__ && mutant('relaunch-on-answer'));
+        if (refusedOnStdio && !answered && !run.exited && !deadline.expired && !(__FAMILIAR_MUTATIONS__ && mutant('relaunch-races-exit'))) {
           let stop: (() => void) | undefined;
           await Promise.race([run.exit, deadline.over, new Promise<void>((r) => (stop = this.clock.setTimer(r, 2_000, { background: false })))]);
           stop?.();
         }
-        const relaunch = refusedOnStdio && (run.ended || !!run.exited) && !deadline.expired;
+        const relaunch = refusedOnStdio && !answered && !!run.exited && !deadline.expired;
         this.endRun(run, listed.failure, false);
         return { ok: false, failure: listed.failure, ...(relaunch ? { relaunch: 'modern' as const } : {}) };
       }
@@ -499,7 +502,7 @@ export class ServerLink {
    * again, from the first page, within the same deadline, and a server whose tools keep changing fails the
    * walk rather than leave a catalog Familiar knows is stale.
    */
-  private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure; readonly session?: true }> {
+  private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure; readonly session?: true; readonly answered?: true }> {
     // This walk owns the run's list until it ends: a list_changed meanwhile only counts, and its retry
     // absorbs it. A session the server ends meanwhile ends the walk before it sends anything more.
     const me = {};
@@ -527,7 +530,7 @@ export class ServerLink {
   }
 
   /** Pages of tools/list, each its own exchange through the barrier, at most 16, and 128 tools in all. */
-  private async walkOnce(run: Run, deadline: Deadline, session: number): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true }> {
+  private async walkOnce(run: Run, deadline: Deadline, session: number): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true; readonly answered?: true }> {
     const raw: Record<string, unknown>[] = [];
     let cursor: string | undefined;
     for (let page = 1; ; page++) {
@@ -538,8 +541,9 @@ export class ServerLink {
       if (deadline.expired) return { failure: { kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." } };
       if (o.end.t !== 'done' || !o.response) return { failure: this.startWords(run, o.end), ...(o.end.t === 'session-ended' ? { session: true } : {}) };
       if (o.response.error) {
-        if (run.era === 'modern' && o.response.error.code === -32022) return { failure: refusedWords(o.response.error) };
-        return { failure: { kind: 'protocol', words: `The server refused to list its tools: ${o.response.error.message}` } };
+        // An answer, not a closed pipe: the server's own word, which decides (no relaunch follows it).
+        if (run.era === 'modern' && o.response.error.code === -32022) return { failure: refusedWords(o.response.error), answered: true };
+        return { failure: { kind: 'protocol', words: `The server refused to list its tools: ${o.response.error.message}` }, answered: true };
       }
       let p;
       try {
