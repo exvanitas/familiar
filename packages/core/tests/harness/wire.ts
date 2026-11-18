@@ -929,9 +929,13 @@ export class Driver {
   }
 
   /** Stop, and when it answered: a local Stop answers only after the process has exited. */
+  private stops = 0;
   stop(id = 's1'): void {
-    this.note({ what: 'stop', server: id });
-    void this.client.stop(id).then((reply) => this.note({ what: 'stopped', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}) }));
+    // Each Stop and its own answer share a token: a second Stop refused while the first is under way
+    // answers at once, and is no answer to the first.
+    const token = `stop-${++this.stops}`;
+    this.note({ what: 'stop', server: id, token });
+    void this.client.stop(id).then((reply) => this.note({ what: 'stopped', server: id, token, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}) }));
   }
 
   /** Test, as Settings runs it: its report, with the tools it showed. */

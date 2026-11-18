@@ -123,7 +123,7 @@ export const H1: Check = (r) => {
     if (later) problems.push(`H1: ${later.body!.method} went to a server whose cleanup the exe refused for good`);
     const start = r.evidence.find((e) => e.what === 'started' && addressOf(e.server) === x.server && e.step > x.start && e.failure);
     if (start && !/[Rr]estart/.test(start.words ?? '')) problems.push(`H1: after cleanup failed for good, Start said "${(start.words ?? '').slice(0, 60)}"`);
-    const stop = r.evidence.find((e) => e.what === 'stopped' && addressOf(e.server) === x.server && e.step > x.start);
+    const stop = r.evidence.find((e) => e.what === 'stopped' && e.failure !== 'refused' && addressOf(e.server) === x.server && e.step > x.start);
     if (stop && !/[Rr]estart/.test(stop.words ?? '')) problems.push(`H1: after cleanup failed for good, Stop said "${(stop.words ?? 'stopped').slice(0, 60)}"`);
   }
   // A call refused busy never goes out afterwards.
@@ -220,8 +220,9 @@ export const H2: Check = (r) => {
   if (r.server.mode.where === 'local') {
     for (const e of r.evidence) {
       if (e.what !== 'stop') continue;
-      const answered = r.evidence.find((y) => y.what === 'stopped' && y.server === e.server && y.seq > e.seq);
-      if (!answered) continue;
+      const answered = r.evidence.find((y) => y.what === 'stopped' && y.token === e.token && y.seq > e.seq);
+      // A Stop refused (another one under way, or not running) stopped nothing.
+      if (!answered || answered.failure === 'refused') continue;
       const epoch = r.exe.log.filter((x) => x.kind === 'write' && x.seq < e.seq).at(-1)?.epoch;
       if (epoch === undefined) continue;
       const exit = r.exe.exits.find((t) => t.epoch === epoch);
@@ -487,6 +488,10 @@ export const H13: Check = (r) => {
       // Departure 1, judged at the ping's own delivery: the flood rule held then (two pongs outstanding, or
       // 32 handed off), or a flood ping came before it on this stream.
       if (/too many pings/.test(words(tokenOf(post.body))) && floodAt(r, [...post.delivered], post.delivered.get(p.id)!, handed)) continue;
+      // Departure 2, remotely: the exchange had already ended for the client (its call answered, stopped
+      // or timed out) and only drains, its cancel refused, so the exe keeps reading what the server sends.
+      const ended = r.evidence.find((e) => e.what === 'outcome' && e.token === tokenOf(post.body));
+      if (ended && ended.step * 1000 <= post.delivered.get(p.id)! && (post.refusals ?? 0) > 0) continue;
       problems.push(`H13: ping ${p.id} on request ${post.n} got no pong and no departure`);
       continue;
     }
