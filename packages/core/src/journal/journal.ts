@@ -875,11 +875,26 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const answer = settled.answer !== undefined ? await root.commit((tx: any) => tx.entry(AssistantEntry, settled.answer), ctx) : undefined;
         return { status: 'answered', text: answer ? entryText(answer).text : '' };
       }
-      const view = await viewNow();
-      if (view.state === 'question') return { status: 'asks', question: view.question };
-      const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
-      const error = decodeModelError(live?.runFailure?.detail);
-      return { status: 'failed', reason: String(settled.reason ?? live?.runFailure?.reason ?? 'unknown'), message: view.state === 'error' ? view.message : (error?.message ?? String(live?.runFailure?.detail ?? '')) };
+      // All read in one transaction (2.2): how the newest run stopped, and whether that run is this
+      // turn's, by its inputs (this submission, or another of its turn, a Yes's continue say). Another
+      // turn's stop is never this turn's question or failure.
+      const sid = String(submission.id);
+      const now: { view: RunView; live: any; mine: boolean } = await harness.commit(async (tx: any) => {
+        const live = await tx.doc(LiveDoc, rootId);
+        const view = runView(live, await tx.doc(InterruptionsDoc), await tx.doc(AnswersDoc), stepCap);
+        const registry = await tx.doc(TurnsDoc);
+        const inputs: string[] = (live?.runFailure?.inputs ?? []).map(String);
+        const mine = inputs.includes(sid) || (inputs.length > 0 && registry.of?.[sid] !== undefined && turnOfInputs(inputs, registry) === registry.of[sid]);
+        // Plain copies: the transaction's documents can't be read once it settles.
+        return JSON.parse(JSON.stringify({ view, live: live ?? null, mine }));
+      }, ctx);
+      if (now.mine && now.view.state === 'question') return { status: 'asks', question: now.view.question };
+      if (!now.mine) {
+        const detail = typeof settled.detail === 'string' ? settled.detail : undefined;
+        return { status: 'failed', reason: String(settled.reason ?? 'unknown'), message: decodeModelError(detail)?.message ?? detail ?? '' };
+      }
+      const error = decodeModelError(now.live?.runFailure?.detail);
+      return { status: 'failed', reason: String(settled.reason ?? now.live?.runFailure?.reason ?? 'unknown'), message: now.view.state === 'error' ? now.view.message : (error?.message ?? String(now.live?.runFailure?.detail ?? '')) };
     }
   });
 

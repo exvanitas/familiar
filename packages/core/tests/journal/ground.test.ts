@@ -215,6 +215,31 @@ describe('2.2 to 2.4: questions, answers and the queue', () => {
 
 /* ---------- interrupted steps: one question per task ---------- */
 
+describe("2.2: a turn's wait gives its own question only", () => {
+  it("A fails, then B stops at its step cap: waiting for A again gives A's failure, never B's question", async () => {
+    let fail = true;
+    const script = (r: ModelRequest) => {
+      if (fail && JSON.stringify(r.messages).includes('first')) return { error: { kind: 'auth', message: 'nope' } as any, text: '' };
+      return { toolCalls: [{ id: `c${r.messages.length}`, name: 'note_add', arguments: { text: 'n' } }] };
+    };
+    const { journal } = await journalOf({ script, stepCap: 2 });
+    const a = await journal.send('first message please answer', 'ra');
+    if (!a.replied) throw new Error('a not replied');
+    expect(await a.turn.wait()).toMatchObject({ status: 'failed' });
+    fail = false;
+    const b = await journal.send('second message, do notes', 'rb');
+    if (!b.replied) throw new Error('b not replied');
+    const bEnd = await b.turn.wait();
+    expect(bEnd).toMatchObject({ status: 'asks', question: { kind: 'steps' } });
+    expect(await journal.turn(a.turn.id).wait()).toMatchObject({ status: 'failed' });
+    // B's own wait, and a Yes's continue (a submission of B's turn), still give B's question.
+    expect(await journal.turn(b.turn.id).wait()).toEqual(bEnd);
+    const going = await journal.answer((bEnd as { question: { id: string } }).question.id, true, 'yes-b');
+    expect(await going!.wait()).toMatchObject({ status: 'asks', question: { kind: 'steps' } });
+    await journal.close();
+  });
+});
+
 describe('2.2: several interrupted steps in one round make one question (S7)', () => {
   // Two built-in effects: a recovered run never gets server tools (2.7), so its second server call would be
   // refused, not cut off. Effects are cut off the same way.
