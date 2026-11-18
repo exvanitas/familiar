@@ -339,3 +339,42 @@ describe('5.4: Mark reviewed marks what Test showed', () => {
     expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F1' }]);
   });
 });
+
+describe('5.5: a revoke holds until the person chooses again', () => {
+  it('a revoke to never, then a choice of allow that saves: the overlay goes and allow stands', async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    const noteAdd = { name: 'note_add', kind: 'effect' } as never;
+    expect(await client.revoke(BUILT_IN, 'note_add', 'never')).toEqual({ ok: true });
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('deny');
+    await client.choose(BUILT_IN, 'note_add', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('allow');
+    // A server tool's: the overlay no longer refuses at the send either.
+    await client.revoke('s1', 'echo', 'never');
+    await client.choose('s1', 'echo', { policy: 'allow', fingerprint: 'f', setupFingerprint: 'l' });
+    expect((client as any).overlay.has(choiceKey('s1', 'echo'))).toBe(false);
+  });
+
+  it('a choice that is not saved leaves the revoke, and a revoke made while a choice is saving outlives it', async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    const noteAdd = { name: 'note_add', kind: 'effect' } as never;
+    await client.revoke(BUILT_IN, 'note_add', 'never');
+    const busy = client.owner.admit('other');
+    if (!('release' in busy)) throw new Error('not admitted');
+    await expect(client.choose(BUILT_IN, 'note_add', { policy: 'allow', fingerprint: '', setupFingerprint: '' })).rejects.toThrow();
+    busy.release();
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('deny');
+    // The choice's write held; a revoke lands meanwhile; the choice then saves: the later revoke stands.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const slow: SettingsStore = { ...store, putIf: async (k, r, g) => (await held, store.putIf(k, r, g)) };
+    const other = await clientOf(slow, speakingPort().port);
+    const choosing = other.choose(BUILT_IN, 'note_search', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    await tick(1);
+    void other.revoke(BUILT_IN, 'note_search', 'never');
+    release();
+    await choosing;
+    expect(gateFor('note_search', { name: 'note_search', kind: 'read' } as never, other.policy([]))).toBe('deny');
+  });
+});

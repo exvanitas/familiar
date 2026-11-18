@@ -101,6 +101,8 @@ export class McpClient {
   private readonly runtimes = new Map<string, ServerRuntime>();
   /** Revokes that hold at once, whatever the owner is doing: "always" back to ask, or anything to never. */
   private readonly overlay = new Map<string, 'ask' | 'never'>();
+  /** How many revokes each key has had, so a choice clears only the revokes made before it. */
+  private readonly revokes = new Map<string, number>();
   /** What each server's last Test showed: each tool's fingerprint, by name. Mark reviewed binds to it. */
   private readonly shown = new Map<string, ReadonlyMap<string, string>>();
   private readonly o: McpClientOptions;
@@ -263,10 +265,17 @@ export class McpClient {
     return this.update(id, r => ({ ...r, limits }));
   }
 
-  /** The person's choice for one tool: "always" for exactly this tool and setup, "ask", or "never". */
+  /**
+   * The person's choice for one tool: "always" for exactly this tool and setup, "ask", or "never". Once
+   * it's saved it replaces a revoke made before it, so that key's overlay goes; a revoke made while it was
+   * saving is newer, and stays.
+   */
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
+    const key = choiceKey(serverId, tool);
+    const before = this.revokes.get(key) ?? 0;
     const r = await this.owner.choose(serverId, tool, choice);
     if (!r.ok) throw new Error(r.words);
+    if ((this.revokes.get(key) ?? 0) === before) this.overlay.delete(key);
   }
 
   /**
@@ -310,6 +319,7 @@ export class McpClient {
    */
   async revoke(serverId: string, tool: string, to: 'ask' | 'never'): Promise<Outcome> {
     const key = choiceKey(serverId, tool);
+    this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
     if (this.overlay.get(key) !== 'never') this.overlay.set(key, to);
     const cur = this.owner.choices()[key];
     // Ask after never isn't a tightening: the saved never stands.
