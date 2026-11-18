@@ -219,7 +219,9 @@ const keepNewest = (order: string[], byKey: Record<string, unknown>, key: string
   if (!order.includes(key)) order.push(key);
   while (order.length > KEEP_RECORDS) delete byKey[order.shift()!];
 };
-type SentRecord = { kind: 'turn'; submission: string } | { kind: 'ack'; decision: Decision };
+/** An ack's decision is written after the ack's own commit wins: absent while it's being decided, or if a
+    kill came between. */
+type SentRecord = { kind: 'turn'; submission: string } | { kind: 'ack'; decision?: Decision };
 /** What each request id of a person's message did, so a resend gets the same result. */
 const SentDoc = defineJournalDoc<{ byRequest: Record<string, SentRecord>; order: string[] }>('familiar.sent', () => ({ byRequest: {}, order: [] }));
 const ConsentDoc = defineJournalDoc<{ cards: Record<string, ConsentCard & { answer?: 'allow' | 'deny' }>; opened?: number }>('familiar.consent', () => ({ cards: {} }));
@@ -918,8 +920,12 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
 
   harness.resume();
 
-  const resultOf = async (record: SentRecord): Promise<SendResult> => {
-    if (record.kind === 'ack') return { replied: false, decision: record.decision };
+  /** Acks being decided now, by request id: a send that lost the ack's commit to an identical one waits
+      for the winner's decision instead of deciding again. */
+  const deciding = new Map<string, Promise<Decision>>();
+  const QUIET: Decision = { act: 'quiet' } as Decision;
+  const resultOf = async (record: SentRecord, requestId: string): Promise<SendResult> => {
+    if (record.kind === 'ack') return { replied: false, decision: record.decision ?? (await deciding.get(requestId)?.catch(() => QUIET)) ?? QUIET };
     return { replied: true, turn: turnFor(await harness.submission(Number(record.submission), ctx)) };
   };
 
@@ -939,18 +945,53 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       // A resend finds what the first send did, before the text is looked at again: by then her last
       // message may have changed, and the same text would be read another way.
       const prior = await remembered(requestId);
-      if (prior) return resultOf(prior);
+      if (prior) return resultOf(prior, requestId);
+      // The record above keeps the newest 256 request ids; pi-durable's own record of the request id
+      // keeps every one. An old ack's resend is an ack again, with no new reaction.
+      const known: { id: string; type: string } | undefined = await harness.commit(async (tx: any) => {
+        const r = await tx.submissionByRequest(rootId, requestId);
+        return r ? { id: String(r.id), type: String(r.type) } : undefined;
+      }, ctx);
+      if (known) return known.type === 'write' ? { replied: false, decision: QUIET } : { replied: true, turn: turnFor(await harness.submission(Number(known.id), ctx)) };
       const at = clock.now();
       remember({ name: 'message-sent', at });
       if (!needsReply(text, await lastPersonaText(), { personaName: options.persona.name })) {
-        const decision = await notice({ name: 'ack-sent', at });
-        // Kept in the transcript for you, never sent to the model: nothing is answered.
-        await submitInTurn({ type: 'write', entry: { kind: AckEntry, data: { text } }, requestId }, true, (tx) => rememberIn(tx, requestId, { kind: 'ack', decision }), undefined, { track: false });
-        return resultOf((await remembered(requestId))!);
+        // Kept in the transcript for you, never sent to the model: nothing is answered. The write and its
+        // record come first, in one commit that checks the record inside it; only the send whose commit
+        // wins decides the reaction, once.
+        let won = false;
+        let decide!: (d: Decision) => void;
+        const decided = new Promise<Decision>((r) => (decide = r));
+        try {
+          await submitInTurn(
+            { type: 'write', entry: { kind: AckEntry, data: { text } }, requestId },
+            true,
+            async (tx) => {
+              // Noted as this commit wins, so an identical send that lost waits for this decision.
+              won = true;
+              deciding.set(requestId, decided);
+              await rememberIn(tx, requestId, { kind: 'ack' });
+            },
+            undefined,
+            { track: false, already: async (tx) => ((await tx.doc(SentDoc)).byRequest[requestId] ? '' : undefined) }
+          );
+          if (won) {
+            const decision = await notice({ name: 'ack-sent', at });
+            decide(decision);
+            await harness.commit(async (tx: any) => {
+              const record = (await tx.doc(SentDoc)).byRequest[requestId];
+              if (record?.kind === 'ack' && !record.decision) record.decision = decision;
+            }, ctx);
+          }
+        } finally {
+          decide(QUIET);
+          if (won && deciding.get(requestId) === decided) deciding.delete(requestId);
+        }
+        return resultOf((await remembered(requestId)) ?? { kind: 'ack' }, requestId);
       }
       lastChatAt = at;
       await submitInTurn({ type: 'input', content: text, requestId }, false, (tx, sid) => rememberIn(tx, requestId, { kind: 'turn', submission: sid }));
-      return resultOf((await remembered(requestId))!);
+      return resultOf((await remembered(requestId))!, requestId);
     },
     turn(id) {
       return {

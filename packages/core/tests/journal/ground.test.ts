@@ -215,6 +215,41 @@ describe('2.2 to 2.4: questions, answers and the queue', () => {
 
 /* ---------- interrupted steps: one question per task ---------- */
 
+describe('2.4: a bare acknowledgement, acted on once per request id', () => {
+  it('two sends of one request id at once: one ack, one decision, and both get it', async () => {
+    let decides = 0;
+    const { journal } = await journalOf({
+      script: () => ({ text: 'Here is a fact about owls.' }),
+      decider: { decide: async () => (decides++, await sleep(5), { act: 'gesture', gesture: 'nod' } as any) }
+    });
+    const first = await journal.send('hi there, tell me something', 'r0');
+    if (first.replied) await first.turn.wait();
+    decides = 0;
+    const [x, y] = await Promise.all([journal.send('thanks', 'r1'), journal.send('thanks', 'r1')]);
+    expect(decides).toBe(1);
+    expect(x).toEqual({ replied: false, decision: { act: 'gesture', gesture: 'nod' } });
+    expect(y).toEqual(x);
+    expect((await journal.transcript()).filter((e) => e.kind === 'familiar.ack')).toHaveLength(1);
+    // A resend later gets the same, with no new decision.
+    expect(await journal.send('thanks', 'r1')).toEqual(x);
+    expect(decides).toBe(1);
+    await journal.close();
+  });
+
+  it("a resend after 300 later requests isn't read again: an ack, with no new decision and no second entry", async () => {
+    let decides = 0;
+    const { journal } = await journalOf({ script: () => ({ text: 'Fine.' }), decider: { decide: async () => (decides++, { act: 'quiet' } as any) } });
+    expect((await journal.send('thanks', 'ack-0')).replied).toBe(false);
+    for (let i = 1; i <= 300; i++) await journal.send('ok', `ack-${i}`);
+    const before = (await journal.transcript()).filter((e) => e.kind === 'familiar.ack').length;
+    decides = 0;
+    expect(await journal.send('thanks', 'ack-0')).toEqual({ replied: false, decision: { act: 'quiet' } });
+    expect(decides).toBe(0);
+    expect((await journal.transcript()).filter((e) => e.kind === 'familiar.ack').length).toBe(before);
+    await journal.close();
+  }, 120_000);
+});
+
 describe("2.2: a turn's wait gives its own question only", () => {
   it("A fails, then B stops at its step cap: waiting for A again gives A's failure, never B's question", async () => {
     let fail = true;
