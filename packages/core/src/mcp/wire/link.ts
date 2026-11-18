@@ -822,9 +822,12 @@ export class ServerLink {
       if (sid[0]) p.offeredSession = sid[0][1];
     }
     const small = p.kind === 'initialize' || !ok;
-    const events = type.startsWith('text/event-stream') ? new EventStream(small ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES) : undefined;
-    // Only the two media types the transport allows; a body of any other type is never read as JSON.
-    if (!events && !type.startsWith('application/json')) return this.input({ t: 'terminal', n: p.n, end: ok ? { t: 'invalid', why: `a ${type.split(';')[0] || 'typeless'} answer` } : { t: 'http', status: head.status } });
+    // Only the two media types the transport allows, exactly: the type before any parameters, trimmed. A
+    // lookalike (application/jsonp, text/event-streaming) is another type. Its words are Familiar's own:
+    // none of the server's header text reaches them.
+    const media = (__FAMILIAR_MUTATIONS__ && mutant('media-prefix')) ? (type.startsWith('text/event-stream') ? 'text/event-stream' : type.startsWith('application/json') ? 'application/json' : type) : type.split(';')[0]!.trim();
+    const events = media === 'text/event-stream' ? new EventStream(small ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES) : undefined;
+    if (!events && media !== 'application/json') return this.input({ t: 'terminal', n: p.n, end: ok ? { t: 'invalid', why: "an answer of a type Familiar doesn't read" } : { t: 'http', status: head.status } });
     // One decoder for the whole body, so a character split across reads comes out whole.
     const decoder = new TextDecoder();
     const status = !ok ? head.status : undefined;

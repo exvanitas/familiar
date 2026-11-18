@@ -439,7 +439,7 @@ Departures 3 and 4 are about remote cancellation and sessions (3.8).
   - `application/json`: one JSON-RPC message, decoded as one text across reads;
   - `text/event-stream`: events whose data are JSON-RPC messages. Event ids and `retry:` fields are ignored, and an event with empty data (a priming event) is skipped, never a failure.
 
-  Any other media type is refused. A status other than 2xx decides on both types alike (after the opening's classifier, 3.3).
+  The type is matched exactly: the part before any parameters, trimmed and compared without case. A lookalike (`application/jsonp`, `application/json-seq`, `text/event-streaming`) is another type, and any other type is refused, in Familiar's own words ("an answer of a type Familiar doesn't read"), with none of the header's text. A status other than 2xx decides on both types alike (after the opening's classifier, 3.3).
 - **A notification or a pong** is answered `202` with no body. Its exchange ends at the head.
 - **Never sent:** a GET of any kind (no standalone stream, no resumption, no `Last-Event-ID`), a `DELETE`, or `notifications/cancelled`. Not opening the GET and not resuming are both allowed by the 2025-11-25 transport.
 - **Named departures 3 and 4:** the transport says a client should send `notifications/cancelled` to cancel, and a session `DELETE` on close. Familiar sends neither to a remote server. A legacy server may therefore finish a call Familiar stopped, and its session expires on its own. The journal already reports every stopped call as possibly partly run, and never repeats it.
@@ -888,6 +888,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `remote-cancel`: send a cancel to a remote server | H2 |
 | `local-cancel-after-seal` | H2 (a write after the terminal event) |
 | `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
+| `media-prefix`: a media type read by its prefix (`application/jsonp` as JSON) | H10 under S21 |
 | `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |
 | `stop-twice`: Stop and the run's end each ask the exe to stop the process | H2 under S11, during initialize |

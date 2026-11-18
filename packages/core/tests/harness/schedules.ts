@@ -144,7 +144,7 @@ export const SCHEDULES: Named[] = [
   {
     // S21: answers of other media types, lookalike and oversized: never read, and no header text in words (H10).
     name: 'S21 answers of other media types',
-    options: { mode: { ...quiet, oddMedia: 0.5 } },
+    options: { mode: { ...quiet, oddMedia: 0.8 } },
     expect: (r) => (r.exe.log.some((x) => x.contentType && x.contentType !== 'application/json' && x.contentType !== 'text/event-stream') ? undefined : 'no odd media type sent')
   },
   {

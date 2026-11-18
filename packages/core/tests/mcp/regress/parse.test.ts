@@ -90,6 +90,31 @@ describe('a status other than 2xx', () => {
     // Refused at initialize itself: the HTML-labelled answer was never read, so nothing followed it.
     expect(net.log.map((x) => x.body?.method)).toEqual(['initialize']);
   });
+
+  for (const type of ['application/jsonp', 'application/json-seq', 'text/event-streaming', 'text/event-stream-anything', `text/x-${'a'.repeat(7000)}`])
+    it(`a lookalike type is another type, and its words carry none of it: ${type.slice(0, 30)}`, async () => {
+      const net = fakeNet((b) => {
+        if (b.method === 'initialize') return { ...json(initResult(b.id)), headers: [['content-type', type]] };
+        if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+        return json(listResult(b.id, ['look']));
+      });
+      const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
+      const r = await link.start(remote, 'L');
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.failure.words).not.toContain(type.split('/')[1]!.slice(0, 12));
+      expect(r.failure.words.length).toBeLessThan(160);
+    });
+
+  it('a parameter after the exact type is still the type', async () => {
+    const net = fakeNet((b) => {
+      if (b.method === 'initialize') return { ...json(initResult(b.id)), headers: [['content-type', 'Application/JSON ; charset=utf-8']] };
+      if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+      return json(listResult(b.id, ['look']));
+    });
+    const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
+    expect((await link.start(remote, 'L')).ok).toBe(true);
+  });
 });
 
 describe('a modern resultType that isn\'t a string', () => {
