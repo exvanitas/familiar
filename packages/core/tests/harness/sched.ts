@@ -17,6 +17,8 @@ export interface Ev {
   readonly label: string;
   /** Events of a lower rank are picked first among the ready ones, when any is ready (timers last). */
   readonly rank?: number;
+  /** A timer's due time on the fake clock: timers fire earliest first, as a clock's do. */
+  readonly due?: number;
   fire(): void;
 }
 
@@ -64,7 +66,7 @@ export class Scheduler {
   timer(callback: () => void, ms: number): () => void {
     let live = true;
     const due = this.now + ms;
-    this.add({ label: `timer:${ms}`, rank: 1, fire: () => {
+    this.add({ label: `timer:${ms}`, rank: 1, due, fire: () => {
       if (!live) return;
       this.now = Math.max(this.now, due);
       callback();
@@ -85,7 +87,13 @@ export class Scheduler {
       const lowest = Math.min(...this.ready.map((e) => e.rank ?? 0));
       const candidates = this.ready.map((e, i) => [e, i] as const).filter(([e]) => (e.rank ?? 0) === lowest);
       // Timers mostly wait for other work: picked only when nothing else is ready, or now and then.
-      const pool = lowest === 0 && this.random() < 0.001 ? this.ready.map((e, i) => [e, i] as const) : candidates;
+      let pool = lowest === 0 && this.random() < 0.001 ? this.ready.map((e, i) => [e, i] as const) : candidates;
+      // Among timers, only the earliest due may fire.
+      const timers = pool.filter(([e]) => e.due !== undefined);
+      if (timers.length) {
+        const earliest = Math.min(...timers.map(([e]) => e.due!));
+        pool = pool.filter(([e]) => e.due === undefined || e.due === earliest);
+      }
       const [ev, i] = pool[Math.floor(this.random() * pool.length)]!;
       this.ready.splice(i, 1);
       this.step++;

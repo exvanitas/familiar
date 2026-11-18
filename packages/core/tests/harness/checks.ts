@@ -1,7 +1,7 @@
 // The independent checks (docs/mcp-design.md 7.2). Each reads only the fake exe's log, the fake server's
 // own record and the driver's evidence log, never the client's state.
 
-import type { Evidence, NativeRec, WireRun } from './wire.ts';
+import { DETACH_MS, EXE_SERVER_CAP, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 
 export type Check = (r: WireRun) => string[];
 
@@ -18,25 +18,96 @@ function exchangeKey(r: WireRun, rec: NativeRec): string {
       const carrier = r.exe.log.find((x) => x.delivered.has(String(b.id)));
       return carrier ? exchangeKey(r, carrier) : `orphan-pong:${b.id}`;
     }
-    // Local: a request whose write is still in flight, else the request written before it whose response
-    // hadn't reached the client yet, else none (an idle ping's own exchange).
-    const inFlight = [...r.exe.log].reverse().find((x) => x.kind === 'write' && x.epoch === rec.epoch && x.seq < rec.seq && x.body !== undefined && x.body.method !== 'notifications/cancelled' && (x.end ?? Infinity) > rec.start);
-    if (inFlight) return exchangeKey(r, inFlight);
-    const outstanding = [...r.exe.log].filter((x) => x.kind === 'write' && x.epoch === rec.epoch && x.seq < rec.seq && x.body?.id !== undefined && x.body?.method);
-    const cancelEnded = (id: unknown) => r.exe.log.some((y) => y.kind === 'write' && y.epoch === rec.epoch && y.body?.method === 'notifications/cancelled' && y.body.params?.requestId === id && (y.end ?? Infinity) <= rec.start);
-    const open = outstanding.reverse().find((x) => (r.exe.responded.get(`${x.epoch}:${x.body!.id}`) ?? Infinity) > rec.start && !cancelEnded(x.body!.id));
-    return open ? `${rec.epoch}:${open.body!.id}` : `idle:${b.id}`;
+    return localPongKey(r, rec);
   }
   if (b?.method === 'notifications/cancelled') return `${rec.epoch}:${b.params?.requestId}`;
   if (b?.id !== undefined) return `${rec.epoch}:${b.id}`;
   return `${rec.epoch}:note:${rec.n}`;
 }
 
+/** Local: the exchange live when a pong's ping reached the client, read from the exe's log and the
+    evidence alone. A request is live from its write until its response line, its cancel, or its outcome
+    (a flood or a time limit ends it with nothing on the pipe); a write-only exchange (initialized, or an
+    idle ping's own pong) is live while its one write is in flight. With neither, the pong opens its own. */
+const pongKeys = new WeakMap<NativeRec, string>();
+function localPongKey(r: WireRun, rec: NativeRec): string {
+  const known = pongKeys.get(rec);
+  if (known) return known;
+  const id = String(rec.body!.id);
+  const d = r.exe.pingDelivered.get(id) ?? rec.start;
+  const writes = r.exe.log.filter((x) => x.kind === 'write' && x.epoch === rec.epoch && x.seq < rec.seq);
+  const request = [...writes].reverse().find((x) => {
+    if (x.body?.id === undefined || !x.body.method) return false;
+    if ((r.exe.responded.get(`${x.epoch}:${x.body.id}`) ?? Infinity) < d) return false;
+    if (writes.some((y) => y.body?.method === 'notifications/cancelled' && y.body.params?.requestId === x.body!.id && y.start < d)) return false;
+    const out = x.body.method === 'tools/call' ? r.evidence.find((e) => e.what === 'outcome' && e.token === tokenOf(x.body)) : undefined;
+    return !(out && out.step < d);
+  });
+  let key: string;
+  if (request) key = `${rec.epoch}:${request.body!.id}`;
+  else {
+    const inFlight = (x: NativeRec) => x.start <= d && (x.end ?? Infinity) > d;
+    const opener = [...writes].reverse().find((x) => inFlight(x) && ((x.body?.method !== undefined && x.body.id === undefined && x.body.method !== 'notifications/cancelled') || (isPong(x.body) && localPongKey(r, x) === `idle:${x.body!.id}`)));
+    // Nothing live, but a write still in flight: an exchange is draining, so the ping is departure 2.
+    key = opener ? (isPong(opener.body) ? `idle:${opener.body!.id}` : `${rec.epoch}:note:${opener.n}`) : writes.some(inFlight) ? `sealed:${id}` : `idle:${id}`;
+  }
+  pongKeys.set(rec, key);
+  return key;
+}
+
 /** H1: per server, the native requests of two different exchanges are never open at once, and at most 3. */
 export const H1: Check = (r) => {
   const problems: string[] = [];
   const open = (x: NativeRec) => [x.start, x.end ?? Infinity] as const;
-  const recs = r.exe.log;
+  const all = r.exe.log.filter((x) => x.kind !== 'model' && !x.refused);
+  for (const server of new Set(all.map((x) => x.server))) problems.push(...H1one(r, all.filter((x) => x.server === server), open));
+  const recs = all;
+  // Nothing waits in line: a call goes out in the step it's made, or is answered in that step (a queue
+  // would hand it off later, and never overlap, so overlap alone can't catch it).
+  for (const e of r.evidence) {
+    if (e.what !== 'call') continue;
+    const out = recs.find((x) => isCall(x.body) && tokenOf(x.body) === e.token);
+    const answered = r.evidence.find((o) => o.what === 'outcome' && o.token === e.token);
+    if (out && out.start !== e.step) problems.push(`H1: ${e.token} made at step ${e.step}, handed off at ${out.start}`);
+    if (!out && answered && answered.step !== e.step && answered.outcome?.kind === 'error') problems.push(`H1: ${e.token} refused only at step ${answered.step}, made at ${e.step}`);
+  }
+  // Busy only while the exe shows the server's exchange in play (a slot held by nothing is a write-only
+  // exchange waiting for a response that never comes); likewise a start that times out.
+  for (const e of r.evidence) {
+    const busy = e.what === 'outcome' && e.outcome?.kind === 'error' && e.outcome.reason === 'busy' && r.evidence.some((c) => c.what === 'call' && c.token === e.token && c.step === e.step);
+    const stalled = e.what === 'started' && e.failure === 'timed-out';
+    if (!busy && !stalled) continue;
+    const s = e.step;
+    if (inPlay(r, e.server ?? 's1', s) || r.evidence.some((o) => (o.what === 'start' || o.what === 'stop') && o.step >= s - 1 && o.step <= s && o !== e)) continue;
+    problems.push(busy ? `H1: ${e.token} refused busy at step ${s} with nothing of its server in play` : `H1: the start timed out at step ${s} with nothing of its server in play`);
+  }
+  // A call refused busy never goes out afterwards.
+  for (const e of r.evidence) {
+    if (e.what !== 'outcome' || e.outcome?.kind !== 'error' || e.outcome.reason !== 'busy') continue;
+    if (recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token)) problems.push(`H1: ${e.token} was refused busy, then sent`);
+  }
+  return problems.slice(0, 3);
+};
+
+/** Whether the exe's log shows something of this server in play at `s`: a request or write still open, or
+    a local request written whose response hasn't come, not cancelled, and its run alive. */
+function inPlay(r: WireRun, server: string, s: number): boolean {
+  const address = `addr-${server.slice(1)}`;
+  return r.exe.log.some((x) => {
+    if (x.kind === 'model' || x.refused) return false;
+    if (x.kind === 'post') return x.server === address && x.start <= s && (x.end ?? Infinity) >= s;
+    if (x.start > s) return false;
+    if ((x.end ?? Infinity) >= s) return true;
+    if (x.body?.id === undefined || !x.body.method) return false;
+    const answered = r.exe.responded.get(`${x.epoch}:${x.body.id}`);
+    const cancelled = r.exe.log.some((y) => y.kind === 'write' && y.epoch === x.epoch && y.body?.method === 'notifications/cancelled' && y.body.params?.requestId === x.body!.id && (y.end ?? Infinity) <= s);
+    const exited = r.exe.exits.some((t) => t.epoch === x.epoch && t.step <= s);
+    return (answered === undefined || answered >= s) && !cancelled && !exited;
+  });
+}
+
+function H1one(r: WireRun, recs: NativeRec[], open: (x: NativeRec) => readonly [number, number]): string[] {
+  const problems: string[] = [];
   for (let i = 0; i < recs.length; i++) {
     for (let j = i + 1; j < recs.length; j++) {
       const [a0, a1] = open(recs[i]!);
@@ -48,25 +119,14 @@ export const H1: Check = (r) => {
     }
   }
   for (let s = 0; s <= r.sched.step; s++) {
-    const n = recs.filter((x) => x.start <= s && (x.end ?? Infinity) > s).length;
-    if (n > 3) problems.push(`H1: ${n} native requests open at step ${s}`);
+    // At most the request and two pongs; locally a stop's cancel may join them, as the terminal step's
+    // last send while the others are still being written (3.4).
+    const openNow = recs.filter((x) => x.start <= s && (x.end ?? Infinity) > s);
+    const n = openNow.filter((x) => !(x.kind === 'write' && x.body?.method === 'notifications/cancelled')).length;
+    if (n > 3 || openNow.length > 4) problems.push(`H1: ${openNow.length} native requests open at step ${s}`);
   }
-  // Nothing waits in line: a call goes out in the step it's made, or is answered in that step (a queue
-  // would hand it off later, and never overlap, so overlap alone can't catch it).
-  for (const e of r.evidence) {
-    if (e.what !== 'call') continue;
-    const out = recs.find((x) => isCall(x.body) && tokenOf(x.body) === e.token);
-    const answered = r.evidence.find((o) => o.what === 'outcome' && o.token === e.token);
-    if (out && out.start !== e.step) problems.push(`H1: ${e.token} made at step ${e.step}, handed off at ${out.start}`);
-    if (!out && answered && answered.step !== e.step && answered.outcome?.kind === 'error') problems.push(`H1: ${e.token} refused only at step ${answered.step}, made at ${e.step}`);
-  }
-  // A call refused busy never goes out afterwards.
-  for (const e of r.evidence) {
-    if (e.what !== 'outcome' || e.outcome?.kind !== 'error' || e.outcome.reason !== 'busy') continue;
-    if (recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token)) problems.push(`H1: ${e.token} was refused busy, then sent`);
-  }
-  return problems.slice(0, 3);
-};
+  return problems;
+}
 
 /** H2: only Familiar's own message kinds; no GET or DELETE; no error replies; no remote cancel; a pong
     only for a ping on its own stream, once; nothing after its exchange's terminal event. */
@@ -90,6 +150,7 @@ export const H2: Check = (r) => {
         // Locally, a pong goes out only while its exchange's request is live: not after its response, and
         // not after its cancel (the exchange sealed: departure 2).
         const key = exchangeKey(r, x);
+        if (key.startsWith('sealed:')) problems.push(`H2: a pong for ${b.id}, which came while its exchange drained`);
         const m = /^(\d+):(.+)$/.exec(key);
         if (m) {
           const responded = r.exe.responded.get(key);
@@ -130,11 +191,32 @@ export const H3: Check = (r) => {
     if (canonical(x.body!.params?.arguments) !== yes.body || x.body!.params?.name !== yes.tool) problems.push(`H3: the call for ${t} isn't what its Yes showed: ${args.slice(0, 60)}`);
     if (used.has(t)) problems.push(`H3: the Yes for ${t} used twice`);
     used.add(t);
-    const revoked = r.evidence.find((e) => e.what === 'revoke' && e.tool === yes.tool && e.seq < x.seq);
+    const revoked = r.evidence.find((e) => e.what === 'revoke' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < x.seq);
     if (revoked) problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
+    // The tool as the server last listed it before the card, and before the handoff: a change between
+    // (a fingerprint change) means the Yes allowed something else (S1).
+    const card = r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
+    const before = listedAt(r, x.server, card.step, yes.tool!);
+    const now = listedAt(r, x.server, x.start, yes.tool!);
+    if (before !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
   }
   return problems.slice(0, 3);
 };
+
+/** The harness's own reading of a server's catalog: the tool's definition in the last first page of a
+    tools/list answer that reached the client before `step`. */
+function listedAt(r: WireRun, server: string, step: number, tool: string): string | undefined {
+  let found: { at: number; def: string | undefined } | undefined;
+  for (const x of r.exe.log) {
+    if (x.server !== server || x.body?.method !== 'tools/list' || x.body.params?.cursor !== undefined || !x.plan) continue;
+    const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : r.exe.responded.get(`${x.epoch}:${x.body.id}`);
+    if (at === undefined || at >= step) continue;
+    const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
+    if (!res) continue;
+    if (!found || at >= found.at) found = { at, def: JSON.stringify(res.tools?.find((d: any) => d.name === tool)) };
+  }
+  return found?.def;
+}
 
 function canonical(v: unknown): string {
   if (v === null || typeof v !== 'object') return JSON.stringify(v);
@@ -213,28 +295,68 @@ export const H12: Check = (r) => {
   return problems.slice(0, 3);
 };
 
-/** H13: every ping the server sent has one disposition: a pong that reached the server, or a named
-    departure whose condition holds (1 a flood, 2 a local drain or blocked write, 6 after the final). */
+/** H13: every ping the server sent has one disposition: a pong handed off for it, or a named departure
+    whose own condition holds in the log (1 a flood, 2 a local ping while its exchange drains or a write is
+    blocked, 6 after the final response on its stream). A handed-off pong's native fate is logged apart
+    (pongFates) and never fails H13. A ping that never reached the client isn't the client's. */
 export const H13: Check = (r) => {
   const problems: string[] = [];
-  const answered = new Set(r.server.arrivals.filter((a) => isPong(a.body)).map((a) => String(a.body.id)));
-  const flooded = new Set(r.evidence.filter((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && /too many pings/.test(e.outcome.words)).map((e) => e.token));
+  // Handed off: a pong the client didn't itself cancel before its head (the exe's own fate, stall, timeout
+  // or busy, is departure 7 and logged apart; the client's cancel is no handoff).
+  const handed = new Set(r.exe.log.filter((x) => isPong(x.body) && (x.cancelAsked === undefined || (x.head !== undefined && x.head <= x.cancelAsked) || x.refused)).map((x) => String(x.body!.id)));
+  const words = (token: string) => {
+    const o = r.evidence.find((e) => e.what === 'outcome' && e.token === token)?.outcome;
+    return o?.kind === 'error' ? o.words : '';
+  };
   for (const p of r.server.pings) {
-    if (answered.has(p.id) || p.afterFinal) continue;
-    const carrier = r.exe.log.find((x) => x.delivered.has(p.id)) ?? r.exe.log.find((x) => `w${x.n}` === p.on || String(x.n) === p.on);
-    if (!carrier) continue; // never reached the client
-    if (carrier.kind === 'post' && !carrier.delivered.has(p.id)) continue; // the stream ended or was cancelled first
-    if (carrier.kind === 'post' && carrier.final !== undefined && carrier.delivered.get(p.id)! > carrier.final) continue; // departure 6
-    const token = tokenOf(carrier.body);
-    if (flooded.has(token)) continue; // departure 1
-    if (r.server.mode.pings === 40) continue; // a flood ends the exchange at its third or 33rd ping
-    if (carrier.kind === 'write') continue; // departure 2 (a local drain or blocked write) is judged by W and T14
-    const outcome = r.evidence.find((e) => e.what === 'outcome' && e.token === token)?.outcome;
-    if (outcome && outcome.kind !== 'result') continue; // the exchange ended before the ping was read
-    problems.push(`H13: ping ${p.id} on request ${carrier.n} got no pong and no departure`);
+    if (handed.has(p.id)) continue;
+    const post = r.exe.log.find((x) => x.kind === 'post' && x.delivered.has(p.id));
+    if (post) {
+      if (post.final !== undefined && post.delivered.get(p.id)! > post.final) continue; // departure 6
+      if (/too many pings/.test(words(tokenOf(post.body)))) continue; // departure 1
+      problems.push(`H13: ping ${p.id} on request ${post.n} got no pong and no departure`);
+      continue;
+    }
+    const at = r.exe.pingDelivered.get(p.id);
+    if (at === undefined) continue; // never reached the client
+    const carrier = r.exe.log.find((x) => `w${x.n}` === p.on);
+    if (!carrier) continue;
+    if (/too many pings/.test(words(tokenOf(carrier.body)))) continue; // departure 1
+    const responded = r.exe.responded.get(`${carrier.epoch}:${carrier.body?.id}`);
+    const draining = (responded !== undefined && responded < at) || r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method === 'notifications/cancelled' && y.start <= at);
+    const blocked = r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.start <= at && (y.end ?? Infinity) > at);
+    // Another exchange live on the same run when an idle ping comes: it waits for no one, so it's departure 2.
+    const busyElsewhere = p.id.startsWith('i') && r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method && y.body.id !== undefined && y.start <= at && (r.exe.responded.get(`${y.epoch}:${y.body.id}`) ?? Infinity) >= at);
+    if (draining || blocked || busyElsewhere) continue; // departure 2
+    problems.push(`H13: local ping ${p.id} got no pong and no departure`);
   }
   return problems.slice(0, 3);
 };
+
+/** Departure 7, logged, never judged: what happened natively to each handed-off pong. */
+export function pongFates(r: WireRun): Record<string, number> {
+  const fates: Record<string, number> = {};
+  for (const x of r.exe.log) {
+    if (!isPong(x.body)) continue;
+    const fate = x.refused ? 'busy' : r.server.arrivals.some((a) => isPong(a.body) && a.body.id === x.body!.id) ? 'received' : x.cancelAsked !== undefined ? 'cancelled' : 'lost';
+    fates[fate] = (fates[fate] ?? 0) + 1;
+  }
+  return fates;
+}
+
+/** H4 (the pass build): every net_cancel returns within the detach bound, even while a helper is held. */
+export const H4: Check = (r) =>
+  r.exe.log
+    .filter((x) => x.cancelAt !== undefined && (x.endAt === undefined ? r.sched.now - x.cancelAt! > DETACH_MS : x.endAt - x.cancelAt! > DETACH_MS))
+    .map((x) => `H4: net_cancel for request ${x.n} took ${x.endAt === undefined ? 'more than' : ''}${(x.endAt ?? r.sched.now) - x.cancelAt!} ms`)
+    .slice(0, 3);
+
+/** H5 (the pass build): a model fetch is never refused busy, whatever the servers hold. */
+export const H5: Check = (r) =>
+  r.evidence
+    .filter((e) => e.what === 'model' && !e.ok)
+    .map(() => `H5: a model fetch refused busy with ${r.exe.peakServer} server requests open`)
+    .slice(0, 3);
 
 /** H14: no call reaches the server twice; after a 404, initialize with no session id, then the new one. */
 export const H14: Check = (r) => {
@@ -280,4 +402,24 @@ export const H14: Check = (r) => {
 };
 
 export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14 };
+export const PASS_CHECKS: Record<string, Check> = { ...WIRE_CHECKS, H4, H5 };
+
+/** Each check's witness (7.2): a step where its condition was in play and could have failed. */
+export const WITNESSES: Record<string, (r: WireRun) => boolean> = {
+  'H1 a busy refusal': (r) => r.evidence.some((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && e.outcome.reason === 'busy'),
+  'H3 a revoke before a handoff': (r) => r.evidence.some((e) => e.what === 'revoke'),
+  'H10 a stale response id': (r) => r.exe.log.some((x) => x.plan?.messages.some((m) => m.result && m.id !== x.body?.id && x.body?.method === 'tools/call')),
+  'H11 a mirrored header': (r) => r.exe.log.some((x) => Object.keys(x.headers).some((k) => k.startsWith('mcp-param-'))),
+  'H12 a modern run': (r) => r.exe.log.some((x) => x.headers['mcp-protocol-version'] === '2026-07-28'),
+  'H13 departure 1 (a flood)': (r) => r.evidence.some((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && /too many pings/.test(e.outcome.words)),
+  'H13 departure 2 (a local ping while draining or blocked)': (r) => r.server.pings.some((p) => r.exe.pingDelivered.has(p.id) && !r.exe.log.some((x) => isPong(x.body) && String(x.body!.id) === p.id)),
+  'H13 departure 6 (a ping after the final)': (r) => r.exe.log.some((x) => x.final !== undefined && [...x.delivered.values()].some((d) => d > x.final!)),
+  'H13 a ping with the final reply, answered': (r) => r.exe.log.some((x) => x.final !== undefined && [...x.delivered].some(([id, d]) => Math.floor(d / 1000) === Math.floor(x.final! / 1000) && d < x.final! && r.exe.log.some((y) => isPong(y.body) && String(y.body!.id) === id))),
+  'H14 a 404 and its re-handshake': (r) => r.exe.log.some((x) => x.status === 404),
+  'H14 a redirect': (r) => r.exe.log.some((x) => x.redirected)
+};
+export const PASS_WITNESSES: Record<string, (r: WireRun) => boolean> = {
+  'H4 a held helper detached': (r) => r.exe.log.some((x) => x.detached),
+  [`H5 a saturation (${EXE_SERVER_CAP} server requests open)`]: (r) => r.exe.peakServer >= EXE_SERVER_CAP && r.evidence.some((e) => e.what === 'model')
+};
 export type { Evidence };

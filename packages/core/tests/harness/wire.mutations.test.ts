@@ -3,16 +3,21 @@
 // first step where the switch changed behaviour. Since the twin's identical prefix passes, the mutant's
 // failure lies at or after that step. A mutation with no such seed is a broken control and fails the build.
 import { describe, expect, it } from 'vitest';
-import { WIRE_CHECKS } from './checks.ts';
-import { wireRun, type Driver, type Mode } from './wire.ts';
+import { PASS_CHECKS } from './checks.ts';
+import { SCHEDULES } from './schedules.ts';
+import { wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
 
 interface Control {
   readonly mutation: string;
-  readonly check: keyof typeof WIRE_CHECKS;
+  readonly check: keyof typeof PASS_CHECKS;
   readonly mode?: Partial<Mode>;
   readonly build?: 'prepass' | 'pass';
   readonly schedule?: (d: Driver) => void;
+  /** A named schedule's options in place of the above. */
+  readonly named?: string;
 }
+
+const named = (prefix: string): WireOptions => SCHEDULES.find((s) => s.name.startsWith(`${prefix} `))!.options;
 
 const remote: Partial<Mode> = { where: 'remote' };
 const local: Partial<Mode> = { where: 'local' };
@@ -41,23 +46,39 @@ const CONTROLS: Control[] = [
   { mutation: 'cancel-pongs-at-drain', check: 'H13', mode: { ...remote, era: 'legacy', pings: 0, pingWithFinal: 1, session404: 'none', redirect: 0 } },
   { mutation: 'resend-404-call', check: 'H14', mode: { ...remote, era: 'legacy', session404: 'once', redirect: 0 } },
   { mutation: 'rehandshake-every-404', check: 'H14', mode: { ...remote, era: 'legacy', session404: 'again', redirect: 0 } },
-  { mutation: 'keep-old-session-id', check: 'H14', mode: { ...remote, era: 'legacy', session404: 'once', redirect: 0 } }
+  { mutation: 'keep-old-session-id', check: 'H14', mode: { ...remote, era: 'legacy', session404: 'once', redirect: 0 } },
+  { mutation: 'page-before-drain', check: 'H1', mode: { ...remote, era: 'legacy', pages: 3, session404: 'none', redirect: 0 } },
+  { mutation: 'write-only-on-response', check: 'H1', mode: { ...local, era: 'legacy', idlePings: 0.9, stopReading: 0 } },
+  {
+    mutation: 'truncate-header',
+    check: 'H11',
+    mode: { ...modern, redirect: 0 },
+    schedule: (d) => d.when('ready', () => d.idle(), () => d.call('mirror', { region: 'x'.repeat(9000) }))
+  },
+  // Under the named schedules.
+  { mutation: 'slot-per-run', check: 'H1', named: 'S8' },
+  { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1' },
+  { mutation: 'cancel-pongs-at-drain', check: 'H13', named: 'S2' },
+  { mutation: 'rehandshake-every-404', check: 'H14', named: 'S3' },
+  { mutation: 'no-detach', check: 'H4', named: 'S8', build: 'pass' },
+  { mutation: 'no-server-cap', check: 'H5', named: 'S10' }
 ];
 
 const MAX_SEEDS = 150;
+const controlName = (c: Control) => `${c.mutation} fails ${c.check}${c.named ? ` under ${c.named}` : ''}${c.build === 'pass' ? ' (pass build)' : ''}`;
 
 describe('every named wire mutation fails its check, beside its unmutated twin', () => {
   for (const c of CONTROLS) {
-    it(`${c.mutation} fails ${c.check}`, async () => {
+    it(controlName(c), async () => {
       const tried: string[] = [];
       for (let seed = 1; seed <= MAX_SEEDS; seed++) {
-        const options = { ...(c.mode ? { mode: c.mode } : {}), ...(c.build ? { build: c.build } : {}), ...(c.schedule ? { schedule: c.schedule } : {}) };
+        const options: WireOptions = { ...(c.named ? named(c.named) : {}), ...(c.mode ? { mode: c.mode } : {}), ...(c.build ? { build: c.build } : {}), ...(c.schedule ? { schedule: c.schedule } : {}) };
         const mutant = await wireRun(seed, { ...options, mutation: c.mutation });
         if (mutant.firstHit === undefined) continue;
-        const failed = WIRE_CHECKS[c.check]!(mutant);
+        const failed = PASS_CHECKS[c.check]!(mutant);
         if (!failed.length) continue;
         const twin = await wireRun(seed, options);
-        const twinFails = WIRE_CHECKS[c.check]!(twin);
+        const twinFails = PASS_CHECKS[c.check]!(twin);
         const prefix = mutant.firstHit - 1;
         const same = JSON.stringify(mutant.sched.log.slice(0, prefix)) === JSON.stringify(twin.sched.log.slice(0, prefix));
         tried.push(`seed ${seed}: twin ${twinFails.length ? 'fails' : 'passes'}, prefix ${same ? 'same' : 'differs'}`);
