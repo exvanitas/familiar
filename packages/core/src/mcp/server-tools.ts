@@ -107,10 +107,11 @@ export function outcomeText(server: string, tool: string, o: CallOutcome): strin
       return outsideContent(server, tool, o.text);
     case 'error':
       throw new Error(o.words);
+    // Stopped or timed out after the handoff, the call may have reached the server (3.11).
     case 'stopped':
-      throw new Error(`The call to ${tool} on ${server} was stopped.`);
+      throw new Error(`The call to ${tool} on ${server} was stopped. It may have partly run.`);
     case 'timed-out':
-      throw new Error(`The call to ${tool} on ${server} took too long and was stopped.`);
+      throw new Error(`The call to ${tool} on ${server} took too long and was stopped. It may have partly run.`);
     case 'interrupted':
       throw new Error(`The server ${server} stopped while ${tool} ran. It may have partly run. Familiar did not send it again.`);
   }

@@ -258,6 +258,15 @@ describe('2.2: several interrupted steps in one round make one question (S7)', (
 describe('2.1: her line', () => {
   const prompt = { system: 'Say one short line.', messages: [{ role: 'user' as const, content: 'Your reminder is due.' }], sources: ['server:weather', 'server:weather'] };
 
+  it('is one model request: an error, even one that says it was never processed, is not tried again, and she stays quiet', async () => {
+    let n = 0;
+    const { journal, model } = await journalOf({ script: () => (++n === 1 ? { error: { kind: 'server', message: 'busy', notProcessed: true } as any, text: '' } : { text: 'Hello there.' }) });
+    expect(await journal.remark(prompt)).toBeUndefined();
+    expect(model.requests).toHaveLength(1);
+    expect((await journal.transcript()).filter((e) => e.kind === 'familiar.remark')).toEqual([]);
+    await journal.close();
+  });
+
   it('into a quiet chat: model-visible, as a note that merges with your next message; its outside record and sources are written', async () => {
     const { journal, model } = await journalOf({ script: (r) => (r.tools.length === 0 && r.system === 'Say one short line.' ? { text: 'The kettle!' } : { text: `answer to ${lastUser(r)}` }) });
     const said = await journal.remark(prompt);

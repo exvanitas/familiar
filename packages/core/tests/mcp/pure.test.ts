@@ -172,6 +172,9 @@ describe('plain words', () => {
     expect(() => outcomeText('S', 't', { kind: 'interrupted' })).toThrow(/may have partly run/);
     expect(() => outcomeText('S', 't', { kind: 'timed-out' })).toThrow(/took too long/);
     expect(() => outcomeText('S', 't', { kind: 'stopped' })).toThrow(/was stopped/);
+    // A call stopped or timed out may have reached the server (3.11): the model is told so, as for a crash.
+    expect(() => outcomeText('S', 't', { kind: 'timed-out' })).toThrow(/It may have partly run\./);
+    expect(() => outcomeText('S', 't', { kind: 'stopped' })).toThrow(/It may have partly run\./);
     expect(() => outcomeText('S', 't', { kind: 'error', reason: 'down', words: 'Down.' })).toThrow('Down.');
   });
 

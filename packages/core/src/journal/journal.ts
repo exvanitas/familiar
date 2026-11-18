@@ -1065,10 +1065,11 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         keepNewest(doc.order, doc.requests, key);
       }, ctx);
       // One request, no tools, through the caps under its own key: never resumable, so its reservation
-      // settles when the call returns, or becomes a spent record at its deadline if the app dies.
+      // settles when the call returns, or becomes a spent record at its deadline if the app dies. One try
+      // only (2.1): an error, retryable or not, means she stays quiet.
       const capped = withRetries(
         cappedPort(options.model, caps!, () => ({ ...options.caps.call, turn: key, conversation: String(rootId) })),
-        { ...options.retries, sleep }
+        { ...options.retries, tries: 1, sleep }
       );
       let text = '';
       try {
