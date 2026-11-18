@@ -65,6 +65,27 @@ function endsThatCallOnly(where: 'local' | 'remote', how: 'stop' | 'time-limit')
 }
 
 export const SCHEDULES: Named[] = [
+  {
+    // S11 with a live call: Stop right after the call's write, with pings and the reply on their way.
+    // Nothing is written to the stopping run, and the call isn't answered by a reply read after Stop.
+    name: 'S11 Stop during a live local call',
+    options: {
+      mode: { ...quiet, where: 'local', pings: 2, pingWithFinal: 1 },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('echo');
+          const token = lastToken(d)!;
+          d.when('written', () => d.exe.log.some((x) => x.body?.params?.arguments?.text === token && x.end !== undefined), () => d.stop());
+        })
+    },
+    expect: (r) => {
+      const stop = r.evidence.find((e) => e.what === 'stop');
+      const out = r.evidence.find((e) => e.what === 'outcome');
+      if (!stop) return 'no Stop made';
+      if (out && out.step > stop.step && out.outcome?.kind === 'result') return 'the call was answered by a reply read after Stop';
+      return undefined;
+    }
+  },
   endsThatCallOnly('local', 'stop'),
   endsThatCallOnly('local', 'time-limit'),
   endsThatCallOnly('remote', 'stop'),

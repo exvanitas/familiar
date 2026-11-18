@@ -111,6 +111,9 @@ interface Run {
   ended: boolean;
   /** A local run's process has exited (the exe said so). */
   exited?: boolean;
+  /** Resolves when the exe says a local run's process has exited. */
+  readonly exit: Promise<void>;
+  sawExit: () => void;
   /** Stop has begun: set synchronously before Stop awaits anything, so no exchange is admitted after it. */
   closing?: boolean;
   nextId: number;
@@ -200,7 +203,9 @@ export class ServerLink {
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish };
+    let sawExit!: () => void;
+    const exit = new Promise<void>((r) => (sawExit = r));
+    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit };
     this.run = run;
     if (target.where === 'local') {
       const processes = this.ports.processes!;
@@ -211,6 +216,15 @@ export class ServerLink {
         run.ended = true;
         options.launched?.();
         return { ok: false, failure: startFailure(e, target.setup.program, target.setup.secrets) };
+      }
+      // Stopped while the exe was still starting it: the process it then started is stopped here, and its
+      // exit awaited, before the start answers, so the next Start meets no orphan.
+      if (run.closing || (run.ended && !run.exited)) {
+        await this.ports.processes!.stop(run.process).catch(() => {});
+        await run.exit;
+        this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
+        options.launched?.();
+        return { ok: false, failure: { kind: 'exited', words: 'The server was stopped.' } };
       }
       // The exe answered: the owner's native start is over (5.1).
       options.launched?.();
@@ -250,6 +264,10 @@ export class ServerLink {
     if (!(__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'))) {
       run.closing = true;
       run.ready = false;
+      // The live exchange ends in this same step ("interrupted"): no pong or reply of it is taken after
+      // Stop. Its native writes still end only at the exit.
+      const ex = this.slot.ex;
+      if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
     }
     // The run's end answers a call in flight "interrupted, it may have partly run" (3.11).
     if (run.target.where === 'local' && run.process !== undefined) {
@@ -581,6 +599,7 @@ export class ServerLink {
   private processEvent(run: Run, e: ProcessEvent): void {
     if (e.t === 'exit') {
       run.exited = true;
+      run.sawExit();
       if (run.ended) return this.releaseWrites(run);
       this.endRun(run, exitFailure(e.code, run.last.text()), true);
       return;

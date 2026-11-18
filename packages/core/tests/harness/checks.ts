@@ -171,8 +171,8 @@ export const H2: Check = (r) => {
     }
   }
   for (const [id, n] of pongs) if (n > 1) problems.push(`H2: ${n} pongs for ${id}`);
-  // Nothing is admitted to a run after its Stop: no request, notification or idle ping's pong of that run
-  // starts once the Stop was made (a pong or cancel of an exchange already live may still go).
+  // Nothing reaches a run after its Stop: no request, notification or pong of that run starts once the
+  // Stop was made.
   for (const e of r.evidence) {
     if (e.what !== 'stop') continue;
     const address = r.server.mode.where === 'remote' ? `addr-${(e.server ?? 's1').slice(1)}` : 'local';
@@ -181,7 +181,8 @@ export const H2: Check = (r) => {
     if (epoch === undefined) continue;
     for (const x of r.exe.log) {
       if (x.server !== address || x.epoch !== epoch || x.seq < e.seq || !x.body) continue;
-      const opener = (x.body.method !== undefined && x.body.method !== 'notifications/cancelled') || (x.kind === 'write' && isPong(x.body) && localPongKey(r, x) === `idle:${x.body.id}`);
+      // Stop ends the live exchange in its own step too, so not even its pongs go out after it.
+      const opener = x.body.method !== 'notifications/cancelled';
       if (opener) problems.push(`H2: ${x.body.method ?? `the pong for ${x.body.id}`} sent to a run after its Stop (step ${e.step})`);
     }
   }
@@ -341,7 +342,9 @@ export const H13: Check = (r) => {
     const blocked = r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.start <= at && (y.end ?? Infinity) > at);
     // Another exchange live on the same run when an idle ping comes: it waits for no one, so it's departure 2.
     const busyElsewhere = p.id.startsWith('i') && r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method && y.body.id !== undefined && y.start <= at && (r.exe.responded.get(`${y.epoch}:${y.body.id}`) ?? Infinity) >= at);
-    if (draining || blocked || busyElsewhere) continue; // departure 2
+    // Stop ends the live exchange in its own step, so a ping that comes after it meets a drain.
+    const stopped = r.evidence.some((e) => e.what === 'stop' && e.step <= at && !r.exe.exits.some((t) => t.epoch === carrier.epoch && t.step < e.step));
+    if (draining || blocked || busyElsewhere || stopped) continue; // departure 2
     problems.push(`H13: local ping ${p.id} got no pong and no departure`);
   }
   return problems.slice(0, 3);
