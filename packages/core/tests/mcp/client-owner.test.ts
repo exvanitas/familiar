@@ -383,7 +383,7 @@ describe("5.4: a server's limits apply from the next start", () => {
   it('a changed handshake limit is the next Start\'s deadline', async () => {
     const store = memorySettingsStore();
     const delays: number[] = [];
-    const clock = { now: () => Date.now(), setTimer: (cb: () => void, ms: number, o: { background: boolean }) => (delays.push(ms), realClock.setTimer(cb, ms, o)) };
+    const clock = { now: () => Date.now(), setTimer: (cb: () => void, ms: number) => (delays.push(ms), realClock.setTimer(cb, ms)) };
     const client = await clientOf(store, speakingPort().port, { clock });
     await client.add({ setup: local('l1'), problems: [] });
     expect((await client.start('l1')).kind).toBe('ready');
