@@ -11,7 +11,7 @@ import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
 import { nodeNetPort } from './node-net.ts';
 import { callWithYes } from '../../src/testing/consent.ts';
-import { createCardDesk, type ConsentCard, type ConsentPort } from '../../src/index.ts';
+import { createCardDesk, OutsideDoc, type ConsentCard, type ConsentPort } from '../../src/index.ts';
 import { mutations } from '../../src/mutations.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
@@ -22,7 +22,7 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice>; review?: boolean } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
   const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
@@ -30,6 +30,12 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
   if (!serverId) {
     const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: testPaths });
     serverId = (await client.add(drafts[0]!)).id;
+  }
+  // The person's Test and Mark reviewed, while it's stopped: its tools' descriptions are theirs now.
+  if (extra.review) {
+    const report = await client.test(serverId);
+    if (!report.ok) throw new Error('Test failed');
+    await client.markReviewed(serverId, report.tools);
   }
   expect((await client.start(serverId)).kind).toBe('ready');
   const tools = client.tools();
@@ -136,7 +142,7 @@ describe('a server tool in the turn loop', () => {
     let held: ServerTool[] = [];
     let client!: McpClient;
     const policy = () => ({ perTool: toolPolicies(held, client.choices()) });
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-consent' });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-consent', review: true });
     held = one.tools;
     client = one.client;
     const echo = client.tools().find(t => t.serverName === 'echo')!;
@@ -164,6 +170,33 @@ describe('a server tool in the turn loop', () => {
     expect(cards[0]!.facts).toMatchObject({ server: one.serverId, tool: 'echo', fingerprint: changed.fingerprint });
     expect(cards[0]!.presentation).toMatch(/^[0-9a-z]+$/);
     expect(echoCalls(one.port)).toBe(2);
+    await one.journal.close();
+  });
+
+  it('a clean chat, but the request offers tools the person never reviewed: their descriptions are outside, so "always" asks and the card offers no Always (5.6)', async () => {
+    const world = nodeWorld();
+    const store = memorySettingsStore();
+    const cards: ConsentCard[] = [];
+    const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
+    const script = (r: ModelRequest): FakeReply => (r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'fakeserver__echo', arguments: { text: 'hi' } }] });
+    let held: ServerTool[] = [];
+    let client!: McpClient;
+    const policy = () => ({ perTool: toolPolicies(held, client.choices()) });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-unreviewed' });
+    held = one.tools;
+    client = one.client;
+    expect(held.filter(t => t.fresh).length).toBeGreaterThan(1);
+    const echo = held.find(t => t.serverName === 'echo')!;
+    await client.choose(echo.server.id, 'echo', { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint });
+    const t1 = await one.journal.send('Echo something.', 'turn-1');
+    if (!t1.replied) throw new Error('not replied');
+    await one.journal.turn(t1.turn.id).wait();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!).toMatchObject({ always: false, facts: { tool: 'echo' } });
+    expect(echoCalls(one.port)).toBe(1);
+    // The request's own outside record names the server, from its tool list alone.
+    const outside: any = await one.journal.read(OutsideDoc);
+    expect(Object.entries(outside.requests).some(([k, v]: [string, any]) => k.startsWith('request:') && v.sources.includes('server:fakeserver'))).toBe(true);
     await one.journal.close();
   });
 

@@ -66,6 +66,11 @@ export interface FamiliarTool {
   readonly readOnlyHint?: boolean;
   /** What it does, in a few plain words for the question after a restart: "saving a note". */
   doing(args: unknown): string;
+  /**
+   * A server's tool the person hasn't reviewed as it is now (5.6): its name and description are the
+   * server's word, so a request that offers it is outside, and "always" doesn't apply to any call it makes.
+   */
+  readonly fresh?: boolean;
   /** Bound to consent at the call (a server's tool): the facts a card shows and a decision binds to,
       read now. Undefined: the call can't be bound (not running, not offered, not plain JSON). */
   readonly consent?: { facts(args: unknown): CardFacts | undefined };
@@ -98,7 +103,8 @@ export interface Allowed {
   readonly outside?: boolean;
 }
 
-export type Gate = (call: { readonly name: string; readonly arguments: unknown }, api: any, context: Context) => Promise<{ refused: string } | Allowed>;
+/** `id` is the model's id for the call, which finds the reply that made it, and that reply's request. */
+export type Gate = (call: { readonly name: string; readonly arguments: unknown; readonly id?: string }, api: any, context: Context) => Promise<{ refused: string } | Allowed>;
 
 export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
   return defineTool({
@@ -109,7 +115,7 @@ export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
     execute: async (args: unknown, api: any, context: Context) => {
       // The gate again, inside the tool: a call pi-durable recovers after a crash (a read or a built-in
       // write, run again) never passes `beforeTool`, so it's checked here against today's policy.
-      const verdict = await gate?.({ name: tool.name, arguments: args }, api, context);
+      const verdict = await gate?.({ name: tool.name, arguments: args, ...(typeof api?.callId === 'string' ? { id: api.callId } : {}) }, api, context);
       if (verdict && 'refused' in verdict) return { isError: true, output: [{ type: 'text', text: verdict.refused }] };
       // The gate mints here, inside the execute, from the facts it checked: a tool bound to consent gets
       // its one-use decision, or nothing runs.

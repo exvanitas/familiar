@@ -29,6 +29,12 @@ const ERROR_PREFIX = 'familiar.model-error:';
  * `toModelRequest` hands it back on the next turn exactly as it came.
  */
 export const REPLAY_FIELD = 'familiarReplay';
+/**
+ * Where a reply keeps the key of its request's outside record (docs/mcp-design.md 5.6), stored with the
+ * reply like the replay: the gate reads it to know whether the request that made a call was outside.
+ * Never sent anywhere.
+ */
+export const REQUEST_FIELD = 'familiarRequest';
 
 function hex(text: string): string {
   return Array.from(new TextEncoder().encode(text), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -197,7 +203,8 @@ export function portProvider(port: () => ModelPort | Promise<ModelPort>, options
             ...snap(),
             stopReason: reason,
             usage: { ...ZERO_USAGE, input, output, totalTokens: input + output },
-            ...(event.replay ? { [REPLAY_FIELD]: event.replay } : {})
+            ...(event.replay ? { [REPLAY_FIELD]: event.replay } : {}),
+            ...(event.request ? { [REQUEST_FIELD]: event.request } : {})
           };
           out.push({ type: 'done', reason, message });
           out.end(message);

@@ -29,14 +29,14 @@ import { needsReply } from '../decide/ack.ts';
 import type { Decision, DecisionContext, DecisionPort, PastReaction, PersonaEvent } from '../decide/port.ts';
 import type { CallInfo, CapsConfig, CapsOptions, Clock, Ledger } from '../model/caps.ts';
 import { cappedPort, createCaps, emptyLedger, extendTurn } from '../model/caps.ts';
-import type { ChatMessage, ModelPort } from '../model/port.ts';
+import type { ChatMessage, ModelPort, ModelRequest } from '../model/port.ts';
 import type { RetryOptions } from '../model/retry.ts';
 import { withRetries } from '../model/retry.ts';
 import { journalUsageStore, LedgerDoc } from './ledger.ts';
 import type { OwnerLock } from './owner.ts';
 import type { PresencePort } from './presence.ts';
 import { presenceReporter, stateOf } from './presence.ts';
-import { decodeModelError, portProvider } from './provider.ts';
+import { decodeModelError, portProvider, REQUEST_FIELD } from './provider.ts';
 import type { JournalStore } from './store.ts';
 import { admit, boundWords, type Budget } from './bounds.ts';
 import { finishTurn, openTurn, recordSubmission, turnKeyOf, turnOfInputs, TurnsDoc } from './turns.ts';
@@ -403,27 +403,59 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     }
     return [...out].sort();
   };
-  /** The outside record of each turn request, written before it's sent and never changed. */
-  const recordOutside = async (): Promise<void> => {
-    const sources = await contextSources();
+  /**
+   * The outside record of each turn request, written before it's sent and never changed (5.6): the sources
+   * of its assembled messages, and the server of every tool it offers that the person hasn't reviewed as it
+   * is now, whose description is the server's word. Its key rides on the reply, for the gate.
+   */
+  const recordOutside = async (request: ModelRequest): Promise<string> => {
+    const sources = new Set(await contextSources());
+    for (const spec of request.tools ?? []) {
+      const t = tools.get(spec.name);
+      if (t?.kind === 'server' && t.fresh && spec.name.includes('__')) sources.add(`server:${spec.name.slice(0, spec.name.indexOf('__'))}`);
+    }
     const key = `request:${Math.random().toString(36).slice(2, 12)}`;
     await harness.commit(async (tx: any) => {
       const doc = await tx.doc(OutsideDoc);
-      doc.requests[key] = { sources, at: clock.now() };
+      doc.requests[key] = { sources: [...sources].sort(), at: clock.now() };
       keepNewest(doc.order, doc.requests, key);
     }, ctx);
+    return key;
   };
   const port = async (): Promise<ModelPort> => {
     const turn = await turnOf();
     const capped = cappedPort(options.model, caps!, () => ({ ...options.caps.call, turn, conversation: String(rootId) }));
     const retried = withRetries(capped, { ...options.retries, sleep });
-    // The request's outside record goes first, then the request.
+    // The request's outside record goes first, then the request; the reply carries the record's key.
     return {
       async *stream(request, signal) {
-        await recordOutside();
-        yield* retried.stream(request, signal);
+        const key = await recordOutside(request);
+        for await (const e of retried.stream(request, signal)) yield e.type === 'done' ? { ...e, request: key } : e;
       }
     };
+  };
+  /**
+   * Whether the request that made a call was outside (5.6), from that request's own record: found through
+   * the reply that holds the call (by the model's call id, newest first), and the key it keeps. No reply
+   * found, no key, or no record (the oldest go past 256): outside.
+   */
+  const callWasOutside = async (callId: string | undefined): Promise<boolean> => {
+    if (!callId) return true;
+    let cursor: unknown;
+    for (let pages = 0; pages < 8; pages++) {
+      const page = await root.entries({ order: 'descending' }, 100, cursor, ctx);
+      for (const e of page.items) {
+        const m = e.model?.[0];
+        if (m?.role !== 'assistant' || !(m.content ?? []).some((b: any) => b.type === 'toolCall' && b.id === callId)) continue;
+        const key = m[REQUEST_FIELD];
+        if (typeof key !== 'string') return true;
+        const record = ((await harness.snapshot(OutsideDoc, ctx)) as any)?.requests?.[key];
+        return !record || !Array.isArray(record.sources) || record.sources.length > 0;
+      }
+      if (!page.next) break;
+      cursor = page.next;
+    }
+    return true;
   };
   const { provider } = portProvider(port, { id: PROVIDER, modelId: options.modelId });
   const models = createModels();
@@ -534,11 +566,11 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
    * to this call. `beforeTool` runs it on every call, and each tool's own execute runs it again, for a call
    * recovered after a crash, which never passes `beforeTool`; the execute hands the tool how it was allowed.
    */
-  const gateCall = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<{ refused: string } | Allowed> => {
+  const gateCall = async (call: { name: string; arguments: unknown; id?: string }, api: any, context: any): Promise<{ refused: string } | Allowed> => {
     const v = await gateWords(call, api, context);
     return typeof v === 'string' ? { refused: v } : v;
   };
-  const gateWords = async (call: { name: string; arguments: unknown }, api: any, context: any): Promise<string | Allowed> => {
+  const gateWords = async (call: { name: string; arguments: unknown; id?: string }, api: any, context: any): Promise<string | Allowed> => {
     const refused = await bounded(api);
     if (refused) return refused;
     const tool = tools.get(call.name);
@@ -557,8 +589,9 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     const factsNow = (): CardFacts | undefined => tool?.consent?.facts(call.arguments);
     let facts = bound ? factsNow() : undefined;
     if (bound && !facts) return `${call.name} can't be sent now: its server isn't running, it no longer offers this tool as it was, or the arguments aren't plain JSON.`;
-    // "Always" never acts on outside content (5.6): while the conversation carries any, it asks.
-    const outside = bound ? (await contextSources()).length > 0 : false;
+    // "Always" never acts on outside content (5.6): if the request that made this call was outside (its own
+    // record, unreviewed tool descriptions included), it asks, and the card offers no Always.
+    const outside = bound ? await callWasOutside(call.id) : false;
     if (policy === 'allow' && bound && outside) policy = 'ask';
     if (policy === 'allow') return { allowedBy: 'always', ...(facts ? { facts, outside } : {}) };
     const stored: (ConsentCard & { answer?: 'allow' | 'deny' }) | undefined = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];

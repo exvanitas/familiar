@@ -111,9 +111,10 @@ export type ModelEvent =
   | { readonly type: 'tool-call'; readonly call: ToolCall }
   /**
    * `unreported`: the endpoint gave no usage for the call, so `usage` holds zeros that mean nothing.
-   * Spend is then unknown, never zero.
+   * Spend is then unknown, never zero. `request` is the journal's own: the key of the request's outside
+   * record (docs/mcp-design.md 5.6), which the stored reply keeps for the gate. Adapters never set it.
    */
-  | { readonly type: 'done'; readonly stopReason: StopReason; readonly usage: Usage; readonly replay?: Replay; readonly unreported?: true }
+  | { readonly type: 'done'; readonly stopReason: StopReason; readonly usage: Usage; readonly replay?: Replay; readonly unreported?: true; readonly request?: string }
   /**
    * `usage` is what the endpoint had reported when the reply ended, so spend can still be counted.
    * `usageFinal` says it is the endpoint's final count for the call; without it, it may be partial.
