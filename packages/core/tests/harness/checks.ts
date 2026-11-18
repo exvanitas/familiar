@@ -311,12 +311,12 @@ export const H12: Check = (r) => {
 
 /** H13: every ping the server sent has one disposition: a pong handed off for it, or a named departure
     whose own condition holds in the log (1 a flood, 2 a local ping while its exchange drains or a write is
-    blocked, 6 after the final response on its stream). A handed-off pong's native fate is logged apart
+    blocked, 5 after the final response on its stream). A handed-off pong's native fate is logged apart
     (pongFates) and never fails H13. A ping that never reached the client isn't the client's. */
 export const H13: Check = (r) => {
   const problems: string[] = [];
   // Handed off: a pong the client didn't itself cancel before its head (the exe's own fate, stall, timeout
-  // or busy, is departure 7 and logged apart; the client's cancel is no handoff).
+  // or busy, is departure 6 and logged apart; the client's cancel is no handoff).
   const handed = new Set(r.exe.log.filter((x) => isPong(x.body) && (x.cancelAsked === undefined || (x.head !== undefined && x.head <= x.cancelAsked) || x.refused)).map((x) => String(x.body!.id)));
   const words = (token: string) => {
     const o = r.evidence.find((e) => e.what === 'outcome' && e.token === token)?.outcome;
@@ -326,7 +326,7 @@ export const H13: Check = (r) => {
     if (handed.has(p.id)) continue;
     const post = r.exe.log.find((x) => x.kind === 'post' && x.delivered.has(p.id));
     if (post) {
-      if (post.final !== undefined && post.delivered.get(p.id)! > post.final) continue; // departure 6
+      if (post.final !== undefined && post.delivered.get(p.id)! > post.final) continue; // departure 5
       if (/too many pings/.test(words(tokenOf(post.body)))) continue; // departure 1
       problems.push(`H13: ping ${p.id} on request ${post.n} got no pong and no departure`);
       continue;
@@ -347,7 +347,7 @@ export const H13: Check = (r) => {
   return problems.slice(0, 3);
 };
 
-/** Departure 7, logged, never judged: what happened natively to each handed-off pong. */
+/** Departure 6, logged, never judged: what happened natively to each handed-off pong. */
 export function pongFates(r: WireRun): Record<string, number> {
   const fates: Record<string, number> = {};
   for (const x of r.exe.log) {
@@ -447,7 +447,7 @@ export const WITNESSES: Record<string, (r: WireRun) => boolean> = {
   'H12 a modern run': (r) => r.exe.log.some((x) => x.headers['mcp-protocol-version'] === '2026-07-28'),
   'H13 departure 1 (a flood)': (r) => r.evidence.some((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && /too many pings/.test(e.outcome.words)),
   'H13 departure 2 (a local ping while draining or blocked)': (r) => r.server.pings.some((p) => r.exe.pingDelivered.has(p.id) && !r.exe.log.some((x) => isPong(x.body) && String(x.body!.id) === p.id)),
-  'H13 departure 6 (a ping after the final)': (r) => r.exe.log.some((x) => x.final !== undefined && [...x.delivered.values()].some((d) => d > x.final!)),
+  'H13 departure 5 (a ping after the final)': (r) => r.exe.log.some((x) => x.final !== undefined && [...x.delivered.values()].some((d) => d > x.final!)),
   'H13 a ping with the final reply, answered': (r) => r.exe.log.some((x) => x.final !== undefined && [...x.delivered].some(([id, d]) => Math.floor(d / 1000) === Math.floor(x.final! / 1000) && d < x.final! && r.exe.log.some((y) => isPong(y.body) && String(y.body!.id) === id))),
   'H14 a 404 and its re-handshake': (r) => r.exe.log.some((x) => x.status === 404),
   'H14 a redirect': (r) => r.exe.log.some((x) => x.redirected)

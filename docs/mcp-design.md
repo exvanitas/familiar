@@ -1,303 +1,963 @@
 # The MCP client
 
-Step 7 of the [build order](design.md#build-order). Familiar's client for MCP servers: local servers it starts through the exe, and remote servers it reaches through the guarded fetch. The code is `packages/core/src/mcp/`. The exe's half (the approval dialog, the job, blanking secrets) was built in step 3 and is in [shell-design.md](shell-design.md#5b-starting-a-local-mcp-server).
+Step 7 of the [build order](design.md#build-order). Familiar's own client for MCP servers: local servers it starts through the exe, and remote servers it reaches through the guarded fetch. It speaks both eras of the protocol itself, with no MCP SDK. The exe's half (the approval dialog, the job, blanking secrets, the guarded fetch) was built in step 3 and is in [shell-design.md](shell-design.md#5b-starting-a-local-mcp-server).
 
 | Part | Where |
 | --- | --- |
-| The state machine of one server | `packages/core/src/mcp/machine.ts` |
-| The actor that runs it | `packages/core/src/mcp/actor.ts` |
-| The MCP session over a transport | `packages/core/src/mcp/session.ts` |
-| The local transport, over a process port | `packages/core/src/mcp/process-transport.ts` |
-| The remote transport, over a fetch | `packages/core/src/mcp/remote.ts` |
+| The client: saved servers with their runs, Add, Test, start, stop, remove, a turn's tools, `send` | `packages/core/src/mcp/client.ts` |
+| One server's link: the wire, the exchange slot, the handshake, pages, calls, pongs | `packages/core/src/mcp/wire/link.ts` |
+| The exchange machine, a pure function | `packages/core/src/mcp/wire/exchange.ts` |
+| The six message kinds Familiar may send | `packages/core/src/mcp/wire/framing.ts` |
+| The parser for a server's untrusted answers | `packages/core/src/mcp/wire/parse.ts` |
+| The modern era's mirrored headers | `packages/core/src/mcp/wire/headers.ts` |
+| `ToolDecision`, consent bound to the exact call | `packages/core/src/mcp/decision.ts` |
+| The owner of durable tool config | `packages/core/src/mcp/owner.ts` |
+| One server's runs | `packages/core/src/mcp/runtime.ts` |
 | A tool list's bounds and fingerprints | `packages/core/src/mcp/catalog.ts` |
+| Server tools as the turn loop sees them | `packages/core/src/mcp/server-tools.ts` |
+| Adding by paste or form, setups, the unpinned flag | `paste.ts`, `setup.ts`, `unpinned.ts` in `packages/core/src/mcp/` |
 | The exe's path and address rules, mirrored | `packages/core/src/mcp/native-rules.ts` |
-| The saved record, fenced by incarnation and revision | `packages/core/src/mcp/saved.ts` |
-| The desktop process port, over the exe | `apps/desktop/src/mcp.ts` |
+| Questions as a view over pi-durable's record | `packages/core/src/journal/view.ts` |
+| The card desk: cards shown, and answers from other windows | `packages/core/src/journal/desk.ts` |
+| Named mutation switches, for the test build only | `packages/core/src/mutations.ts` |
 
-## One actor per server
+Section numbers are stable: code comments and tests cite them ("docs/mcp-design.md 3.4").
 
-Step 3's reviews found races with one cause: a setup's state changed under different locks at different moments. The exe fixed it with one owner per setup. The client is built the same way from the start.
+## 0. The premises
 
-Each server has one actor. It is the only thing that changes that server's state. Everything that happens to a server is a message to it, handled one at a time, in order:
+- **P1. No background runs.** A moment, or her words around a reminder, is one model call with no tools, outside the journal's runs. Her line enters the chat as a write that can't start a run.
+- **P2. Familiar never starts or places a run on its own.** Every submission is your act, a message or an answer, made in one commit that reads pi-durable's state. A question is a view over pi-durable's `pi.live.runFailure`, read live. The journal never starts or places a run by itself. `afterFailedRun` stays `keep`, and no `afterRun` hooks are selected.
+- **P3. Familiar's own small client** for local and remote servers, speaking both eras: legacy (the five versions 2024-10-07 to 2025-11-25) and modern (2026-07-28), the latter when a server refuses the legacy handshake. Familiar's code is the only thing that sends. It runs one exchange at a time per server, behind a cleanup barrier, and the last check and the native handoff are one synchronous function.
+- **P4. The exe bounds what it owns.** Helpers are detached at a bound, chat's share of the 32 open requests is reserved, and the local write bound lives in the exe.
+- **P5. Observe, don't predict.** The real pi-durable and the real client run against a scripted fake server and an unkind fake exe, under seeded interleavings. The checks are independent of the code they check.
 
-- **Commands**, from the app: start, stop, call, stop a call, edit, list the tools again, remove.
-- **Completions and events**, from the transport, the store and the clock: the run started, the handshake finished, a call's answer, the tools changed, a tool list's answer, an edit saved, a removal done, the run closed, a deadline came.
+Standing rules the design keeps:
 
-Nothing goes around it. Two rules hold every effect that changes something outside the actor (step 7's second review found both broken, with one shape: the actor serialized decisions, not effects):
+- no automatic restart after a crash;
+- Test only while Stopped;
+- recovery only at exe start, and any reload makes the app restart-only;
+- consent is one-use, bound to the exact call, and checked at the native handoff;
+- tools keep their own names, under frozen keys;
+- legacy-era servers are supported;
+- a legacy server's ping is answered as the spec requires, and every departure from that is named.
 
-1. **Every change goes through the actor.** The whole saved record lives in the actor: the setup, whether it starts with the app, its limits and the tools the person reviewed. An edit of the setup (admitted only while stopped or down), the other changes (`setEnabled`, `setLimits`, `markReviewed`), the new tool list's fingerprints, the deletion of secrets an edit dropped, the add and the removal are all messages to it. An add is tracked from its first moment, with its address, before the exe's dialog, so a second add of the same id or address is refused while it runs. Each run is started from the record committed at its launch, which stays bound to that run.
-2. **An effect stays owned until it settles.** A deadline answers the caller (timed out, "it may still finish"), but the server stays busy for anything that conflicts until the effect lands, and what lands late is what's kept: a write that lands late is committed; a removal that lands late removes. Nothing is released early, so nothing can land on top of something newer. This holds for writes and deletes of the saved record, Credential Manager deletes, the exe's address add and remove, and `server_forget`.
+## 1. What you see
 
-The saved record has one write in flight and a dirty flag for the next, with no list of waiters beyond the actor's admission cap. Callers of a change wait within it (8), and past it are refused at once.
+- **Her moments and reminder remarks** are one call each, with no tools. If the app is killed mid-call, the moment is lost, never shown late. A reminder itself is never lost: its notification and its chat line are written as before ([turn-design.md](turn-design.md#parked-waits)). Only her words around it can be.
+- **What her model sees.** When she speaks into a quiet chat (nothing running, nothing queued, no question open), her model sees what she said. When she speaks while you're mid-turn or a question is open, the line is shown but her model doesn't see it.
+- **After a failed run**, messages you queued stay on screen, marked as waiting. There's one **Send now** for the queue, which sends the oldest first. Nothing sends them for you.
+- **In a long chat, the summary happens inside a turn.** When the conversation nears the model's context limit, her next reply first waits for the summary. Nothing is summarized quietly in the background between turns (2.5, row 1).
+- **A card asked again is a new card.** If the tool or its arguments changed, an answer to the old card answers nothing.
+- **A question holds your queued message.** Yes sends it, and the stopped run's work goes on. No, or Skip, also sends it: your model sees the stopped run's last tool results before your message.
+- **A new message while a question is open** sends anything queued, then yours, and the question is gone. Its card says "Closed: you moved on".
+- **One thing at a time per server.** A call to a server that's starting, re-reading its tools or answering another call is refused at once: "busy, try again".
+- **A call that times out or is stopped** ends alone, and the server keeps running. Stopping the server itself answers a call in flight "interrupted, it may have partly run".
+- **A crashed server** says so with its last output and waits for Start.
+- **A remote server that ended its session** gets one fresh handshake. The call that met it fails ("the server had ended its session") and is never resent: ask again, and a card call shows a new card. If the server does it again straight away, it waits for Start.
+- **A local server that stops reading** what Familiar sends is stopped within about 10 seconds, even if the main page has gone.
+- **A server that floods pings** has that one operation end, with "the server sent too many pings".
+- **A server that speaks only MCP 2026-07-28** works. Its tool list is re-read only at start and on Test. A legacy server's list is also re-read after a call's reply says the tools changed; a modern server sends that news only on a long-lived subscription Familiar doesn't open. A modern tool whose declaration breaks the protocol's header rule isn't offered, and Test says why.
+- **After a Stop**, a DNS lookup already asked can finish in the background. Nothing is sent for it.
+- **A remote server that answers with a redirect** has the redirect refused, with its status in words. Familiar never follows it (4.4).
+- Test and edits only while stopped, revokes that hold at once, "always" off while outside content is in the conversation, and "Familiar needs a restart" after a reload.
 
-**What guards each effect:**
+## 2. The journal side
 
-| Effect | Guard |
-| --- | --- |
-| Writing the saved record | A revision check in the same IndexedDB readwrite transaction: it lands only on the same incarnation at a lower revision (`saved.ts`) |
-| The first write of an added server | The same transaction: it lands only where nothing is saved under the id |
-| Deleting the saved record | The same transaction: it deletes only its own incarnation |
-| Credential Manager deletes (an edit's cleanup, a removal) | Ownership until settled: no edit, add or removal of the server starts until the delete lands |
-| The exe's address add and remove | Ownership until settled: the add's entry holds the address from before the dialog; a removal holds the id until it lands |
-| `server_forget` (the exe's approval) | Ownership until settled, within the removal |
+### 2.1 Her line: one model call, one commit
 
-Credential Manager and the exe can't take a revision, so ownership is their only guard; the store can, so it has both.
+A moment, or a reminder's remark, is made like this:
 
-The rules are a pure function in `machine.ts`: a state and a message in, a new state and a list of effects out. The effects are what the actor then does: start a run, send a call, cancel a call, close a run, arm a timer, answer a caller. Nothing in the machine waits or touches I/O, so a property test can drive it with any order of messages.
+1. **The decider asks for a line**, as [persona-traits.md](persona-traits.md) defines it.
+2. **Core makes one model request with no tools**, through `cappedPort`, so the caps count it. The ledger needs a turn key for its reservation, so the request gets its own key (`moment:<random>`), which is never resumable: its reservation settles when the call returns, or becomes a spent record at its deadline if the app dies ([turn-design.md](turn-design.md#durable-cap-reservations)). A paused cap means she stays quiet, with no question and no line. A moment ends silently; a reminder's delivery stands.
+3. **Core writes the request's outside record** (5.6) before sending, as for any request. Her remark's sources are the union of the sources of what her prompt included.
+4. **One commit writes her line.** It reads `pi.live` and the inbox (`tx.doc(InboxDoc, root.id)`, pi-durable's typed handle) before its admission, then writes through `root.submit(tx, …)`:
+   - if no run is live, the inbox is empty and `runFailure` is unset: a write with `model`. pi-durable appends it and starts no run;
+   - otherwise: a display-only write, appended at once, busy or idle, which never restarts failed work.
 
-### The states
+   Either way the entry carries her remark's sources, in the same commit.
+5. **If the app dies before step 4**, nothing is written. The moment is lost by design.
+
+**Why each check is needed:**
+
+- **The empty inbox.** A write that isn't display-only, into an idle conversation with queued items, runs a final boundary and starts your queued message. That would be a run Familiar started. The check is never dropped, and never inferred from other state.
+- **No `runFailure`.** A model-visible remark after a failed run would end the context. Your later Send now, or a Yes, would then continue a context ending in her words and find nothing to answer.
+
+**What role her line takes.** It's a **user-role note** in the journal: "Familiar's note: she said …". pi-ai passes messages through unmerged, and local model templates (Ollama, LM Studio) commonly refuse roles that don't alternate. So **`toModelRequest` merges consecutive same-role text messages before the wire**: a note followed by your message becomes one user message, and two notes become one. Tool calls, replay state and tool results are never merged, so no signed assistant content is touched. A test checks that every request body alternates roles.
+
+One side effect, intended: after a failed run, an unanswered message of yours and the next one reach the model as one user message.
+
+**What this removes:** background submission, `whenBusy: "reject"`, a background document, the gate's background check, every "end a background run instead of asking" rule, and placement after background endings.
+
+### 2.2 Questions are `runFailure`, read live
+
+pi-durable records why the newest run ended without an answer in `pi.live.runFailure`. It sets the field in the commit that settles the run's inputs `unanswered`, and removes it in the next commit that starts a run. The record holds the run's task id, its input ids, the reason and a detail.
+
+**The precondition.** A run started in the same commit as the failure keeps it, and so does a run that later answers. Two things start a run in that commit: a reset, and `afterFailedRun: "continue"`. Either would make an old question read as open again once that run answered. Section 2.5 rules both out, with tests. With them ruled out, a failure lasts exactly until the next run starts.
+
+A question is a view over that record (`journal/view.ts`):
+
+| Question | Open when (all read in one transaction) | Detail comes from |
+| --- | --- | --- |
+| The step cap, "I've taken 8 steps on this. Shall I keep going?" | No run is live, `runFailure.reason` is `turn_limit`, and no answer is recorded for this `runFailure.taskId` | [The step cap](turn-design.md#the-step-cap) |
+| A cap pause | `reason` is `model_error`, and the detail decodes (`decodeModelError`) to a `paused` error. No answer recorded | The decoded pause: the turn cap's "Say yes to give it 5000 more", or a daily or dollar cap's words ([turn-design.md](turn-design.md#caps-that-pause-not-fail)) |
+| Run again, or "Do it now?" | `reason` is `aborted`, and an interruption record exists for this `taskId`. No answer recorded | The interruption records |
+| Error | `reason` is anything else (`model_error` that isn't a pause, `no_model`, `interrupted`, `restart_limit`, `faulted`, `orphaned`, `nothing_to_answer`), or `aborted` with no interruption record (your own Stop) | Not a question: the state is `error`, or idle after a Stop, and the chat shows the reason |
+
+**A pause inside a compaction.** A pause hit by a blocking compaction's own summary request arrives as `Compaction failed: Summarization failed: <coded error>`. The view strips both prefixes before decoding.
+
+**The interruption records.** When a cut-off effect or server call becomes a `redo` or `rerun` question, the `afterTools` hook stores one record per interrupted step (which tool, what it was doing, the step id), grouped under the run's task id. The hook then stops the run with `abortTask` ([turn-design.md](turn-design.md#parked-waits)). A run whose task is aborted ends with reason `aborted` and keeps its inbox. The records are inert unless `runFailure` names their task. If the app dies between the records and the abort, pi-durable resumes the task, the calls are still interrupted, and the hook writes the same records again and aborts. If it dies before the records, nothing is shown.
+
+**Several interrupted steps in one round make one question.** In a sequential round an interrupted call commits its result and the next call still starts, and `afterTools` runs once, after every call. So two uncertain effects can share one task. The question lists every interrupted step of that task, and one answer settles all of them: Run again redoes every listed step; Skip skips every one, and the gate refuses each listed tool for the rest of the turn. One question per task keeps "open" exactly the view of pi-durable's record, which names one task. Per-step answers would need an open or closed state per step that `runFailure` can't give, which would be state Familiar holds.
+
+**The answer record**, written by the answer's own commit (2.3), keyed by `runFailure.taskId`. It closes the question even when the answer starts nothing.
+
+**Why it holds.** Nothing records a question after pi-durable's commit. A new run removes the failure in its own starting commit, so a delayed answer finds a superseded question closed. The ledger, presence and the gate all read this same view.
+
+### 2.3 Answers: one commit, checked inside it
+
+An answer is one commit ([turn-design.md](turn-design.md#a-persons-actions)). P2 adds what that commit reads:
+
+1. **Read** `pi.live`, the inbox, any `tx.submission(id)`, the interruption records and the answer records, inside the commit. Every read comes before the commit's admission: `tx.submission` throws `ReadAfterWrite` after the first table write.
+2. **If the question isn't open**, return what's recorded and change nothing. "Not open" means a run is live, `runFailure` names another task, or an answer is already recorded. The card shows "Closed: you moved on" or the earlier answer.
+3. **Otherwise, record the answer and submit what it starts**, in the same commit:
+
+   | Question | Yes | No or Skip |
+   | --- | --- | --- |
+   | Step cap | `continue`, with a fresh 8 steps; the turn's call bound still applies | If a message is queued, as read in the commit: `continue`, which places the oldest first, so your model answers it. Otherwise nothing, and the turn is finished |
+   | Turn cap pause | `continue`, plus the extension in the ledger, once per Yes id | As above |
+   | Daily or dollar cap pause | `continue`, only if there's room again; otherwise it pauses again without spending | As above |
+   | Run again | An input asking her to do every listed step again, through the gate | Skip: a `continue`, so the turn goes on without the calls; the gate refuses each listed tool for the rest of the turn |
+   | "Do it now?" | The same, asking consent again | As Skip |
+
+The `continue` and the input are each the commit's one admission, made before its other table writes. A `continue` places queued items first and they join the run. By default a boundary takes the first queued follow-up and leaves the rest queued, in order. Familiar doesn't model that order; pi-durable does it.
+
+Two answers at once, or an answer retried after a restart, find the first one's record and start nothing more.
+
+**Which turn a started run belongs to.** A run's budget, its cap extensions and its calls are charged to one turn ([turn-design.md](turn-design.md#bounds-on-tool-calls)). The admission commit records which, by one rule: **the turn of the first input the run places.** The boundary places the oldest queued item first, and `followUpMode` stays `one-at-a-time` (2.5, row 18).
+
+- **No queued item, so the run places nothing:** it belongs to the answered question's turn. That covers a Yes, or a Skip that continues.
+- **A queued item placed first:** it belongs to that item's turn, and the answered turn is finished.
+
+This holds the same for a No that places your message, for Send now, and for a Yes made while a message is queued. A Run again input queued behind another message belongs to the old turn, and its run, when it starts, is charged there.
+
+### 2.4 A queued message: Send now, and a new message
+
+- **Send now is one action for the queue.** It's shown beside the oldest queued message whenever no run is live, a message is queued, and no question is open (2.2).
+  - **Why one button, not one per message:** the boundary places the oldest item first, so a button on a later message would send an earlier one.
+  - **The button carries two things:** the oldest item's submission id, and the `runFailure.taskId` it was shown for (or "no failure").
+  - **Its one commit** reads `pi.live` and `tx.submission(id)`, both before its admission. If the conversation is idle, `runFailure` still names that task, no question is open, and that submission is still `queued`, it submits a `continue`, which places the oldest first. If any of those has changed, it does nothing, and the button moves or goes away.
+  - **It leaves a record**, keyed by its request id, holding the submission it was offered for and what it sent (`SendNowDoc`). A retried Send now finds it, and the harness's H7 reads it.
+  - **Nothing else can move the item.** Familiar never withdraws a queued message: no conversation or submission abort exists (2.5, row 17).
+  - It's your act, and the only way a message stranded after an error, a Stop or a pi-durable fault goes on.
+- **A new message** goes through `send`, once per request id. pi-durable decides what happens:
+  - **idle, empty inbox:** it starts a run;
+  - **idle, with queued items:** it queues the new message behind them and runs a final boundary in the same commit, which starts the oldest;
+  - **busy:** it queues as a follow-up.
+
+  So a message's commit either starts a run, or queues behind one when busy, and an open question closes with it. **The exception is a bare "ok" or "thanks"** that needs no reply: a display-only `familiar.ack` write, which starts nothing and leaves any open question open.
+- **A message sent while a card is open** waits behind the card (5.10).
+
+**Why nothing is stranded unseen.** pi-durable keeps the inbox after an unanswered or aborted run. Each ending leaves one of these:
+
+- a question that holds the inbox (2.2);
+- an error or a Stop, which shows Send now;
+- an answered run, which places its follow-ups.
+
+The one pi-durable path that leaves a queue without `runFailure` is an after-run task cut off at the restart limit. It can't arise, because no `afterRun` hooks are selected (2.5, row 5). Even if it did, Send now would show, carrying "no failure", and the same commit check would apply.
+
+### 2.5 P2's preconditions: pi-durable's own paths, all of them
+
+P2 holds only if nothing but your acts admits a submission, runs a boundary or starts a run. This table lists every path pi-durable 1.5.2 has for that, besides the host's own `submit` and `continue`, each with its pin and its check. The tests are in `packages/core/tests/journal/pins.test.ts`, where a module-graph test walks core's bundle for call sites.
+
+| # | Path | On by default? | Pin | Check |
+| --- | --- | --- | --- | --- |
+| 1 | **Background compaction.** A conversation-owned summary is a write submission. Into an idle conversation with queued items it runs a final boundary that places them, starts a run, and clears `runFailure` | Yes (`backgroundTokens: 32768`) | `compaction.backgroundTokens: 0` in the journal's settings, and Familiar sets no model overrides. No conversation `configure({compaction})` is ever called. At open, before `resume()`, any compaction task already persisted (from a journal made before the pin) is aborted, not resumed | A test reads the resolved policy, asserts 0 with no override, and checks the engine runs with exactly those settings. A second opens a journal holding an old compaction task: the queued message stays queued and the step-cap question stays open. S6 (7.2) |
+| 2 | **Manual compaction**, `compact()`: the same placement as row 1 | Only if called | Never called | Module graph |
+| 3 | **Blocking and overflow compaction**, owned by the generation. It appends while the generation holds the run, and places and starts nothing. Its failure ends the run `model_error` with `Compaction failed: …` | Yes | **Kept on purpose.** It's how a long chat is summarized (section 1) | The view decodes the prefixes (2.2). T13 runs a cap pause during a blocking compaction |
+| 4 | **`afterFailedRun: "continue"`**: a final boundary in the failure's commit, whose run keeps `runFailure` | No (`keep`) | Left at the default | A settings test. The mutation, `"continue"`, must fail H7 |
+| 5 | **`afterRun` hooks and after-run tasks**: the boundary moves to `drain`, and tasks may submit with a fresh turn budget. A cut-off `finish` or `drain` leaves the queue with no `runFailure` | No, unless an extension selects one | None selected | The engine's hook list is empty |
+| 6 | **`onYield` continuation**: after a `stop` or `length` answer with nothing queued, it appends a continuation and resets `turns` to 0, which bypasses the step cap | No, unless selected | No `onYield` hook | The engine's hook list, and the module graph |
+| 7 | **Resets**: `root.reset()`, and a tool's `control: { handoff }`. A queued reset starts a successor in the same commit, keeping `runFailure` | Only if called or returned | Never | Module graph for `reset(` and `handoff` |
+| 8 | **`terminate` control**: a round whose every result asks to terminate uses the final boundary, and queued follow-ups start | Only if returned | Familiar's tools never return it | Module graph |
+| 9 | **Steers** (`whenBusy: "steer"`), placed at the next `postTools` | Only if passed | Your messages are follow-ups: `send` passes no `whenBusy` | Module graph |
+| 10 | **Writes that aren't display-only** (`model`, `head` or `edits`): into an idle, non-empty inbox, a final boundary starts the oldest item | Only if sent | **Every Familiar write except her line is display-only**: the reminder line, `familiar.ack` and `familiar.notice`. Her line is model-visible only under 2.1's one-commit check | A test that each of those writes carries no `model`, `head` or `edits`, and that the reminder line is a submission, never a raw `appendEntry` |
+| 11 | **Subagent reporter tasks**: a background reporter posts a child's answer to the parent as a follow-up, and resumes after a restart | Only with a subagent extension | No subagent extension or tools | Exactly one extension is installed, Familiar's own |
+| 12 | **Tools submitting or continuing** through `api.conversation(id)` or `ConversationHandle.submit` | Only if a tool does it | No Familiar tool does | Module graph |
+| 13 | **Raw `tx.createSubmission()`**, with no admission rules | Only if called | Never | Module graph |
+| 14 | **Recovery at open** (`resume()`) resumes live tasks: a generation goes on in its own run, and compaction (1), reporter (11) and after-run (5) tasks resume with their effects | Always | Covered by pinning 1, 5 and 11, plus the sweep in row 1 | Kills at every commit with a message queued behind a failure: no run starts at open |
+| 15 | **Wakeups** (`parkUntil`, `onWake`): pi-durable runs the woken phase and starts nothing itself | Familiar's own | The reminder line is display-only (row 10) | Row 10's test, and turn-design's `wake-delivery` kill test |
+| 16 | **Generation retry and deferred poll**: the same run resends its model request, with no new run and no boundary | Yes | Errors are hex-coded, so only a cut-off request is resent, which is intended ([turn-design.md](turn-design.md#the-journal-facade)). Model requests only, never MCP | None needed for P2 |
+| 17 | **Conversation and submission abort**: withdraws queued inputs, starts nothing | Only if called | Never. Stop is `abortTask` | Module graph for `.abort(` on a conversation or submission handle. This is what makes 2.4's "nothing else can move the item" true |
+| 18 | **Queue modes** (`followUpMode`, `steeringMode`): `all` places every item at once | No (`one-at-a-time`) | Left at the default | A settings test, so "the oldest first" (2.3, 2.4) stays true |
+
+**The submit call sites.** Only these submit, and none of the run-starting ones submits from a callback, a timer, a run's ending or an open:
+
+- run-starting or queueing: `send`, `answer` and Send now;
+- her line, which never starts a run (2.1);
+- two display-only writes:
+  - the gate's bound notice, a `familiar.notice` written from inside the tool call;
+  - the reminder line, a `familiar.reminder` written by the wake task on its timer.
+
+A display-only write is appended at once, busy or idle, and starts nothing. The module-graph test fails on any other call site, and on `compact`, `reset`, `handoff`, `terminate`, `createSubmission`, a conversation or submission abort, `configure`, a steer, `afterRun` or `onYield` anywhere in core. The open-time sweep of row 1 is needed: without it, a compaction task persisted before the pin places queued input even under `backgroundTokens: 0`.
+
+**An upgrade of pi-durable** must recheck this table against the new spec before the pin moves. It's a list of a dependency's own behaviours, and only the pinned version has been read.
+
+### 2.6 What changes in step 5's code
+
+| Part | Before ([turn-design.md](turn-design.md)) | Now |
+| --- | --- | --- |
+| Turn registry, questions | A pause or the step cap records its question when the run ends. Open questions are stored per turn | Removed. Questions come from the view in 2.2. The registry keeps budgets, each submission's id and turn (written in its admission commit), the interruption records and the answer records |
+| Turn registry, "finished" | A turn is marked finished when its run ends with no question, or on a No | The mark stays as a hint for display and for the 64-turn limit. Anything that must not lose a resumable turn decides "resumable" live, in its own commit: from `pi.live` (the run, `runFailure` and its input ids mapped to turns), each of the turn's submissions read with `tx.submission(id)` (any still `queued`), and the consent document (an open card) |
+| Ledger fold | Reads which turns can resume from the registry | Reads the live facts above in the same commit. A turn with an open question, a card, a queued submission or a call in flight is never folded. Queued submissions are read one by one with `tx.submission(id)`, never from a view of the inbox, since a Run again input belongs to the old turn and such a view could miss it |
+| Presence | `waiting` from the consent and question documents | `waiting` from the consent document and the view in 2.2; `error` from the view's error row |
+| `answer` | One commit with an in-commit check | The same, plus the reads in 2.3 |
+| The parked-interruption gate | Refuses another call of a tool waiting on Run again, from the question document | Refuses it while the view shows the interruption open, or after a Skip recorded in this turn |
+| The cap read-back | The journal reads the pause back after the run ends and records a `cap` question | Removed. The view decodes `runFailure` |
+| Send now | Not present | 2.4, one action for the queue |
+| Writes | The reminder line, `familiar.ack`, `familiar.notice` | Each confirmed display-only by test (2.5, row 10) |
+
+Step 5's tests run again on this: the kill tests, the person tests, the bounds and caps property tests, and the turn registry tests. The tests that asserted "record the question at the end" now assert the view. Recording the question after the run ends, the old shape, is a named mutation that must fail H6 and H7 (7.2).
+
+### 2.7 The recovered-run gate
+
+pi-durable 1.5.2 can't give a recovered run its own tools: there's one tool registry per harness, resolved against a fresh snapshot each phase. So:
+
+1. Before `resume()`, while nothing runs, core reads `pi.live`. If a run is live, it notes that run's identity in memory: `run.inputs[0]`, else `run.first`. `run.inputs[0]` is stable across a run's generations.
+2. The gate refuses every server call while the current run has that identity: "This turn was resumed after a restart, so server tools aren't used in it. They work again from your next message."
+3. The gate sits first after the bounds, in `beforeTool` and again in `execute`, before any decision is minted. It never waits.
+4. Server calls whose intent was committed stay `interrupted`.
+
+Nothing is recorded durably, so there's no commit to keep in step. The identity is noted before any task can run.
+
+## 3. The client
+
+### 3.1 Shape
+
+One client module runs in the core window. It doesn't use an MCP SDK: `tests/mcp/bundle.test.ts` bundles it for the browser and fails on any Node built-in or any `@modelcontextprotocol` module, and `tests/mcp/no-eval.test.ts` runs it with code generation from strings off, as under the app's CSP.
+
+**For each server** (by server id, across its runs) the link holds the **exchange slot**: the current exchange, or none. The slot outlives a run. A Stop ends the run, but a Start of the same server is refused busy until the old run's exchange has drained, because a remote Stop has no native exit to wait for. **For each server run** (one Start to one end) it holds:
+
+- the run id from the exe;
+- the era, legacy or modern, decided once at the run's start (3.3) and never changed;
+- the negotiated protocol version;
+- the session id, for a remote server that gave one;
+- the catalog, and its stale bit;
+- the closed mark, set by Stop (3.4).
+
+There's no queue, no second exchange, and no timer that isn't an exchange's own.
+
+The client's surface toward the wire:
+
+- `start(run)` and `stop(run)`, called by the runtime lifecycle (5.4);
+- `list(run)`, called at start, on Test, and on a legacy run whenever `list_changed` has set the stale bit: after the call whose stream carried it, or at once if it arrived while the slot was Idle (a local server can send it unprompted). Otherwise a stale catalog would refuse every call until Stop and Start;
+- `send(decision, signal)`, the only way a tool call reaches a server (3.6).
+
+T1 fixes the export list.
+
+### 3.2 Framing and ids
+
+- **JSON-RPC 2.0.** Every message Familiar sends is one of these kinds:
+  - an `initialize` request;
+  - a `notifications/initialized` notification;
+  - a `tools/list` request, with an optional cursor;
+  - a `tools/call` request;
+  - a result response with an empty result, answering a `ping` (a **pong**);
+  - for local servers only, `notifications/cancelled` for that run's own call (3.9).
+
+  No other message can be built: the serializer (`wire/framing.ts`) takes a tagged union of these kinds and nothing else.
+- **The era decides which kinds a run may build.** The serializer takes the run's era and refuses any kind outside it:
+  - **legacy:** all six;
+  - **modern:** only `tools/list`, `tools/call` and, for local servers, `notifications/cancelled`. The modern era has no handshake and no ping.
+
+  Every modern request also carries, in `params._meta`: `io.modelcontextprotocol/protocolVersion: "2026-07-28"` and `io.modelcontextprotocol/clientCapabilities: {}` (both required), and `io.modelcontextprotocol/clientInfo`, Familiar's name and version.
+- **Ids are Familiar's**: a counter per run, never reused. A response whose id isn't the current exchange's request id, or a ping id it's still answering, is dropped.
+- **Inbound messages:**
+  - a response for the current request ends the exchange's wait (3.4);
+  - a `ping` request is answered (3.7);
+  - any other request gets no reply. A server sending one is out of spec: Familiar declares no capabilities, so it has no sampling, elicitation or roots to serve;
+  - `notifications/tools/list_changed` sets the stale bit;
+  - progress, log and other notifications are ignored;
+  - anything that isn't valid JSON-RPC, or breaks its kind's shape contract, fails the exchange (3.10).
+
+### 3.3 The handshake: legacy first, modern on refusal
+
+**Why legacy first.** Every modern-capable reference server also serves the legacy handshake by default. One narrowed to modern only answers `initialize` with `-32022`, naming its versions: the TypeScript SDK's servers and rmcp's do this. go-sdk and mcp-go never refuse a legacy `initialize`, so Familiar always runs them legacy. Probing first with `server/discover` would risk stdio servers that exit on any request before `initialize`.
+
+**A legacy start** is three steps, each its own exchange, one after another:
+
+1. **`initialize`.** Familiar offers protocol version 2025-11-25, and accepts exactly the five legacy versions, as a discrete list: 2024-10-07, 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25. Any other string is unsupported; there's no range comparison. It sends `capabilities: {}` and its `clientInfo`. The response must carry a supported version, server capabilities with `tools`, and `serverInfo`. On a remote server the session id comes from this response's `Mcp-Session-Id` header, and only this one, validated as in 3.8.
+2. **`notifications/initialized`.** Sent only after step 1's exchange has fully cleaned up. It completes as a write-only exchange (3.4): at its `202` head on remote, at write completion locally.
+3. **The tool list** (3.5).
+
+The whole start runs under the handshake deadline. Its end is `server_stop` for a local server, or the run's end for a remote one.
+
+**The opening's classifier.** The `initialize` exchange's answer is classified in this order, before any HTTP status rule:
+
+1. **If the answer is at most 64 KiB and carries a JSON-RPC error response for this request's id, its code decides,** whatever the HTTP status: 200, 400 or another 4xx. It's read by media type: `application/json` is one body, and `text/event-stream` goes through the event-stream parser (3.10), which skips an empty priming event. The same `-32022` arrives four ways from real servers: as HTTP 400 JSON (the TypeScript SDK), and as 200 JSON, as a 200 event stream, and as a 200 event stream with a priming event and the id of a session already closed (rmcp). **No session id is adopted from a refused handshake** (3.8).
+2. **Otherwise the HTTP status decides**, as for any exchange (3.8).
+
+T14 replays each of those recorded refusals.
+
+**A modern start.** If that answer is a JSON-RPC error `-32022` whose `data.supported` lists `2026-07-28` and no legacy version Familiar speaks, the run's era becomes modern. That's decided in the same synchronous step that ends the `initialize` exchange. There's no new exchange: it's the same `initialize`, classified differently. The start then goes straight to the tool list (3.5), with the modern framing:
+
+- **no `server/discover`:** servers must implement it, but clients may skip it, and the catalog comes from `tools/list` anyway;
+- **no `notifications/initialized`;**
+- **no corrective `-32022` continuation:** Familiar offers exactly one modern version, so a correction could only repeat it.
+
+**A start that fails:** any other `-32022` (a list with neither a legacy version Familiar speaks nor `2026-07-28`), a malformed `data.supported`, or a modern `tools/list` answered `-32022` (the server changed its mind). The start fails with the server's own list in words: "This server speaks MCP 2030-01-01 only; Familiar speaks 2024-11-05 to 2026-07-28".
+
+There's no automatic list refresh in either era.
+
+### 3.4 The exchange loop and its cleanup barrier
+
+An **exchange** is one request Familiar sends, plus every pong it sends for pings that arrived on it. The exchange owns every native request it makes:
+
+- remote: the request's POST, plus one POST per pong;
+- local: the request's write, plus one write per pong, plus a call's cancel write (3.9).
+
+The machine is a pure function (`wire/exchange.ts`): the state and one input give the next state and the effects to do. The link does the effects and feeds back what the natives answer.
 
 | State | Means | Leaves on |
 | --- | --- | --- |
-| Stopped | Nothing runs. It may carry the last failure, in plain words. An edit can be saved here | A start (after a pending edit is saved) |
-| Starting | A run is being started. For a local server this includes the exe's own dialog, if the setup is new or changed | The run started (to Initializing), or failed |
-| Initializing | The MCP handshake and the first tool list, under their own deadline | Ready, a failure, or the deadline |
-| Ready | The server answers calls | A crash (to Restarting or Down), a stop, a remove |
-| Restarting | It crashed. The old run must be closed and a short pause must pass before the next start | The next start (to Starting) |
-| Down | It crashed three times in ten minutes. It keeps its last output for the matrix | A start, which is the person's action |
-| Stopping | Closing the run, under a deadline | Stopped, or Removing if a remove waits |
-| Removing | The approval or the address, its secrets and its saved setup are being removed | Removed. A failed removal stays here, and the next remove tries again |
-| Removed | Gone. Everything is refused | Nothing |
+| Idle | No exchange | A start, a list or a call admitted, or a local idle ping (3.7) |
+| Live | Request handed off, waiting for it to complete | Its completion (below); any terminal path (3.11) |
+| Draining | Ended: no more sends of any kind; cleanup in progress | Every native request it owns has terminated |
 
-The resting states are Stopped, Ready, Down and Removed, with no save, removal or tool list under way, plus a failed removal. Every other state has a pending event or a deadline that leaves it, so no server is ever stuck between two.
+**Completion, per exchange kind.** A write-only exchange has no response to wait for:
 
-### Generations, numbers and deadlines
-
-Each start of a run takes a new generation, a number that only grows. Every event from a run carries its generation, and so does every timer. The actor drops anything whose generation isn't the current one. So a late answer, a late exit or a late deadline from a run that's over never touches the next run. Every other wait (an edit's save, a removal, a tool list) takes a number of its own the same way, and a late completion with an old number is dropped.
-
-Every external wait has a deadline: starting a run (the exe's dialog included), the handshake, a later tool list, closing a run, saving an edit and removing. A start or a handshake past its deadline ends the run as a failure; a tool list past its deadline ends the run as a crash; a save or a removal past its deadline fails in plain words, and can be tried again.
-
-A new run starts only once the old one has closed (or its stop deadline passed). The exe allows one run per setup at a time, and the machine keeps to that, so it never gets `busy` for its own restart.
-
-### Every caller is answered exactly once
-
-A call ends in exactly one of these:
-
-| Answer | When |
-| --- | --- |
-| A result | The server answered. A tool error is a result too, marked as an error |
-| An error | It couldn't be sent: the server isn't running, is stopping, was removed, has too many calls waiting, the tool it was made for changed (`changed`, below), or the protocol failed |
-| `stopped` | The person pressed Stop on this call |
-| `timed-out` | Its deadline came first |
-| `interrupted` | The server crashed, or was stopped, while the call ran. It may have partly run. It is never sent again |
-
-Stop and a deadline both send MCP's cancellation notification for a call that was sent, and answer the caller at once. They don't wait for the server to agree. A call that was never sent (it was waiting for the server to be ready) isn't cancelled on the wire, because the server never saw it.
-
-A call that's already stopped when it's made is answered `stopped` at once, and nothing is written to the server. A call waits only while the server is starting, initializing or restarting, or while its tool list is being read again after the server said it changed, and only within its own deadline. A waiting call was never sent, so it may go to the next run after a crash. A call that was sent goes to one run only: once that run ends, the call is answered `interrupted`, and nothing sends it again. That holds for a crash, a stop, a remove and a deadline alike.
-
-Start, stop, edit and remove are answered exactly once too. A start is answered when the server is ready (with its tools), when the start fails (with the failure in plain words), or when a stop or remove overtakes it. A second start while one is under way joins it.
-
-**Admission is bounded, and a stop wins over the starts before it.** At most 8 starts, 8 stops and 8 removes wait on one server; past that a command is refused at once with plain words. Stops coalesce: one waiting stop answers them all. A stop settles every start made before it, so only a start made after the last stop can ask for another run. (Found in review: Stop A, Start B while stopping, Stop C used to start a run after C.)
-
-**Tool lists are one at a time.** When the server says its tools changed, its catalog is stale: calls wait, and one list is asked for. Another change while it's under way asks for exactly one more after it, however many arrive. An answer whose number isn't the newest is dropped, so an older list never replaces a newer one. Writes of the saved record coalesce the same way: one write in flight, and a storm of changes makes at most one more.
-
-### Limits
-
-| Limit | Default | Settable |
+| Kind | Remote completes at | Local completes at |
 | --- | --- | --- |
-| A call's deadline | 60 s | Per server, 1 s to 15 min |
-| The handshake's deadline | 120 s, since a first `npx` run downloads its package before the server says anything | Per server, 10 s to 5 min |
-| Calls waiting or running at once, per server | 16 | No. Past it a call is answered `busy` |
-| Starting a run, the exe's dialog included | 5 min | No |
-| A tool list after the first | 30 s | No |
-| Writing the record, an edit's cleanup, a removal | 30 s each, then the caller hears it timed out and the server stays busy until it lands | No |
-| Adding (the exe's dialog included) | 5 min, the same way | No |
-| Starts, stops or removes waiting | 8 each | No |
-| Restarts after a crash | 2 in 10 minutes, each 1 s after the old run closed | No |
-| Closing a run | 5 s, then it counts as closed | No. The exe ends the job after 500 ms anyway |
+| `initialize`, `tools/list`, `tools/call` | Its JSON-RPC response | Its JSON-RPC response |
+| `notifications/initialized` | Its `202` head | Its write's completion |
+| A pong as its own exchange (a local idle ping) | Not applicable: remote pongs belong to their request's exchange | Its write's completion |
 
-A start the person makes isn't a restart. If the first run of a start fails (the exe said `declined`, the program wasn't found, the handshake timed out), the server goes back to Stopped with that failure, and nothing tries again on its own. Restarting a run the person never got to approve would just show the dialog again. A crash after Ready is what restarts count, and a restart that fails counts as another crash.
+**Every exchange runs the same steps:**
 
-### The property test
+1. **Admit**, from Idle only, and only for a run that isn't closed. Anything else is answered busy at once, with no queue.
+2. **Hand off the request**, in one synchronous step (3.6, or the same function without a decision for an administrative request).
+3. **Wait in Live.**
+4. **The first terminal event moves the exchange to Draining, synchronously.** That step makes its own last sends, then seals the exchange. For a local call ended by Stop or its time limit, that last send is the `notifications/cancelled` write. After the seal no further send is possible: the serializer checks the state, and the state changed in the same step. On remote, `net_cancel` is then called for the request's POST, after its response has been read whole. A pong already handed off stays outstanding until its native end: it's left to reach its head, within its own 5 s bounds, and then cancelled, so a pong sent just before the final response still reaches the server (3.7).
+5. **Back to Idle** only when every `net_cancel` has returned (remote), or every write has completed or the run has ended (local).
 
-`tests/mcp/machine.property.test.ts` drives the machine with seeded random sequences: commands, and the events a fake world sends back, in any order, late ones and ones from old generations included. After each sequence every pending event is delivered and every timer fired. It checks:
+**The closed mark at Stop.** `stop()` marks the run closed synchronously, before any await, for local and remote servers alike. A local Stop then waits for the exe and the exit, and in that window nothing may reach the stopping server: every admission path (a walk's next page, a handshake step, `send`, an idle ping's pong) refuses a closed run.
 
-- every call, start, stop, edit and remove is answered exactly once
-- every run ends in a resting state
-- an answer from an old run never answers a call sent on a new run, and no effect names a run that isn't the current one
-- no call is ever sent twice, so a crash mid-call never sends it again
-- no run starts while an earlier one is still open
-- a call made for a tool is sent only while the server offers exactly that tool from that setup, and never while the catalog is stale
-- at most one tool list, one save and one removal is under way, and an older list never replaces a newer one
-- no waiting list grows past its bound
+**The barrier.** The next exchange starts only from Idle. So a server never has two exchanges' native requests open at once. That holds for pages, handshake steps, calls, and a Stop followed by a Start, cleanup included. At most 3 native requests are ever open per remote server (the request and two pongs), and at most 4 per local server, counting a Stop's cancel write beside them. The barrier's bound is on native lifetimes: each request or write ends within its native bound. How long a server takes to answer is the call's own time limit, not the barrier's.
 
-Its world is unkind on purpose: a start, a save, a removal or a tool list can hang for ever, a halted run may never close, the server sends storms of fifty "tools changed" at once, and old answers come back late. Seven deliberate breaks each fail it: a stop that leaves earlier starts waiting, any list answer accepted whatever its number, lists not one at a time, no consent check at send, no start deadline, unbounded waiting lists, and a second removal started while one runs. Before step 7's review the world always answered in the end, which is why it missed the hangs.
+**Why it holds by construction:** there's one exchange variable per server, kept across a Stop and a Start; the Idle check and the admission are one synchronous step; and the only way back to Idle is through the barrier. P4 bounds how long the barrier can take, and 4.3 names the interim before the native pass.
 
-## Transports
+### 3.5 Pages
 
-The MCP protocol itself is the official TypeScript SDK's `Client`, pinned at 1.32.2 in core's `package.json`. Core imports only its browser-safe entry points: the client, the Streamable HTTP client transport, and the types. `tests/portable.test.ts` lists them, and `tests/mcp/bundle.test.ts` bundles them for the browser with esbuild and fails on any Node built-in. Two things in the SDK don't suit the webview, and both are replaced:
+`list(run)` is a walk of `tools/list` exchanges:
 
-- **Its JSON Schema checker** (Ajv) compiles code with `new Function` for any tool with an output schema, and the app's CSP forbids eval and `new Function` in every page. The client is given a checker of its own instead, which accepts any structured result. A server's results are text the model reads, never trusted data, so nothing depends on their shape.
-- **Its stdio transport** needs Node. Local servers get a transport of Familiar's own.
+- each page passes the previous page's `nextCursor`;
+- each page is its own exchange, and goes through the barrier;
+- the walk takes at most 16 pages; a 17th `nextCursor` fails the list;
+- it has a 30 s deadline over the whole walk, besides each page's native bounds;
+- the catalog's bounds apply before any hashing (`catalog.ts`): at most 128 tools, each input schema at most 32 levels deep and 4,000 parts, at most 64 KiB per tool and 1 MiB for the whole list, and every name once. The walk over a schema is iterative and stops at the first bound;
+- **on a modern remote run**, each tool's `inputSchema` is scanned for `x-mcp-header` declarations, following the TypeScript SDK's scanner exactly:
+  - **Where a declaration may sit:** only on a property reached from the root by a chain of `properties` keys.
+  - **Where it may not:** anywhere under `items`, `additionalProperties`, `oneOf`, `anyOf`, `allOf`, `not`, `if`, `then`, `else`, `$defs` or a `$ref` target, or at the root. A declaration found there makes the tool invalid.
+  - **Its value:** a non-empty string that's a valid RFC 9110 token, unique case-insensitively within the tool.
+  - **Its type:** the property's `type` must be `string`, `integer` or `boolean`. A `number`, any other type, or none makes the tool invalid.
 
-**With code generation off.** `tests/mcp/no-eval.test.ts` runs the client in a child Node started with `--disallow-code-generation-from-strings`, which refuses eval and `new Function` as the CSP does (the child checks that it does). Against the fake server: initialize, list the tools, one call, a tool error and a refused call. Then a tool with an output schema, over the SDK's in-memory transport, lists and answers. With the SDK's own Ajv checker put back, that last part fails, so the test proves the replacement is needed and enough. zod probes for eval once and falls back. On the runner, the `proc-mcp` checks run the same client in the real core page, under the real CSP, so anything that still needs code generation fails there too.
+  An invalid tool is not offered, and Test lists it with the scanner's reason. Each declaration found is kept with the tool (its path, its header name and its type), and the declarations are part of the tool's fingerprint, since they change what goes on the wire. On stdio nothing is mirrored, so nothing is scanned;
+- modern `tools/list` results also carry `ttlMs` and `cacheScope`. Both are read leniently and ignored: the catalog's refresh points are Familiar's (start, Test).
 
-### Local: over the exe
+While a walk runs, the run's catalog is stale and calls are refused busy. How a walk ends:
 
-`process-transport.ts` is an SDK `Transport` over a `ProcessPort`:
+- **at start:** a failed walk fails the start;
+- **later:** a failed walk ends the run, and the server goes to Failed with the reason, so no call ever meets a catalog it couldn't refresh;
+- **Test:** Test's own walk runs only while the server is Stopped (5.4).
 
-```ts
-interface ProcessPort {
-  start(setup: ProcessSetup, onEvent: (e: ProcessEvent) => void): Promise<{ run: string }>;
-  write(run: string, bytes: Uint8Array): Promise<void>;
-  stop(run: string): Promise<void>;
-  forget(setupId: string): Promise<void>;
-}
-type ProcessEvent = { t: 'out'; line: string } | { t: 'err'; line: string } | { t: 'exit'; code: number | null };
-```
+### 3.6 Calls, and the handoff as one synchronous function
 
-That is the exe's `server_start`, `server_write`, `server_stop` and `server_forget`, as typed in `apps/desktop/src/shell.ts`. The exe already splits stdout into lines and blanks literal copies of the setup's secret values from both streams before a line leaves Rust (not escaped copies: see "Not settled").
+`send(decision, signal)` takes a `ToolDecision` (5.5) and the call's abort signal. In one synchronous function, with no `await` anywhere in it, it:
 
-- Each message goes out as one line of JSON, as MCP's stdio transport says.
-- Each stdout line is parsed as one JSON-RPC message. A line that isn't one is kept with the last output and otherwise ignored, since some servers print banners.
-- stderr is kept as the last output: the last 40 lines, at most 16 KiB. It's what Test and the matrix show when a server exits.
-- The run's exit closes the transport, and the exit code goes with the last output.
+1. **refuses** unless:
+   - the decision is genuine (in the module-private `WeakSet`), unused and not aborted;
+   - its server's run is Ready and not closed, with the run and launch the decision was minted for;
+   - the catalog isn't stale, and it offers that tool with the decision's fingerprint;
+   - the choice in the owner's memory, with the revoke overlay applied, still allows it: from "always", still "always" with these fingerprints; from a yes, not "never";
+   - the exchange slot is Idle;
+2. **marks the decision used**;
+3. **builds the body** from the decision itself: the tool's own name, and the arguments in the canonical form the card and the hash used (5.5). Nothing about the body comes from anywhere else;
+4. **on a modern remote run, builds the headers** from the same decision:
+   - `MCP-Protocol-Version: 2026-07-28`;
+   - `Mcp-Method: tools/call`;
+   - `Mcp-Name`, the tool's own name;
+   - one `Mcp-Param-{Name}` per declaration, from the decision's own arguments at the declaration's path. The codec follows the TypeScript SDK's exactly:
+     - **Omitted:** an absent or `null` value gets no header.
+     - **Converted:** a string passes through; a boolean becomes `true` or `false`; an integer becomes its decimal string.
+     - **Refused before the handoff** (rather than omitted, so the server never meets a body without its header): a value that isn't a primitive of the declared type, a non-finite number, an integer outside the safe range, or a string that isn't well-formed UTF-16. A lone surrogate would become U+FFFD in UTF-8, so the header and the body would disagree.
+     - **Encoded:** the plain value when it's visible ASCII, space or interior tab, with no leading or trailing whitespace. Otherwise, an empty string and a value that already looks like the sentinel included, the `=?base64?…?=` sentinel over its UTF-8.
 
-The adapters:
+   A refused value, a mirrored header longer than `net_fetch`'s 8 KiB per header, or more than its 64 headers in all, refuses the call before the handoff: "This call's arguments can't be sent to this server's headers". Nothing is truncated;
+5. **opens the exchange** in Live, and calls `net_fetch` (remote) or `server_write` (local).
 
-- **Desktop**, `apps/desktop/src/mcp.ts`: over `shell.ts`. Starting may show the exe's dialog.
-- **Node**, for core's tests, `packages/core/tests/mcp/node-process.ts`: spawns the program, splits lines, and blanks the setup's secret values with `[hidden]` on both streams before core sees a line, as the exe does. So core's tests see what core will see in the app.
+The native call is the start of a Tauri `invoke`, and everything before it is synchronous. So between the last check and the handoff nothing can run: no revoke, no Stop, no catalog change. There's no token to carry through someone else's awaits, and no second place a `tools/call` could be built: the serializer's `tools/call` constructor is private to `send`.
 
-Both run the same contract (`src/testing/process-contract.ts`).
+On the call's response, the result goes to the journal's tool `execute`. The exchange drains through the barrier, and the slot frees on its own.
 
-### Remote: over the guarded fetch
+The call's time limit, and stopping the call, abort its signal. That's a terminal path (3.11): the exchange drains, and the call is answered "timed out (or stopped); it may have partly run". The journal never runs a server tool again on its own. The session and the run stay, so the next call uses them as they are. Stopping the server is different: it ends the run, and a call in flight is answered "interrupted, it may have partly run".
 
-A remote server is a saved address of kind `server`. Core adds it with `address_add`, which asks the person in the exe's own dialog. Every request then goes through `guardedFetch(addressId)`, which reaches only that address and swaps the placeholder for the stored key.
+### 3.7 Pings, pongs and floods
 
-- **Streamable HTTP** is the SDK's `StreamableHTTPClientTransport` with the guarded fetch passed in as its `fetch`.
-- **Legacy SSE is refused in v1**, in plain words: "This server uses an older connection (SSE) that Familiar doesn't support yet." Its server names the URL for its posts itself, often beside the stream's path, so its approval would have to cover a whole origin, and two servers on one origin would share one address and key. (Step 7's first build supported it with the origin as the address; review found that widening, and it's gone.)
-- **One server per address.** The exe gives an identical address the same id, so two servers on it would share its key, and removing either would remove the other's. A second server on an address already in use is refused, before the dialog and again by the id the exe returns, which is never removed.
-- Redirects stay with the guarded fetch's own rule: under the same saved address, or refused.
-- A key goes in one header, as the placeholder (`familiar-stored-key`), and the exe swaps it. The exe swaps only in `Authorization`, `X-API-Key`, `Api-Key` and `X-Goog-Api-Key`, so a key in any other header is refused when the server is added, with words that say so.
-- A remote run has no process. It starts when the transport connects and closes when the transport does (a stream error, the session ending, a stop). That close counts as a crash, so the same restarts apply.
+Legacy servers may ping on any request's stream, and the spec says the receiver must respond promptly with an empty response.
 
-## Tools
+**A modern run has no pings.** 2026-07-28 removed `ping`, and a modern peer answers it `-32601`. A `ping`, or any other inbound request, on a modern run's stream gets no reply. That isn't a departure, since the requirement is the legacy era's. No pong can be built on a modern run (3.2), and the rest of this section is about legacy runs.
 
-On Ready, and on `notifications/tools/list_changed`, the actor lists the server's tools, one list at a time (above).
+- **A ping arriving on the current exchange's stream is answered by that exchange**, each id once. The pong is handed off synchronously by the parser, which reads messages in order, in the same step that reads the ping. So a ping that arrives with the final reply, in the same chunk and ahead of it, is answered before the reply ends the exchange, and its pong is left to reach its head (3.4). A handler run later, in a microtask, would run after the exchange had ended and lose that ping.
+- **Up to 2 pongs outstanding, and up to 32 in all per exchange.** A pong counts as outstanding until its native end, not only until its head. Each has its own 5 s native bounds, and its body is never read, so it's cancelled at its head.
+- **A third concurrent ping, or a 33rd in all, ends the exchange** with "the server sent too many pings". **Named departure 1:** that ping gets no answer. It keeps the work bounded: one exchange makes at most 33 native requests, at most 3 at once. A normal server that pings every 30 s through a 15-minute call sends 30.
+- **A local ping with no live exchange** (a local server may ping while idle) is answered as an exchange of its own: one write, through the barrier.
+- **Named departure 2:** a local ping that arrives while the exchange is Draining, or while a write is blocked, gets no pong. A blocked writer means the server stopped reading, and the exe's write bound ends that run within 10 s anyway (section 4).
+- **Named departure 5:** a ping that comes after the final response on the same stream gets no pong. The parser stops at the final response and discards the rest of its chunk, and the stream is cancelled. A server should end the stream after its response, and the request has completed, so nothing waits on that ping.
+- **Named departure 6:** a pong handed off in time can still be lost to its own native failure: a stalled credential read or lookup, its 5 s timeout, or `busy` from the exe's server cap (section 4). Familiar promises a timely handoff of each pong. What the network then does to it is logged, not promised.
+- **A pong is a result response**, built by Familiar's code for an id it read as a `ping` on this exchange. Error replies are never built, so none can be sent.
 
-- **Bounded before anything hashes it** (`catalog.ts`): at most 128 tools in up to 16 pages, each tool's input schema at most 32 levels deep and 4,000 parts, at most 64 KiB per tool and 1 MiB for the whole list. The walk is iterative and stops at the first bound, so a schema nested 10,000 levels fails in plain words instead of overflowing the stack. Two tools with one name fail the list too ("Familiar can't tell them apart"). A list that fails ends the handshake, or a later list's run, as a plain failure.
-- **A fingerprint per tool**: SHA-256 of its name, its title, its effective description (the description, or the title when there's none, since that's what the model and the consent card show) and its input schema, in canonical JSON (keys sorted at every level). Annotations aren't in it. A new or changed fingerprint is a new tool.
-- **A tool's identity for consent** is the server's immutable id and the tool's own name, with the fingerprint of what the person saw. Never the model's name for it, which depends on labels and on the other servers. `choiceKey(serverId, toolName)` is the key step 8 keeps choices under.
-- **Checked at the moment of the call, in the actor.** Each server tool carries the server's id, its run's setup fingerprint, the tool's name and its fingerprint, and every call it makes carries the last two as an expectation. The actor sends it only if the current catalog offers exactly that tool from exactly that setup. Otherwise it answers `changed` without sending ("echo changed since it was offered, so Familiar didn't send the call. It will ask again."). So a wrapper a turn kept from before a change can never call the changed tool, and the next offer of it goes through the gate, which asks again.
-- **What the person reviewed is kept.** The saved record keeps each tool's last fingerprint and the fingerprint the person last reviewed. A tool whose two differ is fresh: new, or changed since review. Test reports which tools are fresh and which changed, against what was reviewed.
-- **"Always for this" is narrow, and it reaches the gate by identity.** Step 8 stores the person's choice for a tool under `choiceKey`, with the tool's fingerprint and the setup fingerprint. The gate reads a policy per model name, so that map is built per wrapper, from that wrapper's own identity (`wrapperPolicy`, and `toolPolicies` over a list of wrappers), and only from the very wrappers the turn loop holds: never by matching names across whatever servers run now. An "always" holds only for that server and tool, and only while both fingerprints are the same, so a changed tool, or a new command, folder, setting, version or address, puts it back to ask. Two servers with identical setups never share one. A "never" holds whatever changed, since stricter is safe. (Found in review: a policy built from the current servers' wrappers, matched by name, let one server's "always" allow another server's wrapper that a turn had kept, once the names had moved.)
-- **The choice is read again at the send.** The gate says how it let a call through, and the journal hands that to the tool (`ToolStep.allowedBy`): by the person's standing "always", or because they said yes to this call. The call carries it into the actor's queue, and at the moment it's sent (after any wait behind other calls, or for the server to start) the client reads the person's choice for the wrapper's own identity again. A "never" refuses it either way. A call let through on "always" is refused unless that "always" still stands, with both fingerprints matching; one the person said yes to needs only the tool and setup unchanged, which the actor checks. Refused at the send, nothing reaches the server. A client given no choices can't confirm an "always", so it refuses such a call. (The journal's change for this is the gate's verdict carrying how it allowed, in `journal.ts` and `tools.ts`; its rules are unchanged.)
-- **The setup fingerprint** covers the command, its arguments, its folder, the plain settings with their values and the secret names, or for a remote server its address, transport, plain headers and key header. Not secret values, so a renewed key asks nothing. Not the label.
-- **Names the model sees**: `<server>__<tool>`, letters, digits, `_` and `-` only, at most 64 characters, starting with a letter, which every provider accepts. Accents are dropped and anything else becomes `_`. A name comes from the server's label and the tool's own name, never from order. When two servers' labels clash, each gets a short tag from a hash of its id (`Same_3f2a__echo`), four hex characters, growing by two until the tags differ; two tools of one server that clash once made safe or cut to 64 get tags from their own names the same way. So a name never moves from one server's tool to another's because a third server started or stopped. A server alone keeps its plain label, so a name can still change when a clash starts or ends; that's why the gate's policy is built per wrapper, above, and not by name.
-- **Each tool is a `FamiliarTool` of kind `server`.** So it's never run again after a restart: the journal reports it as interrupted, with Run again. The gate asks for it unless the person chose otherwise. It carries `readOnlyHint` to show, never to trust. Its `doing` names the server ("calling echo on Fake server"), and it carries the server's id and label, so a turn shows which server it called. It doesn't set `asks`, because that would also overrule the person's "always".
-- **Results are outside content.** Each server tool carries `outside: true`, and its text starts with a line saying it's what the server returned, not the person's words, and grants nothing (`outsideContent`, which step 8's rule may reword). The text is the result's text parts, a plain note for images, sounds, files and links, or the structured content as JSON if there's no text. At most 32,000 characters, with a note saying how much was cut. A tool error, a refusal, Stop, a deadline and `interrupted` reach the model as a tool error in plain words.
-- **The step cap and call bounds** apply as they do to every tool: server calls count against the same 8 per reply and 32 per turn.
-- **A turn's tools** are the tools of every Ready server, built fresh for each turn.
+Departures 3 and 4 are about remote cancellation and sessions (3.8).
 
-## Adding a server
+### 3.8 Remote specifics (Streamable HTTP, legacy era)
 
-**By paste.** `parsePaste(text, { newId, defaultCwd })` reads the common `mcpServers` block, VS Code's `servers` or `mcp.servers`, a bare map of servers, one server object, or the inside of a block without its braces. Comments and trailing commas are forgiven. A server with a `command` is local (`args`, `env`, `cwd`). One with `url`, `serverUrl` or `httpUrl` and no command is remote (`headers`, and `type` or `transport`; `sse` is read so it can be refused in plain words). Each server gives a draft. The raw paste is never kept: the parser returns only what it read, and the caller drops the text.
+- **Every request is one POST** through the guarded fetch ([shell-design.md](shell-design.md#5c-the-guarded-fetch)) to the server's saved address, carrying:
+  - `Content-Type: application/json`;
+  - `Accept: application/json, text/event-stream`;
+  - after `initialize`, `MCP-Protocol-Version` set to the negotiated version;
+  - `Mcp-Session-Id` if the server gave one. It's adopted only from a successful `initialize` response, never from a refused one, as exactly one header value of visible ASCII (0x21 to 0x7E), at most 1 KiB. Anything else fails the start: "the server sent a session id Familiar can't use";
+  - the setup's own headers (reserved names refused, 5.7). The key goes only in one of the four swap headers, as the placeholder the exe swaps.
+- **A response is read one of two ways:**
+  - `application/json`: one JSON-RPC message;
+  - `text/event-stream`: events whose data are JSON-RPC messages. Event ids and `retry:` fields are ignored, and an event with empty data (a priming event) is skipped, never a failure.
+- **A notification or a pong** is answered `202` with no body. Its exchange ends at the head.
+- **Never sent:** a GET of any kind (no standalone stream, no resumption, no `Last-Event-ID`), a `DELETE`, or `notifications/cancelled`. Not opening the GET and not resuming are both allowed by the 2025-11-25 transport.
+- **Named departures 3 and 4:** the transport says a client should send `notifications/cancelled` to cancel, and a session `DELETE` on close. Familiar sends neither to a remote server. A legacy server may therefore finish a call Familiar stopped, and its session expires on its own. The journal already reports every stopped call as possibly partly run, and never repeats it.
+- **A stream that ends before its response** is a terminal path: "the server ended the reply". The call is reported "interrupted, it may have partly run".
+- **A 404 on a request that carried `Mcp-Session-Id` means the server ended the session.** The spec says the client must then start a new session with a fresh `initialize`, and servers do expire idle sessions. So:
+  1. **The 404 ends that exchange** as a terminal path. If it was a call, the call becomes a tool error, "the server had ended its session", and is **never resent**: its decision is used, and a card call needs a new card. A page fails its walk, and the catalog stays stale.
+  2. **The next exchange is a re-handshake.** The `initialize` POST carries no session id. The new session id from its response, validated as above, goes on `notifications/initialized` and every request after it. Then the tool list is read again. Each step is its own exchange through the barrier, under the handshake deadline. The run isn't Ready meanwhile, so calls are refused busy, as during any start.
+  3. **The bound.** If the re-handshake fails, or a request gets a 404 before one exchange has completed after it, the run fails: Failed, "the server ended its session", and you press Start. The bound rearms at the first exchange after the re-handshake (its list walk included) that completes without a 404. So a server can't loop through re-handshakes, and one that drops its session again an hour later gets a fresh one.
+  4. **Only a Live exchange's own request counts.** A 404 on a pong, or on any request after its exchange's terminal event, schedules nothing.
+  5. **It isn't a restart.** Nothing is respawned. The run, its run id and its admission stay. Local servers have no sessions and are unaffected.
+- **A redirect is refused.** After the native pass, `net_fetch` never follows a redirect for a `server`-kind address, and a 3xx ends the request with its status (4.4). As a second line, the client fails any exchange whose response head says `redirected: true`, with "the server redirected Familiar's request".
+- **HTTP errors** (4xx, 5xx, `401`, `403`) fail the exchange with their status in words. The opening's classifier (3.3) reads a JSON-RPC error body first. There's no sign-in flow, since OAuth isn't in part 1. **What's given up:** a pushed `list_changed` on the GET stream. The catalog refreshes at start, on Test, and after a call's stream carries `list_changed`.
 
-**By form.** `localDraft` (a label, a command, arguments, a folder, and settings each marked secret or not) and `remoteDraft` (a label, an address, a transport and headers) give the same draft, with the same checks.
+### 3.8b Remote specifics, modern era (2026-07-28)
 
-**A draft** is the setup, with no secret values in it, plus the values for Settings to store, plus problems (which stop it being added) and notes (which don't).
+The same POST through the guarded fetch, with these differences:
 
-**Secrets.**
+- **Headers:**
+  - `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method` on every request, plus `Mcp-Name` and the `Mcp-Param-*` headers on `tools/call`;
+  - for `tools/list`, the headers are built by the same function that builds the body, with no decision;
+  - no `Mcp-Session-Id`, ever: the modern era has no sessions, and its servers answer `GET` and `DELETE` with `405`.
 
-- Every setting of a local server is a secret by default, kept in Credential Manager as `server:<setupId>:<NAME>`.
-- Except the settings that change what runs (`PATH`, `NODE_OPTIONS` and the rest of the exe's list in 5b): those can only be plain settings, whose values the approval binds.
-- And except short values (under 8 bytes, which the exe won't store as a secret) whose names don't look like credentials, such as `LOG_LEVEL=info`. Those stay plain, and a note says so, since a plain value is shown in the approval and saved with the setup.
-- **A credential is only ever a secret.** A setting whose name looks like one (key, token, secret, auth, password, pwd, passphrase, credential, session, cookie, private) is a secret however short. A short one is refused in plain words, never kept as a plain setting, and such a name as a plain setting is refused too, by paste, form or edit. One that also changes what runs (`NPM_CONFIG__AUTH`) can be neither, and is refused. (Found in review: `API_KEY=abc123` used to become a plain setting, shown in the approval and saved.)
-- A value the exe would refuse as a secret (over 1024 bytes, a control character, part of a `[key]` or `[hidden]` marker) is a problem, in the exe's own terms.
-- A README's example value (`<YOUR_TOKEN>`, `${input:token}`, `your-api-key-here`) is a problem: "put your own value in".
-- A remote server gets one key per address, as `addr:<addressId>`, from an `Authorization` (with its `Bearer`, `Token` or `Basic` prefix kept in the setup), `X-API-Key`, `Api-Key` or `X-Goog-Api-Key` header. The header then holds the placeholder. Any other header that looks like it carries a key (key, token, secret, auth, password, credential, session, cookie) is refused with words that say why, and so are two key headers.
-- `secret_set` is a Settings command. So Settings puts the draft's values straight into Credential Manager, and core gets the draft without them. `add` returns the refs to store them under. Core may only delete them, when the server is removed or a secret is dropped by an edit.
+  The three standard headers are required on every modern POST, and a missing or mismatched one gets `400` with `-32020`.
+- **Cancel is the spec's own:** closing the request's stream. Aborting the POST is exactly that, so departure 3 doesn't apply on modern runs. Nor does departure 4: there's no session to delete.
+- **A `400` whose body is a JSON-RPC error** for the request's id is read as that error. `-32020` (a header mismatch) and `-32021` (a capability Familiar didn't declare) become tool errors in words, with **no retry**. A retry would be a send Familiar's caller didn't start.
+- **No session to lose,** so the 404 rule doesn't apply. A modern request answered `-32022` ends the run, with the server's list in words.
+- **Never sent on modern:** `initialize` after the opening, `notifications/initialized`, pongs, `notifications/cancelled`, any GET, any `DELETE`, `server/discover` and `subscriptions/listen`.
+- **Known limitation:** `list_changed` reaches a modern client only through `subscriptions/listen`, a long-lived request. Familiar doesn't open it: it would be an exchange that never ends, holding the server's one slot. So on a modern server the catalog refreshes only at start and on Test. The handoff's fingerprint check (3.6) compares the decision with Familiar's own catalog, so it can't see a change the server made in between: such a call goes out as you consented to it, against the tool as last listed. A legacy server has the same exposure between `list_changed` notifications (section 8).
 
-**The exe's rules, early.** The checks mirror shell-core's: 64 arguments, 32 plain settings, 32 secrets, 8 KiB for the whole setup, setting names of ASCII letters, digits, `_`, `-` and `.` not starting with a digit, names compared ignoring case, no NUL, CR or LF in an argument.
+### 3.9 Local specifics (stdio)
 
-- **Paths** (`native-rules.ts`, from paths.rs and server_path.rs): the program is a plain name to look up, or a full local path; the folder is a full local path. A full local path is a drive letter, `:\`, then plain names: no UNC (`\\server\share`), no `\\?\` or `\\.\`, no drive-relative `C:evil.exe`, no relative folder, no `..`, no stream (`:`), no device name (`COM1`, `CONOUT$` and the rest, with any extension), and none of the exe's invisible characters. Only syntax: links and drives are the exe's to walk. The app checks with these Windows rules; core's tests on Linux pass POSIX rules, since their fake server lives at a POSIX path.
-- **Addresses**: no user name, query or `#` part, no encoded dot or slash in the path, no header the guarded fetch drops. Only a literal IP is classed here, with the exe's own rules (address.rs): loopback, the private ranges and `fc00::/7` (as literals only), IPv4-mapped IPv6 as its IPv4, link-local, documentation, multicast and the rest refused. `http://` to a literal public IP is refused. A name is never classed here, not even one starting `fc`: the exe classes it after the person approves it and it's looked up, and refuses `http://` there if it comes out public.
+- **A request is one `server_write`** of the message plus a newline, at most 4 MiB. Responses arrive as `out` lines on the run's channel, which the exe caps at 4 MiB and blanks of the setup's secrets before they leave Rust ([shell-design.md](shell-design.md#5b-starting-a-local-mcp-server)).
+- **An exchange's request write**, any pong writes and a call's cancel write are all owned by that exchange. They go through the one writer the exe keeps per server. Because the barrier admits one exchange at a time, nothing of a next exchange can queue behind a blocked write.
+- **A local call that's stopped or times out** sends `notifications/cancelled` for its id, as the spec advises, as the terminal step's last send, made before the exchange is sealed (3.4). The exchange drains once that write completes or the run ends. A late response to the cancelled id is dropped by id.
+- **The write bound is the exe's** (section 4). A write pending past 10 s ends the job, and the run goes to Failed with "It stopped reading what Familiar sent".
+- **A run that ends ends its process.** A local run that ends for any reason, a reported one included, stops its process, and its pending writes end at the exit.
+- **stderr lines**, and stray stdout lines (3.10), are kept for the server's last output: the last 40 lines, at most 16 KiB.
+- **A modern stdio run** uses the same `_meta` envelope, with no headers and no mirroring. It keeps the `notifications/cancelled` write, which stdio sends in either era. There are no pings.
+  - **A modern refusal on stdio takes one of two paths, chosen at run time.** Some servers keep the pipe after refusing and serve modern requests on it (the TypeScript SDK's `serveStdio`); others exit before their loop (an rmcp stdio binary). So after a modern refusal the client goes on to `tools/list`:
+    - **If the answer comes,** the run goes on.
+    - **If the run's `exit` arrives first,** the start makes one relaunch, with the era fixed to modern for that one start. The second `server_start` is readmitted through the owner (5.1), like any start: it rechecks the committed launch and the enabled flag in the admission step; if another durable effect is in flight it fails "busy", and you press Start; an approved setup with an unchanged form starts with no dialog.
 
-`apps/desktop/tests/mcp.test.ts` reads shell-core's source and fails if the lists (settings that change what runs, invisible characters, device names, swap headers) or the limits drift apart; core's tests check the rules case by case.
+    It's never a restart after a crash, and the era isn't saved: the next Start begins legacy-first again.
 
-**The unpinned flag.** `npx`, `npm exec` (and `npm x`), `bunx`, `pnpm dlx`, `uvx` (and `uv tool run`) and `docker run` fetch what they run. With no exact version (`name@1.2.3`, `name==1.2.3`), with `@latest` or a range, or for an image with no tag other than `latest` and no digest, they can fetch new code at any start, which the approval never saw. Every package the command names is checked, not just the first: each `-p`/`--package` of npx, npm exec, bunx and pnpm dlx, and uvx's `--from` and every `--with`. Only the runner's own options count, those before `--` or the package: what follows belongs to the program it runs, so a `--package` there can't hide an unpinned package. A pinned main package with an unpinned extra is flagged for the extra. What those packages themselves depend on is beyond the flag. A local path, a `file:` or `git` spec, and a plain `node server.js` aren't flagged.
+### 3.10 Validating untrusted answers
 
-**Adding** saves the setup stopped and not enabled. A remote server's address (its URL) is added first, with the exe's own dialog, and refused if another server already uses it.
+A server's answers are untrusted. The parser (`wire/parse.ts`) checks them before anything reaches the exchange, the journal or a card:
 
-**Editing** keeps the id, so what the person reviewed carries over and a changed tool shows as changed. The actor admits it only while the server is stopped or down, and it counts only once saved. A remote server's address can't change: a new address needs its own approval and key, so it's removed and added again.
+- **Size:** 4 MiB for a call's or a page's response, and 64 KiB for a handshake's, with `net_fetch`'s own caps underneath. The same per event-stream event, and the exe's 4 MiB line cap locally. A larger one fails the exchange.
+- **Shape, per message kind.** Every message must be valid JSON, nested at most 64 deep, an object with `jsonrpc: "2.0"`. Then by kind:
+  - **a response:** an `id` equal to an id this exchange is waiting on, and exactly one of `result` or `error`. `error.code` must be an integer, and `error.message` is a string, cut to 1 KiB;
+  - **a request:** a `method` string of at most 128 bytes, an `id` that's a string of at most 128 bytes or a safe integer, and `params` an object if present;
+  - **a notification:** a `method` string of at most 128 bytes, no `id`, and `params` an object if present.
 
-## Saved setups
+  Anything else fails the exchange.
+- **A local stdout line that doesn't start with `{`** can't be a JSON-RPC message, so it's kept as the server's output (some servers print banners), not failed. A line that starts with `{` and doesn't parse fails its exchange.
+- **The event stream:** an event may span any number of reads, and is assembled up to 4 MiB; its `data:` lines are joined with newlines; a comment, or an event with empty data, is ignored; the events of one exchange total at most 8 MiB, notifications included. Past either bound, the exchange fails.
+- **A local line the exe dropped** for being over 4 MiB arrives as an `err` event. While an exchange is Live, it fails that exchange ("the server sent a line too long") instead of leaving it to its time limit.
+- **`initialize`:** a supported `protocolVersion`, `capabilities.tools` present, and `serverInfo.name` a string.
+- **`tools/list`:** `tools` an array within the catalog's bounds, each with a valid name, an object `inputSchema`, and an optional description, title and annotations. `nextCursor` a string of at most 1 KiB.
+- **`tools/call`:** `content` is an array, each item checked by its variant:
+  - `text`: a string;
+  - `image` and `audio`: `data` a base64 string and `mimeType` a string;
+  - `resource_link`: `uri` and `name` strings;
+  - `resource`: a `resource` with a `uri`, and `text` or a base64 `blob`.
 
-A small key-value settings store (`packages/core/src/settings/store.ts`), general so step 11 can keep personas and the rest of Settings in it. Each record carries its schema version. Values are JSON, copied in and out. Two implementations run one contract (`src/testing/settings-contract.ts`): in memory, and on IndexedDB through core's `strictIndexedDB`, so every transaction is strict and a write counts only once it's complete (fake-indexeddb in Node).
+  Each item must be within the size bound. An unknown kind becomes a text line, "unsupported content". `isError` is a boolean. `structuredContent` is an object, passed on as untrusted JSON, and **isn't validated against the tool's `outputSchema`** (section 8).
+- **Modern results:**
+  - `resultType` is required. `"complete"` is a result. `"input_required"` becomes a tool error ("the server asked for input Familiar can't give"): Familiar declares no capabilities, so a conforming server shouldn't ask. Any other value is a tool error too, and a missing `resultType` is a protocol violation;
+  - tool results must carry `content` explicitly;
+  - `ttlMs`, `cacheScope` and `_meta`'s `io.modelcontextprotocol/serverInfo` are tolerated and ignored;
+  - no retry of any kind follows a modern result. `requestState` and `inputRequests` are never echoed back.
+- Unknown fields are ignored, never trusted. Nothing from a server becomes a header, a URL or a request id, except the validated session id (3.8).
 
-The actor writes its record: one write at a time, the next coalesced behind a dirty flag, each of the record as it is then, nothing after a removal begins, and each fenced by incarnation and revision in its own transaction, so a late write can't bring a removed record back or land over a newer one. A saved server is `mcp.server.<id>`, version 1. Its `incarnation` and `rev` fields stay inside version 1, with no version 2 or migration, since no version of Familiar has shipped records without them: the setup (never a secret's value), whether it starts with the app, its own limits, and its tools as last seen with the fingerprints the person reviewed. A record of a version this code doesn't know is skipped and left as it is, never overwritten.
+### 3.11 Terminal paths
 
-## Test and prerequisites
+Each of these moves the exchange to Draining in one synchronous step, and each is a check in the harness (H2, 7.2):
 
-**Test** starts the server if it isn't running (the exe asks if the setup is new or changed), lists its tools with their fingerprints and which are fresh, and stops it again unless it was running or on its way up. Every failure comes back in plain words:
-
-| What happened | What Test says |
+| Path | Answer to the caller |
 | --- | --- |
-| The program isn't there | "Familiar couldn't find the program "npx"." and what to install: Node.js (the LTS from nodejs.org) for `npx`, `node`, `npm`, `pnpm` and `bun`; uv for `uvx` and `uv`; Docker Desktop for `docker` |
-| It exited | "The server exited with code 2. Its last output is below.", with the last output |
-| It never finished the handshake | "The server didn't finish starting within 120 seconds." |
-| It started but didn't speak MCP | "The program started but didn't answer as an MCP server.", with its last output |
-| The person said no, or the exe stopped asking | "You chose not to start it.", or how to let Familiar ask again from the tray |
-| The exe refused the setup | Each of `unsafe-path`, `unsafe-argument`, `duplicate-setting`, `unsafe-secret`, `invalid`, `busy`, `start-failed` and `revoked` in its own words. The exe's message isn't shown |
-| A remote server refused or couldn't be reached | The guarded fetch's kind (`no-key`, `not-saved`, `insecure`, `blocked-address`, `redirect-refused`, `tls`, `timeout`, `network` and the rest), or the HTTP status: 401 and 403 say the key was refused, 404 that nothing answered there |
+| The response, a result or a JSON-RPC error | The result, or the error in words |
+| The call's time limit, or the call stopped (its signal) | "Timed out (or stopped); it may have partly run" |
+| The list's 30 s, or the handshake deadline | The list or the start fails |
+| The stream ended before the response | "The server ended the reply" (interrupted) |
+| A flood of pings | "The server sent too many pings" |
+| An invalid answer (3.10) | "The server sent something Familiar couldn't read" |
+| A native error (`timeout`, `network`, `busy`, `revoked`, …) | The kind in words |
+| A 3xx, or a head that says `redirected` | "The server redirected Familiar's request" |
+| A local line dropped as too long (`err` event) | "The server sent a line too long" |
+| A 404 on a request with a session id (legacy remote) | For a call: "the server had ended its session", never resent. Then one re-handshake (3.8) |
+| The run ends: Stop (the closed mark), a crash, an exit, removal, a failed re-handshake, a second 404 | "Interrupted, it may have partly run" for a call |
+| Modern: `input_required`, an unknown `resultType`, `-32020`, `-32021` | A tool error in words, no retry |
+| Modern: `-32022` on a later request | The run ends, with the server's versions in words |
+| A mirrored value refused, or a header too long (refused before the handoff, so no exchange opens) | "This call's arguments can't be sent to this server's headers" |
 
-**Prerequisites.** `checkPrerequisites(finder)` gives a row for each of Node.js, Python's uv and Docker: found or not, what it's for, and where to get it. Finding a program without starting it needs the exe, which has no such command. So the check takes a `ProgramFinder` port, shaped as the command will be: it takes only a name from a fixed list (`node`, `npx`, `uv`, `uvx`, `docker`), and answers only `found`, `not-found` or `unknown`, never a path. Without a finder every row is `unknown` and says "Checked when you press Test", where a missing program comes back as `not-found` with the same words. The command (`program_find`, looking one of those names up as `server_start` resolves a program, and touching nothing else) is for the pre-release native pass.
+## 4. The exe
 
-## Starting with the app, and removing
+### 4.1 P4's three bounds (pre-release native pass)
 
-**Starting with the app**: the app's core page (`apps/desktop/src/app/core.ts`) opens the client once it has said ready, and `startEnabled` starts every enabled server. Approved ones start with no dialog, since the exe compares the setup with its stored approval. A turn's tools are the Ready servers' tools.
+1. **Helpers are detached at a bound.** Today `net_cancel` and a removal return only once every helper the request started has finished, so a hung lookup or credential read holds the request.
+   - **The change:** `net_cancel` returns within 1 s of the cancel, and the Resolving step's 20 s deadline ends the request whatever its helpers do. A helper still running then is detached: its result is discarded, it's counted, and it can start nothing more.
+   - **Detached helpers count against their own request's share, and only that share.** A helper detached from a `server`-kind request keeps one place in the server share (item 2) until it finishes. Past 8 detached server helpers, new server fetches get `busy`, and model fetches are untouched. A helper detached from a model request counts against the model share the same way. So hung lookups on servers can never eat into chat's reservation.
+   - **The guarantee becomes** "nothing of the request is sent after the cancel returns, except a DNS query already in the system's resolver". A credential read already started may finish into a dropped task.
+   - Runner check `net.helper-detach`: a lookup held forever, then `net_cancel` returns within its bound, and a model fetch then succeeds.
+2. **Chat's share is reserved.** Today the 32 open requests are shared by everyone.
+   - **The change:** requests to `server`-kind addresses get their own cap of 24 within the 32. Every request counts until its task has terminated or been detached. So a model fetch always has at least 8. That's against server load only: chat's own fetches (her line, the decider's bigger model, the turn) can still fill those 8 themselves (section 8).
+   - Runner check `net.server-cap`: with 24 server requests held, a model fetch succeeds and the 25th server request is `busy`. With 8 server helpers detached and hung, plus 16 server requests open, a model fetch still succeeds.
+3. **The local write bound lives in the exe.**
+   - **The change:** the writer thread notes when its oldest pending write began. Past 10 s the actor ends the job, which breaks the write, and the run's `exit` event carries `stalled-write`.
+   - It holds after the page has gone, with no dependence on the exe noticing the renderer's exit. The page's own 10 s timer goes: one owner.
+   - Runner check `server.write-bound`: a full pipe, then the core renderer killed, and the job ends within 11 s. Its control holds the renderer-exit relaunch back (a runner-only switch), and the check requires `stalled-write` as the `exit` event's cause. Without that, the relaunch would end the job anyway, and the control would pass for the wrong reason.
 
-**Remove** stops the server (a call in flight is answered `interrupted`), then removes what's kept for it, in an order a retry can repeat: `server_forget` and each secret for a local server, or `address_remove` (which deletes the address's key) for a remote one, then its saved record and its tools with it. A removal that fails leaves the server Removing, refusing starts and calls, and the next remove tries again.
+### 4.2 Other native items
 
-## Proof
+- **On a second `shell_ready`, or when the core renderer goes away**, the exe ends every server job, then exits and relaunches itself, with its runner check. Renderer-exit detection still matters for the relaunch; it no longer carries the local write bound.
+- **`totalMs` and `idleMs` run on shell-core's request task**, independent of `net_read` pulls, with `totalMs` a new option every MCP request sets to its whole deadline.
+  - **Its runner check, `net.total-deadline`, isn't a reload.** A reload triggers the relaunch, which would end the request first and let the control pass for the wrong reason. Instead the runner calls `net_fetch` directly with `totalMs` 5 s; a server trickles a chunk every 2 s, inside `idleMs`; nobody calls `net_read`, the page sets no timer, and the exe stays alive for 15 s.
+  - **What it records** is the event that ended the request. It must be the request task's `timeout`, at 5 s plus at most 1 s. The control omits `totalMs`: the request must still be open at 15 s, and the check fails if anything else ended it.
+- **`address_add` answers whether it created the address** (a `created` flag), so a rollback removes only what its own add made (5.1).
+- **`notify_state`**, for step 8.
 
-Core's tests, in Node:
+### 4.3 The interim, before the native pass
 
-- `tests/mcp/machine.property.test.ts`: the machine under 5,000 seeded random sequences of 60 steps and 300 of 400 steps, in the unkind world above. Before review four breaks were shown to fail it (a crash that keeps its sent calls, a result accepted from any run, a start during a stop launched at once, an answer that keeps its call); after review seven more (listed above). Plus unit cases: a crash mid-call, down after three crashes, the person's failed start not retried, review's Stop A / Start B / Stop C sequence, a start and a removal that never answer, a late removal answer dropped, an edit admitted only while stopped with a start waiting for it, a call for a changed tool or another setup never sent, a storm of a thousand tool changes making one list at a time with an older answer dropped, and 10,000 starts with only 8 waiting.
-- `tests/mcp/client.property.test.ts`: the whole client under a seeded scheduler, with fake store, Credential Manager, exe and session ports whose every effect can stall, land in any order, or land after its deadline (newer effects often run first, so older ones linger). Random adds with clashing ids and addresses, edits that drop secrets and bring them back, removes, starts, stops, metadata changes and tool storms, with deadlines firing; Settings stores a value whenever an add or edit asks for one. Then: every public promise settled; the store holds exactly what each actor committed and nothing for a server that's gone; no secret a server needs was deleted after it was stored; no address serves two servers or was removed under one; waits per server stayed under the cap. Its control plants one late write past the fence, and the checks catch it. An edit released before its cleanup lands, and a removal released at its deadline, each fail it.
-- `tests/mcp/ownership.test.ts`: review r20's cases by hand: two adds of one address at once, two edits where the first's secret delete is held, a write and a removal held past their deadlines, and 10,000 changes behind one stalled write.
-- `tests/mcp/client.test.ts`, against the real fake server over the Node process adapter: add by paste with nothing secret saved, Test, the second start asking nothing, calls and their outside-content mark, Stop and a deadline answered at once with the cancellation sent, a crash mid-call answered `interrupted` and sent once, three crashes then Down with the last output, an edit to variant b made together with a start (the run is the new setup, and no "always" survives it), echo changed on the running server (the old wrapper refused before sending, only echo back to ask), "always" not passing between two servers with identical setups, a call already stopped writing nothing, `print_secret` blanked, remove with a call in flight, plain words for a refused start, a missing program, an exit and a silent program, starting with the app. Over HTTP: the address added, only the placeholder sent, a refused key and a missing key in plain words. Legacy SSE and a second server on one address refused.
-- `tests/mcp/journal.test.ts`: a real server tool in the turn loop, killed mid-call. After the restart it's reported interrupted with Run again, and the server never gets it again. And a tool with "always" that the running server changes: the next call in the same turn loop goes back to ask through the gate, and the wrapper the loop holds is refused without sending. Dropping the expectation from the wrapper fails both this and the client's stale-wrapper test.
-- `tests/mcp/process-contract.test.ts`: the process port contract on the Node adapter.
-- `tests/mcp/paste.test.ts` and `tests/mcp/pure.test.ts`: the paste shapes, secrets and short credentials, the exe's limits and path rules, remote headers and literal addresses, the unpinned flag with unpinned extras, model names, tool-list bounds (10,000 levels, 5,000 parts, 70 KB, 129 tools, a duplicate name), the title-only fingerprint, fingerprints (SHA-256 against node:crypto), the marker rule, plain words, result text, prerequisites, the runner's own options for the unpinned flag.
-- `tests/settings-store.test.ts`: the settings store contract on memory and IndexedDB, and every IndexedDB transaction strict.
-- `tests/mcp/bundle.test.ts`: the client bundles for the browser with no Node built-in and no stub.
-- `tests/mcp/no-eval.test.ts`: the client with code generation from strings off, as above.
+- **A hung helper** holds that request, and so that server's exchange in Draining. Its slot stays held, and a call to that server is refused busy. Chat and other servers go on, unless enough helpers hang to fill the shared 32. Remove also waits, holding the owner of durable effects; Settings shows "Saving…" with the restart words (5.1).
+- **The local write bound is a page timer.** A renderer crash with a full pipe leaves that write unbounded until you restart.
+- **No `totalMs`.** A server trickling within `idleMs` lives past its deadline only across a reload. The page is restart-only then, and quitting ends it.
+- **Redirects are followed** (4.4). The client's second line, failing a head that says `redirected`, is in both builds, but by then a 307 has re-sent the body once.
+- **No `created` flag.** A rollback leaves the address in place, and the start-time sweep of addresses no record owns removes it (5.2).
 
-On the Windows runner, through the real exe: the `proc-mcp` phase (`apps/desktop/shell-check/mcp-checks.ts`) runs core's client over the desktop ports against the fake server, with the driver answering the exe's dialog. Its seven ids are in the security inventory: `mcp.add`, `mcp.call`, `mcp.crash-mid-call`, `mcp.changed-tool`, `mcp.secret-blanked`, `mcp.remove`, and `mcp.secret-json-escaped`, which is marked as a known gap (below). The gate requires the first six to pass. The secret is a key the driver types into Settings, which the page never learns. The checks run in the real core page under the real CSP.
+The harness runs both builds, the pre-pass contract and the pass's (7.2), so each limitation is a measured one.
 
-- `mcp.changed-tool` changes echo on the running server (`set_variant`), with the setup unchanged, so it isolates the tool's fingerprint: through `gateFor` with the person's "always" for every tool, echo asks and the others still allow; the wrapper made before the change is refused and nothing is sent; the new one answers. Its control idea: with the call's expectation dropped from the wrapper, the old wrapper would send, and the check fails.
-- `mcp.remove` re-adds the exact launch it removed, secret name included, has the driver type its key into Settings again, and needs the dialog to appear. Its control idea: with `server_forget` skipped, the stored approval would match and the start would come with no dialog, and the check fails.
-- `mcp.secret-json-escaped`: the driver types a key with a quote in the middle into Settings for a second server, which prints it. The page learns only the key's first and last ten characters, which JSON leaves as they are. It passes only if neither comes back anywhere core heard or answered, so only if the JSON-escaped form (`\"`) is blanked too. Until the native pass it fails, as a known gap.
+### 4.4 No redirects for servers (pre-release native pass)
 
-## Later
+**Order in the native pass.** These come first, ahead of every other native item, as early runner checks: the no-follow rule, with `net.no-redirect`, and 4.5's two unverified items, with `net.tls-egress` and `net.pool-retry`. Each one either changes the exe's contract or measures something it hasn't stated, and the fake exe (7.2), the client's handoff and P4's items all rest on that contract. A result that differs from what's written here is known before anything else is built on it. P4's three bounds and 4.2's items follow.
 
-- **OAuth** sign-in for remote servers. v1 takes servers with no sign-in or a fixed key.
-- **`program_find`** in the exe, for the prerequisites check: the pre-release native pass.
-- **Step 8**: the consent cards (showing a fresh tool as new or changed, and the server it calls), the policies UI that stores choices under `choiceKey` with both fingerprints, and the outside-content rule. The turn loop takes its tool list when the journal opens, so step 8 must give each turn the current catalog (`client.tools()`); until then a tool changed under a long-open journal is refused at the call, which is safe but leaves it unusable until the next offer.
-- **The pre-release native pass**: JSON-escaped secret redaction (below) and `program_find`.
-- **Step 9**: the capability matrix rows for servers: Down with its last output, the unpinned flag.
-- **Step 11**: the Settings pages that call these functions: paste and form, Test, review, edit, remove, the prerequisites.
+Today `net_fetch` follows up to 5 redirects under the saved address, and reports `redirected` only after the fact. A 307 or 308 sends the same POST body again to the new path; a 301, 302 or 303 is followed as a GET. So one `tools/call` handoff could reach the server twice, or as a GET. That isn't a consent problem: the destination is under your approved address, and the body is the approved one. But "never resent" and "no GET" must be true on the wire.
 
-## Not settled
+- **The change:** for a `server`-kind address, `net_fetch` never follows a redirect. A 3xx ends the request with its status and headers, and nothing is sent to the `Location`. Model-kind addresses keep today's rule.
+- **The client** fails such an exchange (3.11), and fails any head that says `redirected: true`.
+- **The runner check `net.no-redirect`:** one server answers 307 and another 303, each pointing to a second path on the same server. Arrivals are counted at both paths: exactly one at the first, none at the second, and the exchange fails with the status.
+- **The fake exe** has a redirect mode that follows as today's contract does, so H14 fails if the client's second line is removed.
 
-- **A secret holding a quote, or another character JSON escapes, isn't blanked from a server's JSON output.** The exe blanks literal copies only. A server printing its secret inside JSON writes `abcd\"efgh` for `abcd"efgh`, the literal match misses it, and core's `JSON.parse` rebuilds the secret, which then reaches the model and the journal. Core never sees secret values, so it can't blank them itself. So the claim is: **literal copies of a server's secrets are blanked before core sees a line; copies the server escapes or encodes are not.** The fix belongs to the exe, in the pre-release native pass: match each secret's JSON-escaped form too, bounded, on every path back. Until then a person can avoid it by using secrets without quotes, backslashes or control characters.
+### 4.5 What one exe command can put on the wire
 
-  **How the gap is held open, visibly.** `security.mcp.secret-json-escaped` is a security id like the others, and its entry in `security-inventory.json`'s `knownGaps` carries the reason "pre-release native pass: JSON-escaped redaction" and the detail its failure is expected to start with, "an escaped copy came back". The gate (`gate.mjs`) reports a FAIL with exactly that detail as KNOWN GAP: printed in the summary and counted, and not failing an everyday run. Any other FAIL, a SKIP, or no report at all fails every run, since then the check couldn't measure the gap (the first Windows run showed why: the check failed on a Settings window left open, and the gate still showed KNOWN GAP); a PASS is noted, and the mark can go. In release mode (`gate.mjs --release`, or `FAMILIAR_GATE_RELEASE=1`) every mark still present fails the gate, so no release ships with it. Closing it means the check passes and the mark is removed in the same change. A static test fails if a mark has no reason or no expected detail, or names an id outside the inventory, so a gap can't be marked silently. Nothing runs the gate in release mode yet: step 12's release workflow must.
-- **A change that lands after its deadline is kept.** Its caller heard it timed out ("it may still finish, and Settings will show it if it does"), and Settings shows what was kept once it lands. Until then the server is busy for anything that conflicts: the person sees "Familiar is still finishing an earlier change to this server. Try again in a moment." If an effect never lands at all (the exe or the store wedged), the server stays busy that way until the app restarts; nothing is released early to get around that.
-- **Open after review 21 (2026-11-16)**, recorded under the stop rule while the owner decides between one last batch and carrying them. None is reachable from the model or from a server in the paths that ship: each needs a store or exe call that never lands, or an internal call made without the turn loop's gate.
-  - *A call with no record of how it was allowed is treated like a yes.* `admit` checks only the fingerprints when `allowedBy` is missing, and `client.call` without `expect` sends with no consent check. Every server tool in a turn goes through the gate, which always sets both. It should fail closed before step 8 adds callers.
-  - *A change refused as busy still takes effect.* An enabled, limits or reviewed change past the cap of 8 behind a stalled write changes the pending record before it's refused, so it's saved later.
-  - *Waiters behind an effect that never lands aren't answered.* The effect stays owned, as rule 1 says, but an edit, start or removal queued behind it keeps its caller waiting until the app restarts.
-  - *The saved record's delete checks the incarnation, not the revision.* Ownership already keeps a delete from racing a write (removal waits for writes, and nothing writes after it begins), so only a direct call to the store shows it.
-  - *Two adds the exe answers with one address id*, with both saves held, can both succeed. The exe gives one id only to an identical address, and an identical URL is reserved before the dialog, so only a fake reaches it.
-  - *A failed write drops a change queued behind it* and still reports that change as done.
-  - *Tool names a server picks to collide with the generated tags* (`echo`, `Echo`, `echo_092c`, `echo_092c_6d89`) can still give two tools one model name, and one is dropped. Consent stays by identity, so nothing transfers.
-  - *A late commit sends no change event*, so Settings shows it at its next refresh rather than at once.
-  - *The client property's control doesn't exercise the revision guard*: with `putIf` and `deleteIf` made unconditional, the property still passes. The guard is covered by the store's contract cases, not by a test of the client that fails on revert.
-- **A remote server that goes away** isn't seen as a crash. Its transport closes only when the SDK's does: a failed call is answered with an error, and the server stays Ready. So restarts and Down apply to local servers, and to remote ones only when the transport closes.
-- **A remote server's quiet stream.** The guarded fetch ends a read that's quiet past its idle limit. The desktop ports give server addresses the exe's cap of 15 minutes, and the SDK opens the stream again after.
-- **A stop whose run never closes.** After 5 s the machine counts it closed. If the exe still holds that run, the next start is `busy`, which comes back as a failure in plain words rather than a second run.
-- **The handshake's deadline** is 120 s by default, for a first `npx` run that downloads its package. A slow network can need more, and the person can set up to 5 minutes.
-- **zod's eval probe.** The SDK checks messages with zod, which tries `new Function` once to decide whether it may compile, and falls back when it's refused (shown in Node with code generation off). In the page the refusal may show as one CSP report. Ajv isn't used at all (above).
-- **The process port contract** runs on the Node adapter only. The runner's checks cover the desktop adapter end to end through the client, but not case by case, since the contract's secret case needs a value the page knows and only Settings may store one.
+The exe's wire behaviour, listed in full:
+
+| # | Command, or case | What reaches the wire beyond Familiar's own bytes | Pin | Check |
+| --- | --- | --- | --- | --- |
+| 1 | `net_fetch`, a redirect | A re-POST (307, 308), or a GET (301 to 303) | No-follow for servers (4.4) | `net.no-redirect` |
+| 2 | `net_fetch` behind a manual system proxy, public addresses only | A `CONNECT`, or a forwarded request for `http`. What the proxy then does, retries included, isn't Familiar's | **Named:** behind a proxy, "one POST" holds at Familiar's side only. `net_proxy` shows the kind | The existing runner proxy check |
+| 3 | DNS lookups, Familiar's pre-check and the resolver's | Queries for the address's name. After a detach, one already sent can finish after the cancel | Named (4.1, section 1) | `net.helper-detach` |
+| 4 | TLS with the platform verifier | **Unverified:** whether Windows' chain building fetches issuer certificates or revocation data from CA hosts outside the saved address | Named until measured | `net.tls-egress`: capture DNS and connections during an `https` fetch to a public test host |
+| 5 | Pooled lan and loopback connections | **Unverified:** whether the client re-sends a request on a pooled connection that closed before the request was written. That's a resend with nothing delivered, not a duplicate at the server | Named until measured. If it does, MCP requests get a client per request, as public addresses already do | `net.pool-retry`: a loopback server that closes idle keep-alive connections, counting arrivals per call |
+| 6 | Headers Familiar didn't write | The key in one of four swap headers (by design); `Host`, `Content-Length`, and presumably `Accept-Encoding` with decompression on | Intended | The existing header-filter tests |
+| 7 | `net_cancel` | A TCP close or HTTP/2 stream reset, no new request | — | — |
+| 8 | `address_add` | One DNS lookup after Allow | Approved egress. Its answer gains a `created` flag (4.2) | Existing, plus the flag in the exe's own tests |
+| 9 | `server_start` | One process, which may fetch packages itself (`npx`, `uvx`), outside the exe's reach. Familiar's only second start is the modern relaunch (3.9) | Readmitted through the owner (3.9) | T14 |
+| 10 | `server_write` | Exactly one stdin write per call, at most 4 MiB, up to 8 in flight; never on its own, never retried | — | — |
+| 11 | `server_stop` | Closes stdin, then ends the job at 500 ms; no message to the server | — | — |
+| 12 | Output handling | A stdout line over 4 MiB is dropped with an `err` event, and secrets become `[hidden]`. That changes what Familiar receives, not what's sent | The `err` event is a terminal path (3.10) | T14 |
+
+If either unverified item turns out true (certificate fetches outside the saved address, or a pooled retry), the design takes it in before the rest of the pass: by naming the egress, or by a client per MCP request.
+
+## 5. Durable config, consent and names
+
+### 5.1 One owner of durable effects
+
+- **One module owns all durable tool config** (`owner.ts`): saved servers, setups, keys, enabled flags, limits, reviewed fingerprints, your choices for every tool (built-in and server), the one mark of a change under way, and the tombstones of removed servers. The journal doesn't own tool config.
+- **One durable effect at a time**, for everything. A second is answered busy at once ("Saving another change. Try again in a moment."), and a refused command changes nothing.
+- **Durable effects get no deadlines.** If the exe or the store never answers, Settings says "Saving…", and after 10 s: "Familiar is waiting on Windows. Restarting Familiar finishes or undoes this change." The timer changes only the words.
+- **The owner keeps one record, written whole per step**, in one strict IndexedDB transaction, so each step commits atomically. The owner notifies Settings then.
+- **The changes**, each a fixed list of steps with one mark, owned until done:
+
+  | Change | Steps | If a step fails |
+  | --- | --- | --- |
+  | Add local | Check the draft. Save the record, stopped and not enabled, in one commit | Not saved |
+  | Add remote | Normalize the URL to the exe's address identity, and refuse if a saved server has that identity. Mark (with the identity). `address_add` (the exe's dialog, unless it already holds that identity). Record and clear the mark, in one commit | Declined, or `address_add` failed: clear the mark, not saved. If `address_add` succeeded and the commit failed: the owner stays held and the mark becomes a rollback obligation until `address_remove` settles and the mark-clear commits; only then "not saved". The rollback removes the address only if this add created it, as `created` says. Until the native pass adds that flag, a rollback leaves the address for the start-time sweep (5.2). A failure there: "Couldn't finish undoing the add. Retry". An address already gone counts as done, and no dialog appears |
+  | Edit a local setup | Refused unless Stopped. New record and a mark naming the dropped secrets, in one commit. `secret_delete` each. Clear the mark | Before the commit: not saved. After: "Saved; cleanup not finished" |
+  | Remove | Stop (awaited). Record set to removing, plus a mark, in one commit. `server_forget` or `address_remove`. `secret_delete` each. Delete the record and its choices, keep the tombstone, clear the mark, in one commit | After the first commit: "Removing; cleanup not finished" |
+  | Enable, Disable | Commit, answer, release. Then a separate start or stop | The start's failure doesn't undo the enable |
+  | Limits, mark reviewed, a choice | One commit | Not saved |
+
+  Steps after the commit are idempotent. A change saved with its cleanup unfinished keeps its mark, and every other change is refused until Retry, or a restart's repair, finishes it. Starts of other servers are still admitted then, since no effect is in flight.
+- **The address identity is the exe's.** Core keeps its own copy of the exe's URL normalization (case, punycode, default ports, one trailing dot, trailing slashes), and a drift test checks it against the exe's source. So `https://x` and `https://x:443` are one server, and a second is refused.
+- **Native starts** are admitted by the owner, and count as the effect in flight until they return a run id or a failure. While a start's dialog is open, nothing else durable goes anywhere.
+- **Fail closed:**
+  - an unreadable choice loads as "ask" for its tool, never as empty. That loosens a lost "never" to "ask", which still needs your Yes on a card for every call. It never loosens to "always";
+  - an unreadable server record isn't started or overwritten;
+  - a record of another version loads nothing, and nothing is written;
+  - a missing secret stops the start, and the refusal lists all of the setup's secrets.
+
+#### Saved setups
+
+The owner's record lives in core's settings store (`packages/core/src/settings/`), under `mcp.owner`, with its schema version. The store is a small key-value store on IndexedDB through core's strict wrapper, so every transaction is strict. A setup never holds a secret's value: secrets are in Credential Manager, put there by Settings (5.8).
+
+### 5.2 Ids, keys and tombstones
+
+Server ids are random and never reused. A removed server leaves a tombstone, which keeps each cleanup item (forget, each secret, the address) with a done flag. Each exe start retries the items not done, and completion, not age, shrinks the tombstone to its id and key. An add that reuses a removed server's id is refused: "A removed server had this id, and ids are never used again. Add it as a new server." (`REMOVED_ID_WORDS`). Any server-kind address no record owns is removed at start.
+
+### 5.3 Restart-only, and repair in a fresh exe
+
+- **Core calls `shell_ready` before it builds anything.** A refused second call means a reload. Then no owner is built, no journal opens or resumes, no tool is installed, and no config, choice, reservation or card command is accepted. The page shows only "Familiar needs a restart".
+- **Settings fails closed.** It shows "restart needed" when its messages get no answer, or that answer.
+- **Repair runs only in a fresh exe**, where every old native operation ended with the old process. The one mark is rolled back (before its commit) or finished (after it), `address_add` is never repeated, and then the enabled servers start, one admitted start at a time.
+
+### 5.4 The runtime lifecycle
+
+- **States:** Stopped, Starting, Ready, Stopping, Failed. Every run has the exe's run id, and an event from another run is dropped.
+- **No automatic restart.** A crash ends the run, calls in flight are answered "interrupted, it may have partly run", and the server goes to Failed with the reason and its last output.
+- **A server Stop during a call** answers the call "interrupted": the run ends under it (3.11).
+- **A start reads the committed launch** in the same synchronous step as its admission. Edits need Stopped.
+- **Nothing is ever resent.** A call while not Ready is refused "not running", and a call is never sent again on any path.
+- **Stop waits** for the exe's answer and the exit, with no deadline of its own. A start the exe never answers stays Starting, holding the owner, until a restart. That's unbounded by design.
+- **One exchange per server** (3.4). A call's timeout, or stopping the call, ends that call only.
+- **Test runs only while Stopped:** an admitted start, the tool list, then a stop. A failed Test leaves the server Stopped. "Mark reviewed" after it is a change.
+
+### 5.5 Consent: `ToolDecision`, the card's facts and the canonical form
+
+- **A `ToolDecision` is opaque** (`decision.ts`). Its constructor isn't exported, it has a type brand, and minted decisions live in a module-private `WeakSet`. Only the gate mints one, inside the tool's `execute`, from durable facts:
+  - a standing "always" for exactly this identity and both fingerprints, and only while the request carries no outside content;
+  - or a stored yes for this card whose identity, fingerprints and arguments hash all match this call now.
+
+  A mismatch mints nothing, drops the old answer and asks again. A "never" mints nothing. A decision records how it was minted, is bound to its step id, and is used once.
+- **Each presentation of a card gets a fresh, one-use card id.** The stored facts and any answer are keyed by that id, under the step id. When the facts change (a new fingerprint, or new arguments), the old id is retired, and the re-ask is a new presentation with a new id. An answer carrying a retired id, a duplicate included, answers nothing. So a Yes given to the first card can never mint against the second card's facts, which you never saw.
+- **The card's facts are stored when the card is made:** server id, the tool's own name, the tool's fingerprint, the launch fingerprint, and the canonical arguments with their SHA-256. They live in the journal's consent document. The answer is checked against those stored facts, never against the catalog as it is when the answer arrives. A change while the card is visible makes the yes mint nothing.
+- **The arguments are the ones `beforeTool` receives**, after pi-durable's repair and coercion. `execute` gets exactly those, and no hook may replace them.
+- **The canonical form** is one function, used by the card, the stored answer, the mint and the body (3.6): `JSON.stringify` of the parsed value with object keys sorted by plain string order at every level, arrays kept in order, `undefined` keys dropped, and `-0` written as `0`. A value outside plain JSON is refused before a card is made.
+- **Revokes hold at once.** A tightening (always to ask, anything to never) takes effect in an in-memory overlay that `send` reads synchronously, whatever the owner is doing. Its durable write is tried after. "Never" from either the overlay or the saved choice wins.
+- **Until step 8's choices UI**, the journal isn't fed the owner's choices, and every server tool asks.
+
+### 5.6 The outside record
+
+- **One immutable record per request**, written by core from the request's assembled input before it's sent. A missing or unreadable record counts as outside.
+- **Every entry carries its sources.** A server result carries its server, and so does an unreviewed tool's description. Any entry made while handling an outside request carries that request's sources: her replies, compaction summaries, notes and reminders written then, and her remark (2.1).
+- **Stored notes and reminders keep their sources**, and every read or delivery of them carries them. A request is outside if any entry in its assembled input carries a source. While it's outside, "always" doesn't apply, and a card offers no Always.
+
+### 5.7 Messages from other windows, and reserved headers
+
+- **Card answers go through the card desk** (`journal/desk.ts`), the journal's consent port as the core page holds it. Another window answers a card with `{ presentation, button }`, and nothing else in the message is read. The buttons are yes, always (only where the card offers it: a server tool, with nothing outside in the request) and skip. A button the card didn't offer counts as Skip. Each presentation is answered at most once; an answer for a presentation that isn't showing (retired, already answered, or never shown) answers nothing.
+- **Settings' edits** carry bounded draft values, and core validates them into its own snapshot. Approval facts, fingerprints, ownership state and call arguments are never accepted from any window.
+- **Reserved headers.** A setup header is refused, case-insensitively, if it names `mcp-session-id`, `mcp-protocol-version`, `last-event-id`, `content-type`, `accept` or `host`. Also refused, because the modern era's headers are built from the decision (3.6): `mcp-method`, `mcp-name`, and any name starting `mcp-param-`. The client's own headers are set after the setup's, so even an unrefused name couldn't override them.
+
+### 5.8 Secrets and reservations
+
+- **Core's side.** `Owner.reserve(ref)` grants one reservation for one secret ref of a server saved now, with a fresh id used once. The grant holds the owner (no other change, no removal of that server) until `acknowledge(id, ref)`. An acknowledgement with an unknown, used or mismatched id or ref does nothing. A grant never acknowledged holds the owner until the exe restarts, and is nothing after.
+- **Settings' side** comes with step 8: it consumes the grant in the same step as it calls `secret_set`, and acknowledges by the grant's id only after that call settles. The value never passes through core.
+
+### 5.9 Names
+
+- **Each server gets a key at add time:** a lower-case letter, then letters and digits, up to 16, from its label. A label with no Latin letter falls back to `server`. Keys are unique against every key ever issued, tombstones included, by a digit suffix, and are never changed or reused.
+- **The model's name is `<key>__<tool's own name>`**, offered only if the tool's own name is letters, digits, `_` and `-`, and the whole fits 64 characters. Nothing is converted.
+- **The key has no `_`**, so the first `__` splits a name back into one server and one tool. Choices are keyed by server id and tool name.
+- **A tool not offered** is listed in Test with the reason. Two tools with one name fail the list.
+- **No other extension can take a name.** pi-durable lets a later extension's tool replace an earlier one of the same name. So the installed extensions are fixed to Familiar's own (2.5, row 11), server tools are registered only under `<key>__…`, and a test asserts that no built-in tool's name contains `__`.
+
+### 5.10 Cards and chat text
+
+- **A message sent while a card is open** is queued as a follow-up. It shows "She's waiting for your answer above" with the card's Skip beside it, which sends that card's presentation id. When the next call opens another card, the notice moves to it, and a delayed Skip for the old id answers nothing.
+- **Chat text never settles a card.** The card's wait observes its call's abort signal, so `close()` never hangs.
+
+### 5.11 Adding a server
+
+- **By paste or by form** (`paste.ts`). A paste can be the common `mcpServers` block, VS Code's `servers`, a bare map of servers, or one server object, with comments and trailing commas forgiven. A form gives the same draft. A draft is the setup with no secret values in it, the values for Settings to store, and problems (which stop it being added) and notes (which don't). The raw paste is never kept.
+- **Secrets.** Every setting of a local server is a secret by default, except the settings that change what runs (which can only be plain, since the approval binds their values) and short values whose names don't look like credentials. A setting whose name looks like a credential is only ever a secret. A remote server's key goes in one of the four swap headers as a placeholder, which the exe swaps.
+- **The exe's rules, early** (`setup.ts`, `native-rules.ts`): its limits, its path rules and its classes of literal addresses, mirrored so a draft fails with the same words before anything reaches the exe. A test reads the exe's source and fails if the lists drift.
+- **Legacy SSE is refused** in plain words: its server names the URL for its posts itself, so its approval would have to cover a whole origin.
+- **The unpinned flag** (`unpinned.ts`): `npx`, `uvx`, `bunx`, `pnpm dlx` and `docker run` without an exact version or digest can fetch new code at any start, which the approval never saw. Such a setup is flagged, with how to pin it.
+- **A tool's fingerprint** is SHA-256 over its name, title, effective description (the description, or the title when there's none) and input schema, in canonical JSON, plus its header declarations on a modern remote run (3.5). A changed fingerprint is a new tool, and goes back to ask.
+
+## 6. Guarantees
+
+Each check names a test (T1 to T14), a harness check (H1 to H14), or the walk (W), and the mutation that must fail it. Section 7 defines them.
+
+| # | Guarantee | Mechanism | Check: what fails, and the mutation |
+| --- | --- | --- | --- |
+| G1 | Never two durable effects in flight | One owner, one synchronous admission, no timer releases it (5.1) | T3: two in flight (release on a timer) |
+| G2 | Nothing waits in line | Commands that don't fit are refused at once; no queue anywhere; one exchange per server (3.4, 5.1) | T3: at most one unresolved (queue instead of refuse); H1 (queue a call behind a live exchange) |
+| G3 | A start runs the committed launch | Edits need Stopped; the launch is read in the admission step (5.4) | T3 (an `await` between check and admission) |
+| G4 | Any reload is terminal; repair only in a fresh exe | The `shell_ready` refusal checked first; repair at exe start (5.3) | T4 (build the owner after a refused `shell_ready`) |
+| G5 | A half-done change ends wholly before or after | One mark, a rollback obligation, idempotent steps, tombstones (5.1, 5.2) | T3, T4 (no mark; release before the mark-clear) |
+| G6 | An unreadable store never loosens past "ask": a lost choice becomes "ask", which needs your Yes, never "always" or a silent run | Fail closed (5.1) | T4 (load unreadable choices as empty; load them as "always") |
+| G7 | One native write per reservation | One-use grants, held until acknowledged by id and ref (5.8) | T12 (a mismatched or repeated acknowledgement releasing the owner) |
+| G8 | No call without a gate-minted decision | Opaque, one-use decisions; `tools/call` is built only inside `send` (3.6, 5.5) | T1, T2 (drop the `WeakSet`; export a raw call); H3 |
+| G9 | The last check and the handoff are one synchronous step, and the body and its headers are the decision's | 3.6 | T2 (check, then an `await`, then hand off); H3 (an `await` before the handoff with a revoke in it; the body from the model's arguments); H11 (mirror `Mcp-Param-*` from another call's arguments; truncate an over-long header) |
+| G10 | A yes covers only what the card showed | The card's facts are stored when it's made (5.5) | T7 (h), and H3 under S1 (mint from the step id; ignore the fingerprint) |
+| G11 | A revoke holds at once | The overlay, read synchronously by `send` (5.5) | T2, T3 (the revoke waits for the owner) |
+| G12 | "Always" never acts on outside content | The outside record, her remark included (5.6, 2.1) | T9 (a remark without sources) |
+| G13 | A client message carries no authority | Presentation id and button only; drafts validated by core (5.7) | T10 (accept a client's fingerprint; honour a button the card didn't offer) |
+| G14 | One exchange per server, cleanup included, across Stop and Start | The per-server slot and the barrier (3.1, 3.4) | H1 (free the slot at the response, before cleanup; admit while draining; send page n+1 before page n drains; key the slot per run, then Stop and Start during a drain, S8); W |
+| G15 | Only Familiar's own messages reach the wire, and nothing reaches a stopping run | A tagged serializer of six kinds, narrowed by the run's era; no SDK; the closed mark (3.2, 3.4) | H2 (a `DELETE` at Stop; a remote cancel; a pong after its exchange ended; the local cancel after the seal; no closed mark at Stop, S11); H12 (a modern run builds `initialized`, answers a stray ping or sends a session id; a retry after `input_required`) |
+| G16 | Every native request and write an exchange makes ends within its native bound, cleanup included, and every exchange kind completes | `headersMs`, `idleMs`, `totalMs`, pongs at 5 s; P4's detach; completion per kind (3.4, 4.1) | H4 on the pass build (no detach: a held helper keeps the slot past its bound, S8); W and H1 (write-only exchanges completed only on a response: a local idle ping leaves the server busy) |
+| G17 | Server load can't take chat's requests | The server cap of 24 within 32, detached server helpers counted in it (4.1) | H5 under S10 (no server cap: with 24 server requests held, a model fetch refused) |
+| G18 | A call's timeout or stop ends that call only | Its signal drains its exchange; the run stays (3.6) | T5 and S13 (close the run on a call's timeout) |
+| G19 | A recovered server call never runs unasked | The recovered-run gate (2.7) | T13's recovered-run test, and T7's kill mid-call (drop the run check) |
+| G20 | A question is open exactly while pi-durable says its run stopped there | Questions are a view over `runFailure`, under 2.5's preconditions (2.2) | H6 and H7 (record the question when the run ends); T13. A queued reset is ruled out by the module-graph pin (2.5, row 7) |
+| G21 | Every submission is your act, admitted in one commit with its check, and no pi-durable path starts a run on its own | `send`, `answer`, Send now, her line; `submit(tx, …)`; 2.5's eighteen pins (2.3 to 2.5) | H7 (split an answer's check from its `continue`; automatic placement after an error; `afterFailedRun: "continue"`; a per-message Send now); 2.5's settings and module-graph tests; S6 (7.2) |
+| G22 | A queued message is never stranded unseen | A question holds it, or Send now shows (2.4) | H8 (hide Send now after a fault) |
+| G23 | Her line never starts, restarts or places a run | The one-commit write choice (2.1) | H9 (drop the `runFailure` check from her line). The empty-inbox check has no reachable failing state (7.2) |
+| G24 | Consent never rides on chat text, and the notice follows the open card | 5.10 | T13 (read queued text as an answer; resolve Skip against the current card) |
+| G25 | A model name names one tool, for good | Frozen keys, no conversion (5.9) | T6 (keys unique only among servers saved now) |
+| G26 | A sent call reaches one run, is never resent by Familiar or the exe, and never meets a catalog Familiar knows is stale. It can meet a change the server made since the last listing (3.8b, section 8) | Run ids, no resend, stale refuses (5.4, 3.5); a 404'd call is a tool error with its decision used (3.8); no redirect followed (4.4) | T5 (resend after a connection error); H10 (accept a response for any id); H14 (resend the 404'd call after the re-handshake; keep the old session id; drop the `redirected` check under the redirect mode; Ready during a session recovery, S12) |
+| G27 | Test never disturbs a running server | Test only while Stopped (5.4) | T8 (allow Test while running) |
+| G28 | A local server that stops reading is stopped, even with the page gone | The exe's write bound (4.1) | T11 and `server.write-bound` on the runner (the bound in the page only: the renderer killed with a full pipe outlives 11 s) |
+| G29 | A run's era is decided once, from the server's own refusal, and every request of that run is framed for it | The era is set in the step that ends the `initialize` exchange, and the serializer takes it (3.2, 3.3) | H12 (turn modern on any `initialize` error); T14 |
+| G30 | A tool the protocol says to exclude is never offered | The declaration scan at list time; declarations in the fingerprint (3.5) | T14 (a tool declaring a `number` header is listed); T6 (declarations left out of the fingerprint: a changed declaration keeps its "always") |
+| G31 | A server that drops its session gets at most one re-handshake per drop, never two in a row | The bound in 3.8 | H14 under S3 (re-handshake on every 404) |
+| G32 | Every ping a legacy server sends gets a timely pong handoff once, or meets a named departure. What the network does to a handed-off pong is logged (departure 6) | Pongs from the parser in the step that reads the ping; pongs outstanding until their native end (3.4, 3.7) | H13 under S2 (pong in a microtask; cancel pongs at once on draining: a ping with the final reply is lost with no departure) |
+| G33 | A card's answer settles only the presentation you saw | A fresh one-use card id per presentation (5.5) | T7 (i), S9 (answers keyed by step id: a duplicated Yes from the first card mints against the second's facts) |
+| G34 | Two saved servers never share one address, and a rollback never removes another's | The exe's normalized identity; rollback only of what this add created (5.1) | T4 (compare raw URLs: `:443` and no port make two records; roll back an address this add didn't create) |
+| G35 | No `tools/call` reaches the server more than once, or as a GET | No-follow for servers (4.4); the `redirected` check (3.8) | `net.no-redirect` on the runner; H14 under the fake exe's redirect mode |
+
+**The five classes of defect, and the guarantees that rule each out:**
+
+| Class | Ruled out by | Why it can't arise |
+| --- | --- | --- |
+| **State changed outside its current owner** | G1, G3, G4, G11, G13, G20, G21, G23, G27, G34 | Durable config has one owner. Run state belongs to pi-durable alone: Familiar keeps no copy of "a question is open", and never places a run |
+| **An effect landing after its change answered** | G4, G5, G7, G9, G15, G19, G20, G21, G26, G29, G31, G35 | The check and the handoff are one synchronous step. A superseded question closes in the commit that superseded it. Nothing is sent from a stage Familiar didn't start |
+| **A stale waiter, queue or native request** | G2, G14, G15, G16, G17, G18, G22, G23, G28, G32 | No queues. One exchange per server, cleanup included. Cleanup is bounded natively. Chat's share is reserved |
+| **Consent not bound to the exact call at the native handoff** | G8, G9, G10, G11, G12, G19, G24, G30, G33 | The body and, on modern, its mirrored headers are built from the decision inside the synchronous handoff, and the decision is checked against the card's stored facts |
+| **A name mapping to two identities** | G25, G26, G30, G34 | Frozen keys, original names only, a reserved namespace, one address identity, run ids on every event |
+
+## 7. The tests
+
+### 7.1 The ground, checked against the real dependencies
+
+The design reads pi-durable's spec and the reference servers' behaviour. Before the code that depends on them, each reading was checked against the real thing, and those checks stay as tests:
+
+- **pi-durable's `runFailure` and inbox** (`tests/journal/pi-durable-b1.test.ts`), against the real 1.5.2 on a fake IndexedDB: for a step cap, a cap pause through `cappedPort`, an `abortTask`, a Stop, a new message, a `continue`, and a display-only and a model write in each state. `runFailure` is set and removed as the spec says; a cap pause arrives as `model_error` with a decodable detail, and inside a blocking compaction with both prefixes (2.2); `backgroundTokens: 0` starts no compaction task, shown at a 100,000-token window; `tx.submission(id)` reads a queued submission inside a commit before its admission, and throws `ReadAfterWrite` after; the inbox is kept after an unanswered or aborted run; a display-only write is appended in every state.
+- **Role alternation** (`tests/journal/ground.test.ts`): every request body alternates roles after the merge (2.1).
+- **The modern opening.** The TypeScript SDK's servers (HTTP and stdio, default and modern-only) were run, and rmcp's read from its source. Their exact refusals (status, media type, body) are what T14 replays, and they settle 3.9's two stdio paths.
+- **The code pins** (`tests/journal/pins.test.ts`): 2.5's settings, hooks, extensions and call sites, and `run.inputs[0]` stable across a run's generations (2.7).
+- **The address identity** (`tests/mcp/owner.test.ts`): core's normalization against the exe's (5.1).
+
+An upgrade of pi-durable must run these, and T13, again.
+
+### 7.2 The seeded harness
+
+**What runs:** the real client (`McpClient`, its links and the exchange machine) and the real journal on the real pi-durable 1.5.2. There are two harnesses, both in `packages/core/tests/harness/`:
+
+- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H14 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S13;
+- **the journal harness** (`journal.ts`, checks in `journal-checks.ts`): the real journal over a fake IndexedDB that outlives each life, with a gated fake model. It runs H6 to H9 over seeded runs (40 by default, `FAMILIAR_JSEEDS`), and the named schedule S5.
+
+**The fake MCP server, scripted per seed.** Its legacy modes, local and remote, can:
+
+- answer JSON or an event stream, with chunk boundaries anywhere;
+- send pings (none, two concurrent, a flood, one in the same chunk as the final reply) and `list_changed`;
+- end streams early, stall heads and trickle bodies;
+- page with `nextCursor`, including 17 pages;
+- send unsupported requests, invalid answers and responses for stale ids;
+- end a session: a 404 on the next request carrying its id; then, per seed, accept the re-handshake, 404 the first request after it again, fail the re-handshake, or 404 always;
+- refuse `initialize` with `-32022`, or with another error;
+- send local idle pings, and stop reading stdin.
+
+Its **modern modes**, local and remote:
+
+- **modern-only:** refuses `initialize` with `-32022` and `data.supported: ["2026-07-28"]`; on stdio, either keeps the pipe or exits, per seed, so both of 3.9's paths run;
+- **both eras:** serves `initialize` too, so Familiar must stay legacy;
+- **request validation:** rejects a request whose `_meta` envelope or standard headers are missing or disagree with the body, or whose `Mcp-Param-*` headers disagree with the arguments, with `400` and `-32020`;
+- **tools:** one with a mirrored `string` argument, one with a non-ASCII mirrored value, one declaring a `number` header, one returning `input_required`, one with `resultType` absent;
+- **misbehaviour:** a stray `ping` and a server-to-client request on a modern stream.
+
+**The unkind fake exe.** It implements shell-design's `net_fetch`, `net_read`, `net_cancel`, `server_write` and the channel by their contract, not kindly:
+
+- `net_cancel` returns only when the request's task and every helper have terminated, and a helper can be held for any time;
+- the 32 open requests are counted until termination;
+- the writer takes 8 writes in flight, and blocks when the fake server stops reading;
+- a redirect mode follows 3xx answers as today's contract does: a 307 re-POSTs, a 303 becomes a GET;
+- a pong's native fate can be a stall, a timeout or `busy`.
+
+The **pass build** adds P4's detach bound, the server cap and the native write bound. The fake exe records every native request with its start, cancel and termination, the exchange and run it belonged to, and its body.
+
+**The independent evidence log.** Checks never read the code under test's memory or UI. The harness keeps its own log:
+
+- **your actions**, written by the test driver as it acts: each message, each answer with its button and presentation id, each Send now, Stop, revoke and Settings change;
+- **what was shown**, recorded at the card and button ports, the journal's own ports with test doubles behind them;
+- **commits**, recorded at the storage boundary: each commit's pre-state and post-state of `pi.live`, its submissions and Familiar's documents, across lives;
+- **handoffs**, recorded by the fake exe: each native request, with its JSON-RPC id and body. The harness matches a body to the decision whose stored card facts (or "always" record) produce it, rather than taking the client's word for it.
+
+**The scheduler** (`sched.ts`). Every native answer, every timer and every action is an event in one ready set, and at each step the seed picks the next one: a server chunk, a helper finishing, a timer, an action of yours, one of her lines, or a kill and reopen at a commit. After each event the code under test runs until it settles, so a run is a function of its seed.
+
+**The checks.** Each reads only the fake exe's log, the fake server's own record, the commit log and the evidence log:
+
+- **H1.** Per server, the native requests of two different exchanges are never open at once, cleanup included, and at most 3 are open on a remote server, 4 on a local one (3.4). Every call refused busy is answered within the step it was made, and no handoff for it ever follows. Overlap alone can't catch a queue, since a call queued until the slot drains never overlaps.
+- **H2.** Every request body is one of the six kinds (3.2). No GET or `DELETE` is ever made, no error response is sent, and no `notifications/cancelled` goes to a remote server. No pong is sent for an id that wasn't a ping on its own exchange. No request is made after its exchange's terminal event, or after its run's Stop, and none outlives its run.
+- **H3.** Every `tools/call` body equals, byte for byte, the canonical body built from one stored card's facts, or one "always" record, that the evidence log shows answered, or in force, before the handoff, and not used by an earlier handoff. No call reaches the fake exe for a decision whose revoke, abort or fingerprint change the log shows before the handoff.
+- **H4.** In the pass build, every `net_cancel` returns within its bound, even while a helper is held, and a held helper never keeps an exchange out of Idle past the bound. The pre-pass build records the same as a measured limitation.
+- **H5.** In the pass build, at saturation: with 24 server requests open (detached helpers among them), a model fetch is never refused `busy`.
+- **H6.** Both directions, against an independent history. From the commit log, the harness keeps its own record of each unanswered ending, from the submissions' own settlements, and of every run start after it. It never reads `runFailure` to judge `runFailure`. A question is due exactly when the latest ending has no run start after it and no answer. H6 fails if a question is shown that isn't due, or if one that is due isn't shown.
+- **H7.** Every run start in the store is in a commit that also holds one of these: your new message; an answer record whose commit's pre-state shows the question open; a Send now record whose pre-state shows its submission queued and oldest; or pi-durable's own boundary after an answered run. Nothing else, so a compaction boundary fails it.
+- **H8.** After every step: if the conversation is idle, the inbox isn't empty and no question is open, Send now is shown.
+- **H9.** Her line's entry is model-visible only if, in its commit, no run was live, the inbox was empty and `runFailure` was unset. Her line never appears in a commit that starts a run.
+- **H10.** A late response for an ended exchange's id never reaches a caller.
+- **H11.** On a modern remote run, every `tools/call` POST's `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` headers equal what the harness derives from that POST's body and the raw listed `inputSchema`, using its own scanner and its own fixed vectors: values that need base64, edge whitespace, sentinel-shaped values, unsafe integers, lone surrogates, and declarations under `items` and `oneOf`. A call whose mirrored value would be refused, or would pass 8 KiB, makes no native request.
+- **H12.** A run's requests all have one era's framing. A modern run never sends `initialize` after its opening, `notifications/initialized`, a pong, `Mcp-Session-Id` or a remote `notifications/cancelled`. A legacy run never sends the `_meta` envelope's reserved keys or the modern-only headers. A run turns modern only after an `initialize` answered `-32022` whose list names 2026-07-28 and no legacy version. No request follows an `input_required`, `-32020` or `-32021` answer for the same call.
+- **H13.** Every ping id the fake server sends has exactly one disposition, kept by the fake server and the fake exe, not the client: a pong handed off for that id before its exchange sealed, or one of named departures 1, 2 and 5 whose own condition holds in the log at that step (departure 5, for example, requires the ping to have come after the final response on its stream). A ping with neither fails. A handed-off pong's native fate (received, or lost: departure 6) is logged separately and never fails H13.
+- **H14.** No call is sent twice:
+  - no two native requests carry the same decision's call, matched through the evidence log;
+  - no two requests in a run carry the same body once the JSON-RPC id is removed, unless the log shows two separately answered or "always" decisions for them. T7 (j) is the positive witness: two identical calls, approved separately, each go out once;
+  - after a 404, the next request is an `initialize` with no session id, then `initialized` with the new one, and no call is admitted until the re-handshake's list has completed;
+  - a 404 before one exchange has completed after a re-handshake, or a failed re-handshake, ends the run with no further request;
+  - under the redirect mode, a redirected call fails, and nothing follows it.
+
+**Every check needs a witness.** For each check, the seed set must contain at least one step where its condition was in play and could have failed: H1 a busy refusal, H6 both a due and a superseded question, H13 a ping for each departure, H5 a saturation. A check with no witness in a build's seeds fails the build.
+
+**Named mutations.** Each is a switch in the code under test (`src/mutations.ts`), off unless a test turns it on, and counted each time it changes behaviour. **They exist only in the test build.** Every call site is written `__FAMILIAR_MUTATIONS__ && mutant('name')`; the app build defines the constant `false`, so the bundler drops the branch and the name with it. `apps/desktop/tests/mutations-bundle.test.ts` scans the app's pages for any switch left, and a control builds the same pages with the constant `true` and finds them, so the scan can see.
+
+**How a mutation must fail.** Each mutant runs beside its unmutated twin, on the same seed and schedule. It passes its control only if:
+
+- the named check fails in the mutant;
+- the same check passes in the twin;
+- the two runs' histories are identical up to the first step where the switch changed behaviour.
+
+Since the twin's identical prefix passes, the mutant's failure lies at or after that step. So a failure is caused by the switch, not only ordered after it. A mutation with no such seed is a broken control, and fails the build.
+
+| Mutation | Must fail |
+| --- | --- |
+| `free-slot-at-response`: free the slot at the response, before cleanup | H1 |
+| `queue-call`: queue a call behind a live exchange | H1 |
+| `admit-while-draining` | H1 |
+| `page-before-drain`: send page n+1 before page n drains | H1 |
+| `slot-per-run`: key the exchange slot per run | H1, and under S8 |
+| `write-only-on-response`: complete write-only exchanges only on a response | H1 (a local idle ping leaves the server busy) |
+| `pong-after-end`: answer a ping after its exchange ended | H2 |
+| `delete-at-stop` | H2 |
+| `remote-cancel`: send a cancel to a remote server | H2 |
+| `local-cancel-after-seal` | H2 (a write after the terminal event) |
+| `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
+| `body-from-model-args` | H3 |
+| `await-before-handoff` | H3, with a revoke scheduled in the await |
+| `ignore-fingerprint` | H3 under S1 |
+| `no-detach` | H4 under S8, pass build |
+| `no-server-cap` | H5 under S10 |
+| `accept-any-response-id` | H10 |
+| `mirror-previous-call`: mirror `Mcp-Param-*` from the previous call's arguments | H11 |
+| `truncate-header`: truncate an over-long mirrored header instead of refusing | H11 |
+| `modern-on-any-error` | H12 |
+| `initialized-on-modern` | H12 |
+| `answer-stray-ping-modern` | H12 |
+| `retry-after-input-required` | H12 |
+| `session-id-on-modern` | H12 |
+| `pong-in-microtask` | H13 |
+| `cancel-pongs-at-drain` | H13, and under S2 |
+| `resend-404-call` | H14 |
+| `rehandshake-every-404` | H14, and under S3 |
+| `keep-old-session-id` | H14 |
+| `ready-during-recovery`: Ready while a session recovery runs | H14 under S12 |
+| `ignore-redirected`: drop the client's `redirected` check | H14 under the redirect mode |
+| `question-at-end`: record the question when the run ends, the old shape | H6, H7 |
+| `after-failed-continue`: `afterFailedRun: "continue"` | H7 (the run it starts in the failure's own commit is no act of yours; H6 sees it on too few seeds to be its control) |
+| `split-answer`: split an answer's check from its `continue` | H7 |
+| `auto-placement`: place queued input automatically after an error | H7 |
+| `per-message-send-now` | H7 (its pre-state shows another submission oldest) |
+| `hide-send-now`: hide Send now after a fault | H8 |
+| `remark-no-failure-check`: drop the `runFailure` check from her line | H9 |
+| `answers-by-step`: card answers keyed by step id, not presentation | T7 (i) |
+
+**Mutations with no control, and why:**
+
+- **`remark-no-inbox-check`**, dropping the empty-inbox check from her line. On pi-durable 1.5.2 no schedule can reach a failing state: a run's end places queued input, and a failure keeps `runFailure`, so an idle chat with no failure and input queued never exists while the `runFailure` check stands. The check stays, as defence in depth.
+- **A queued reset after a step cap**, and an `onYield` continuation. No reset or `onYield` path exists in Familiar to switch on. They're covered by 2.5's module-graph and hook pins only.
+- **`background-compaction`**, the default `backgroundTokens`. S6 runs it, but at the journal's 32,000-token window a background summary can't happen before a blocking one: the blocking threshold (32,000 − 16,384) is below pi-durable's default `keepRecentTokens` (20,000), so any history long enough to cut is past blocking first. In both builds the chat compacts only inside a turn, nothing is placed, and H7 holds. S6's evidence for a background summary landing in an idle, failed chat is pi-durable's own probe at a larger window (7.1), with the settings pins (2.5, row 1).
+
+**Named schedules**, run beside the random seeds:
+
+- **S1, a fingerprint change while a card is shown:** the card opens with fingerprint F1 and arguments A; the catalog changes to F2; you answer Yes. H3 sees no handoff, and T7 (h) asserts the card asks again.
+- **S2, a ping in the same chunk as the final reply:** its pong is still handed off (H13).
+- **S3, a 404 mid-call, then a 404 again** on the re-handshake's first page: the run ends, and nothing more is sent (H14).
+- **S4, a kill between the interruption records and `abortTask`.** Not yet a named schedule (section 8).
+- **S5, a step cap with a message queued, then a new message, then a delayed Yes** (H6, H7, in the journal harness).
+- **S6, a step cap with a message queued in a chat that compacts** (H7, above).
+- **S7, two interrupted steps in one round, then a kill, then Run again:** one question lists both, and one answer settles both (T13).
+- **S8, Stop then Start while a remote call's POST is still in `net_cancel`** (H1; H4 in the pass build).
+- **S9, a duplicated Yes from the first card arriving after the changed tool's card is shown** (T7 (i)).
+- **S10, server saturation:** servers each hold a call and a detached helper, then more, then chat fetches a model (H5).
+- **S11, Stop during a walk, or while Ready, then a call:** nothing reaches the stopping run after Stop (H2).
+- **S12, calls during a session recovery:** refused busy until the re-handshake's list completes (H14).
+- **S13, a call's time limit, or its stop, ends that call only:** the run stays Ready (T5's named case).
+
+### 7.3 The exchange machine's exhaustive walk (W)
+
+`tests/harness/walk.test.ts`. The exchange machine (3.4) and its terminal paths are a pure function. The walk explores every interleaving of its inputs for one server, in each era and place: admit, a response, a ping, a pong head, a stream end, a deadline, Stop, a run end, each `net_cancel` returning, each local write completing (the request, a pong, the cancel), a dropped-line `err` event, and a Stop and Start of the same server. It allows up to 3 pings (so 2 pongs outstanding, and a flood) and up to two exchanges per path; the modern era has no ping input.
+
+States are deduplicated exactly: a set of the canonical state's JSON, compared by string equality, never by a hash, since a hash can collide and silently drop states. It checks H1's rule (no native request of one exchange open while another's is; the request and two pongs at most, plus a local stop's cancel), and liveness: from every reachable state, once every native request and write has ended and every request kind has its answer or its deadline, the slot is Idle. A write-only exchange gets no answer and has no deadline, so one that waits for a response fails. Its controls are H1's mutations. It models nothing Familiar doesn't own.
+
+### 7.4 The tests, by number
+
+| # | What it covers | Where |
+| --- | --- | --- |
+| T1 | Types and exports: a `ToolDecision` can't be built or skipped; the client's export list is fixed | `tests/mcp/t-suite.test.ts` |
+| T2 | Decisions at the handoff: a cast object, another server's decision, an old fingerprint, a second use, an aborted signal, "never" after minting, and "always" revoked between mint and handoff each give zero handoffs; a revoke is scheduled at every point before `send`. A fresh decision hands off once | `tests/mcp/t-suite.test.ts` |
+| T3 | The owner property: seeded histories of adds, edits, removes and choices, each life cut off at a seeded point where every later port and store call hangs. After repair: no mark left, no unfinished tombstone, the exe's server addresses exactly the remote records', no id or key reused, every removed secret deleted | `tests/mcp/owner.property.test.ts` |
+| T4 | One effect at a time, each change's steps and mark, the rollback, tombstones, repair in a fresh start, failing closed (an unreadable choice is "ask"; another version loads nothing), and the address identity: one record for a URL with and without `:443`; a rollback leaves an address it didn't create | `tests/mcp/owner.test.ts` |
+| T5 | The runtime, through the real client against the fake server: start, list, call, Stop, a deadline, a crash mid-call (Failed until Start, never resent), remove with a call in flight, plain words for failures; S13 | `tests/mcp/client.test.ts`, the harness |
+| T6 | Names over successive catalogs: random adds and removes of servers whose labels clash; `<key>__<tool>` maps to one server and tool for the whole history | `tests/mcp/names.property.test.ts` |
+| T7 | A bound yes through the journal: a server call killed mid-call is interrupted, with Run again, and never sent again; "always" runs a call only while nothing outside is in the conversation; a changed tool asks again, with the facts read now; one server's "always" never allows another's saved tool; (h) the catalog changes while the card is shown, and the yes mints nothing; (i) S9, a duplicated Yes from the first card answers nothing on the second; (j) two identical calls, each approved on its own card, each go out once | `tests/mcp/journal.test.ts`, `tests/mcp/client.test.ts`, `tests/mcp/t-suite.test.ts` |
+| T8 | Test while running is refused | `tests/mcp/t-suite.test.ts` |
+| T9 | The outside record, her remark included: a remark made while a server result is in context carries that server's source, the next request is outside, "always" asks, and the card offers no Always. The control: the same remark without sources | `tests/journal/ground.test.ts` |
+| T10 | Messages from other windows: a card answer carries a presentation id and a button, nothing else is read, a button not offered is a Skip, and each presentation answers once; a setup can't give Familiar's own headers, in any case | `tests/mcp/windows.test.ts` |
+| T11 | One exchange per server, and everything it causes: a remote server that ignores cancellation and trickles; a local server that stops reading with a call larger than the pipe; a priming event then an early end; a large result in many raw chunks reaching the caller whole before the POST is cancelled; local cancel writes held in their exchange. The pass build adds the exe's write bound with the renderer killed, and the runner's `net.total-deadline` | `tests/mcp/wire.test.ts`, `tests/mcp/wire-modern.test.ts` |
+| T12 | Reservations: one fresh grant for one ref of a saved server, held until acknowledged by its id and ref, used once; a grant never acknowledged holds the owner until the exe restarts, and is nothing after | `tests/mcp/windows.test.ts` |
+| T13 | The journal on this ground, against the real pi-durable: the question view's every row, closed by an answer record; her line in every state (quiet, mid-turn, after a stop with a message queued, after a failure, at a paused cap) is the right kind of write and never starts a run; every answer row of 2.3; a new message closes an open question in its own commit, and a delayed Yes then does nothing; a No with a message queued charges the new run to that message's turn; a bare "ok" leaves a question open; Send now on a queue of three sends the oldest; S7; a cap pause inside a blocking compaction reads as a cap question; the recovered-run gate; every row of 2.5; card turnover, and chat text settling nothing | `tests/journal/ground.test.ts`, `tests/journal/pins.test.ts` |
+| T14 | The wire against the fake server, both eras, counted at the server. Legacy: pings on every exchange kind, two concurrent, a third, 40 sequential; 17 pages; an unsupported request; a 404 session; a stream ended early; invalid answers; a session id too long, non-ASCII or doubled; each message kind's malformed shapes; events split across reads, empty events and a dropped long line; a version outside the list; the opening's `-32022` in each recorded form, each turning modern and adopting no session id; 307 and 303 under the redirect mode. Modern: a modern-only server, remote and local (both stdio paths), reaches Ready with no discover and no `initialized`; a both-era server stays legacy; the mirrored tools, the non-ASCII value included, pass the server's validation; the `number`-header tool isn't offered and Test says why; `input_required` and an absent `resultType` are tool errors with no retry; a stray ping gets nothing. No GET, `DELETE`, error reply or remote cancel is ever seen | `tests/mcp/t-suite.test.ts`, `tests/mcp/wire.test.ts`, `tests/mcp/wire-modern.test.ts` |
+
+On the Windows runner, through the real exe, the `proc-mcp` checks run the same client in the real core page under the real CSP, with `mcp.legacy-transport` and `mcp.modern-transport` counting requests at the fake server. The native pass adds, first, `net.no-redirect`, `net.tls-egress` and `net.pool-retry` (4.4, 4.5), then `net.helper-detach`, `net.server-cap`, `server.write-bound` (with the relaunch held back) and `net.total-deadline`.
+
+Each build reports seeds run, checks passed and mutations failed (every one with a control must fail), plus the runner's results.
+
+## 8. What stays hard
+
+- **Familiar's own protocol code.** The handshake, the event-stream parser and the validation of untrusted shapes are Familiar's. They're covered by T14, by the harness's chunking over the parser, and by `mcp.legacy-transport` on the runner. Whether the official conformance package can drive a client not built on the SDK is unverified.
+- **P2 rests on pi-durable 1.5.2's semantics**, pinned exactly. An upgrade must recheck 2.5 against the new spec, and run 7.1's tests and T13 again. If a later step ever wants an `afterRun` hook, P2 must be revisited first.
+- **The named departures:**
+  1. a ping flood ends its exchange;
+  2. a local ping during a blocked write or a drain gets no pong;
+  3. no cancel is sent to a remote legacy server;
+  4. no session `DELETE`;
+  5. a ping after the final response on its stream gets no pong;
+  6. a pong handed off in time can still be lost to its own native failure, `busy` from the server cap included.
+- **The re-handshake on 404** is one per drop, so a server that drops sessions often costs one handshake each time. A call cut by the drop is never resent: you ask again.
+- **The interim before the native pass** (4.3).
+- **On modern servers the catalog refreshes only at start and on Test** (3.8b). A tool the server changed in between is still called as you consented to it, against the tool as last listed. A legacy server has the same exposure between `list_changed` notifications.
+- **The modern era's evidence.** The TypeScript SDK's servers were run; rmcp's behaviour is read from its source, and `mcp.modern-transport` is its first run. go-sdk and mcp-go never refuse a legacy `initialize`, so in practice only TypeScript SDK and rmcp servers can be modern-only.
+- **Header mirroring** follows the TypeScript SDK's reading of the spec. Its edge cases are checked against the fake server's validation, which is written from that same reading.
+- **A revoke not saved is lost at a restart.** You're told, and the saved choice holds after the restart.
+- **Structured output isn't schema-checked.** A tool's `structuredContent` goes to the model as bounded, untrusted JSON, without validation against its `outputSchema`. A validator that needs no code generation could add it later.
+- **Chat's reserved share is held against servers, not against chat itself.** Her line, the decider's bigger model and a turn can together use the 8 (4.1).
+- **Wire behaviour still unmeasured:** whether Windows fetches certificate data outside the saved address, and whether pooled lan or loopback connections are retried (4.5). Each has a runner check. Behind a proxy, "one POST" holds at Familiar's side only.
+- **Background compaction is off.** In a long chat, a reply waits for its summary.
+- **A secret holding a quote, or another character JSON escapes, isn't blanked from a server's JSON output.** The exe blanks literal copies only. The fix is the exe's, in the pre-release native pass, and `mcp.secret-json-escaped` holds the gap open on the runner as a known gap ([shell-design.md](shell-design.md#5b-starting-a-local-mcp-server)).
+- **S4 isn't a named schedule yet.** A kill between the interruption records and `abortTask` is argued in 2.2: pi-durable resumes the task, and the hook writes the same records again.
+- **Defects the harness found**, both fixed in the build:
+  - a pong counted as outstanding only until its head let one exchange hold 5 native requests. A pong now counts until its native end (3.7; `05cf3df`);
+  - a local run that ended for a reported reason kept its process alive. A local run that ends now stops its process, and its writes end at the exit (3.9; `2082356`).

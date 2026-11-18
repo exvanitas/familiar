@@ -25,7 +25,7 @@ describe('the wire, under seeded interleavings', () => {
     const missing = Object.keys({ ...WITNESSES, ...PASS_WITNESSES }).filter((w) => !seen.has(w));
     expect(missing, 'checks with no witness in these seeds').toEqual([]);
     if (process.env.FAMILIAR_VERBOSE) console.log("WITNESSES", [...seen].join("; "), "FATES", JSON.stringify(fates));
-    // Departure 7: logged, never judged.
+    // Departure 6: logged, never judged.
     expect(fates.received).toBeGreaterThan(0);
   }, 600_000);
 });
