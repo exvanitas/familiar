@@ -126,9 +126,10 @@ export class McpClient {
     return this.owner.repair();
   }
 
-  /** Starting with the app: every enabled server starts, one admitted start at a time. */
+  /** Starting with the app: every enabled server starts, one admitted start at a time. Each start reads
+      the committed record again, enabled flag included, so one turned off meanwhile isn't started. */
   async startEnabled(): Promise<void> {
-    for (const s of this.owner.servers()) if (s.enabled && !s.removing) await this.runtimes.get(s.setup.id)?.start();
+    for (const s of this.owner.servers()) if (s.enabled && !s.removing) await this.runtimes.get(s.setup.id)?.start({ auto: true });
   }
 
   list(): ServerStatus[] {

@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { McpClient, type McpClientOptions } from '../../src/mcp/client.ts';
 import { Owner, OWNER_KEY, OWNER_VERSION, type OwnerPorts } from '../../src/mcp/owner.ts';
-import type { ProcessPort } from '../../src/mcp/process.ts';
+import type { ProcessEvent, ProcessPort } from '../../src/mcp/process.ts';
 import type { NetPort } from '../../src/mcp/wire/link.ts';
 import type { ServerSetup } from '../../src/mcp/setup.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
@@ -188,4 +188,73 @@ describe('5.4: one start at a time owns the phase', () => {
       }
     });
   }
+});
+
+describe('5.3: starting with the app', () => {
+  it('a server disabled while an earlier one starts is not started: each automatic start reads the committed flag', async () => {
+    const store = memorySettingsStore();
+    let releaseA!: () => void;
+    const aHeld = new Promise<void>((r) => (releaseA = r));
+    const { port, starts } = speakingPort((id, msg) => (id === 'A' && msg.method === 'initialize' ? aHeld : undefined));
+    const client = await clientOf(store, port);
+    await client.add({ setup: local('A'), problems: [] });
+    await client.add({ setup: local('B'), problems: [] });
+    await client.setEnabled('A', true);
+    await client.setEnabled('B', true);
+    const all = client.startEnabled();
+    await tick(10);
+    expect(starts).toEqual(['A']);
+    await client.setEnabled('B', false);
+    releaseA();
+    await all;
+    expect(starts).toEqual(['A']);
+    expect(client.get('A')!.phase).toBe('ready');
+    expect(client.get('B')!.phase).toBe('stopped');
+  });
+
+  it("an automatic start's modern relaunch reads the committed flag too: turned off during the first attempt, it isn't launched again", async () => {
+    for (const disable of [true, false]) {
+      const store = memorySettingsStore();
+      let release!: () => void;
+      const held = new Promise<void>((r) => (release = r));
+      let starts = 0;
+      let emit!: (e: ProcessEvent) => void;
+      // A modern-only stdio server: it refuses the legacy opening and ends its process; a relaunch with the
+      // era fixed lists its tools.
+      const port: ProcessPort = {
+        async start(_s, onEvent) {
+          emit = onEvent;
+          return { run: `p${++starts}` };
+        },
+        async write(_run, bytes) {
+          const msg = JSON.parse(new TextDecoder().decode(bytes));
+          if (msg.method === 'initialize') {
+            await held;
+            const refusal = { jsonrpc: '2.0', id: msg.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: ['2026-07-28'], requested: '2025-11-25' } } };
+            queueMicrotask(() => (emit({ t: 'out', line: JSON.stringify(refusal) }), emit({ t: 'exit', code: 0 })));
+          } else if (msg.method === 'tools/list') {
+            const list = { jsonrpc: '2.0', id: msg.id, result: { resultType: 'complete', ttlMs: 0, cacheScope: 'private', tools: [{ name: 'look', inputSchema: { type: 'object', properties: {} } }] } };
+            queueMicrotask(() => emit({ t: 'out', line: JSON.stringify(list) }));
+          }
+        },
+        async stop() {
+          queueMicrotask(() => emit({ t: 'exit', code: 0 }));
+        },
+        async forget() {}
+      };
+      const client = await clientOf(store, port);
+      await client.add({ setup: local('A'), problems: [] });
+      await client.setEnabled('A', true);
+      const all = client.startEnabled();
+      await tick(10);
+      expect(starts).toBe(1);
+      if (disable) await client.setEnabled('A', false);
+      release();
+      await all;
+      // The control, still enabled: the relaunch runs and the server is Ready.
+      expect(starts, disable ? 'turned off' : 'still on').toBe(disable ? 1 : 2);
+      expect(client.get('A')!.phase).toBe(disable ? 'stopped' : 'ready');
+      expect(client.owner.busy).toBe(false);
+    }
+  });
 });

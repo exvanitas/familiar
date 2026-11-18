@@ -86,13 +86,18 @@ export class ServerRuntime {
     this.onChange();
   }
 
-  /** Starts the committed record. Admitted only from Stopped or Failed, and by the owner. */
-  async start(): Promise<Reply> {
+  /**
+   * Starts the committed record. Admitted only from Stopped or Failed, and by the owner. An automatic
+   * start (`auto`, starting with the app) also needs the committed record enabled, read in the same step,
+   * and so does its modern relaunch: a server turned off meanwhile isn't started.
+   */
+  async start(options: { readonly auto?: boolean } = {}): Promise<Reply> {
     if (this.phaseNow !== 'stopped' && this.phaseNow !== 'failed') return { kind: 'refused', words: this.phaseNow === 'ready' ? 'It is already running.' : `It is ${this.phaseNow}.` };
     // The launch is read in the same step as the admission.
     const record: OwnedServer | undefined = this.owner.server(this.id);
     if (!record) return { kind: 'refused', words: this.owner.unreadableServers().includes(this.id) ? "Familiar can't read this server's saved setup, so it won't start it." : 'No server is saved with that id.' };
     if (record.removing) return { kind: 'refused', words: 'It is being removed.' };
+    if (options.auto && !record.enabled) return { kind: 'refused', words: 'It is turned off.' };
     const setup = record.setup;
     if (setup.kind === 'remote' && setup.transport === 'sse') return { kind: 'failed', failure: { kind: 'protocol', words: "Legacy SSE servers are not supported. Use the server's Streamable HTTP address." } };
     // The target is built before the admission, in the same synchronous step: a record that can't be
@@ -119,6 +124,7 @@ export class ServerRuntime {
       }
     };
     let r;
+    let turnedOff = false;
     // Everything after the admission is inside this block, so a throw anywhere still releases the owner.
     try {
       this.set('starting');
@@ -126,18 +132,32 @@ export class ServerRuntime {
       // A modern-only stdio server that ended its process after refusing the legacy opening: one more start
       // of the same setup, readmitted by the owner, era fixed to modern (3.9).
       if (!r.ok && r.relaunch === 'modern' && current()) {
+        const now = this.owner.server(this.id);
         const again = this.owner.admit('start', { start: true });
         if (!('release' in again)) r = { ok: false as const, failure: { kind: 'busy' as const, words: 'Familiar is saving another change. Press Start again.' } };
-        else if (this.owner.server(this.id) !== record && JSON.stringify(this.owner.server(this.id)?.setup) !== JSON.stringify(setup)) {
+        else if (options.auto && !now?.enabled) {
+          again.release();
+          turnedOff = true;
+        } else if (JSON.stringify(now?.setup) !== JSON.stringify(setup)) {
           again.release();
           r = { ok: false as const, failure: { kind: 'busy' as const, words: 'The setup changed. Press Start again.' } };
         } else {
           let once = false;
-          r = await this.link.start(target, launch, { era: 'modern', launched: () => (once ? undefined : ((once = true), again.release())) });
+          const releaseAgain = () => (once ? undefined : ((once = true), again.release()));
+          try {
+            r = await this.link.start(target, launch, { era: 'modern', launched: releaseAgain });
+          } finally {
+            releaseAgain();
+          }
         }
       }
     } finally {
       launched();
+    }
+    if (turnedOff && current()) {
+      // An automatic start whose server was turned off before its relaunch: Stopped, as it was asked.
+      this.set('stopped');
+      return { kind: 'stopped' };
     }
     if (!current()) {
       // Stopped meanwhile. Its run, if it got one and it's still the link's, is ended here; a later
