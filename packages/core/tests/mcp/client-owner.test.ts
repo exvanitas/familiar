@@ -310,3 +310,32 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
     expect(await other.revoke('s1', 'echo', 'never')).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
   });
 });
+
+describe('5.4: Mark reviewed marks what Test showed', () => {
+  for (const how of ['the report', 'names'] as const) {
+    it(`Test shows F1, the catalog moves to F2, then Mark reviewed (${how}): F2 is still unreviewed`, async () => {
+      const store = memorySettingsStore();
+      const client = await clientOf(store, speakingPort().port);
+      await client.add({ setup: local('l1'), problems: [] });
+      const report = await client.test('l1');
+      if (!report.ok) throw new Error('test failed');
+      const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
+      // A run lists echo changed before the person presses Mark reviewed.
+      await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F2' }]);
+      await client.markReviewed('l1', how === 'names' ? ['echo'] : report.tools);
+      expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F2', reviewed: f1 }]);
+      // Back at F1, what the person saw: reviewed.
+      await client.owner.seen('l1', [{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+      expect(client.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+    });
+  }
+
+  it('a name Test never showed is marked nothing', async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    await client.add({ setup: local('l1'), problems: [] });
+    await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F1' }]);
+    await client.markReviewed('l1', ['echo']);
+    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F1' }]);
+  });
+});

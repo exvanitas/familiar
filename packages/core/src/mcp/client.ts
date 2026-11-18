@@ -101,6 +101,8 @@ export class McpClient {
   private readonly runtimes = new Map<string, ServerRuntime>();
   /** Revokes that hold at once, whatever the owner is doing: "always" back to ask, or anything to never. */
   private readonly overlay = new Map<string, 'ask' | 'never'>();
+  /** What each server's last Test showed: each tool's fingerprint, by name. Mark reviewed binds to it. */
+  private readonly shown = new Map<string, ReadonlyMap<string, string>>();
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {
@@ -231,12 +233,25 @@ export class McpClient {
     await rt.stop();
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
     const reviewed = s.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
+    this.shown.set(id, new Map(tools.map(t => [t.name, t.fingerprint])));
     return { ok: true, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}), ...(notOffered.length ? { notOffered } : {}) };
   }
 
-  /** The person has seen these tools' names and descriptions as they are now. */
-  markReviewed(id: string, names: readonly string[]): Promise<void> {
-    return this.update(id, r => ({ ...r, tools: r.tools.map(t => (names.includes(t.name) ? { ...t, reviewed: t.fingerprint } : t)) }));
+  /**
+   * The person has seen these tools' names and descriptions, as Test showed them: each is marked reviewed
+   * at the fingerprint it was shown with, never at whatever the catalog holds when this lands. A tool
+   * since changed stays unreviewed. Give Test's report tools; a bare name means the fingerprint the last
+   * Test of this server showed for it, and a name it didn't show is marked nothing.
+   */
+  markReviewed(id: string, tools: readonly (string | { readonly name: string; readonly fingerprint: string })[]): Promise<void> {
+    const last = this.shown.get(id);
+    const at = new Map<string, string>();
+    for (const t of tools) {
+      const name = typeof t === 'string' ? t : t.name;
+      const fingerprint = typeof t === 'string' ? last?.get(t) : t.fingerprint;
+      if (fingerprint !== undefined) at.set(name, fingerprint);
+    }
+    return this.update(id, r => ({ ...r, tools: r.tools.map(t => (at.has(t.name) ? { ...t, reviewed: at.get(t.name)! } : t)) }));
   }
 
   setEnabled(id: string, enabled: boolean): Promise<void> {
