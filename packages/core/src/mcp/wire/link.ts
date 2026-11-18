@@ -109,6 +109,8 @@ interface Run {
   stale: boolean;
   ready: boolean;
   ended: boolean;
+  /** A local run's process has exited (the exe said so). */
+  exited?: boolean;
   nextId: number;
   /** Re-handshakes since the last exchange that completed without a 404. */
   dropped: number;
@@ -474,7 +476,7 @@ export class ServerLink {
     // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
     // past the step's deadline, whatever a server keeps sending.
     for (;;) {
-      if (!(this.slot.ex?.phase === 'draining' && mutant('admit-while-draining'))) await Promise.race([this.drained(), deadline.over]);
+      if (!this.early(kind)) await Promise.race([this.drained(), deadline.over]);
       if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended) return { end: { t: 'run-ended' } };
       const started = this.exchangeNow(run, kind, requestId, body, method);
@@ -482,9 +484,15 @@ export class ServerLink {
     }
   }
 
+  /** Only under a named mutation: admitting before the slot has drained. */
+  private early(kind: ExchangeKind): boolean {
+    const ex = this.slot.ex;
+    return ex?.phase === 'draining' && (mutant('admit-while-draining') || (kind === 'list' && ex.kind === 'list' && mutant('page-before-drain')));
+  }
+
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
   private exchangeNow(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, method?: string, extra?: readonly (readonly [string, string])[]): Promise<Outcome> | undefined {
-    if (this.busy && !(this.slot.ex?.phase === 'draining' && mutant('admit-while-draining'))) return undefined;
+    if (this.busy && !this.early(kind)) return undefined;
     let resolve!: (o: Outcome) => void;
     const promise = new Promise<Outcome>((r) => (resolve = r));
     const n = this.slot.next;
@@ -562,11 +570,13 @@ export class ServerLink {
   }
 
   private processEvent(run: Run, e: ProcessEvent): void {
-    if (run.ended) return;
     if (e.t === 'exit') {
+      run.exited = true;
+      if (run.ended) return this.releaseWrites(run);
       this.endRun(run, exitFailure(e.code, run.last.text()), true);
       return;
     }
+    if (run.ended) return;
     if (e.t === 'err') {
       if (DROPPED_LINE.test(e.line)) {
         const ex = this.slot.ex;
@@ -813,13 +823,21 @@ export class ServerLink {
     run.failure = failure;
     run.finish();
     const ex = this.slot.ex;
-    if (ex && this.pending.get(ex.n)?.run === run) {
-      if (ex.phase === 'live') this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
-      // A local run's end ends its writes; remote requests still end through net_cancel.
-      if (run.target.where === 'local') for (const h of [...(this.slot.ex?.open ?? [])]) this.input({ t: 'released', handle: h });
+    if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
+    if (run.target.where === 'local') {
+      // A local run that ends with its process still running stops it, whatever ended it; its writes end
+      // when the exe says the process has exited, not before, so a blocked write keeps the slot (H1).
+      // Remote requests end through net_cancel.
+      if (run.process !== undefined && !run.exited) void this.ports.processes!.stop(run.process).catch(() => this.releaseWrites(run));
+      else this.releaseWrites(run);
     }
-    if (run.target.where === 'local' && run.process !== undefined && !report) void this.ports.processes!.stop(run.process).catch(() => {});
     if (report) this.events.ended(run.id, failure);
+  }
+
+  /** A local run's process is gone: its exchange's writes have ended. */
+  private releaseWrites(run: Run): void {
+    const ex = this.slot.ex;
+    if (ex && this.pending.get(ex.n)?.run === run) for (const h of [...ex.open]) this.input({ t: 'released', handle: h });
   }
 
   private exitWords(run: Run): Failure {
