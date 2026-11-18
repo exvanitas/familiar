@@ -48,7 +48,13 @@ function apply(s: State, input: Input | { t: 'restart' }, where: Where): { next:
   let slot = s.slot;
   let effects: readonly ReturnType<typeof step>['effects'][number][] = [];
   if (input.t === 'restart') {
-    // Stop and Start of the same server: the run ends; under the mutation the new run gets a fresh slot.
+    // Stop and Start of the same server, as the link does them: Stop ends the live exchange in its own step
+    // (the slot is the server's, so a drain carries on); under the mutation the new run gets a fresh slot.
+    if (slot.ex && slot.ex.phase === 'live') {
+      const r = step(slot, { t: 'terminal', n: slot.ex.n, end: { t: 'run-ended' } });
+      slot = r.slot;
+      effects = r.effects;
+    }
     if (slotPerRun) slot = { next: slot.next };
   } else {
     const r = step(slot, input);
@@ -93,7 +99,7 @@ function inputs(s: State, where: Where, era: Era): (Input | { t: 'restart' })[] 
     else if (o.cancelAsked) out.push({ t: 'released', handle: o.h });
     else if (o.what === 'pong' && !o.head) out.push({ t: 'pong-head', handle: o.h });
   }
-  if (slotPerRun && s.admits < MAX_ADMITS) out.push({ t: 'restart' });
+  if (s.admits < MAX_ADMITS) out.push({ t: 'restart' });
   return out;
 }
 
@@ -133,6 +139,7 @@ function settles(s: State, where: Where, seen: Map<string, boolean>): boolean {
 interface Walked {
   readonly states: number;
   readonly problems: string[];
+  readonly restarts: number;
 }
 
 function walk(where: Where, era: Era): Walked {
@@ -141,10 +148,12 @@ function walk(where: Where, era: Era): Walked {
   const settled = new Map<string, boolean>();
   const todo: State[] = [start];
   const problems: string[] = [];
+  let restarts = 0;
   while (todo.length && problems.length < 200) {
     const s = todo.pop()!;
     if (!settles(s, where, settled)) problems.push(`liveness: stuck from ${JSON.stringify(s).slice(0, 200)}`);
     for (const input of inputs(s, where, era)) {
+      if (input.t === 'restart') restarts++;
       const { next, problems: p } = apply(s, input, where);
       for (const x of p) problems.push(`${x} after ${JSON.stringify(input)}`);
       const key = JSON.stringify(next);
@@ -153,7 +162,7 @@ function walk(where: Where, era: Era): Walked {
       todo.push(next);
     }
   }
-  return { states: seen.size, problems };
+  return { states: seen.size, problems, restarts };
 }
 
 const PLACES: [Where, Era][] = [
@@ -171,6 +180,8 @@ describe('W: the exchange machine, every interleaving', () => {
       expect(w.problems).toEqual([]);
       // Legacy has pings, so many more states; both must be more than a handful.
       expect(w.states).toBeGreaterThan(era === 'legacy' ? 1000 : 20);
+      // A Stop and Start was reachable, and every state it led to settled.
+      expect(w.restarts).toBeGreaterThan(0);
     });
   }
 

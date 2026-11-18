@@ -94,7 +94,10 @@ describe('every named wire mutation fails its check, beside its unmutated twin',
         const twin = await wireRun(seed, options);
         const twinFails = PASS_CHECKS[c.check]!(twin);
         const prefix = mutant.firstHit - 1;
-        const same = JSON.stringify(mutant.sched.log.slice(0, prefix)) === JSON.stringify(twin.sched.log.slice(0, prefix));
+        // The same history up to the first hit: the scheduler's choices, and every native handoff with its
+        // bytes, not only the labels.
+        const natives = (w: typeof mutant) => JSON.stringify(w.exe.log.filter((x) => x.start <= prefix).map((x) => [x.kind, x.server, x.start, x.raw ?? null]));
+        const same = JSON.stringify(mutant.sched.log.slice(0, prefix)) === JSON.stringify(twin.sched.log.slice(0, prefix)) && natives(mutant) === natives(twin);
         tried.push(`seed ${seed}: twin ${twinFails.length ? 'fails' : 'passes'}, prefix ${same ? 'same' : 'differs'}`);
         if (!twinFails.length && same) return;
       }
