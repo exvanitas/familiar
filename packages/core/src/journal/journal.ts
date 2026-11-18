@@ -327,11 +327,29 @@ export function journalSettings(resendDelayMs = 2000) {
 }
 
 export async function openJournal(options: JournalOptions): Promise<Journal> {
-  const clock = options.clock ?? systemClock;
-  const owner = await options.owner.acquire(options.store.name);
   // The reserved namespace (5.9): `__` belongs to server tools' `<key>__<tool>` names, so no built-in may
-  // take one, and no later tool can replace a server's.
+  // take one, and no later tool can replace a server's. Checked before the journal is held.
   for (const t of options.tools) if (t.kind !== 'server' && t.name.includes('__')) throw new Error(`A built-in tool may not have __ in its name: ${t.name}`);
+  const owner = await options.owner.acquire(options.store.name);
+  // An open that fails anywhere after the acquire gives the journal back: its engine closed if it opened,
+  // its timers stopped, and the lease released, so the next open goes ahead.
+  const opened: { harness?: any; stop?: () => void } = {};
+  try {
+    return await openHeld(options, owner, opened);
+  } catch (error) {
+    opened.stop?.();
+    try {
+      await opened.harness?.close(ctx);
+    } catch {
+      // Closing is best effort here: the open's own error is the one to report.
+    }
+    owner.release();
+    throw error;
+  }
+}
+
+async function openHeld(options: JournalOptions, owner: { release(): void }, opened: { harness?: any; stop?: () => void }): Promise<Journal> {
+  const clock = options.clock ?? systemClock;
   const tools = new Map(options.tools.map((t) => [t.name, t]));
   const gen = options.newGen?.() ?? Math.random().toString(36).slice(2, 10);
   const presence = presenceReporter(options.presence, options.persona.id, gen);
@@ -654,25 +672,26 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   };
 
   const settings = journalSettings(options.resendDelayMs);
-  try {
-    harness = await Harness.open(
-      options.store.storage,
-      {
-        models,
-        registry,
-        identity: { attribution: null },
-        settings,
-        now: () => clock.now(),
-        setTimer: (cb: () => void, ms: number, o: { background: boolean }) => clock.setTimer(cb, ms, o),
-        onWake,
-        onReport: (r: any) => report(r.kind, r.error)
-      } as any,
-      ctx
-    );
-  } catch (error) {
-    owner.release();
-    throw error;
-  }
+  opened.stop = () => {
+    dead = true;
+    presence.stop();
+    cancelWake?.();
+  };
+  harness = await Harness.open(
+    options.store.storage,
+    {
+      models,
+      registry,
+      identity: { attribution: null },
+      settings,
+      now: () => clock.now(),
+      setTimer: (cb: () => void, ms: number, o: { background: boolean }) => clock.setTimer(cb, ms, o),
+      onWake,
+      onReport: (r: any) => report(r.kind, r.error)
+    } as any,
+    ctx
+  );
+  opened.harness = harness;
   const root: any = await harness.root(ctx, {
     agent: { model: { provider: PROVIDER, modelId: options.modelId }, instructions: options.persona.instructions, maxTurns: stepCap }
   });

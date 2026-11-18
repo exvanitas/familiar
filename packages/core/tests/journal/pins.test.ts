@@ -234,4 +234,36 @@ describe('5.9: `__` is reserved for server tools', () => {
       })
     ).rejects.toThrow(/may not have __/);
   });
+
+  it('an open that fails, before or after the engine opens, gives the journal back: the next open with the same owner goes ahead', async () => {
+    const owner = memoryOwner();
+    const base = {
+      owner,
+      model: createFakeModel(() => ({ text: 'ok' })),
+      modelId: 'fake-1',
+      caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
+      tools: [],
+      wake: { wakeAt: () => {} },
+      notifier: { notify: () => {} },
+      consent: { ask: async () => true },
+      presence: { report: () => {} },
+      persona: { id: 'olive', name: 'Olive', instructions: '' },
+      decider: { decide: async (event: any, context: any) => decideByRules(event, context) },
+      ambient: () => ({ persona: { sketch: 'kind', interests: [] }, chattiness: 'medium' as const, doNotDisturb: false, fullscreen: false, sentAway: false, chatInFront: true, teaserDue: false })
+    };
+    const factory = new IDBFactory();
+    // A store handle per open, as the app makes one: a failed open closes the engine, and its storage with it.
+    const storeOf = () => openJournalStore('pins-lease', { indexedDB: factory as any });
+    const free = async () => Promise.race([owner.acquire('pins-lease').then((l) => (l.release(), 'acquired')), new Promise((r) => setTimeout(() => r('held'), 200))]);
+    // A bad name.
+    await expect(openJournal({ ...base, store: await storeOf(), tools: [{ name: 'bad__name', description: '', inputSchema: {}, kind: 'effect', doing: () => 'x', run: async () => '' }] } as any)).rejects.toThrow(/__/);
+    expect(await free()).toBe('acquired');
+    // A failure once the engine is open: the persona's instructions, first read for the conversation's agent.
+    const persona = { id: 'olive', name: 'Olive', get instructions(): string { throw new Error('no instructions'); } };
+    await expect(openJournal({ ...base, store: await storeOf(), persona } as any)).rejects.toThrow(/no instructions/);
+    expect(await free()).toBe('acquired');
+    // And then a good open of the same journal.
+    const journal = await openJournal({ ...base, store: await storeOf() } as any);
+    await journal.close();
+  });
 });
