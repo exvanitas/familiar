@@ -180,11 +180,14 @@ export class McpClient {
   /** Adds a draft as a server, stopped and not yet enabled. Returns the refs Settings must store its
       secret values under; the values never pass through here. */
   async add(draft: Pick<Draft, 'setup' | 'problems'>): Promise<{ id: string; secretRefs: string[] }> {
-    const problems = [...draft.problems, ...setupProblems(draft.setup, this.o.paths)];
+    // Core's own snapshot, taken before validation or any await; nothing after reads the caller's draft.
+    const setup = JSON.parse(JSON.stringify(draft.setup)) as ServerSetup;
+    const problems = [...draft.problems, ...setupProblems(setup, this.o.paths)];
     if (problems.length) throw new Error(problems[0]);
-    const r = await this.owner.add(draft.setup);
+    const r = await this.owner.add(setup);
     if (!r.ok) throw new Error(r.words);
-    return { id: draft.setup.id, secretRefs: secretRefs(this.owner.server(draft.setup.id)!.setup) };
+    // The saved record's refs (a remote one's include its address's key), by the snapshot's id.
+    return { id: setup.id, secretRefs: secretRefs(this.owner.server(setup.id)!.setup) };
   }
 
   /** Changes a stopped server's setup, keeping its id. A remote server's address can't change here. */

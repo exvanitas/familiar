@@ -138,6 +138,45 @@ describe('5.1: a saved setup, as the owner keeps it', () => {
     expect((owner.server('l1')!.setup as any).args).toEqual(['y.js']);
     expect(((await store.get(OWNER_KEY))!.value as any).servers.l1.setup.args).toEqual(['y.js']);
   });
+
+  it("a remote draft changed while its address dialog is open changes nothing: the URL approved is the one saved, and an id changed to a saved server's overwrites nothing", async () => {
+    const remote = (id: string, url: string): ServerSetup => ({ kind: 'remote', id, label: `Remote ${id}`, url, transport: 'http', headers: [] });
+    for (const via of ['owner', 'client'] as const) {
+      const store = memorySettingsStore();
+      const asked: string[] = [];
+      let open!: () => void;
+      let release!: () => void;
+      const addresses = {
+        add: async ({ url }: { url: string }) => {
+          asked.push(url);
+          open();
+          await new Promise<void>((r) => (release = r));
+          return { id: `addr-${asked.length}` };
+        },
+        remove: async () => {},
+        list: async () => []
+      };
+      const client = await clientOf(store, speakingPort().port, { addresses });
+      await client.add({ setup: local('l1'), problems: [] });
+      const before = JSON.stringify(client.owner.server('l1'));
+      // The URL, then the id, changed while the dialog is open.
+      for (const change of ['url', 'id'] as const) {
+        const setup: any = remote(`r-${change}`, `https://${change}.example/mcp`);
+        const dialog = new Promise<void>((r) => (open = r));
+        const adding = via === 'owner' ? client.owner.add(setup) : client.add({ setup, problems: [] });
+        await dialog;
+        if (change === 'url') setup.url = 'https://other.example/mcp';
+        else setup.id = 'l1';
+        release();
+        const r: any = await adding;
+        if (via === 'owner') expect(r, `${via} ${change}`).toEqual({ ok: true });
+        else expect(r.id, `${via} ${change}`).toBe(`r-${change}`);
+        expect(client.owner.server(`r-${change}`)?.setup, `${via} ${change}`).toMatchObject({ id: `r-${change}`, url: `https://${change}.example/mcp`, address: `addr-${asked.length}` });
+        expect(JSON.stringify(client.owner.server('l1')), `${via} ${change}`).toBe(before);
+      }
+      expect(asked).toEqual(['https://url.example/mcp', 'https://id.example/mcp']);
+    }
+  });
 });
 
 describe('5.4: one start at a time owns the phase', () => {

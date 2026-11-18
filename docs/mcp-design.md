@@ -699,7 +699,7 @@ Provenance holds by construction: every message the model can see carries its ow
 ### 5.7 Messages from other windows, and reserved headers
 
 - **Card answers go through the card desk** (`journal/desk.ts`), the journal's consent port as the core page holds it. Another window answers a card with `{ presentation, button }`, and nothing else in the message is read. The buttons are yes, always (only where the card offers it: a server tool, with nothing outside in the request) and skip. A button the card didn't offer counts as Skip. Each presentation is answered at most once; an answer for a presentation that isn't showing (retired, already answered, or never shown) answers nothing.
-- **Settings' edits** carry bounded draft values, and core validates them into its own snapshot. Approval facts, fingerprints, ownership state and call arguments are never accepted from any window.
+- **Settings' edits** carry bounded draft values, and core validates them into its own snapshot. An Add copies the setup, its secret names included, at entry, before validation, admission or any await, and reads only the copy, so a draft changed while the exe's dialog is open changes neither the URL approved nor the id saved. Approval facts, fingerprints, ownership state and call arguments are never accepted from any window.
 - **Reserved headers.** A setup header is refused, case-insensitively, if it names `mcp-session-id`, `mcp-protocol-version`, `last-event-id`, `content-type`, `accept` or `host`. Also refused, because the modern era's headers are built from the decision (3.6): `mcp-method`, `mcp-name`, and any name starting `mcp-param-`. The client's own headers are set after the setup's, so even an unrefused name couldn't override them.
 
 ### 5.8 Secrets and reservations

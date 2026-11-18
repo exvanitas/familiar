@@ -320,8 +320,13 @@ export class Owner {
 
   /* ---------- the changes ---------- */
 
-  /** Add, local or remote. The id must be new: never one saved or tombstoned. */
-  async add(setup: ServerSetup): Promise<Outcome> {
+  /**
+   * Add, local or remote. The id must be new: never one saved or tombstoned. The setup is copied first,
+   * before any check or await, and only the copy is read: a caller changing its draft while the exe's
+   * dialog is open changes nothing approved or saved.
+   */
+  async add(draft: ServerSetup): Promise<Outcome> {
+    const setup = clone(draft);
     if (this.doc.servers[setup.id] !== undefined) return no('A server with this id is already saved.');
     if (this.doc.tombstones[setup.id] !== undefined) return no(REMOVED_ID_WORDS);
     let identity: string | undefined;
