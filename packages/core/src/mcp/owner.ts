@@ -230,13 +230,13 @@ export class Owner {
   unreadableServers(): readonly string[] {
     return Object.keys(this.doc.servers).filter((id) => !readServer(this.doc.servers[id]));
   }
-  /** The person's choices. An unreadable one is left out: the gate's default, which asks. */
+  /**
+   * The person's choices. An unreadable one loads as "ask" for its tool, never as nothing: for a built-in
+   * that runs without asking, nothing would mean its default allow (5.1, G6).
+   */
   choices(): Readonly<Record<string, ToolChoice>> {
     const out: Record<string, ToolChoice> = {};
-    for (const [k, v] of Object.entries(this.doc.choices)) {
-      const c = readChoice(v);
-      if (c) out[k] = c;
-    }
+    for (const [k, v] of Object.entries(this.doc.choices)) out[k] = readChoice(v) ?? { policy: 'ask', fingerprint: '', setupFingerprint: '' };
     return out;
   }
   get mark(): Mark | undefined {

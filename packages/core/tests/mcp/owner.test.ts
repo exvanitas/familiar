@@ -266,7 +266,7 @@ describe('5.2 and 5.3: repair in a fresh start', () => {
 });
 
 describe('5.1: failing closed', () => {
-  it('an unreadable choice loads as "ask" (absent), never "always"; an unreadable server is neither listed nor overwritten', async () => {
+  it('an unreadable choice loads as an explicit "ask", never "always" and never absent; an unreadable server is neither listed nor overwritten', async () => {
     const store = memorySettingsStore();
     await store.put(OWNER_KEY, {
       v: 1,
@@ -279,7 +279,7 @@ describe('5.1: failing closed', () => {
       } as never
     });
     const owner = await Owner.open(ports(store).p);
-    expect(owner.choices()).toEqual({ [JSON.stringify(['l1', 'note'])]: { policy: 'deny', fingerprint: 'f', setupFingerprint: 's' } });
+    expect(owner.choices()).toEqual({ [JSON.stringify(['l1', 'echo'])]: { policy: 'ask', fingerprint: '', setupFingerprint: '' }, [JSON.stringify(['l1', 'note'])]: { policy: 'deny', fingerprint: 'f', setupFingerprint: 's' } });
     expect(owner.servers().map((s) => s.setup.id)).toEqual(['l1']);
     expect(owner.unreadableServers()).toEqual(['bad']);
     expect(await owner.update('bad', (s) => s)).toMatchObject({ ok: false });
@@ -306,7 +306,7 @@ describe('5.1: the owner keeps built-in choices too', () => {
     await client.choose(BUILT_IN, 'note_add', { policy: 'deny', fingerprint: '', setupFingerprint: '' });
     await client.choose(BUILT_IN, 'look', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
     expect(client.policy([])).toEqual({ perTool: { note_add: 'deny', look: 'allow' } });
-    client.revoke(BUILT_IN, 'look', 'ask');
-    expect(client.policy([]).perTool).toEqual({ note_add: 'deny' });
+    void client.revoke(BUILT_IN, 'look', 'ask');
+    expect(client.policy([]).perTool).toEqual({ note_add: 'deny', look: 'ask' });
   });
 });

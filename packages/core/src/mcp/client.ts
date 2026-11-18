@@ -21,6 +21,19 @@ import type { GatePolicy, ToolPolicy } from '../journal/gate.ts';
 
 /** The server id built-in tools' choices are kept under: no saved server can have it (ids are non-empty). */
 export const BUILT_IN = '';
+
+/** A revoke whose durable write didn't land. */
+export const REVOKE_NOT_SAVED = 'Revoked for now, but not saved: it comes back when Familiar restarts. Try again.';
+
+/** The built-in tool a choice key names, or undefined for a server's tool or a key that names nothing. */
+function builtInTool(key: string): string | undefined {
+  try {
+    const k: unknown = JSON.parse(key);
+    return Array.isArray(k) && k.length === 2 && k[0] === BUILT_IN && typeof k[1] === 'string' ? k[1] : undefined;
+  } catch {
+    return undefined;
+  }
+}
 import { secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 import { unpinned, type Unpinned } from './unpinned.ts';
@@ -249,21 +262,23 @@ export class McpClient {
     const choices = this.owner.choices();
     const perTool: Record<string, ToolPolicy> = { ...toolPolicies(wrappers, choices) };
     for (const [key, c] of Object.entries(choices)) {
-      const [server, tool] = JSON.parse(key) as [string, string];
-      if (server === BUILT_IN) perTool[tool] = c.policy;
+      const tool = builtInTool(key);
+      if (tool !== undefined) perTool[tool] = c.policy;
     }
     for (const w of wrappers) this.tighten(perTool, w.name, choiceKey(w.server.id, w.serverName));
     for (const [key] of this.overlay) {
-      const [server, tool] = JSON.parse(key) as [string, string];
-      if (server === BUILT_IN) this.tighten(perTool, tool, key);
+      const tool = builtInTool(key);
+      if (tool !== undefined) this.tighten(perTool, tool, key);
     }
     return { perTool };
   }
 
+  /** The overlay on top: "never" denies; "ask" asks, explicitly, since a built-in's absent entry is its
+      default, which for some is allow. */
   private tighten(perTool: Record<string, ToolPolicy>, name: string, key: string): void {
     const o = this.overlay.get(key);
     if (o === 'never') perTool[name] = 'deny';
-    else if (o === 'ask' && perTool[name] === 'allow') delete perTool[name];
+    else if (o === 'ask' && perTool[name] !== 'deny') perTool[name] = 'ask';
   }
 
   /** The person's choices, from the owner. */
@@ -271,12 +286,21 @@ export class McpClient {
     return this.owner.choices();
   }
 
-  /** A tightening holds at once, in memory, whatever the owner is doing; its durable write follows. */
-  revoke(serverId: string, tool: string, to: 'ask' | 'never'): void {
+  /**
+   * A tightening holds at once, in memory, whatever the owner is doing; its durable write follows, and its
+   * outcome is the answer. "Ask" is saved as an explicit ask, never as no choice, since no choice is a
+   * built-in's default. A write the owner refuses (busy, a change unfinished) or the store loses is
+   * answered not ok, in words Settings shows: the revoke holds until Familiar restarts, and the saved
+   * choice comes back then unless it's tried again.
+   */
+  async revoke(serverId: string, tool: string, to: 'ask' | 'never'): Promise<Outcome> {
     const key = choiceKey(serverId, tool);
     if (this.overlay.get(key) !== 'never') this.overlay.set(key, to);
     const cur = this.owner.choices()[key];
-    void this.owner.choose(serverId, tool, to === 'never' ? { policy: 'deny', fingerprint: cur?.fingerprint ?? '', setupFingerprint: cur?.setupFingerprint ?? '' } : undefined).catch(() => undefined);
+    // Ask after never isn't a tightening: the saved never stands.
+    if (to === 'ask' && cur?.policy === 'deny') return { ok: true };
+    const r = await this.owner.choose(serverId, tool, { policy: to === 'never' ? 'deny' : 'ask', fingerprint: cur?.fingerprint ?? '', setupFingerprint: cur?.setupFingerprint ?? '' }).catch((): Outcome => ({ ok: false, words: 'The store failed.' }));
+    return r.ok ? r : { ok: false, words: `${REVOKE_NOT_SAVED} ${r.words}` };
   }
 
   /** The tools a turn may offer the model: those of every Ready server, named `<key>__<tool>`, bound to

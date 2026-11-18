@@ -1,7 +1,9 @@
 // The client over the owner, with fake ports: what a saved record holds, when a start may run, what a
 // revoke and Mark reviewed save (docs/mcp-design.md 5.1, 5.4, 5.5).
 import { describe, expect, it } from 'vitest';
-import { McpClient, type McpClientOptions } from '../../src/mcp/client.ts';
+import { BUILT_IN, McpClient, type McpClientOptions } from '../../src/mcp/client.ts';
+import { choiceKey } from '../../src/mcp/server-tools.ts';
+import { gateFor } from '../../src/journal/gate.ts';
 import { Owner, OWNER_KEY, OWNER_VERSION, type OwnerPorts } from '../../src/mcp/owner.ts';
 import type { ProcessEvent, ProcessPort } from '../../src/mcp/process.ts';
 import type { NetPort } from '../../src/mcp/wire/link.ts';
@@ -256,5 +258,55 @@ describe('5.3: starting with the app', () => {
       expect(client.get('A')!.phase).toBe(disable ? 'stopped' : 'ready');
       expect(client.owner.busy).toBe(false);
     }
+  });
+});
+
+describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-asking', () => {
+  const noteAdd = { name: 'note_add', kind: 'effect' } as never;
+  const look = { name: 'note_search', kind: 'read' } as never;
+
+  it("an unreadable choice for a built-in that runs without asking loads as ask, not as the built-in's allow", async () => {
+    const store = memorySettingsStore();
+    await store.put(OWNER_KEY, { v: OWNER_VERSION, value: { rev: 1, servers: {}, keys: [], tombstones: {}, choices: { [choiceKey(BUILT_IN, 'note_add')]: { policy: 'deny', fingerprint: 3 }, [choiceKey(BUILT_IN, 'note_search')]: 'garbage' } } as never });
+    const client = await clientOf(store, speakingPort().port);
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('ask');
+    expect(gateFor('note_search', look, client.policy([]))).toBe('ask');
+    // A key that isn't a choice key at all names no tool, and breaks nothing.
+    await store.put(OWNER_KEY, { v: OWNER_VERSION, value: { rev: 1, servers: {}, keys: [], tombstones: {}, choices: { 'not json': { policy: 'allow', fingerprint: '', setupFingerprint: '' } } } as never });
+    expect((await clientOf(store, speakingPort().port)).policy([])).toEqual({ perTool: {} });
+  });
+
+  it('a revoke to Ask of a built-in holds as ask at once and is saved as ask, so a restart keeps it', async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    await client.choose(BUILT_IN, 'note_add', { policy: 'deny', fingerprint: '', setupFingerprint: '' });
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('deny');
+    // Ask after never isn't a tightening: never stays.
+    expect(await client.revoke(BUILT_IN, 'note_add', 'ask')).toEqual({ ok: true });
+    expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('deny');
+    // A built-in reads its default allow when nothing is saved; a revoke to Ask makes it ask, at once and after.
+    const revoking = client.revoke(BUILT_IN, 'note_search', 'ask');
+    expect(gateFor('note_search', look, client.policy([]))).toBe('ask');
+    expect(await revoking).toEqual({ ok: true });
+    expect(client.choices()[choiceKey(BUILT_IN, 'note_search')]).toMatchObject({ policy: 'ask' });
+    const again = await clientOf(store, speakingPort().port);
+    expect(gateFor('note_search', look, again.policy([]))).toBe('ask');
+  });
+
+  it('a revoke the owner refuses holds for now and says it was not saved; a restart brings the saved choice back', async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    await client.choose('s1', 'echo', { policy: 'allow', fingerprint: 'f', setupFingerprint: 'l' });
+    const busy = client.owner.admit('other');
+    if (!('release' in busy)) throw new Error('not admitted');
+    const r = await client.revoke('s1', 'echo', 'ask');
+    busy.release();
+    expect(r).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
+    expect((client as any).overlay.get(choiceKey('s1', 'echo'))).toBe('ask');
+    expect((await clientOf(store, speakingPort().port)).choices()[choiceKey('s1', 'echo')]?.policy).toBe('allow');
+    // A failing store says the same.
+    const failing: SettingsStore = { ...store, putIf: async () => false };
+    const other = await clientOf(failing, speakingPort().port);
+    expect(await other.revoke('s1', 'echo', 'never')).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
   });
 });
