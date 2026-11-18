@@ -102,3 +102,16 @@ describe('the desktop ports', () => {
     expect('secretSet' in ports.secrets).toBe(false);
   });
 });
+
+describe("core's address identity matches the exe's normalize (B6)", () => {
+  it('the exe drops one trailing dot and every trailing slash, and core does the same', async () => {
+    const { addressIdentity } = await import('@familiar/core');
+    const src = rust('address.rs');
+    const normalize = src.slice(src.indexOf('pub fn normalize'), src.indexOf('fn host_str'));
+    expect(normalize).toContain("strip_suffix('.')");
+    expect(normalize).toContain("trim_end_matches('/')");
+    expect(normalize).toContain('Url::parse(input)');
+    expect(addressIdentity('https://H.Example.:443/mcp//')).toBe('https://h.example/mcp');
+    expect(addressIdentity('http://localhost.:3000/')).toBe('http://localhost:3000');
+  });
+});

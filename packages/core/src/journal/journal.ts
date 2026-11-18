@@ -317,6 +317,9 @@ export function journalSettings(resendDelayMs = 2000) {
 export async function openJournal(options: JournalOptions): Promise<Journal> {
   const clock = options.clock ?? systemClock;
   const owner = await options.owner.acquire(options.store.name);
+  // The reserved namespace (5.9): `__` belongs to server tools' `<key>__<tool>` names, so no built-in may
+  // take one, and no later tool can replace a server's.
+  for (const t of options.tools) if (t.kind !== 'server' && t.name.includes('__')) throw new Error(`A built-in tool may not have __ in its name: ${t.name}`);
   const tools = new Map(options.tools.map((t) => [t.name, t]));
   const gen = options.newGen?.() ?? Math.random().toString(36).slice(2, 10);
   const presence = presenceReporter(options.presence, options.persona.id, gen);

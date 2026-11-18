@@ -24,7 +24,7 @@ const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes
 async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; storeName?: string; choices?: () => Record<string, ToolChoice> } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
-  const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock, ...(extra.choices ? { choices: extra.choices } : {}) });
+  const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
   let serverId = id;
   if (!serverId) {
     const { drafts } = parsePaste(JSON.stringify({ mcpServers: { 'Fake server': { command: process.execPath, args: [FAKE_MAIN] } } }), { newId: () => 'fake-journal', defaultCwd: REPO, paths: testPaths });
@@ -67,7 +67,7 @@ describe('a server tool in the turn loop', () => {
     const script = (r: ModelRequest): FakeReply => {
       const last = r.messages.at(-1);
       if (last?.role === 'tool') return { text: `Done. (${last.content.slice(0, 80)})` };
-      return { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'Fake_server__slow', arguments: { ms: 20_000 } }] };
+      return { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'fakeserver__slow', arguments: { ms: 20_000 } }] };
     };
     const one = await life(world, store, undefined, script);
     void one.journal.send('Please wait a while.', 'turn-1');
@@ -84,7 +84,7 @@ describe('a server tool in the turn loop', () => {
     const questions = await two.journal.questions();
     expect(end.status).toBe('asks');
     expect(questions).toHaveLength(1);
-    expect(questions[0]!.text).toMatch(/^Fake_server__slow was cut off/);
+    expect(questions[0]!.text).toMatch(/^fakeserver__slow was cut off/);
     expect(questions[0]!.kind).toBe('rerun');
     const transcript = JSON.stringify(await two.journal.transcript());
     expect(transcript).toMatch(/may have partially run/);
@@ -98,21 +98,21 @@ describe('a server tool in the turn loop', () => {
     const world = nodeWorld();
     const store = memorySettingsStore();
     const cards: ConsentCard[] = [];
-    let choices: Record<string, ToolChoice> = {};
     const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
     const script = (r: ModelRequest): FakeReply => {
       const last = r.messages.at(-1);
       if (last?.role === 'tool') return { text: 'Done.' };
-      return { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'Fake_server__echo', arguments: { text: 'hi' } }] };
+      return { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'fakeserver__echo', arguments: { text: 'hi' } }] };
     };
     // The gate's policy comes from the wrappers the turn loop holds, each by its own identity.
     let held: ServerTool[] = [];
-    const policy = () => ({ perTool: toolPolicies(held, choices) });
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-consent', choices: () => choices });
+    let client!: McpClient;
+    const policy = () => ({ perTool: toolPolicies(held, client.choices()) });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-consent' });
     held = one.tools;
-    const client: McpClient = one.client;
+    client = one.client;
     const echo = client.tools().find(t => t.serverName === 'echo')!;
-    choices = { [choiceKey(echo.server.id, 'echo')]: { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
+    await client.choose(echo.server.id, 'echo', { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint });
 
     // "Always", and nothing outside in the conversation yet: it runs without asking.
     const t1 = await one.journal.send('Echo something.', 'turn-1');
@@ -153,15 +153,15 @@ describe('a server tool in the turn loop', () => {
     expect((await client.start('z')).kind).toBe('ready');
     // A turn loop holds z's wrappers, from when z ran alone.
     const held = client.tools();
-    expect(held.find(t => t.serverName === 'echo')!.name).toBe('Same__echo');
+    expect(held.find(t => t.serverName === 'echo')!.name).toBe('same__echo');
     expect((await client.start('a')).kind).toBe('ready');
     const aEcho = client.tools().find(t => t.server.id === 'a' && t.serverName === 'echo')!;
     // "Always" only for a's echo.
     const choices: Record<string, ToolChoice> = { [choiceKey('a', 'echo')]: { policy: 'allow', fingerprint: aEcho.fingerprint, setupFingerprint: aEcho.setupFingerprint } };
-    // With both running, neither has the name z's wrapper carries.
-    expect(client.tools().map(t => t.name)).not.toContain('Same__echo');
+    // Frozen keys: z keeps its name, and a has its own.
+    expect(client.tools().map(t => t.name).sort()).toEqual(expect.arrayContaining(['same__echo', 'same2__echo']));
     let asks = 0;
-    const script = (r: ModelRequest): FakeReply => (r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'Same__echo', arguments: { text: 'hi' } }] });
+    const script = (r: ModelRequest): FakeReply => (r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'same__echo', arguments: { text: 'hi' } }] });
     const loop = await turnLoop(world, held, script, { policy: () => ({ perTool: toolPolicies(held, choices) }), ask: () => { asks++; return false; }, storeName: 'mcp-r20-1' });
     const t = await loop.journal.send('Echo something.', 'turn-1');
     if (!t.replied) throw new Error('not replied');

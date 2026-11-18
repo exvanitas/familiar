@@ -6,7 +6,6 @@
 import type { FamiliarTool, ToolStep } from '../journal/tools.ts';
 import type { ToolPolicy } from '../journal/gate.ts';
 import { effectiveDescription } from './catalog.ts';
-import { sha256 } from './hash.ts';
 import type { CardFacts, ToolDecision } from './decision.ts';
 import type { CallOutcome, ListedTool } from './types.ts';
 
@@ -27,75 +26,6 @@ export function toolChanges(before: readonly { name: string; fingerprint: string
     changed: now.filter(t => old.has(t.name) && old.get(t.name) !== t.fingerprint).map(t => t.name),
     removed: before.filter(t => !fresh.has(t.name)).map(t => t.name)
   };
-}
-
-export const MAX_MODEL_NAME = 64;
-const PREFIX_CHARS = 20;
-
-/** Letters, digits, `_` and `-` only, runs of `_` collapsed so `__` stays the separator. */
-function safe(text: string): string {
-  return text.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/_+/g, '_').replace(/^[_-]+|[_-]+$/g, '');
-}
-
-/** The first `n` hex characters of a SHA-256: a short, stable tag. */
-const tag = (text: string, n: number) => sha256(text).slice(0, n);
-
-/** For each group of keys that clash, the shortest tag length (from 4, by 2) that tells its members apart
-    by `tag(of(member))`. Deterministic: it depends only on who is in the group, never on order. */
-function tagLength<T>(group: readonly T[], of: (m: T) => string): number {
-  for (let n = 4; n < 64; n += 2) if (new Set(group.map(m => tag(of(m), n))).size === group.length) return n;
-  return 64;
-}
-
-function groupBy<T>(items: readonly T[], key: (t: T) => string): T[][] {
-  const groups = new Map<string, T[]>();
-  for (const i of items) groups.set(key(i), [...(groups.get(key(i)) ?? []), i]);
-  return [...groups.values()];
-}
-
-/**
- * The names the model sees: `<server>__<tool>`, made of letters, digits, `_` and `-`, at most 64
- * characters, starting with a letter, as every provider accepts. A name comes from the server's label and
- * the tool's own name, never from order. When two servers' labels clash, each gets a short tag from a hash
- * of its id (`Same_3f2a__echo`); when tags clash too, they grow until they don't. The same goes for two
- * tools whose names clash once made safe or cut to length. So a name never moves to another server's
- * tool because another server started or stopped: it's that server's, or no one's.
- */
-export function modelNames(servers: readonly { readonly id: string; readonly label: string; readonly tools: readonly { readonly name: string }[] }[]): Map<string, Map<string, string>> {
-  const slug = (label: string) => {
-    const p = safe(label).slice(0, PREFIX_CHARS).replace(/[_-]+$/, '') || 'server';
-    return /^[A-Za-z]/.test(p) ? p : `s${p}`.slice(0, PREFIX_CHARS);
-  };
-  const prefix = new Map<string, string>();
-  for (const group of groupBy(servers, s => slug(s.label).toLowerCase())) {
-    if (group.length === 1) { prefix.set(group[0]!.id, slug(group[0]!.label)); continue; }
-    const n = tagLength(group, s => s.id);
-    for (const s of group) prefix.set(s.id, `${slug(s.label)}_${tag(s.id, n)}`);
-  }
-  type Entry = { server: string; tool: string; name: string };
-  const entries: Entry[] = [];
-  for (const s of servers) {
-    // A server's list never names a tool twice (checkTools refuses it); a second one gets no name.
-    const tools = [...new Map(s.tools.map(t => [t.name, t])).values()];
-    const mine = tools.map(t => ({ server: s.id, tool: t.name, name: `${prefix.get(s.id)}__${safe(t.name) || 'tool'}`.slice(0, MAX_MODEL_NAME) }));
-    // Two of one server's tools that clash once made safe or cut: each gets a tag of its own name.
-    for (const group of groupBy(mine, e => e.name.toLowerCase())) {
-      if (group.length === 1) continue;
-      const n = tagLength(group, e => e.tool);
-      for (const e of group) e.name = `${e.name.slice(0, MAX_MODEL_NAME - n - 1)}_${tag(e.tool, n)}`;
-    }
-    entries.push(...mine);
-  }
-  // A clash left across servers can come only from cutting to 64: tagged by server and tool.
-  for (const group of groupBy(entries, e => e.name.toLowerCase())) {
-    if (group.length === 1) continue;
-    const n = tagLength(group, e => `${e.server}\u0000${e.tool}`);
-    for (const e of group) e.name = `${e.name.slice(0, MAX_MODEL_NAME - n - 1)}_${tag(`${e.server}\u0000${e.tool}`, n)}`;
-  }
-  const out = new Map<string, Map<string, string>>();
-  for (const s of servers) out.set(s.id, new Map());
-  for (const e of entries) out.get(e.server)!.set(e.tool, e.name);
-  return out;
 }
 
 /** The words around a server's result: what the model reads is outside content. Step 8's outside-content

@@ -36,7 +36,8 @@ export function desktopMcpPorts(shell: Shell = createShell()): Pick<McpClientOpt
     net: desktopNetPort(shell),
     addresses: {
       add: async ({ url, label }) => ({ id: (await shell.addressAdd({ kind: 'server', url, label })).id }),
-      remove: id => shell.addressRemove(id)
+      remove: id => shell.addressRemove(id),
+      list: async () => (await shell.addressList()).filter(a => !a.removing).map(a => ({ id: a.id, kind: a.kind, url: a.url }))
     },
     secrets: { delete: ref => shell.secretDelete(ref) }
   };

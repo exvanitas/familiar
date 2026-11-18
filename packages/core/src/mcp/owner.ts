@@ -1,0 +1,482 @@
+// One owner of durable tool config (docs/mcp-design.md 5.1 to 5.3, 5.9): the saved servers, their keys,
+// enabled flags, limits and tools seen and reviewed, the person's choices for every tool, the one mark of
+// a change under way, and the tombstones of removed servers. All of it is one record in the settings
+// store, written whole in one strict transaction per step, so each step commits atomically.
+//
+// - One durable effect at a time, for everything. A second is refused at once: "Saving another change.
+//   Try again in a moment." A refused command changes nothing. Native starts count while the exe answers.
+// - No deadlines on an effect: if the exe or the store never answers, Settings says "Saving…", and after
+//   10 s that restarting finishes or undoes the change. The timer changes only the words.
+// - Each change is a fixed list of steps with one mark. A change saved with its cleanup unfinished keeps
+//   the mark, and every other change is refused until Retry or a restart's repair finishes it; starts of
+//   other servers are still admitted then.
+// - Fail closed: an unreadable choice loads as "ask"; an unreadable server is neither started nor
+//   overwritten; the whole record unreadable means nothing loads and nothing is written.
+
+import type { JsonValue } from '../model/port.ts';
+import type { SettingsStore } from '../settings/store.ts';
+import type { ToolPolicy } from '../journal/gate.ts';
+import { literalClass } from './native-rules.ts';
+import type { ServerLimits, SavedTool } from './saved.ts';
+import { choiceKey, type ToolChoice } from './server-tools.ts';
+import { secretRefs, type ServerSetup } from './setup.ts';
+
+export const OWNER_KEY = 'mcp.owner';
+export const OWNER_VERSION = 1;
+export const BUSY_WORDS = 'Saving another change. Try again in a moment.';
+export const WAITING_WORDS = 'Familiar is waiting on Windows. Restarting Familiar finishes or undoes this change.';
+export const UNFINISHED_WORDS = 'A change was saved but its cleanup didn\'t finish. Press Retry first.';
+export const WAITING_AFTER_MS = 10_000;
+
+export interface OwnedServer {
+  readonly setup: ServerSetup;
+  /** The frozen key models see before `__` (5.9). */
+  readonly key: string;
+  readonly enabled: boolean;
+  readonly limits: ServerLimits;
+  readonly tools: readonly SavedTool[];
+  /** Set by a removal's first commit. */
+  readonly removing?: true;
+}
+
+export interface Tombstone {
+  readonly key: string;
+  /** Cleanup items, each with a done flag. When all are done the tombstone shrinks to its key. */
+  readonly forget?: boolean;
+  readonly secrets?: Readonly<Record<string, boolean>>;
+  readonly address?: { readonly id: string; readonly done: boolean };
+}
+
+export type Mark =
+  | { readonly kind: 'add-remote'; readonly server: string; readonly identity: string }
+  | { readonly kind: 'edit'; readonly server: string; readonly dropped: readonly string[] }
+  | { readonly kind: 'remove'; readonly server: string };
+
+interface Doc {
+  rev: number;
+  servers: Record<string, JsonValue>;
+  choices: Record<string, JsonValue>;
+  keys: string[];
+  tombstones: Record<string, Tombstone>;
+  mark?: Mark;
+}
+
+export interface OwnerPorts {
+  readonly store: SettingsStore;
+  readonly forget: (setupId: string) => Promise<void>;
+  readonly addresses: { add(spec: { url: string; label: string }): Promise<{ id: string }>; remove(id: string): Promise<void>; list?(): Promise<readonly { id: string; kind: string; url: string }[]> };
+  readonly secrets: { delete(ref: string): Promise<void> };
+  readonly now: () => number;
+}
+
+export type Outcome = { readonly ok: true } | { readonly ok: false; readonly words: string };
+
+const ok: Outcome = { ok: true };
+const no = (words: string): Outcome => ({ ok: false, words });
+
+/* ---------- B6: the exe's address identity ---------- */
+
+/**
+ * A URL as the exe normalizes it (shell-core address.rs `normalize`): scheme and host lower case, the host
+ * as punycode, one trailing dot dropped, the default port dropped, no trailing slash. WHATWG `URL` does
+ * the first parts as Rust's `url` crate does; the trailing dot and slashes are done here.
+ */
+export function addressIdentity(url: string): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return undefined;
+  }
+  let host = u.hostname;
+  if (!literalClass(host) && !host.startsWith('[')) {
+    if (host.endsWith('.')) host = host.slice(0, -1);
+    if (host === '' || host.endsWith('.')) return undefined;
+  }
+  const path = u.pathname.replace(/\/+$/, '');
+  return `${u.protocol.slice(0, -1)}://${host}${u.port ? `:${u.port}` : ''}${path}`;
+}
+
+/* ---------- 5.9: keys ---------- */
+
+export const MAX_KEY = 16;
+export const MAX_MODEL_NAME = 64;
+
+/** A key from a label: a lower-case letter, then letters and digits, at most 16; `server` with no Latin letter. */
+export function keyBase(label: string): string {
+  const latin = label.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const from = latin.replace(/^[0-9]+/, '');
+  return (from || 'server').slice(0, MAX_KEY);
+}
+
+/** A key unique against every key ever issued, by a digit suffix. Never changed or reused. */
+export function issueKey(label: string, issued: readonly string[]): string {
+  const base = keyBase(label);
+  const taken = new Set(issued);
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const suffix = String(n);
+    const k = `${base.slice(0, MAX_KEY - suffix.length)}${suffix}`;
+    if (!taken.has(k)) return k;
+  }
+}
+
+/** The model's name for a tool: `<key>__<tool's own name>`, or why it isn't offered. Nothing is converted. */
+export function modelName(key: string, tool: string): { readonly name: string } | { readonly reason: string } {
+  if (!/^[A-Za-z0-9_-]+$/.test(tool)) return { reason: `Its name "${tool.slice(0, 64)}" has characters a model can't call (only letters, digits, _ and -).` };
+  const name = `${key}__${tool}`;
+  if (name.length > MAX_MODEL_NAME) return { reason: `Its name is too long for a model (${name.length} characters with the server's key; at most ${MAX_MODEL_NAME}).` };
+  return { name };
+}
+
+/* ---------- reading the record ---------- */
+
+const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function readServer(v: unknown): OwnedServer | undefined {
+  if (!isObj(v) || !isObj(v.setup) || typeof v.key !== 'string' || typeof v.enabled !== 'boolean' || !isObj(v.limits) || !Array.isArray(v.tools)) return undefined;
+  const s = v.setup as Record<string, unknown>;
+  if (typeof s.id !== 'string' || typeof s.label !== 'string') return undefined;
+  if (s.kind === 'local') {
+    if (typeof s.program !== 'string' || !Array.isArray(s.args) || typeof s.cwd !== 'string' || !Array.isArray(s.env) || !Array.isArray(s.secrets)) return undefined;
+  } else if (s.kind === 'remote') {
+    if (typeof s.url !== 'string' || !Array.isArray(s.headers)) return undefined;
+  } else return undefined;
+  const tools = v.tools.filter((t): t is SavedTool => isObj(t) && typeof t.name === 'string' && typeof t.fingerprint === 'string');
+  return { setup: s as unknown as ServerSetup, key: v.key, enabled: v.enabled, limits: v.limits as ServerLimits, tools, ...(v.removing === true ? { removing: true as const } : {}) };
+}
+
+function readChoice(v: unknown): ToolChoice | undefined {
+  if (!isObj(v) || (v.policy !== 'allow' && v.policy !== 'ask' && v.policy !== 'deny') || typeof v.fingerprint !== 'string' || typeof v.setupFingerprint !== 'string') return undefined;
+  return { policy: v.policy as ToolPolicy, fingerprint: v.fingerprint, setupFingerprint: v.setupFingerprint };
+}
+
+/* ---------- the owner ---------- */
+
+export class Owner {
+  private doc: Doc;
+  /** The whole record couldn't be read: nothing loads, nothing is written. */
+  readonly unreadable: boolean;
+  private effect: { readonly what: string; readonly since: number } | undefined;
+  private readonly ports: OwnerPorts;
+  private readonly listeners = new Set<() => void>();
+
+  private constructor(doc: Doc, unreadable: boolean, ports: OwnerPorts) {
+    this.doc = doc;
+    this.unreadable = unreadable;
+    this.ports = ports;
+  }
+
+  static async open(ports: OwnerPorts): Promise<Owner> {
+    const stored = await ports.store.get(OWNER_KEY);
+    if (stored === undefined) return new Owner({ rev: 0, servers: {}, choices: {}, keys: [], tombstones: {} }, false, ports);
+    const v = stored.value;
+    if (stored.v !== OWNER_VERSION || !isObj(v) || !isObj(v.servers) || !isObj(v.choices) || !Array.isArray(v.keys) || !isObj(v.tombstones) || typeof v.rev !== 'number') {
+      return new Owner({ rev: -1, servers: {}, choices: {}, keys: [], tombstones: {} }, true, ports);
+    }
+    return new Owner(JSON.parse(JSON.stringify(v)) as Doc, false, ports);
+  }
+
+  /** Hears every commit. */
+  onChange(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /* ---------- reads, of committed state ---------- */
+
+  servers(): readonly OwnedServer[] {
+    return Object.values(this.doc.servers).flatMap((v) => {
+      const s = readServer(v);
+      return s ? [s] : [];
+    });
+  }
+  server(id: string): OwnedServer | undefined {
+    return readServer(this.doc.servers[id]);
+  }
+  /** Saved records that couldn't be read: never started, never overwritten. */
+  unreadableServers(): readonly string[] {
+    return Object.keys(this.doc.servers).filter((id) => !readServer(this.doc.servers[id]));
+  }
+  /** The person's choices. An unreadable one is left out: the gate's default, which asks. */
+  choices(): Readonly<Record<string, ToolChoice>> {
+    const out: Record<string, ToolChoice> = {};
+    for (const [k, v] of Object.entries(this.doc.choices)) {
+      const c = readChoice(v);
+      if (c) out[k] = c;
+    }
+    return out;
+  }
+  get mark(): Mark | undefined {
+    return this.doc.mark;
+  }
+  tombstones(): Readonly<Record<string, Tombstone>> {
+    return this.doc.tombstones;
+  }
+  /** What Settings shows: nothing, "Saving…", or the restart words after 10 s. */
+  saving(): { readonly what: string; readonly words: string } | undefined {
+    const e = this.effect;
+    if (!e) return this.doc.mark ? { what: this.doc.mark.kind, words: UNFINISHED_WORDS } : undefined;
+    return { what: e.what, words: this.ports.now() - e.since >= WAITING_AFTER_MS ? WAITING_WORDS : 'Saving…' };
+  }
+  get busy(): boolean {
+    return this.effect !== undefined;
+  }
+
+  /* ---------- the one effect ---------- */
+
+  /**
+   * Admits one effect, synchronously, or refuses at once. While a mark is left unfinished, only Retry and
+   * starts are admitted.
+   */
+  admit(what: string, options: { readonly start?: boolean } = {}): { readonly release: () => void } | Outcome {
+    if (this.unreadable) return no("Familiar can't read its saved servers, so it changes nothing. Restart Familiar.");
+    if (this.effect) return no(BUSY_WORDS);
+    if (this.doc.mark && !options.start && what !== 'retry' && what !== 'repair') return no(UNFINISHED_WORDS);
+    const token = { what, since: this.ports.now() };
+    this.effect = token;
+    return {
+      release: () => {
+        if (this.effect === token) this.effect = undefined;
+        this.notify();
+      }
+    };
+  }
+
+  private notify(): void {
+    for (const l of [...this.listeners]) l();
+  }
+
+  /** One commit: the change applied to a copy, written whole in one transaction, fenced by the revision. */
+  private async commit(change: (d: Doc) => void): Promise<boolean> {
+    if (this.unreadable) return false;
+    const next = JSON.parse(JSON.stringify(this.doc)) as Doc;
+    change(next);
+    next.rev = this.doc.rev + 1;
+    const rev = this.doc.rev;
+    const written = await this.ports.store.putIf(OWNER_KEY, { v: OWNER_VERSION, value: next as unknown as JsonValue }, (cur) => (cur === undefined ? rev === 0 : isObj(cur.value) && cur.value.rev === rev));
+    if (written) {
+      this.doc = next;
+      this.notify();
+    }
+    return written;
+  }
+
+  /** A commit no effect owns: the tools a run listed, saved as the tools last seen. */
+  async seen(id: string, tools: readonly SavedTool[]): Promise<void> {
+    const s = this.server(id);
+    if (!s || s.removing || JSON.stringify(s.tools) === JSON.stringify(tools)) return;
+    await this.commit((d) => {
+      const cur = readServer(d.servers[id]);
+      if (cur) d.servers[id] = { ...cur, tools } as unknown as JsonValue;
+    });
+  }
+
+  /* ---------- the changes ---------- */
+
+  /** Add, local or remote. The id must be new: never one saved or tombstoned. */
+  async add(setup: ServerSetup): Promise<Outcome> {
+    if (this.doc.servers[setup.id] !== undefined || this.doc.tombstones[setup.id] !== undefined) return no('A server with this id is already saved.');
+    let identity: string | undefined;
+    if (setup.kind === 'remote') {
+      identity = addressIdentity(setup.url);
+      if (!identity) return no("That isn't a web address Familiar can use.");
+      const other = this.servers().find((s) => s.setup.kind === 'remote' && addressIdentity(s.setup.url) === identity);
+      if (other) return no(`Another server, ${other.setup.label}, already uses this address. Familiar keeps one server per address.`);
+    }
+    const t = this.admit('add');
+    if (!('release' in t)) return t;
+    try {
+      const key = issueKey(setup.label, this.doc.keys);
+      const record = (s: ServerSetup): JsonValue => ({ setup: s, key, enabled: false, limits: {}, tools: [] }) as unknown as JsonValue;
+      if (setup.kind === 'local') {
+        if (!(await this.commit((d) => ((d.servers[setup.id] = record(setup)), d.keys.push(key))))) return no('The server could not be saved.');
+        return ok;
+      }
+      // Remote: the mark first, then the exe's dialog, then the record and the mark's clearing together.
+      if (!(await this.commit((d) => (d.mark = { kind: 'add-remote', server: setup.id, identity: identity! })))) return no('The server could not be saved.');
+      let address: { id: string };
+      try {
+        address = await this.ports.addresses.add({ url: setup.url, label: setup.label });
+      } catch (e) {
+        await this.clearMark();
+        return no(e instanceof Error && /declined/i.test(e.message) ? 'You chose not to allow this address.' : 'The address could not be added.');
+      }
+      // The exe returns an identical saved address's id: if another server holds it, this add can't share it,
+      // and the address is never removed here (it's that server's).
+      const holder = this.servers().find((s) => s.setup.kind === 'remote' && s.setup.address === address.id);
+      if (holder) {
+        await this.clearMark();
+        return no(`Another server, ${holder.setup.label}, already uses this address. Familiar keeps one server per address.`);
+      }
+      const saved = { ...setup, address: address.id };
+      if (await this.commit((d) => ((d.servers[setup.id] = record(saved)), d.keys.push(key), delete d.mark))) return ok;
+      // The add's commit failed after address_add. The exe can't yet say whether it created the address
+      // (B6), so the rollback leaves it for the start-time sweep, which removes any address no record owns.
+      await this.clearMark();
+      return no('The server could not be saved.');
+    } finally {
+      t.release();
+    }
+  }
+
+  private async clearMark(): Promise<void> {
+    for (let i = 0; i < 3; i++) if (await this.commit((d) => delete d.mark)) return;
+  }
+
+  /** A change of a stopped server's setup: the record and a mark naming the dropped secrets, then their deletes. */
+  async edit(id: string, setup: ServerSetup, stopped: boolean): Promise<Outcome> {
+    const cur = this.server(id);
+    if (!cur || cur.removing) return no('No server is saved with that id.');
+    if (!stopped) return no('Stop the server before changing it.');
+    const t = this.admit('edit');
+    if (!('release' in t)) return t;
+    try {
+      const dropped = secretRefs(cur.setup).filter((r) => !secretRefs(setup).includes(r));
+      if (!(await this.commit((d) => ((d.servers[id] = { ...cur, setup } as unknown as JsonValue), dropped.length ? (d.mark = { kind: 'edit', server: id, dropped }) : undefined)))) return no('The change was not saved.');
+      if (!dropped.length) return ok;
+      return (await this.finishEdit(dropped)) ? ok : no('Saved; cleanup not finished. Press Retry.');
+    } finally {
+      t.release();
+    }
+  }
+
+  private async finishEdit(dropped: readonly string[]): Promise<boolean> {
+    try {
+      for (const ref of dropped) await this.ports.secrets.delete(ref);
+    } catch {
+      return false;
+    }
+    return this.commit((d) => delete d.mark);
+  }
+
+  /** Remove: Stop (awaited), the record set removing with a mark, the native cleanup, then the record and
+      its choices gone and the tombstone kept, in one commit. */
+  async remove(id: string, stop: () => Promise<void>): Promise<Outcome> {
+    const cur = this.server(id);
+    if (!cur) return no('No server is saved with that id.');
+    const t = this.admit('remove');
+    if (!('release' in t)) return t;
+    try {
+      await stop();
+      const setup = cur.setup;
+      const stone: Tombstone = {
+        key: cur.key,
+        ...(setup.kind === 'local' ? { forget: false, secrets: Object.fromEntries(secretRefs(setup).map((r) => [r, false])) } : {}),
+        ...(setup.kind === 'remote' && setup.address ? { address: { id: setup.address, done: false } } : {})
+      };
+      if (!(await this.commit((d) => ((d.servers[id] = { ...cur, removing: true } as unknown as JsonValue), (d.tombstones[id] = stone), (d.mark = { kind: 'remove', server: id }))))) return no('The removal was not saved.');
+      return (await this.finishRemove(id)) ? ok : no('Removing; cleanup not finished. Press Retry.');
+    } finally {
+      t.release();
+    }
+  }
+
+  /** The native cleanup of a tombstone, each item idempotent, its done flag committed as it goes. */
+  private async cleanTombstone(id: string): Promise<boolean> {
+    const stone = this.doc.tombstones[id];
+    if (!stone) return true;
+    let clean = true;
+    try {
+      if (stone.forget === false) {
+        await this.ports.forget(id);
+        await this.commit((d) => (d.tombstones[id] = { ...d.tombstones[id]!, forget: true }));
+      }
+      for (const [ref, done] of Object.entries(stone.secrets ?? {})) {
+        if (done) continue;
+        await this.ports.secrets.delete(ref);
+        await this.commit((d) => (d.tombstones[id] = { ...d.tombstones[id]!, secrets: { ...d.tombstones[id]!.secrets, [ref]: true } }));
+      }
+      if (stone.address && !stone.address.done) {
+        await this.ports.addresses.remove(stone.address.id);
+        await this.commit((d) => (d.tombstones[id] = { ...d.tombstones[id]!, address: { id: stone.address!.id, done: true } }));
+      }
+    } catch {
+      clean = false;
+    }
+    return clean;
+  }
+
+  private async finishRemove(id: string): Promise<boolean> {
+    if (!(await this.cleanTombstone(id))) return false;
+    const prefix = choiceKey(id, '').slice(0, -2);
+    // Completion, not age, shrinks the tombstone to its id and key.
+    return this.commit((d) => {
+      delete d.servers[id];
+      for (const k of Object.keys(d.choices)) if (k.startsWith(prefix)) delete d.choices[k];
+      d.tombstones[id] = { key: d.tombstones[id]!.key };
+      delete d.mark;
+    });
+  }
+
+  /** Retry: finishes the mark's cleanup. */
+  async retry(): Promise<Outcome> {
+    const mark = this.doc.mark;
+    if (!mark) return ok;
+    const t = this.admit('retry');
+    if (!('release' in t)) return t;
+    try {
+      return (await this.finishMark(mark)) ? ok : no('Cleanup still didn\'t finish. Try again, or restart Familiar.');
+    } finally {
+      t.release();
+    }
+  }
+
+  private async finishMark(mark: Mark): Promise<boolean> {
+    if (mark.kind === 'edit') return this.finishEdit(mark.dropped);
+    if (mark.kind === 'remove') return this.finishRemove(mark.server);
+    // An add whose record was never committed: not saved. Its address, if one was made, is an orphan.
+    await this.clearMark();
+    return this.doc.mark === undefined;
+  }
+
+  /**
+   * Repair, only in a fresh exe (5.3): every old native operation ended with the old process. The one mark
+   * is rolled back or finished (address_add is never repeated), unfinished tombstones are retried, and any
+   * server address no record owns is removed.
+   */
+  async repair(): Promise<Outcome> {
+    const t = this.admit('repair');
+    if (!('release' in t)) return t;
+    try {
+      if (this.doc.mark && !(await this.finishMark(this.doc.mark))) return no('Repair didn\'t finish. Press Retry.');
+      for (const id of Object.keys(this.doc.tombstones)) {
+        const s = this.doc.tombstones[id]!;
+        if (s.forget === false || Object.values(s.secrets ?? {}).some((x) => !x) || (s.address && !s.address.done)) {
+          if (await this.cleanTombstone(id)) await this.commit((d) => (d.tombstones[id] = { key: d.tombstones[id]!.key }));
+        }
+      }
+      if (this.ports.addresses.list) {
+        const owned = new Set(this.servers().flatMap((s) => (s.setup.kind === 'remote' && s.setup.address ? [s.setup.address] : [])));
+        for (const a of await this.ports.addresses.list()) if (a.kind === 'server' && !owned.has(a.id)) await this.ports.addresses.remove(a.id).catch(() => {});
+      }
+      return ok;
+    } finally {
+      t.release();
+    }
+  }
+
+  /** Enable, Disable, limits, mark reviewed, a choice: one commit each. */
+  async update(id: string, change: (s: OwnedServer) => OwnedServer, what = 'update'): Promise<Outcome> {
+    const cur = this.server(id);
+    if (!cur || cur.removing) return no('No server is saved with that id.');
+    const t = this.admit(what);
+    if (!('release' in t)) return t;
+    try {
+      return (await this.commit((d) => (d.servers[id] = change(cur) as unknown as JsonValue))) ? ok : no('The change was not saved.');
+    } finally {
+      t.release();
+    }
+  }
+
+  async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<Outcome> {
+    const t = this.admit('choice');
+    if (!('release' in t)) return t;
+    try {
+      const key = choiceKey(serverId, tool);
+      return (await this.commit((d) => (choice ? (d.choices[key] = choice as unknown as JsonValue) : delete d.choices[key]))) ? ok : no('The choice was not saved.');
+    } finally {
+      t.release();
+    }
+  }
+}

@@ -186,7 +186,7 @@ export class ServerLink {
    * tool list. Refused busy while the slot holds an exchange (a Stop's drain included). The whole start
    * runs under one deadline; past it the local process is stopped, or the remote run ends.
    */
-  async start(target: Target, launch: string, options: { readonly era?: Era } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
+  async start(target: Target, launch: string, options: { readonly era?: Era; readonly launched?: () => void } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
@@ -199,10 +199,14 @@ export class ServerLink {
         run.process = started.run;
       } catch (e) {
         run.ended = true;
+        options.launched?.();
         return { ok: false, failure: startFailure(e, target.setup.program) };
       }
+      // The exe answered: the owner's native start is over (5.1).
+      options.launched?.();
       if (run.ended) return { ok: false, failure: this.exitWords(run) };
     }
+    if (target.where === 'remote') options.launched?.();
     const { deadline, cancel } = this.deadline(run, this.limits.startMs);
     try {
       // A modern relaunch skips the opening: the era was decided by the refusal on the first start.

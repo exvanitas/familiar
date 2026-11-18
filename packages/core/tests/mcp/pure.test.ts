@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { canonicalJson, sha256 } from '../../src/mcp/hash.ts';
 import { CHECKED_AT_TEST, checkPrerequisites, FINDABLE, prerequisiteOf } from '../../src/mcp/prerequisites.ts';
-import { modelNames, outcomeText, toolChanges, toolFingerprint } from '../../src/mcp/server-tools.ts';
+import { outcomeText, toolChanges, toolFingerprint } from '../../src/mcp/server-tools.ts';
+import { issueKey, keyBase, modelName } from '../../src/mcp/owner.ts';
 import { CatalogError, checkTools, effectiveDescription } from '../../src/mcp/catalog.ts';
 import { posixPaths, windowsPaths } from '../../src/mcp/native-rules.ts';
 import { REPO, testPaths } from './fake.ts';
@@ -58,53 +59,31 @@ describe('the unpinned flag', () => {
   for (const [program, args] of pinned) it(`leaves ${program} ${args.join(' ')}`, () => expect(unpinned(program, args)).toBeUndefined());
 });
 
-describe('model names', () => {
-  it('namespaced, safe for every provider, at most 64, starting with a letter', () => {
-    const names = modelNames([{ id: 'b', label: 'Fichiers été / 2', tools: [{ name: 'read file' }, { name: 'x'.repeat(80) }, { name: '***' }] }]).get('b')!;
-    expect(names.get('read file')).toBe('Fichiers_ete_2__read_file');
-    for (const n of names.values()) expect(n).toMatch(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
-    expect(names.get('***')).toBe('Fichiers_ete_2__tool');
-    expect(modelNames([{ id: 'c', label: '42 tools', tools: [{ name: 't' }] }]).get('c')!.get('t')).toBe('s42_tools__t');
-    expect(modelNames([{ id: 'd', label: '', tools: [{ name: 't' }] }]).get('d')!.get('t')).toBe('server__t');
+describe('model names: frozen keys (5.9)', () => {
+  it('a key is a lower-case letter, then letters and digits, at most 16, from the label; "server" with no Latin letter', () => {
+    expect(keyBase('Fichiers été / 2')).toBe('fichiersete2');
+    expect(keyBase('42 tools')).toBe('tools');
+    expect(keyBase('')).toBe('server');
+    expect(keyBase('日本語')).toBe('server');
+    expect(keyBase('A very long server label indeed')).toBe('averylongserverl');
+    expect(keyBase('Under_score-dash')).toBe('underscoredash');
   });
 
-  it('names come from labels and ids, never order: a clash of labels gets a tag from each id', () => {
-    const a = { id: 'a', label: 'Same', tools: [{ name: 'echo' }, { name: 'Echo' }] };
-    const b = { id: 'b', label: 'Same', tools: [{ name: 'echo' }] };
-    const c = { id: 'c', label: 'Other', tools: [{ name: 'echo' }] };
-    const one = modelNames([a, b, c]);
-    const two = modelNames([c, b, a]);
-    for (const s of [a, b, c]) expect([...one.get(s.id)!]).toEqual([...two.get(s.id)!]);
-    const all = [...one.values()].flatMap(m => [...m.values()]);
-    expect(new Set(all.map(n => n.toLowerCase())).size).toBe(all.length);
-    expect(one.get('b')!.get('echo')).toBe(`Same_${sha256('b').slice(0, 4)}__echo`);
-    expect(one.get('c')!.get('echo')).toBe('Other__echo');
-    // a's echo and Echo clash ignoring case: each gets a tag of its own name.
-    expect(one.get('a')!.get('echo')).toBe(`Same_${sha256('a').slice(0, 4)}__echo_${sha256('echo').slice(0, 4)}`);
-    // Alone, a server keeps its plain label; with others its name doesn't depend on which others.
-    expect(modelNames([b]).get('b')!.get('echo')).toBe('Same__echo');
-    expect(modelNames([b, a]).get('b')!.get('echo')).toBe(modelNames([a, b, c]).get('b')!.get('echo'));
-    // A cut name that clashes still fits, and stays unique.
-    const long = { id: 'l', label: 'L', tools: [{ name: 'y'.repeat(70) }, { name: 'y'.repeat(71) }] };
-    const cut = [...modelNames([long]).get('l')!.values()];
-    expect(cut.every(n => n.length <= 64)).toBe(true);
-    expect(new Set(cut).size).toBe(2);
+  it('keys are unique against every key ever issued, by a digit suffix, within 16 characters', () => {
+    expect(issueKey('Same', [])).toBe('same');
+    expect(issueKey('Same', ['same'])).toBe('same2');
+    expect(issueKey('Same', ['same', 'same2'])).toBe('same3');
+    expect(issueKey('A very long server label', ['averylongserverl'])).toBe('averylongserver2');
   });
 
-  it('when two ids share a short tag, the tags grow until they differ', () => {
-    // Find two ids whose first four hex characters agree.
-    const seen = new Map<string, string>();
-    let pair: [string, string] | undefined;
-    for (let i = 0; !pair; i++) {
-      const id = `id${i}`;
-      const t = sha256(id).slice(0, 4);
-      if (seen.has(t)) pair = [seen.get(t)!, id];
-      else seen.set(t, id);
-    }
-    const names = modelNames(pair.map(id => ({ id, label: 'Same', tools: [{ name: 'echo' }] })));
-    const [x, y] = pair.map(id => names.get(id)!.get('echo')!);
-    expect(x).not.toBe(y);
-    expect(x).toBe(`Same_${sha256(pair[0]).slice(0, 6)}__echo`);
+  it("a model name is <key>__<tool's own name>, offered only if the name is letters, digits, _ and -, and fits 64", () => {
+    expect(modelName('files', 'read_file')).toEqual({ name: 'files__read_file' });
+    expect(modelName('files', 'read file')).toMatchObject({ reason: expect.stringMatching(/can't call/) });
+    expect(modelName('files', 'x'.repeat(58))).toMatchObject({ reason: expect.stringMatching(/too long/) });
+    expect(modelName('files', 'x'.repeat(57))).toEqual({ name: `files__${'x'.repeat(57)}` });
+    // The key has no `_`, so the first `__` splits a name back into one server and one tool.
+    const n = (modelName('files', 'a__b') as { name: string }).name;
+    expect(n.slice(0, n.indexOf('__'))).toBe('files');
   });
 });
 
@@ -241,10 +220,8 @@ describe('tool lists, bounded before anything hashes them (r19 #6, #10, #11)', (
     try { checkTools([tool('deep', { inputSchema: { type: 'object', 'x-extra': root } })]); } catch (e) { expect(e).toBeInstanceOf(CatalogError); }
   });
 
-  it('two tools with one name fail the list; model names stay unique', () => {
+  it('two tools with one name fail the list', () => {
     expect(() => checkTools([tool('echo'), tool('echo')])).toThrow(/two tools named echo/);
-    const names = modelNames([{ id: 'a', label: 'S', tools: [{ name: 'echo' }, { name: 'echo' }] }]).get('a')!;
-    expect([...names.values()]).toEqual(['S__echo']);
   });
 
   it("a title-only tool's fingerprint follows its title, which the model reads as its description", () => {

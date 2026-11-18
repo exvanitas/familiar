@@ -85,7 +85,7 @@ describe('the MCP client, local, against the fake server', () => {
     const w = await world();
     const id = await addFake(w, { FAKE_SECRET: BLANKED_VALUE, LOG_LEVEL: 'info' });
     // Saved: the secret's name, never its value. A short value is a plain setting.
-    const saved = JSON.stringify(await w.store.get(`mcp.server.${id}`));
+    const saved = JSON.stringify((await w.store.get('mcp.owner'))?.value);
     expect(saved).not.toContain(BLANKED_VALUE);
     expect(saved).toContain('FAKE_SECRET');
     expect(saved).toContain('LOG_LEVEL');
@@ -106,7 +106,7 @@ describe('the MCP client, local, against the fake server', () => {
     expect(w.port.asked).toBe(1);
     const tools = w.client.tools();
     const echo = tools.find(t => t.serverName === 'echo')!;
-    expect(echo.name).toBe('Fake_server__echo');
+    expect(echo.name).toBe('fakeserver__echo');
     expect(echo.kind).toBe('server');
     expect(echo.outside).toBe(true);
     expect(echo.fresh).toBe(false);
@@ -236,21 +236,22 @@ describe('the MCP client, local, against the fake server', () => {
     const b = await addFake(w);
     await w.client.start(b);
     const other = w.client.tools().find(t => t.serverName === 'echo')!;
-    expect(other.name).toBe(tool.name);
+    // A second server with the same label gets its own frozen key: the model's name differs too.
+    expect(other.name).toBe('fakeserver2__echo');
+    expect(tool.name).toBe('fakeserver__echo');
     expect(other.fingerprint).toBe(tool.fingerprint);
     expect(toolPolicies([other], always)).toEqual({});
   });
 
   it('a "never" for the wrapper\'s own identity refuses its call before sending, even past the gate', async () => {
-    let choices: Record<string, ToolChoice> = {};
-    const w = await world({ choices: () => choices });
+    const w = await world();
     const id = await addFake(w);
     await w.client.start(id);
     const echo = w.client.tools().find(t => t.serverName === 'echo')!;
-    choices = { [choiceKey(id, 'echo')]: { policy: 'deny', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
+    await w.client.choose(id, 'echo', { policy: 'deny', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint });
     await expect(runWithYes(echo, { text: 'no' })).rejects.toThrow(/You chose never to run echo/);
     expect(sentCalls(w.port, 'echo')).toBe(0);
-    choices = {};
+    await w.client.choose(id, 'echo', undefined);
     expect(await runWithYes(echo, { text: 'yes' })).toMatch(/\nyes$/);
     // A revoke holds at once, in memory, whatever is saved.
     w.client.revoke(id, 'echo', 'never');
@@ -259,25 +260,24 @@ describe('the MCP client, local, against the fake server', () => {
   });
 
   it('a decision minted on "always" is checked again at the send: the choice changed, revoked, or outside content, and nothing is written', async () => {
-    let choices: Record<string, ToolChoice> = {};
-    const w = await world({ choices: () => choices });
+    const w = await world();
     const id = await addFake(w);
     await w.client.start(id);
     const echo = w.client.tools().find(t => t.serverName === 'echo')!;
-    const always = { [choiceKey(id, 'echo')]: { policy: 'allow' as const, fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint } };
+    const always: ToolChoice = { policy: 'allow' as const, fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint };
     const facts = w.client.facts(id, 'echo', { text: 'kept' })!;
     const signal = new AbortController().signal;
-    choices = always;
+    await w.client.choose(id, 'echo', always);
     // Kept: it goes.
     expect(await w.client.send(mintDecision(facts, 's1', 'always', false)!, signal)).toMatchObject({ kind: 'result', text: 'kept' });
     // Never minted for outside content.
     expect(mintDecision(facts, 's2', 'always', true)).toBeUndefined();
     // The choice taken back after the mint: refused at the send.
     const d = mintDecision(facts, 's3', 'always', false)!;
-    choices = {};
+    await w.client.choose(id, 'echo', undefined);
     expect(await w.client.send(d, signal)).toMatchObject({ kind: 'error', words: expect.stringMatching(/Your "always" for echo on this server no longer stands/) });
     // Withdrawn by the overlay: the same.
-    choices = always;
+    await w.client.choose(id, 'echo', always);
     w.client.revoke(id, 'echo', 'ask');
     expect(await w.client.send(mintDecision(facts, 's4', 'always', false)!, signal)).toMatchObject({ kind: 'error' });
     expect(sentCalls(w.port, 'echo')).toBe(1);
@@ -327,7 +327,8 @@ describe('the MCP client, local, against the fake server', () => {
     expect(removed).toEqual({ kind: 'removed' });
     expect(await slow).toEqual({ kind: 'interrupted' });
     expect(w.deleted).toEqual([`server:${id}:FAKE_SECRET`]);
-    expect(await w.store.get(`mcp.server.${id}`)).toBeUndefined();
+    expect(w.client.owner.server(id)).toBeUndefined();
+    expect(w.client.owner.tombstones()[id]).toEqual({ key: 'fakeserver' });
     expect(w.client.list()).toEqual([]);
     expect(w.port.pids()).toEqual([]);
     expect(await callWithYes(w.client, id, 'echo', { text: 'x' })).toMatchObject({ kind: 'error', reason: 'not-running' });
@@ -399,7 +400,7 @@ describe('the MCP client, remote, against the fake server over HTTP', () => {
     const { id, secretRefs } = await w.client.add(draft);
     expect(w.addresses.added).toEqual([http.url]);
     expect(secretRefs).toEqual(['addr:addr-1']);
-    expect(JSON.stringify(await w.store.get(`mcp.server.${id}`))).not.toContain('remote-k1');
+    expect(JSON.stringify((await w.store.get('mcp.owner'))?.value)).not.toContain('remote-k1');
 
     expect((await w.client.start(id)).kind).toBe('ready');
     expect(await callWithYes(w.client, id, 'echo', { text: 'over http' })).toMatchObject({ kind: 'result', text: 'over http' });
@@ -443,9 +444,9 @@ describe('the tools a turn sees', () => {
     const names = tools.map(t => t.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names.every(n => /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(n))).toBe(true);
-    // Two servers with the same label: each gets a tag from its own id, so neither name depends on the other.
-    expect(names).toContain(`Fake_server_${sha256(a).slice(0, 4)}__echo`);
-    expect(names).toContain(`Fake_server_${sha256(b).slice(0, 4)}__echo`);
+    // Two servers with the same label: each has its own frozen key, issued at add time.
+    expect(names).toContain('fakeserver__echo');
+    expect(names).toContain('fakeserver2__echo');
     await w.client.stop(b);
     expect(w.client.tools().every(t => t.server.id === a)).toBe(true);
   });

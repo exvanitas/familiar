@@ -18,9 +18,11 @@ export { kindOf } from './process.ts';
 export type { ProcessError, ProcessEvent, ProcessPort, ProcessSetup } from './process.ts';
 export { KEY_HEADERS, KEY_PLACEHOLDER, remoteHeaders } from './remote.ts';
 export type { RemoteTarget } from './remote.ts';
-export { addServer, deleteServer, fresh, keyOf, loadServers, readServer, SAVED_VERSION, saveServer, SERVER_PREFIX } from './saved.ts';
-export type { SavedServer, SavedTool, ServerLimits } from './saved.ts';
-export { choiceKey, modelNames, outcomeText, wrapperPolicy, outsideContent, serverTool, toolChanges, toolFingerprint, toolPolicies, MAX_MODEL_NAME } from './server-tools.ts';
+export { fresh } from './saved.ts';
+export type { SavedTool, ServerLimits } from './saved.ts';
+export { addressIdentity, BUSY_WORDS, issueKey, keyBase, MAX_KEY, MAX_MODEL_NAME, modelName, Owner, OWNER_KEY, OWNER_VERSION, UNFINISHED_WORDS, WAITING_AFTER_MS, WAITING_WORDS } from './owner.ts';
+export type { Mark, OwnedServer, OwnerPorts, Outcome, Tombstone } from './owner.ts';
+export { choiceKey, outcomeText, wrapperPolicy, outsideContent, serverTool, toolChanges, toolFingerprint, toolPolicies } from './server-tools.ts';
 export type { Sender, ServerTool, ToolChanges, ToolChoice } from './server-tools.ts';
 export { CatalogError, checkTools, effectiveDescription, MAX_CATALOG_BYTES, MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES, MAX_TOOL_BYTES, MAX_TOOLS } from './catalog.ts';
 export {

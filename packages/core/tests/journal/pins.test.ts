@@ -199,3 +199,31 @@ describe('5.5: decisions are minted only by the gate', () => {
     expect(sitesOf(files, /\.handoff\(/)).toEqual([expect.stringMatching(/^mcp\/client\.ts: /)]);
   });
 });
+
+/* ---------- 5.9: the reserved namespace ---------- */
+
+describe('5.9: `__` is reserved for server tools', () => {
+  it("no built-in's name holds it, and the journal refuses a built-in that does", async () => {
+    const { RUN_WITHOUT_ASKING, BUILT_IN_READS } = await import('../../src/index.ts');
+    expect([...RUN_WITHOUT_ASKING, ...BUILT_IN_READS].filter((n) => n.includes('__'))).toEqual([]);
+    const store = await openJournalStore('pins-names', { indexedDB: new IDBFactory() as any });
+    const model = createFakeModel(() => ({ text: 'ok' }));
+    await expect(
+      openJournal({
+        store,
+        owner: memoryOwner(),
+        model,
+        modelId: 'fake-1',
+        caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
+        tools: [{ name: 'files__read', description: '', inputSchema: {}, kind: 'read', doing: () => 'x', run: async () => '' }],
+        wake: { wakeAt: () => {} },
+        notifier: { notify: () => {} },
+        consent: { ask: async () => true },
+        presence: { report: () => {} },
+        persona: { id: 'olive', name: 'Olive', instructions: '' },
+        decider: { decide: async (event, context) => decideByRules(event, context) },
+        ambient: () => ({ persona: { sketch: 'kind', interests: [] }, chattiness: 'medium', doNotDisturb: false, fullscreen: false, sentAway: false, chatInFront: true, teaserDue: false })
+      })
+    ).rejects.toThrow(/may not have __/);
+  });
+});

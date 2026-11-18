@@ -3,15 +3,19 @@
    the enabled MCP servers. The rest of the agent core joins it in later steps. */
 import { McpClient, openSettingsStore, systemClock } from '@familiar/core';
 import { desktopMcpPorts } from '../mcp.ts';
+import { boot } from './boot.ts';
 import { createShell, MIN_API, reason, type CoreMessage } from '../shell.ts';
 
 const shell = createShell();
 
-/* The saved servers, the enabled ones started. An approved setup starts with no dialog. */
+/* The saved servers: repaired (this is a fresh exe), then the enabled ones started, one admitted start at
+   a time. An approved setup starts with no dialog. */
 async function startServers(): Promise<McpClient | undefined> {
   try {
     const client = await McpClient.open({ store: await openSettingsStore(indexedDB), ...desktopMcpPorts(shell), clock: systemClock });
-    client.startEnabled();
+    const repaired = await client.repair();
+    if (!repaired.ok) await shell.log(`mcp: repair did not finish: ${repaired.words}`);
+    void client.startEnabled();
     return client;
   } catch (e) {
     await shell.log(`mcp: the saved servers could not be loaded: ${reason(e)}`);
@@ -43,8 +47,14 @@ async function onMessage(m: CoreMessage) {
   const granted = persisted || await navigator.storage.persist();
   const { quota, usage } = await navigator.storage.estimate();
   await shell.log(`persist granted=${granted} persisted=${persisted} quota=${quota} usage=${usage}`);
-  await shell.ready(m => { void onMessage(m); });
-  await shell.traySet({ tooltip: 'Familiar', icon: 'tray.png', items: [{ id: 'chat', label: 'Open chat' }, { id: 'settings', label: 'Settings' }] });
-  if (!info.autostarted) await openChat();
-  await startServers();
+  // Ready first: a refused ready (a reload in a running exe) builds nothing at all.
+  await boot(
+    () => shell.ready(m => { void onMessage(m); }),
+    async () => {
+      await shell.traySet({ tooltip: 'Familiar', icon: 'tray.png', items: [{ id: 'chat', label: 'Open chat' }, { id: 'settings', label: 'Settings' }] });
+      if (!info.autostarted) await openChat();
+      await startServers();
+    },
+    words => shell.log(`core: shell_ready refused, restart-only: ${words}`)
+  );
 })();
