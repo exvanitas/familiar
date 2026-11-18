@@ -161,6 +161,8 @@ export class Owner {
   /** The whole record couldn't be read: nothing loads, nothing is written. */
   readonly unreadable: boolean;
   private effect: { readonly what: string; readonly since: number } | undefined;
+  /** The one reservation granted and not yet acknowledged (5.8): it holds the effect. */
+  private reservation: { readonly id: string; readonly ref: string; readonly release: () => void } | undefined;
   private readonly ports: OwnerPorts;
   private readonly listeners = new Set<() => void>();
 
@@ -411,6 +413,32 @@ export class Owner {
       d.tombstones[id] = { key: d.tombstones[id]!.key };
       delete d.mark;
     });
+  }
+
+  /* ---------- reservations (5.8) ---------- */
+
+  /**
+   * Settings asks before it saves a secret's value: the owner grants one reservation for that one ref, of
+   * a server saved now, with a fresh id used once. The grant holds the owner (no other change, no removal
+   * of that server) until Settings acknowledges it by that id, after its `secret_set` has settled, or until
+   * the exe restarts and the owner is opened again. The value never passes through core.
+   */
+  reserve(ref: string): { readonly ok: true; readonly grant: { readonly id: string; readonly ref: string } } | Outcome {
+    if (typeof ref !== 'string' || !this.servers().some((s) => !s.removing && secretRefs(s.setup).includes(ref))) return no('No saved server has that secret.');
+    const t = this.admit('secret');
+    if (!('release' in t)) return t;
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    this.reservation = { id, ref, release: t.release };
+    return { ok: true, grant: { id, ref } };
+  }
+
+  /** Settings' acknowledgement: by the grant's id and ref. Anything else (unknown, used, mismatched) does nothing. */
+  acknowledge(id: unknown, ref: unknown): boolean {
+    const r = this.reservation;
+    if (!r || typeof id !== 'string' || id !== r.id || ref !== r.ref) return false;
+    this.reservation = undefined;
+    r.release();
+    return true;
   }
 
   /** Retry: finishes the mark's cleanup. */
