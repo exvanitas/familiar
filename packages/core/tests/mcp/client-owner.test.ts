@@ -26,14 +26,14 @@ const ownerPorts = (store: SettingsStore): OwnerPorts => ({
 });
 
 /** A process port where each server's runs answer the handshake and list `echo`. */
-function speakingPort(hold?: (id: string, msg: any) => Promise<void> | undefined) {
+function speakingPort(hold?: (id: string, msg: any) => Promise<void> | undefined, describe: () => string = () => 'the echo tool') {
   const starts: string[] = [];
   const procs = new Map<string, ReturnType<typeof fakeProcess>>();
   const runOf = new Map<string, string>();
   const port: ProcessPort = {
     async start(setup, onEvent) {
       starts.push(setup.id);
-      const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify(listResult(msg.id, ['echo']))] : []));
+      const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'echo', description: describe(), inputSchema: { type: 'object', properties: {} } }] } })] : []));
       procs.set(setup.id, fp);
       const { run } = await fp.port.start(setup, onEvent);
       const id = `${setup.id}-${starts.length}`;
@@ -353,31 +353,77 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
 });
 
 describe('5.4: Mark reviewed marks what Test showed', () => {
-  for (const how of ['the report', 'names'] as const) {
-    it(`Test shows F1, the catalog moves to F2, then Mark reviewed (${how}): F2 is still unreviewed`, async () => {
-      const store = memorySettingsStore();
-      const client = await clientOf(store, speakingPort().port);
-      await client.add({ setup: local('l1'), problems: [] });
-      const report = await client.test('l1');
-      if (!report.ok) throw new Error('test failed');
-      const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
-      // A run lists echo changed before the person presses Mark reviewed.
-      await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F2' }]);
-      await client.markReviewed('l1', how === 'names' ? ['echo'] : report.tools);
-      expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F2', reviewed: f1 }]);
-      // Back at F1, what the person saw: reviewed.
-      await client.owner.seen('l1', [{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
-      expect(client.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
-    });
-  }
-
-  it('a name Test never showed is marked nothing', async () => {
+  it('Test shows F1, the catalog moves to F2, then Mark reviewed of that report: F2 is still unreviewed', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
     await client.add({ setup: local('l1'), problems: [] });
-    await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F1' }]);
-    await client.markReviewed('l1', ['echo']);
-    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F1' }]);
+    const report = await client.test('l1');
+    if (!report.ok) throw new Error('test failed');
+    const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
+    // A run lists echo changed before the person presses Mark reviewed.
+    await client.owner.seen('l1', [{ name: 'echo', fingerprint: 'F2' }]);
+    await client.markReviewed('l1', report.report, ['echo']);
+    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: 'F2', reviewed: f1 }]);
+    // Back at F1, what the person saw: reviewed.
+    await client.owner.seen('l1', [{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+    expect(client.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+  });
+
+  it('two Tests, then Mark reviewed pressed on the first report: it marks what the first showed, and the second\'s tool stays unreviewed', async () => {
+    const store = memorySettingsStore();
+    let words = 'one';
+    const client = await clientOf(store, speakingPort(undefined, () => words).port);
+    await client.add({ setup: local('l1'), problems: [] });
+    const first = await client.test('l1');
+    if (!first.ok) throw new Error('test 1');
+    words = 'two';
+    const second = await client.test('l1');
+    if (!second.ok) throw new Error('test 2');
+    const [f1, f2] = [first.tools[0]!.fingerprint, second.tools[0]!.fingerprint];
+    expect(f1).not.toBe(f2);
+    expect(first.report).not.toBe(second.report);
+    await client.markReviewed('l1', first.report, ['echo']);
+    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f2, reviewed: f1 }]);
+  });
+
+  it("a report that core never issued, or another server's, marks nothing; a name the report didn't show is marked nothing", async () => {
+    const store = memorySettingsStore();
+    const client = await clientOf(store, speakingPort().port);
+    await client.add({ setup: local('l1'), problems: [] });
+    await client.add({ setup: local('l2'), problems: [] });
+    const report = await client.test('l1');
+    if (!report.ok) throw new Error('test failed');
+    const other = await client.test('l2');
+    if (!other.ok) throw new Error('test failed');
+    const before = JSON.stringify(client.owner.server('l1')!.tools);
+    await expect(client.markReviewed('l1', 'never-issued', ['echo'])).rejects.toThrow(/Test again/);
+    await expect(client.markReviewed('l1', other.report, ['echo'])).rejects.toThrow(/Test again/);
+    expect(JSON.stringify(client.owner.server('l1')!.tools)).toBe(before);
+    await client.markReviewed('l1', report.report, ['other']);
+    expect(JSON.stringify(client.owner.server('l1')!.tools)).toBe(before);
+  });
+
+  it("Test's catalog write dropped while the owner was busy, then Mark reviewed, then a reopen: the tools Test showed are reviewed at what it showed", async () => {
+    const store = memorySettingsStore();
+    let busy: { release: () => void } | undefined;
+    let client!: McpClient;
+    // While the run lists its tools, another change holds the owner, so Test's catalog write is skipped.
+    client = await clientOf(store, speakingPort(async (_id, msg) => {
+      if (msg.method === 'tools/list' && !busy) {
+        const t = client.owner.admit('other');
+        if ('release' in t) busy = t;
+      }
+    }).port);
+    await client.add({ setup: local('l1'), problems: [] });
+    const report = await client.test('l1');
+    if (!report.ok) throw new Error('test failed');
+    expect(busy).toBeDefined();
+    busy!.release();
+    const f1 = report.tools.find((t) => t.name === 'echo')!.fingerprint;
+    expect(client.owner.server('l1')!.tools).toEqual([]);
+    await client.markReviewed('l1', report.report, ['echo']);
+    const again = await clientOf(store, speakingPort().port);
+    expect(again.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
   });
 });
 

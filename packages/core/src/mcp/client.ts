@@ -52,6 +52,9 @@ export interface SecretPort {
   delete(ref: string): Promise<void>;
 }
 
+/** How many recent Test reports Mark reviewed can still name. */
+const REPORTS_KEPT = 16;
+
 /** A call's time limit when the server's record names none, and its bounds. */
 export const CALL_MS = 60_000;
 export const CALL_MS_MIN = 1_000;
@@ -93,7 +96,15 @@ export interface TestedTool extends ListedTool {
 }
 
 export type TestReport =
-  | { readonly ok: true; readonly tools: readonly TestedTool[]; readonly changes: ToolChanges; readonly unpinned?: Unpinned; readonly notOffered?: readonly { readonly name: string; readonly reason: string }[] }
+  | {
+      readonly ok: true;
+      /** Core's id for this report: Mark reviewed names it, and marks what this report showed. */
+      readonly report: string;
+      readonly tools: readonly TestedTool[];
+      readonly changes: ToolChanges;
+      readonly unpinned?: Unpinned;
+      readonly notOffered?: readonly { readonly name: string; readonly reason: string }[];
+    }
   | { readonly ok: false; readonly failure: Failure };
 
 export class McpClient {
@@ -103,8 +114,10 @@ export class McpClient {
   private readonly overlay = new Map<string, 'ask' | 'never'>();
   /** How many revokes each key has had, so a choice clears only the revokes made before it. */
   private readonly revokes = new Map<string, number>();
-  /** What each server's last Test showed: each tool's fingerprint, by name. Mark reviewed binds to it. */
-  private readonly shown = new Map<string, ReadonlyMap<string, string>>();
+  /** What each recent Test report showed, by the report's id: its server, and each tool's fingerprint by
+      name. Mark reviewed binds to one of them. The newest few are kept. */
+  private readonly reports = new Map<string, { readonly server: string; readonly shown: ReadonlyMap<string, string> }>();
+  private reportCount = 0;
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {
@@ -235,25 +248,33 @@ export class McpClient {
     await rt.stop();
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
     const reviewed = s.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
-    this.shown.set(id, new Map(tools.map(t => [t.name, t.fingerprint])));
-    return { ok: true, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}), ...(notOffered.length ? { notOffered } : {}) };
+    const report = `test-${++this.reportCount}-${Math.random().toString(36).slice(2, 10)}`;
+    this.reports.set(report, { server: id, shown: new Map(tools.map(t => [t.name, t.fingerprint])) });
+    for (const old of this.reports.keys()) if (this.reports.size > REPORTS_KEPT) this.reports.delete(old);
+    return { ok: true, report, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}), ...(notOffered.length ? { notOffered } : {}) };
   }
 
   /**
-   * The person has seen these tools' names and descriptions, as Test showed them: each is marked reviewed
-   * at the fingerprint it was shown with, never at whatever the catalog holds when this lands. A tool
-   * since changed stays unreviewed. Give Test's report tools; a bare name means the fingerprint the last
-   * Test of this server showed for it, and a name it didn't show is marked nothing.
+   * The person has seen these tools' names and descriptions, as one Test report showed them: each named
+   * tool is marked reviewed at the fingerprint that report showed, never at whatever the catalog holds when
+   * this lands, so a tool changed since stays unreviewed. A name the report didn't show is marked nothing,
+   * and a report core didn't issue for this server (or one too old to be kept) marks nothing: "Test again".
+   * A tool the report showed that the saved list lacks (Test's own catalog write was skipped while the
+   * owner was busy) is saved as seen at that fingerprint, reviewed, so the review isn't lost.
    */
-  markReviewed(id: string, tools: readonly (string | { readonly name: string; readonly fingerprint: string })[]): Promise<void> {
-    const last = this.shown.get(id);
+  markReviewed(id: string, report: string, names: readonly string[]): Promise<void> {
+    const shown = this.reports.get(report);
+    if (!shown || shown.server !== id) return Promise.reject(new Error('That Test report is no longer open. Test again.'));
     const at = new Map<string, string>();
-    for (const t of tools) {
-      const name = typeof t === 'string' ? t : t.name;
-      const fingerprint = typeof t === 'string' ? last?.get(t) : t.fingerprint;
+    for (const name of names) {
+      const fingerprint = shown.shown.get(name);
       if (fingerprint !== undefined) at.set(name, fingerprint);
     }
-    return this.update(id, r => ({ ...r, tools: r.tools.map(t => (at.has(t.name) ? { ...t, reviewed: at.get(t.name)! } : t)) }));
+    return this.update(id, r => {
+      const tools = r.tools.map(t => (at.has(t.name) ? { ...t, reviewed: at.get(t.name)! } : t));
+      for (const [name, fingerprint] of at) if (!r.tools.some(t => t.name === name)) tools.push({ name, fingerprint, reviewed: fingerprint });
+      return { ...r, tools };
+    });
   }
 
   setEnabled(id: string, enabled: boolean): Promise<void> {

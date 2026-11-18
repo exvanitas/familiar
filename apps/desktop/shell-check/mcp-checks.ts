@@ -112,7 +112,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(client.get(id)?.phase === 'stopped', 'Test left the server running: ' + client.get(id)?.phase);
     const record = JSON.stringify(((await store.get('mcp.owner'))?.value as any)?.servers?.[id]);
     ok(record.includes('FAKE_SECRET') && !record.includes('typed-later') && leaks([record]) === 0, 'the saved setup holds a secret value');
-    await client.markReviewed(id, report.tools.map(t => t.name));
+    await client.markReviewed(id, report.report, report.tools.map(t => t.name));
     // Looked for while the start is under way; one that came would be refused.
     const starting = client.start(id);
     const again = await dialog('none', START);

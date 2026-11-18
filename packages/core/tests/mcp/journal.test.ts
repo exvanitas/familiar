@@ -35,7 +35,7 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
   if (extra.review) {
     const report = await client.test(serverId);
     if (!report.ok) throw new Error('Test failed');
-    await client.markReviewed(serverId, report.tools);
+    await client.markReviewed(serverId, report.report, report.tools.map((t) => t.name));
   }
   expect((await client.start(serverId)).kind).toBe('ready');
   const tools = client.tools();
