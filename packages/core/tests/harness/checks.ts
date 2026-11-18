@@ -215,8 +215,26 @@ export const H3: Check = (r) => {
     const now = listedAt(r, x.server, x.start, yes.tool!);
     if (before !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
   }
+  problems.push(...staleCatalogCalls(r));
   return problems.slice(0, 3);
 };
+
+/** A list_changed delivered on a run makes its catalog stale: no call goes out on that run until a tools/list
+    walked after it has come back whole (G26). The notification comes ahead of its stream's final message,
+    so it was delivered by the step that message was. */
+function staleCatalogCalls(r: WireRun): string[] {
+  const problems: string[] = [];
+  const recs = r.exe.log.filter((x) => x.kind === 'post');
+  for (const c of recs) {
+    if (c.final === undefined || !c.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed')) continue;
+    const d = Math.floor(c.final / 1000);
+    const relisted = recs.find((x) => x.epoch === c.epoch && x.body?.method === 'tools/list' && x.start >= d && x.final !== undefined && !x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+    const until = relisted ? Math.floor(relisted.final! / 1000) : Infinity;
+    const call = recs.find((x) => x.epoch === c.epoch && isCall(x.body) && x.start > d && x.start <= until);
+    if (call) problems.push(`H3: ${tokenOf(call.body)} went out on a catalog a list_changed had made stale`);
+  }
+  return problems;
+}
 
 /** The harness's own reading of a server's catalog: the tool's definition in the last first page of a
     tools/list answer that reached the client before `step`. */

@@ -46,6 +46,8 @@ export interface Mode {
   readonly hold: boolean;
   /** Each answer in one chunk (S2: a ping in the same chunk as the final reply). */
   readonly oneChunk: boolean;
+  /** A list_changed ahead of the first tools/list answer of each session, its variant flipped (S14). */
+  readonly changeOnList: boolean;
   /** How often a cancelled request's helper is held, for any time (H4). */
   readonly holdHelpers: number;
   /** Which requests' helpers may be held: any, or only calls (S8, S10). */
@@ -73,6 +75,7 @@ export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
     initError: 0,
     hold: false,
     oneChunk: false,
+    changeOnList: false,
     holdHelpers: r() < 0.2 ? 0.5 : 0,
     holdWhich: 'any',
     ...over
@@ -110,6 +113,7 @@ export class ScriptedServer {
   /** Every request that reached it, in order. `followed`: the exe's own redirect follow, not the client's. */
   readonly arrivals: { body: Msg; headers: Record<string, string>; method: string; step: number; followed?: boolean }[] = [];
   private lastId: unknown;
+  private changedThisSession = -1;
   /** Its tools' variant: a list_changed it sends changes the echo tool's description (S1). */
   variant = 'a';
 
@@ -157,6 +161,14 @@ export class ScriptedServer {
     if (!body.method) return { status: 202, sse: false, messages: [], final: -1 };
     if (m.era === 'modern' && !modernReq) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'no', data: { supported: [MODERN] } } }]);
     const complete = modernReq ? { resultType: 'complete' } : {};
+    if (body.method === 'tools/list' && m.changeOnList && !modernReq && this.changedThisSession !== this.session) {
+      this.changedThisSession = this.session;
+      const page = Number(body.params?.cursor ?? 0);
+      const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
+      const listed = { jsonrpc: '2.0', id: body.id, result: { tools: page === 0 ? tools(m.era, this.variant) : [], ...next } };
+      this.variant = this.variant === 'a' ? 'b' : 'a';
+      return { status: 200, sse: true, messages: [{ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, listed], final: 1 };
+    }
     if (body.method === 'tools/list') {
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};

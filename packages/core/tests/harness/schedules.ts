@@ -64,7 +64,34 @@ function endsThatCallOnly(where: 'local' | 'remote', how: 'stop' | 'time-limit')
   };
 }
 
+/** S14: list_changed on a walk's page (the initial walk, between pages, or a refresh): the catalog that
+    walk read isn't published; another walk follows before any call goes out. */
+function changeDuringWalk(pages: number, refresh: boolean): Named {
+  return {
+    name: `S14 list_changed during ${refresh ? 'the initial walk, then a call that brings a refresh' : pages > 1 ? 'the initial walk, between pages' : 'the initial walk'}`,
+    options: {
+      mode: { ...quiet, pages, changeOnList: true, sse: 1, ...(refresh ? { listChanged: 1 } : {}) },
+      schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo'))
+    },
+    expect: (r) => {
+      const recs = r.exe.log.filter((x) => x.kind === 'post');
+      const changedAt = recs.filter((x) => x.body?.method === 'tools/list' && x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+      if (!changedAt.length) return 'no list_changed on a walk';
+      for (const c of changedAt) {
+        const after = recs.filter((x) => x.seq > c.seq && x.epoch === c.epoch);
+        const nextList = after.find((x) => x.body?.method === 'tools/list');
+        const firstCall = after.find((x) => x.body?.method === 'tools/call');
+        if (firstCall && (!nextList || nextList.seq > firstCall.seq)) return 'a call went out on a catalog a list_changed had made stale';
+      }
+      return undefined;
+    }
+  };
+}
+
 export const SCHEDULES: Named[] = [
+  changeDuringWalk(1, false),
+  changeDuringWalk(3, false),
+  changeDuringWalk(1, true),
   {
     // S11 with a live call: Stop right after the call's write, with pings and the reply on their way.
     // Nothing is written to the stopping run, and the call isn't answered by a reply read after Stop.

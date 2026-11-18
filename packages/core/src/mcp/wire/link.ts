@@ -8,7 +8,7 @@
 // through the exe's net_fetch, read with net_read, ended with net_cancel; a local one is one server_write
 // of a line. What comes back is checked (parse.ts) and fed to the machine as inputs, in order.
 
-import { checkTools, CatalogError } from '../catalog.ts';
+import { checkTools, CatalogError, MAX_TOOLS } from '../catalog.ts';
 import type { ProcessEvent, ProcessPort, ProcessSetup } from '../process.ts';
 import { LastOutput } from '../last-output.ts';
 import type { CallOutcome, Failure, ListedTool } from '../types.ts';
@@ -107,6 +107,10 @@ interface Run {
   /** Tools listed but not offered, with why (Test shows them). */
   notOffered: readonly { readonly name: string; readonly reason: string }[];
   stale: boolean;
+  /** Counts list_changed notifications: a walk publishes its catalog only if none came while it ran. */
+  changes: number;
+  /** A refresh walk is already scheduled for list_changed: a burst is one more walk. */
+  relisting?: boolean;
   ready: boolean;
   ended: boolean;
   /** A local run's process has exited (the exe said so). */
@@ -205,7 +209,7 @@ export class ServerLink {
     const over = new Promise<void>((r) => (finish = r));
     let sawExit!: () => void;
     const exit = new Promise<void>((r) => (sawExit = r));
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit };
+    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, changes: 0, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit };
     this.run = run;
     if (target.where === 'local') {
       const processes = this.ports.processes!;
@@ -250,6 +254,11 @@ export class ServerLink {
       }
       run.ready = true;
       return { ok: true, run: run.id, tools: run.tools };
+    } catch (e) {
+      // Nothing a server sends may throw out of a start: whatever did ends the run, in words.
+      const failure = unexpected(e);
+      this.endRun(run, failure, false);
+      return { ok: false, failure };
     } finally {
       cancel?.();
     }
@@ -290,7 +299,7 @@ export class ServerLink {
     if (this.busy) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
     const { deadline, cancel } = this.deadline(run, this.limits.listMs);
     try {
-      const r = await this.walk(run, deadline);
+      const r = await this.walk(run, deadline).catch((e: unknown) => ({ failure: unexpected(e) }));
       if ('tools' in r) {
         this.events.listed?.(run.id, r.tools);
         return r.tools;
@@ -440,9 +449,31 @@ export class ServerLink {
     return undefined;
   }
 
-  /** Pages of tools/list, each its own exchange through the barrier, at most 16. */
+  /**
+   * The tool list, published only if no list_changed came while it was walked: otherwise it's walked
+   * again, from the first page, within the same deadline, and a server whose tools keep changing fails the
+   * walk rather than leave a catalog Familiar knows is stale.
+   */
   private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure }> {
-    run.stale = true;
+    for (let attempt = 0; ; attempt++) {
+      const at = run.changes;
+      run.stale = true;
+      const r = await this.walkOnce(run, deadline);
+      if (!('tools' in r)) return r;
+      if (run.changes !== at && !(__FAMILIAR_MUTATIONS__ && mutant('publish-stale-walk'))) {
+        if (attempt >= 2) return { failure: { kind: 'protocol', words: "The server's tools kept changing while Familiar listed them." } };
+        continue;
+      }
+      run.tools = r.tools;
+      run.declarations = r.declarations;
+      run.notOffered = r.notOffered;
+      run.stale = false;
+      return { tools: run.tools };
+    }
+  }
+
+  /** Pages of tools/list, each its own exchange through the barrier, at most 16, and 128 tools in all. */
+  private async walkOnce(run: Run, deadline: Deadline): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure }> {
     const raw: Record<string, unknown>[] = [];
     let cursor: string | undefined;
     for (let page = 1; ; page++) {
@@ -462,9 +493,19 @@ export class ServerLink {
       } catch (e) {
         return { failure: { kind: 'protocol', words: `The server's tool list was wrong: ${(e as Error).message}.` } };
       }
-      raw.push(...p.tools);
+      // Bounded before anything is kept: every listed tool counts, offered or not.
+      if (raw.length + p.tools.length > MAX_TOOLS) return { failure: { kind: 'protocol', words: `The server lists more than ${MAX_TOOLS} tools. Familiar takes at most ${MAX_TOOLS}.` } };
+      for (const t of p.tools) raw.push(t);
       cursor = p.nextCursor;
       if (cursor === undefined) break;
+    }
+    // Names are checked over every listed tool, before any is scanned: one that isn't offered still can't
+    // share a name with one that is.
+    const names = new Set<string>();
+    for (const t of raw) {
+      if (typeof t.name !== 'string') continue;
+      if (names.has(t.name)) return { failure: { kind: 'protocol', words: `The server lists two tools named ${t.name.slice(0, 64)}, so Familiar can't tell them apart.` } };
+      names.add(t.name);
     }
     // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
     // rules isn't offered, and Test says why (3.5). The declarations come from the schema, which the
@@ -484,15 +525,11 @@ export class ServerLink {
       offered.push(t);
     }
     try {
-      run.tools = checkTools(offered as never);
-      run.declarations = declarations;
-      run.notOffered = notOffered;
+      return { tools: checkTools(offered as never), declarations, notOffered };
     } catch (e) {
       if (e instanceof CatalogError) return { failure: e.failure };
       throw e;
     }
-    run.stale = false;
-    return { tools: run.tools };
   }
 
   /* ---------- exchanges ---------- */
@@ -784,8 +821,16 @@ export class ServerLink {
     }
     if (m.method === 'notifications/tools/list_changed' && run.era === 'legacy') {
       run.stale = true;
-      // Idle: walk now; otherwise after the exchange that carried it.
-      if (run.ready) void this.drained().then(() => (run.ended || !run.stale ? undefined : this.list()));
+      run.changes++;
+      // Idle: walk now; otherwise after the exchange that carried it. A burst is one more walk, and a walk
+      // under way when it comes walks again on its own.
+      if (run.ready && !run.relisting) {
+        run.relisting = true;
+        void this.drained().then(() => {
+          run.relisting = false;
+          return run.ended || !run.stale ? undefined : this.list();
+        });
+      }
     }
     return false;
   }
@@ -841,7 +886,7 @@ export class ServerLink {
       } finally {
         cancel?.();
       }
-    })();
+    })().catch((e: unknown) => this.endRun(run, unexpected(e), true));
   }
 
   /* ---------- the run's end ---------- */
@@ -933,6 +978,11 @@ export function endWords(end: End): string {
 export function reservedHeader(name: string): boolean {
   const n = name.toLowerCase();
   return ['mcp-session-id', 'mcp-protocol-version', 'last-event-id', 'content-type', 'accept', 'host', 'mcp-method', 'mcp-name'].includes(n) || n.startsWith('mcp-param-');
+}
+
+/** A throw from reading a server's answers, as words: it ends the run like any invalid answer. */
+function unexpected(e: unknown): Failure {
+  return { kind: 'protocol', words: `The server sent something Familiar couldn't handle (${e instanceof Error ? e.name : 'an error'}).` };
 }
 
 function kindText(e: unknown): string {
