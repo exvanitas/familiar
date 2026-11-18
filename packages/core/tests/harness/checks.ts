@@ -218,7 +218,10 @@ export const H3: Check = (r) => {
       problems.push(`H3: a call with no Yes: ${args.slice(0, 60)}`);
       continue;
     }
-    if (canonical(x.body!.params?.arguments) !== yes.body || x.body!.params?.name !== yes.tool) problems.push(`H3: the call for ${t} isn't what its Yes showed: ${args.slice(0, 60)}`);
+    // The expected bytes are the harness's own canonical form of the arguments the Yes was for, never the
+    // client's: a shared canonicalization error can't pass.
+    const want = `"arguments":${canonical(yes.args)}`;
+    if (!x.raw?.includes(want) || x.body!.params?.name !== yes.tool) problems.push(`H3: the call for ${t} isn't, byte for byte, what its Yes showed: ${args.slice(0, 60)}`);
     if (used.has(t)) problems.push(`H3: the Yes for ${t} used twice`);
     used.add(t);
     const revoked = r.evidence.find((e) => e.what === 'revoke' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < x.seq);
@@ -301,24 +304,45 @@ function declared(schema: any, path: string[] = []): { path: string[]; name: str
 /** H11: a modern remote call's standard and mirrored headers match its own body and the listed schema. */
 export const H11: Check = (r) => {
   const problems: string[] = [];
-  for (const x of r.exe.log) {
-    if (x.kind !== 'post' || !isCall(x.body) || x.headers['mcp-protocol-version'] !== '2026-07-28') continue;
+  const recs = r.exe.log.filter((x) => x.kind === 'post');
+  // A run is modern by the server's own record: its opening initialize was refused -32022. Never by the
+  // client's own headers.
+  const modernRun = (x: NativeRec) => {
+    const opening = recs.find((y) => runOf(r, y) === runOf(r, x) && y.server === x.server && y.body?.method === 'initialize');
+    return !!opening?.plan?.messages.some((m) => m.error?.code === -32022);
+  };
+  for (const x of recs) {
+    if (!isCall(x.body) || !modernRun(x)) continue;
     const b = x.body!;
     if (x.headers['mcp-method'] !== 'tools/call') problems.push('H11: Mcp-Method missing on a call');
     if (x.headers['mcp-name'] !== b.params?.name) problems.push('H11: Mcp-Name differs from the body');
-    const schema = b.params?.name === 'mirror' ? { properties: { region: { type: 'string', 'x-mcp-header': 'Region' } } } : {};
+    // The schema as the server listed it last before this call, scanned by the harness's own scanner.
+    const listing = recs.filter((y) => y.server === x.server && runOf(r, y) === runOf(r, x) && y.body?.method === 'tools/list' && y.seq < x.seq && y.plan).at(-1);
+    const listed = listing?.plan?.messages.find((m) => m.result?.tools)?.result.tools as any[] | undefined;
+    const schema = listed?.find((t) => t.name === b.params?.name)?.inputSchema ?? {};
     for (const d of declared(schema)) {
       let v: any = b.params?.arguments;
-      for (const k of d.path) v = v?.[k];
+      for (const k of d.path) v = v !== null && typeof v === 'object' && Object.hasOwn(v, k) ? v[k] : undefined;
       const header = x.headers[`mcp-param-${d.name.toLowerCase()}`];
       if (v === undefined || v === null) {
         if (header !== undefined) problems.push(`H11: a header for an absent ${d.name}`);
         continue;
       }
-      const plain = typeof v === 'string' && v !== '' && v === v.trim() && /^[\x20-\x7e\t]*$/.test(v) && !(v.startsWith('=?base64?') && v.endsWith('?='));
-      const expected = plain ? String(v) : `=?base64?${Buffer.from(String(v), 'utf8').toString('base64')}?=`;
-      if (header !== expected) problems.push(`H11: Mcp-Param-${d.name} is "${String(header).slice(0, 30)}", the body says "${String(v).slice(0, 30)}"`);
+      const text = typeof v === 'string' ? v : String(v);
+      const plain = typeof v !== 'string' || (v !== '' && v === v.trim() && /^[\x20-\x7e\t]*$/.test(v) && !(v.startsWith('=?base64?') && v.endsWith('?=')));
+      const expected = plain ? text : `=?base64?${Buffer.from(text, 'utf8').toString('base64')}?=`;
+      if (header !== expected) problems.push(`H11: Mcp-Param-${d.name} is "${String(header).slice(0, 30)}", the body says "${text.slice(0, 30)}"`);
     }
+  }
+  // A value that can't be mirrored faithfully (a lone surrogate) or past 8 KiB once encoded makes no request.
+  for (const e of r.evidence) {
+    if (e.what !== 'yes' || (e.tool !== 'mirror' && e.tool !== 'mirror2')) continue;
+    const region = (e.args as any)?.region;
+    if (typeof region !== 'string') continue;
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(region);
+    const tooLong = Buffer.byteLength(`=?base64?${Buffer.from(region, 'utf8').toString('base64')}?=`) > 8 * 1024;
+    // Only a modern remote run mirrors: elsewhere the value goes in the body alone.
+    if ((lone || tooLong) && recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token && modernRun(x))) problems.push(`H11: ${e.token}'s value can't be mirrored, and a request went out`);
   }
   return problems.slice(0, 3);
 };
@@ -522,6 +546,8 @@ export const WITNESSES: Record<string, (r: WireRun) => boolean> = {
   'H3 a revoke before a handoff': (r) => r.evidence.some((e) => e.what === 'revoke'),
   'H10 a stale response id': (r) => r.exe.log.some((x) => x.plan?.messages.some((m) => m.result && m.id !== x.body?.id && x.body?.method === 'tools/call')),
   'H11 a mirrored header': (r) => r.exe.log.some((x) => Object.keys(x.headers).some((k) => k.startsWith('mcp-param-'))),
+  'H11 a typed mirrored header': (r) => r.exe.log.some((x) => x.headers['mcp-param-count'] !== undefined),
+  'H11 a value refused before the handoff': (r) => r.evidence.some((e) => e.what === 'outcome' && e.tool === 'mirror' && e.outcome?.kind === 'error' && /headers/.test(e.outcome.words)),
   'H12 a modern run': (r) => r.exe.log.some((x) => x.headers['mcp-protocol-version'] === '2026-07-28'),
   'H13 departure 1 (a flood)': (r) => r.evidence.some((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && /too many pings/.test(e.outcome.words)),
   'H13 departure 2 (a local ping while draining or blocked)': (r) => r.server.pings.some((p) => r.exe.pingDelivered.has(p.id) && !r.exe.log.some((x) => isPong(x.body) && String(x.body!.id) === p.id)),

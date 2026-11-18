@@ -32,6 +32,10 @@ const concat = (parts: readonly Uint8Array[]): Uint8Array => {
   return out;
 };
 const MODERN = '2026-07-28';
+/** H11's fixed values for a mirrored string: plain, non-ASCII, empty, edge whitespace, sentinel-shaped, a
+    lone surrogate (refused), and one past 8 KiB once encoded (refused). */
+export const MIRROR_VECTORS = ['eu-1', 'café', '', ' edge ', '=?base64?eHk=?=', '\uD800x', 'é'.repeat(4000)];
+
 /** The exe's admission (4.1): 32 open requests in all, server requests at most 24 in the pass build. */
 export const EXE_TOTAL = 32;
 export const EXE_SERVER_CAP = 24;
@@ -126,7 +130,12 @@ export interface Plan {
 const tools = (era: Mode['era'], variant: string) => [
   { name: 'echo', description: variant === 'a' ? 'Echo.' : 'Echo, changed.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
   { name: 'slow', description: 'Slow.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
-  ...(era !== 'legacy' ? [{ name: 'mirror', description: 'Mirror.', inputSchema: { type: 'object', properties: { text: { type: 'string' }, region: { type: 'string', 'x-mcp-header': 'Region' } } } }] : [])
+  ...(era !== 'legacy'
+    ? [
+        { name: 'mirror', description: 'Mirror.', inputSchema: { type: 'object', properties: { text: { type: 'string' }, region: { type: 'string', 'x-mcp-header': 'Region' } } } },
+        { name: 'mirror2', description: 'Mirror, typed.', inputSchema: { type: 'object', properties: { text: { type: 'string' }, count: { type: 'integer', 'x-mcp-header': 'Count' }, flag: { type: 'boolean', 'x-mcp-header': 'Flag' } } } }
+      ]
+    : [])
 ];
 
 export class ScriptedServer {
@@ -222,6 +231,8 @@ export class ScriptedServer {
       if (modernReq && this.r() < 0.2) msgs.push({ jsonrpc: '2.0', id: 'stray', method: 'ping' }, { jsonrpc: '2.0', id: 'ask', method: 'sampling/createMessage', params: {} });
       if (!modernReq && this.r() < m.pingWithFinal) msgs.push(this.ping(on));
       const text = String(body.params?.arguments?.text ?? '');
+      // A modern server checks each mirrored header against the body (-32020 on a mismatch).
+      if (modernReq && headerMismatch(body, headers, tools(m.era, this.variant))) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32020, message: 'header mismatch' } }]);
       const result = modernReq && this.r() < m.inputRequired ? { resultType: 'input_required', inputRequests: {} } : { content: [{ type: 'text', text: `ran ${body.params?.name} ${text} — café ✓ 𝄞` }], ...complete };
       if (this.r() >= m.earlyEnd) msgs.push({ jsonrpc: '2.0', id: body.id, result });
       if (!modernReq && this.r() < 0.1) msgs.push(this.ping(on, true));
@@ -231,6 +242,26 @@ export class ScriptedServer {
     if (body.method === 'ping') return json([{ jsonrpc: '2.0', id: body.id, result: {} }]);
     return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'nope' } }]);
   }
+}
+
+/** The server's own reading of the mirrored headers: what each declared argument must arrive as. */
+export function headerMismatch(body: Msg, headers: Record<string, string>, listed: readonly Msg[]): boolean {
+  const schema = listed.find((t) => t.name === body.params?.name)?.inputSchema;
+  for (const [k, p] of Object.entries((schema?.properties ?? {}) as Record<string, Msg>)) {
+    const name = p['x-mcp-header'];
+    if (typeof name !== 'string') continue;
+    const v = body.params?.arguments?.[k];
+    const got = headers[`mcp-param-${name.toLowerCase()}`];
+    if (v === undefined || v === null) {
+      if (got !== undefined) return true;
+      continue;
+    }
+    const text = typeof v === 'string' ? v : String(v);
+    const plain = typeof v === 'string' ? v !== '' && v === v.trim() && /^[\x20-\x7e\t]*$/.test(v) && !(v.startsWith('=?base64?') && v.endsWith('?=')) : true;
+    const want = plain ? text : `=?base64?${Buffer.from(text, 'utf8').toString('base64')}?=`;
+    if (got !== want) return true;
+  }
+  return false;
 }
 
 /* ---------- the unkind fake exe ---------- */
@@ -257,6 +288,8 @@ export interface NativeRec {
   refusedCancel?: boolean;
   readonly method: string;
   readonly body: Msg | undefined;
+  /** The body's bytes as text, as the exe received them. */
+  readonly raw?: string;
   readonly headers: Record<string, string>;
   readonly start: number;
   /** Arrived at the server (remote), or the write was taken (local). */
@@ -338,7 +371,7 @@ export class FakeExe {
         const headers: Record<string, string> = {};
         for (const [k, v] of spec.headers) headers[k.toLowerCase()] = v;
         if (parsed?.method === 'initialize') this.epoch++;
-        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, method: spec.method, body: parsed, headers, start: this.sched.step, delivered: new Map(), epoch: this.epoch };
+        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, method: spec.method, body: parsed, raw: text, headers, start: this.sched.step, delivered: new Map(), epoch: this.epoch };
         if (!this.admits('post')) {
           rec.refused = 'busy';
           rec.end = rec.terminated = this.sched.step;
@@ -589,7 +622,7 @@ export class FakeExe {
           } catch {
             body = undefined;
           }
-          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: this.epoch };
+          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: this.epoch };
           this.log.push(rec);
           if (!p || p.exited) {
             rec.end = this.sched.step;
@@ -614,6 +647,8 @@ export interface Evidence {
   readonly step: number;
   readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'start' | 'started' | 'model';
   readonly failure?: string;
+  /** The arguments the person's Yes was for, as the driver made them (H3 builds its own canonical form). */
+  readonly args?: unknown;
   readonly server?: string;
   readonly ok?: boolean;
   readonly token?: string;
@@ -781,7 +816,7 @@ export class Driver {
     if (!facts) return;
     const decision = mintDecision(facts, token, 'asked', false)!;
     this.note({ what: 'card', token, tool, body: facts.canonical, server: id });
-    this.note({ what: 'yes', token, tool, body: facts.canonical, server: id });
+    this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id });
     const stop = new AbortController();
     this.calls.set(token, stop);
     this.note({ what: 'call', token, tool, server: id });
@@ -815,7 +850,11 @@ export class Driver {
         if (this.client.get('s1')?.phase !== 'ready' && tries++ < 30 && action !== 'stop-call') return void this.sched.addLater({ label: `act:${action}`, rank: 0, fire }, 3 + Math.floor(this.sched.random() * 8));
         if (action === 'call') this.call(this.sched.random() < 0.3 ? 'slow' : 'echo');
         else if (action === 'stop-call') this.stopCall();
-        else if (action === 'mirror') this.call('mirror', { region: this.sched.random() < 0.3 ? 'café' : 'eu-1' });
+        else if (action === 'mirror') {
+          const y = this.sched.random();
+          if (y < 0.6) this.call('mirror', { region: MIRROR_VECTORS[Math.floor(this.sched.random() * MIRROR_VECTORS.length)] });
+          else this.call('mirror2', { count: [0, 7, -12, 2 ** 31][Math.floor(this.sched.random() * 4)], flag: this.sched.random() < 0.5 });
+        }
         else if (action === 'revoke') this.call('echo', {}, true);
         else {
           this.stop();

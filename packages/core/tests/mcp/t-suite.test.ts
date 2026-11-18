@@ -166,17 +166,24 @@ describe('T2: decisions at the handoff', () => {
     client.revoke(id, 'echo', 'never');
     expect(await client.send(d1, signal())).toMatchObject({ kind: 'error' });
     expect(calls(port)).toBe(0);
-    // "always" revoked between mint and send, on another tool.
+    // "always" revoked between mint and send, on another tool: first shown to work, with a saved Allow.
+    const note = client.tools().find((t) => t.serverName === 'add_note')!;
+    // The revoke above saves itself in the background: wait for the owner.
+    for (let i = 0; i < 100 && client.owner.busy; i++) await new Promise((r) => setTimeout(r, 10));
+    await client.choose(id, 'add_note', { policy: 'allow', fingerprint: note.fingerprint, setupFingerprint: note.setupFingerprint });
+    expect((await client.send(yes(client, id, 'add_note', { text: 'w' }, 'always'), signal())).kind).toBe('result');
+    expect(calls(port)).toBe(1);
     const d2 = yes(client, id, 'add_note', { text: 'x' }, 'always');
     client.revoke(id, 'add_note', 'ask');
     expect(await client.send(d2, signal())).toMatchObject({ kind: 'error' });
-    expect(calls(port)).toBe(0);
+    expect(calls(port)).toBe(1);
     // A fresh one hands off once; the same decision again is refused.
+    await new Promise((r) => setTimeout(r, 50));
     const d3 = yes(client, id, 'slow', { ms: 1 });
     expect((await client.send(d3, signal())).kind).toBe('result');
-    expect(calls(port)).toBe(1);
+    expect(calls(port)).toBe(2);
     expect((await client.send(d3, signal())).kind).toBe('error');
-    expect(calls(port)).toBe(1);
+    expect(calls(port)).toBe(2);
   }, 30_000);
 
   it("another server's decision goes to its own server only, and a decision for a server that's gone hands off nothing", async () => {

@@ -37,6 +37,7 @@ const CONTROLS: Control[] = [
   { mutation: 'await-before-handoff', check: 'H3' },
   { mutation: 'accept-any-response-id', check: 'H10', mode: { staleId: 0.9 } },
   { mutation: 'mirror-previous-call', check: 'H11', mode: modern },
+  { mutation: 'mirror-wrong-value', check: 'H11', mode: modern },
   { mutation: 'modern-on-any-error', check: 'H12', mode: { era: 'legacy', initError: 0.6 } },
   { mutation: 'initialized-on-modern', check: 'H12', mode: modern },
   { mutation: 'answer-stray-ping-modern', check: 'H12', mode: modern },

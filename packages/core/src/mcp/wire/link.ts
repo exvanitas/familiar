@@ -352,7 +352,10 @@ export class ServerLink {
     let extra: (readonly [string, string])[] | undefined;
     if (run.era === 'modern' && run.target.where === 'remote') {
       const mirrored = (__FAMILIAR_MUTATIONS__ && mutant('mirror-previous-call')) && run.lastCall ? run.lastCall.args : canonicalArguments;
-      const params = paramHeaders(run.declarations.get(name) ?? [], JSON.parse(mirrored), this.headers(run, 'tools/call').length + 1);
+      const values = JSON.parse(mirrored);
+      // A named mutation: a mirrored value that isn't the body's.
+      if ((__FAMILIAR_MUTATIONS__ && mutant('mirror-wrong-value')) && values && typeof values === 'object' && 'region' in values) values.region = `${String(values.region)}-x`;
+      const params = paramHeaders(run.declarations.get(name) ?? [], values, this.headers(run, 'tools/call').length + 1);
       if (!params.ok) return Promise.resolve({ kind: 'error', reason: 'protocol', words: HEADER_WORDS });
       extra = [['Mcp-Name', name], ...params.headers];
     }
