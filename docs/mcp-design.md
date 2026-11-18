@@ -306,6 +306,8 @@ T14 replays each of those recorded refusals.
 - **no `notifications/initialized`;**
 - **no corrective `-32022` continuation:** Familiar offers exactly one modern version, so a correction could only repeat it.
 
+**Only a run's opening decides its era.** A re-handshake after a dropped session (3.8) never changes it: a `-32022` there ends the run, and Start opens a new one.
+
 **A start that fails:** any other `-32022` (a list with neither a legacy version Familiar speaks nor `2026-07-28`), a malformed `data.supported`, or a modern `tools/list` answered `-32022` (the server changed its mind). The start fails with the server's own list in words: "This server speaks MCP 2030-01-01 only; Familiar speaks 2024-11-05 to 2026-07-28".
 
 There's no automatic list refresh in either era.
@@ -341,7 +343,9 @@ The machine is a pure function (`wire/exchange.ts`): the state and one input giv
 4. **The first terminal event moves the exchange to Draining, synchronously.** That step makes its own last sends, then seals the exchange. For a local call ended by Stop or its time limit, that last send is the `notifications/cancelled` write. After the seal no further send is possible: the serializer checks the state, and the state changed in the same step. On remote, `net_cancel` is then called for the request's POST, after its response has been read whole. A pong already handed off stays outstanding until its native end: it's left to reach its head, within its own 5 s bounds, and then cancelled, so a pong sent just before the final response still reaches the server (3.7).
 5. **Back to Idle** only when every `net_cancel` has returned (remote), or every write has completed or the run has ended (local).
 
-**The closed mark at Stop.** `stop()` marks the run closed synchronously, before any await, for local and remote servers alike. A local Stop then waits for the exe and the exit, and in that window nothing may reach the stopping server: every admission path (a walk's next page, a handshake step, `send`, an idle ping's pong) refuses a closed run.
+**The closed mark at Stop.** `stop()` marks the run closed synchronously, before any await, for local and remote servers alike, and in the same step ends the run's live exchange ("interrupted"). A local Stop then waits for the exe and the exit, and in that window nothing reaches the stopping server: every admission path (a walk's next page, a handshake step, `send`, an idle ping's pong) refuses a closed run, and the ended exchange sends no pong and takes no reply. Its writes still end only at the exit. A Stop that comes while the exe is still starting a local server is met when the start returns: the process it started is stopped, and its exit awaited, before the start answers, so the next Start meets no orphan.
+
+**Cleanup the exe refused.** A refused `net_cancel` is tried again 1, 2 and 4 s later; after that the run ends ("Familiar couldn't end a request to the server"), and the request stays counted. A refused `server_stop` releases nothing. The slot never frees on cleanup the exe didn't confirm.
 
 **The barrier.** The next exchange starts only from Idle. So a server never has two exchanges' native requests open at once. That holds for pages, handshake steps, calls, and a Stop followed by a Start, cleanup included. At most 3 native requests are ever open per remote server (the request and two pongs), and at most 4 per local server, counting a Stop's cancel write beside them. The barrier's bound is on native lifetimes: each request or write ends within its native bound. How long a server takes to answer is the call's own time limit, not the barrier's.
 
@@ -364,6 +368,10 @@ The machine is a pure function (`wire/exchange.ts`): the state and one input giv
 
   An invalid tool is not offered, and Test lists it with the scanner's reason. Each declaration found is kept with the tool (its path, its header name and its type), and the declarations are part of the tool's fingerprint, since they change what goes on the wire. On stdio nothing is mirrored, so nothing is scanned;
 - modern `tools/list` results also carry `ttlMs` and `cacheScope`. Both are read leniently and ignored: the catalog's refresh points are Familiar's (start, Test).
+
+Every listed tool counts toward the 128 before any is kept, across pages, and names are checked across all of them, offered or not, before the modern scan. Anything thrown while reading a start, a refresh or a recovery ends the run in words; nothing a server sends can throw out of them.
+
+**`list_changed` during a walk.** Each run counts the `list_changed` notifications it reads. A walk publishes its catalog only if none came while it ran; otherwise it walks again from the first page, within the same deadline, and after three tries fails rather than keep a catalog Familiar knows is stale. A notification on a Ready run schedules one walk after the exchange that carried it, so a burst is one more walk.
 
 While a walk runs, the run's catalog is stale and calls are refused busy. How a walk ends:
 
@@ -427,9 +435,11 @@ Departures 3 and 4 are about remote cancellation and sessions (3.8).
   - after `initialize`, `MCP-Protocol-Version` set to the negotiated version;
   - `Mcp-Session-Id` if the server gave one. It's adopted only from a successful `initialize` response, never from a refused one, as exactly one header value of visible ASCII (0x21 to 0x7E), at most 1 KiB. Anything else fails the start: "the server sent a session id Familiar can't use";
   - the setup's own headers (reserved names refused, 5.7). The key goes only in one of the four swap headers, as the placeholder the exe swaps.
-- **A response is read one of two ways:**
-  - `application/json`: one JSON-RPC message;
+- **A response is read one of two ways, and only these:**
+  - `application/json`: one JSON-RPC message, decoded as one text across reads;
   - `text/event-stream`: events whose data are JSON-RPC messages. Event ids and `retry:` fields are ignored, and an event with empty data (a priming event) is skipped, never a failure.
+
+  Any other media type is refused. A status other than 2xx decides on both types alike (after the opening's classifier, 3.3).
 - **A notification or a pong** is answered `202` with no body. Its exchange ends at the head.
 - **Never sent:** a GET of any kind (no standalone stream, no resumption, no `Last-Event-ID`), a `DELETE`, or `notifications/cancelled`. Not opening the GET and not resuming are both allowed by the 2025-11-25 transport.
 - **Named departures 3 and 4:** the transport says a client should send `notifications/cancelled` to cancel, and a session `DELETE` on close. Familiar sends neither to a remote server. A legacy server may therefore finish a call Familiar stopped, and its session expires on its own. The journal already reports every stopped call as possibly partly run, and never repeats it.
@@ -437,7 +447,7 @@ Departures 3 and 4 are about remote cancellation and sessions (3.8).
 - **A 404 on a request that carried `Mcp-Session-Id` means the server ended the session.** The spec says the client must then start a new session with a fresh `initialize`, and servers do expire idle sessions. So:
   1. **The 404 ends that exchange** as a terminal path. If it was a call, the call becomes a tool error, "the server had ended its session", and is **never resent**: its decision is used, and a card call needs a new card. A page fails its walk, and the catalog stays stale.
   2. **The next exchange is a re-handshake.** The `initialize` POST carries no session id. The new session id from its response, validated as above, goes on `notifications/initialized` and every request after it. Then the tool list is read again. Each step is its own exchange through the barrier, under the handshake deadline. The run isn't Ready meanwhile, so calls are refused busy, as during any start.
-  3. **The bound.** If the re-handshake fails, or a request gets a 404 before one exchange has completed after it, the run fails: Failed, "the server ended its session", and you press Start. The bound rearms at the first exchange after the re-handshake (its list walk included) that completes without a 404. So a server can't loop through re-handshakes, and one that drops its session again an hour later gets a fresh one.
+  3. **The bound.** If the re-handshake fails, or a request gets a 404 before one exchange has completed after the recovery, the run fails: Failed, "the server ended its session", and you press Start. The bound rearms at the first page or call made after the recovery (not the re-handshake's own walk) that completes without a 404. So a server that drops its session on every call gets one re-handshake, never two in a row, and one that drops it again an hour later gets a fresh one. A refresh page's 404 is recovered the same way, not ended. A re-handshake answered with a modern refusal ends the run (3.3).
   4. **Only a Live exchange's own request counts.** A 404 on a pong, or on any request after its exchange's terminal event, schedules nothing.
   5. **It isn't a restart.** Nothing is respawned. The run, its run id and its admission stay. Local servers have no sessions and are unaffected.
 - **A redirect is refused.** After the native pass, `net_fetch` never follows a redirect for a `server`-kind address, and a 3xx ends the request with its status (4.4). As a second line, the client fails any exchange whose response head says `redirected: true`, with "the server redirected Familiar's request".
@@ -486,17 +496,19 @@ A server's answers are untrusted. The parser (`wire/parse.ts`) checks them befor
 
   Anything else fails the exchange.
 - **A local stdout line that doesn't start with `{`** can't be a JSON-RPC message, so it's kept as the server's output (some servers print banners), not failed. A line that starts with `{` and doesn't parse fails its exchange.
+- **Text across reads:** a character split across reads comes out whole (one decoder per body), and a CR that ends a read ends its line at once, an LF right after it being its pair, not an empty line.
 - **The event stream:** an event may span any number of reads, and is assembled up to 4 MiB; its `data:` lines are joined with newlines; a comment, or an event with empty data, is ignored; the events of one exchange total at most 8 MiB, notifications included. Past either bound, the exchange fails.
 - **A local line the exe dropped** for being over 4 MiB arrives as an `err` event. While an exchange is Live, it fails that exchange ("the server sent a line too long") instead of leaving it to its time limit.
-- **`initialize`:** a supported `protocolVersion`, `capabilities.tools` present, and `serverInfo.name` a string.
+- **`initialize`:** a supported `protocolVersion`, `capabilities.tools` present, and `serverInfo.name` a string. A local server's answer has the handshake's 64 KiB bound too.
 - **`tools/list`:** `tools` an array within the catalog's bounds, each with a valid name, an object `inputSchema`, and an optional description, title and annotations. `nextCursor` a string of at most 1 KiB.
 - **`tools/call`:** `content` is an array, each item checked by its variant:
   - `text`: a string;
-  - `image` and `audio`: `data` a base64 string and `mimeType` a string;
+  - `image` and `audio`: `data` a base64 string (whole quads, with the padding its length requires) and `mimeType` a string;
   - `resource_link`: `uri` and `name` strings;
   - `resource`: a `resource` with a `uri`, and `text` or a base64 `blob`.
 
-  Each item must be within the size bound. An unknown kind becomes a text line, "unsupported content". `isError` is a boolean. `structuredContent` is an object, passed on as untrusted JSON, and **isn't validated against the tool's `outputSchema`** (section 8).
+  Each item must be within the size bound. An unknown kind becomes a text line, "unsupported content". `isError` is a boolean. `structuredContent` is an object, passed on as untrusted JSON, and **isn't validated against the tool's `outputSchema`** (section 8). When a result has content items, `structuredContent` isn't passed to the model at all: the model reads the content.
+- **Words from a server** are shown without converting its values by their own methods, and cut at characters, never inside a surrogate pair.
 - **Modern results:**
   - `resultType` is required. `"complete"` is a result. `"input_required"` becomes a tool error ("the server asked for input Familiar can't give"): Familiar declares no capabilities, so a conforming server shouldn't ask. Any other value is a tool error too, and a missing `resultType` is a protocol violation;
   - tool results must carry `content` explicitly;
@@ -554,7 +566,7 @@ Each of these moves the exchange to Draining in one synchronous step, and each i
 ### 4.3 The interim, before the native pass
 
 - **A hung helper** holds that request, and so that server's exchange in Draining. Its slot stays held, and a call to that server is refused busy. Chat and other servers go on, unless enough helpers hang to fill the shared 32. Remove also waits, holding the owner of durable effects; Settings shows "Saving…" with the restart words (5.1).
-- **The local write bound is a page timer.** A renderer crash with a full pipe leaves that write unbounded until you restart.
+- **The local write bound is a page timer:** each local write has a 10 s watchdog; past it the server has stopped reading, its run ends ("The server stopped reading what Familiar sent, so it was stopped") and it's stopped. A renderer crash with a full pipe leaves that write unbounded until you restart.
 - **No `totalMs`.** A server trickling within `idleMs` lives past its deadline only across a reload. The page is restart-only then, and quitting ends it.
 - **Redirects are followed** (4.4). The client's second line, failing a head that says `redirected`, is in both builds, but by then a 307 has re-sent the body once.
 - **No `created` flag.** A rollback leaves the address in place, and the start-time sweep of addresses no record owns removes it (5.2).
@@ -773,17 +785,18 @@ An upgrade of pi-durable must run these, and T13, again.
 
 **What runs:** the real client (`McpClient`, its links and the exchange machine) and the real journal on the real pi-durable 1.5.2. There are two harnesses, both in `packages/core/tests/harness/`:
 
-- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H14 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S13;
+- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H14 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S18;
 - **the journal harness** (`journal.ts`, checks in `journal-checks.ts`): the real journal over a fake IndexedDB that outlives each life, with a gated fake model. It runs H6 to H9 over seeded runs (40 by default, `FAMILIAR_JSEEDS`), and the named schedule S5.
 
 **The fake MCP server, scripted per seed.** Its legacy modes, local and remote, can:
 
-- answer JSON or an event stream, with chunk boundaries anywhere;
+- answer JSON or an event stream, its results carrying multibyte text, its events written over two `data:` lines with CR, LF or CRLF line ends;
 - send pings (none, two concurrent, a flood, one in the same chunk as the final reply) and `list_changed`;
 - end streams early, stall heads and trickle bodies;
 - page with `nextCursor`, including 17 pages;
 - send unsupported requests, invalid answers and responses for stale ids;
-- end a session: a 404 on the next request carrying its id; then, per seed, accept the re-handshake, 404 the first request after it again, fail the re-handshake, or 404 always;
+- end a session: a 404 on the next request carrying its id, on every call, or on a refresh page; then, per seed, accept the re-handshake, 404 the first request after it again, refuse it as modern-only, fail it, or 404 always;
+- send `list_changed` ahead of a walk's first page;
 - refuse `initialize` with `-32022`, or with another error;
 - send local idle pings, and stop reading stdin.
 
@@ -797,13 +810,14 @@ Its **modern modes**, local and remote:
 
 **The unkind fake exe.** It implements shell-design's `net_fetch`, `net_read`, `net_cancel`, `server_write` and the channel by their contract, not kindly:
 
-- `net_cancel` returns only when the request's task and every helper have terminated, and a helper can be held for any time;
+- it hands over bytes, with chunk boundaries anywhere, through a multibyte character or between a CR and its LF;
+- `net_cancel` returns only when the request's task and every helper have terminated, and a helper can be held for any time; now and then it refuses a `net_cancel` once, keeping the request alive;
 - the 32 open requests are counted until termination;
 - the writer takes 8 writes in flight, and blocks when the fake server stops reading;
 - a redirect mode follows 3xx answers as today's contract does: a 307 re-POSTs, a 303 becomes a GET;
 - a pong's native fate can be a stall, a timeout or `busy`.
 
-The **pass build** adds P4's detach bound, the server cap and the native write bound. The fake exe records every native request with its start, cancel and termination, the exchange and run it belonged to, and its body.
+The **pass build** adds P4's detach bound (1 s), the server cap, the refusal past 8 detached server helpers, and the native write bound. The checks judge by the contract's own numbers (`contract.ts`), which the fake exe never imports, so a wrong number in the fake can't pass its own check. The fake exe records every native request with its start, cancel and termination, the exchange and run it belonged to, and its body.
 
 **The independent evidence log.** Checks never read the code under test's memory or UI. The harness keeps its own log:
 
@@ -816,24 +830,24 @@ The **pass build** adds P4's detach bound, the server cap and the native write b
 
 **The checks.** Each reads only the fake exe's log, the fake server's own record, the commit log and the evidence log:
 
-- **H1.** Per server, the native requests of two different exchanges are never open at once, cleanup included, and at most 3 are open on a remote server, 4 on a local one (3.4). Every call refused busy is answered within the step it was made, and no handoff for it ever follows. Overlap alone can't catch a queue, since a call queued until the slot drains never overlaps.
-- **H2.** Every request body is one of the six kinds (3.2). No GET or `DELETE` is ever made, no error response is sent, and no `notifications/cancelled` goes to a remote server. No pong is sent for an id that wasn't a ping on its own exchange. No request is made after its exchange's terminal event, or after its run's Stop, and none outlives its run.
-- **H3.** Every `tools/call` body equals, byte for byte, the canonical body built from one stored card's facts, or one "always" record, that the evidence log shows answered, or in force, before the handoff, and not used by an earlier handoff. No call reaches the fake exe for a decision whose revoke, abort or fingerprint change the log shows before the handoff.
+- **H1.** Per server, the native requests of two different exchanges are never open at once, cleanup included, and at most 3 are open on a remote server, 4 on a local one (3.4). Every call refused busy is answered within the step it was made, and no handoff for it ever follows. Overlap alone can't catch a queue, since a call queued until the slot drains never overlaps. Busy, and a start that times out, only while the exe shows the server's exchange in play; no local write stays pending past the interim bound (4.3).
+- **H2.** Every request body is one of the six kinds (3.2). No GET or `DELETE` is ever made, no error response is sent, and no `notifications/cancelled` goes to a remote server. No pong is sent for an id that wasn't a ping on its own exchange. No request is made after its exchange's terminal event, nothing at all (not even a pong) after its run's Stop, and none outlives its run.
+- **H3.** Every `tools/call` body equals, byte for byte, the canonical body the harness builds itself from the arguments one Yes was for, answered before the handoff and not used by an earlier one. No call reaches the fake exe for a decision whose revoke, abort or fingerprint change the log shows before the handoff, and none goes out on a catalog a `list_changed` made stale before a walk after it came back.
 - **H4.** In the pass build, every `net_cancel` returns within its bound, even while a helper is held, and a held helper never keeps an exchange out of Idle past the bound. The pre-pass build records the same as a measured limitation.
 - **H5.** In the pass build, at saturation: with 24 server requests open (detached helpers among them), a model fetch is never refused `busy`.
 - **H6.** Both directions, against an independent history. From the commit log, the harness keeps its own record of each unanswered ending, from the submissions' own settlements, and of every run start after it. It never reads `runFailure` to judge `runFailure`. A question is due exactly when the latest ending has no run start after it and no answer. H6 fails if a question is shown that isn't due, or if one that is due isn't shown.
 - **H7.** Every run start in the store is in a commit that also holds one of these: your new message; an answer record whose commit's pre-state shows the question open; a Send now record whose pre-state shows its submission queued and oldest; or pi-durable's own boundary after an answered run. Nothing else, so a compaction boundary fails it.
 - **H8.** After every step: if the conversation is idle, the inbox isn't empty and no question is open, Send now is shown.
 - **H9.** Her line's entry is model-visible only if, in its commit, no run was live, the inbox was empty and `runFailure` was unset. Her line never appears in a commit that starts a run.
-- **H10.** A late response for an ended exchange's id never reaches a caller.
-- **H11.** On a modern remote run, every `tools/call` POST's `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` headers equal what the harness derives from that POST's body and the raw listed `inputSchema`, using its own scanner and its own fixed vectors: values that need base64, edge whitespace, sentinel-shaped values, unsafe integers, lone surrogates, and declarations under `items` and `oneOf`. A call whose mirrored value would be refused, or would pass 8 KiB, makes no native request.
-- **H12.** A run's requests all have one era's framing. A modern run never sends `initialize` after its opening, `notifications/initialized`, a pong, `Mcp-Session-Id` or a remote `notifications/cancelled`. A legacy run never sends the `_meta` envelope's reserved keys or the modern-only headers. A run turns modern only after an `initialize` answered `-32022` whose list names 2026-07-28 and no legacy version. No request follows an `input_required`, `-32020` or `-32021` answer for the same call.
-- **H13.** Every ping id the fake server sends has exactly one disposition, kept by the fake server and the fake exe, not the client: a pong handed off for that id before its exchange sealed, or one of named departures 1, 2 and 5 whose own condition holds in the log at that step (departure 5, for example, requires the ping to have come after the final response on its stream). A ping with neither fails. A handed-off pong's native fate (received, or lost: departure 6) is logged separately and never fails H13.
+- **H10.** A late response for an ended exchange's id never reaches a caller. Each result arrives exactly as the server wrote it, its multibyte text whole however the bytes were split, and no valid answer is read as invalid.
+- **H11.** On a modern remote run (modern by the server's own refusal of its opening, never by the client's headers), every `tools/call` POST's `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` headers equal what the harness derives from that POST's body and the schema the server last listed, using its own scanner. The driver sends fixed vectors: non-ASCII, empty, edge whitespace, sentinel-shaped, integer and boolean values, a lone surrogate, and one past 8 KiB once encoded. A call whose mirrored value would be refused, or would pass 8 KiB, makes no native request. The scripted server answers `-32020` to a header that isn't the body's.
+- **H12.** Judged per run, from one Start to its end, re-handshakes included. A run's requests all have one era's framing, every frame after the opening checked. A modern run never sends `initialize` after its opening, `notifications/initialized`, a pong, `Mcp-Session-Id` or a remote `notifications/cancelled`. A legacy run never sends the `_meta` envelope's reserved keys or the modern-only headers. A run turns modern only after an `initialize` answered `-32022` whose list names 2026-07-28 and no legacy version. No request follows an `input_required`, `-32020` or `-32021` answer for the same call.
+- **H13.** Every ping id the fake server sends has exactly one disposition, kept by the fake server and the fake exe, not the client: a pong handed off for that id before its exchange sealed, or one of named departures 1, 2 and 5 whose own condition holds in the log at that step (departure 5, for example, requires the ping to have come after the final response on its stream). Departure 1 covers the ping that flooded and those after it, never one before a ping that got a pong. A ping with neither fails. A handed-off pong's native fate (received, or lost: departure 6) is logged separately and never fails H13.
 - **H14.** No call is sent twice:
   - no two native requests carry the same decision's call, matched through the evidence log;
   - no two requests in a run carry the same body once the JSON-RPC id is removed, unless the log shows two separately answered or "always" decisions for them. T7 (j) is the positive witness: two identical calls, approved separately, each go out once;
-  - after a 404, the next request is an `initialize` with no session id, then `initialized` with the new one, and no call is admitted until the re-handshake's list has completed;
-  - a 404 before one exchange has completed after a re-handshake, or a failed re-handshake, ends the run with no further request;
+  - judged per run: after a 404 on a Ready run, the next request is an `initialize` with no session id, then `initialized` with the new one, and no call is admitted until the re-handshake's list has completed, each tried call refused as the run not being Ready, not only by the busy slot. An empty history there is a missed re-handshake;
+  - a 404 before a page or call has completed after the recovery's own walk, or a failed re-handshake, ends the run with no further request;
   - under the redirect mode, a redirected call fails, and nothing follows it.
 
 **Every check needs a witness.** For each check, the seed set must contain at least one step where its condition was in play and could have failed: H1 a busy refusal, H6 both a due and a superseded question, H13 a ping for each departure, H5 a saturation. A check with no witness in a build's seeds fails the build.
@@ -844,7 +858,7 @@ The **pass build** adds P4's detach bound, the server cap and the native write b
 
 - the named check fails in the mutant;
 - the same check passes in the twin;
-- the two runs' histories are identical up to the first step where the switch changed behaviour.
+- the two runs' histories are identical up to the first step where the switch changed behaviour: the scheduler's choices and every native handoff with its bytes (wire), or every commit's submissions, entries and documents (journal).
 
 Since the twin's identical prefix passes, the mutant's failure lies at or after that step. So a failure is caused by the switch, not only ordered after it. A mutation with no such seed is a broken control, and fails the build.
 
@@ -861,6 +875,17 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `remote-cancel`: send a cancel to a remote server | H2 |
 | `local-cancel-after-seal` | H2 (a write after the terminal event) |
 | `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
+| `no-write-bound`: no interim page bound on a local write | H1 under S18 |
+| `release-on-refused-cancel`: free the slot on a refused `net_cancel` or stop | H1 |
+| `publish-stale-walk`: publish a walk's catalog though `list_changed` came during it | H3 under S14 |
+| `decoder-per-chunk`: a new decoder for each read | H10 |
+| `cr-forgets-pair`: an LF after a read-ending CR read as an empty line | H10 |
+| `late-detach`: detach a held helper at 1.5 s | H4 under S8, pass build |
+| `drop-pong-before-flood`: drop a ping silently before a flood | H13 |
+| `mirror-wrong-value`: a mirrored value that isn't the body's | H11 |
+| `era-change-on-recovery`: a re-handshake's modern refusal turns the run modern | H12 under S15 |
+| `end-on-refresh-404`: end the run on a refresh page's 404 | H14 under S16 |
+| `rearm-in-recovery`: rearm the 404 bound with the re-handshake's own walk | H14 under S17 |
 | `body-from-model-args` | H3 |
 | `await-before-handoff` | H3, with a revoke scheduled in the await |
 | `ignore-fingerprint` | H3 under S1 |
@@ -907,14 +932,19 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 - **S7, two interrupted steps in one round, then a kill, then Run again:** one question lists both, and one answer settles both (T13).
 - **S8, Stop then Start while a remote call's POST is still in `net_cancel`** (H1; H4 in the pass build).
 - **S9, a duplicated Yes from the first card arriving after the changed tool's card is shown** (T7 (i)).
-- **S10, server saturation:** servers each hold a call and a detached helper, then more, then chat fetches a model (H5).
-- **S11, Stop during a walk, or while Ready, then a call:** nothing reaches the stopping run after Stop (H2).
-- **S12, calls during a session recovery:** refused busy until the re-handshake's list completes (H14).
+- **S10, server saturation:** 8 server helpers detached and hung, then each of 24 servers holds a call, then chat fetches a model (H5).
+- **S11, Stop during a walk, or while Ready, then a call, and Stop during a live local call:** nothing reaches the stopping run after Stop, and no reply read after it answers the call (H2).
+- **S12, calls during a session recovery:** each refused as the run not being Ready, until the re-handshake's list completes (H14).
 - **S13, a call's time limit, or its stop, ends that call only:** the run stays Ready (T5's named case).
+- **S14, `list_changed` on the initial walk, between pages, and before a refresh:** a walk follows before any call (H3).
+- **S15, a modern refusal on a re-handshake:** the run ends, still legacy (H12).
+- **S16, a 404 on a refresh page:** one fresh `initialize`, the run kept (H14).
+- **S17, a 404 on every call:** the second call's 404 ends the run (H14).
+- **S18, a local server that stops reading:** the interim bound stops it within 10 s, and the slot frees (H1).
 
 ### 7.3 The exchange machine's exhaustive walk (W)
 
-`tests/harness/walk.test.ts`. The exchange machine (3.4) and its terminal paths are a pure function. The walk explores every interleaving of its inputs for one server, in each era and place: admit, a response, a ping, a pong head, a stream end, a deadline, Stop, a run end, each `net_cancel` returning, each local write completing (the request, a pong, the cancel), a dropped-line `err` event, and a Stop and Start of the same server. It allows up to 3 pings (so 2 pongs outstanding, and a flood) and up to two exchanges per path; the modern era has no ping input.
+`tests/harness/walk.test.ts`. The exchange machine (3.4) and its terminal paths are a pure function. The walk explores every interleaving of its inputs for one server, in each era and place: admit, a response, a ping, a pong head, a stream end, a deadline, Stop, a run end, each `net_cancel` returning, each local write completing (the request, a pong, the cancel), a dropped-line `err` event, and a Stop and Start of the same server, as the link does it (the live exchange ends in Stop's own step; the slot carries on), which the clean walk must reach. It allows up to 3 pings (so 2 pongs outstanding, and a flood) and up to two exchanges per path; the modern era has no ping input.
 
 States are deduplicated exactly: a set of the canonical state's JSON, compared by string equality, never by a hash, since a hash can collide and silently drop states. It checks H1's rule (no native request of one exchange open while another's is; the request and two pongs at most, plus a local stop's cancel), and liveness: from every reachable state, once every native request and write has ended and every request kind has its answer or its deadline, the slot is Idle. A write-only exchange gets no answer and has no deadline, so one that waits for a response fails. Its controls are H1's mutations. It models nothing Familiar doesn't own.
 
