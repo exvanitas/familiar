@@ -108,8 +108,10 @@ async function coreSources(): Promise<{ file: string; code: string }[]> {
     });
 }
 
+// A line guarded by a named mutation switch (mutations.ts) is the harness's control, off in the app, and
+// isn't a call site; the last test below holds that nothing in core turns a switch on.
 const sitesOf = (files: { file: string; code: string }[], pattern: RegExp) =>
-  files.flatMap(({ file, code }) => code.split('\n').flatMap((line, i) => (pattern.test(line) ? [`${file}: ${line.trim()}`] : [])));
+  files.flatMap(({ file, code }) => code.split('\n').flatMap((line) => (pattern.test(line) && !line.includes('mutant(') ? [`${file}: ${line.trim()}`] : [])));
 
 describe('2.5: the module graph', () => {
   it('pulls in the journal, and finds call sites in it (the scan can see)', async () => {
@@ -155,6 +157,11 @@ describe('2.5: the module graph', () => {
     expect(sitesOf(files, /type: 'continue'/)).toHaveLength(2);
     // The one task that submits is the wake's delivery, through its runtime's conversation handle.
     expect(sitesOf(files, /runtime\.conversation\(/)).toEqual([expect.stringContaining('journal/journal.ts: ')]);
+  });
+
+  it('turns no named mutation on: only mutations.ts itself touches the switches', async () => {
+    const files = await coreSources();
+    expect(sitesOf(files, /mutations\.set\(|\bon\.add\(/).filter((s) => !s.startsWith('mutations.ts: '))).toEqual([]);
   });
 });
 

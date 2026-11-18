@@ -41,6 +41,13 @@ import type { JournalStore } from './store.ts';
 import { admit, boundWords, type Budget } from './bounds.ts';
 import { finishTurn, openTurn, recordSubmission, turnKeyOf, turnOfInputs, TurnsDoc } from './turns.ts';
 import { oldestQueued, runView, type Answers, type Interruptions, type Question, type RunView } from './view.ts';
+import { mutant } from '../mutations.ts';
+
+/** For a named mutation only: the newest queued input, where Send now must offer the oldest. */
+const newestQueued = (inbox: any): string | undefined => {
+  const items = (inbox?.items ?? []).filter((i: any) => i.mode !== 'write');
+  return items.length ? String(items.at(-1).id) : undefined;
+};
 import { gateFor, type GatePolicy } from './gate.ts';
 import type { Allowed, FamiliarTool, JournalDocToken } from './tools.ts';
 import { defineJournalDoc, toDurableTool } from './tools.ts';
@@ -311,7 +318,12 @@ export interface Journal {
  * that set `backgroundTokens` would turn it back on for that model.
  */
 export function journalSettings(resendDelayMs = 2000) {
-  return { retry: { maxRetries: 2, baseDelayMs: resendDelayMs }, toolExecution: 'sequential' as const, compaction: { backgroundTokens: 0 } };
+  return {
+    retry: { maxRetries: 2, baseDelayMs: resendDelayMs },
+    toolExecution: 'sequential' as const,
+    compaction: mutant('background-compaction') ? {} : { backgroundTokens: 0 },
+    ...(mutant('after-failed-continue') ? { afterFailedRun: 'continue' as const } : {})
+  };
 }
 
 export async function openJournal(options: JournalOptions): Promise<Journal> {
@@ -468,6 +480,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   const runIdentity = async () => identityOf(await harness.snapshot(LiveDoc, rootId, ctx));
 
   /** The view (view.ts) from committed state. */
+  let atEnd: Question | undefined;
   const viewNow = async (): Promise<RunView> =>
     runView(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(InterruptionsDoc, ctx), await harness.snapshot(AnswersDoc, ctx), stepCap);
   /** The view inside a commit. */
@@ -765,6 +778,14 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
   };
   const onLive = (live: any) => {
     const wasRunning = !!lastLive?.run;
+    // Named mutations only: the old shape's question kept from the run's end, and RETHINK's automatic
+    // placement after an error.
+    if (wasRunning && !live?.run && live?.runFailure) {
+      void viewNow().then((v) => {
+        if (v.state === 'question') atEnd = v.question;
+      });
+      if (mutant('auto-placement')) void harness.snapshot(InboxDoc, rootId, ctx).then((inbox: any) => (oldestQueued(inbox) ? root.submit({ type: 'continue' }, ctx) : undefined)).catch(() => undefined);
+    }
     lastLive = live;
     refresh();
     if (dead) return;
@@ -867,6 +888,8 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
 
   const questions = async (): Promise<readonly Question[]> => {
     const view = await viewNow();
+    // The old shape, as a named mutation: the question recorded when the run ended, kept until answered.
+    if (atEnd && mutant('question-at-end')) return (await harness.snapshot(AnswersDoc, ctx))?.byTask?.[atEnd.id.slice(4)] ? [] : [atEnd];
     return view.state === 'question' ? [view.question] : [];
   };
   /** The words of a Yes to cut-off steps: one line per step, through the gate again. */
@@ -909,6 +932,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
     questions,
     async answer(id, yes, requestId) {
       if (!id.startsWith('run:')) return undefined;
+      let splitLater: any;
       const task = id.slice('run:'.length);
       // One commit: read, check the question is still open, record the answer and admit what it starts.
       // Every read comes before the admission; the answer and its submission are stored together or not
@@ -919,9 +943,11 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         if (prior) return prior.submission ?? '';
         const live = await tx.doc(LiveDoc, rootId);
         const view = runView(live, await tx.doc(InterruptionsDoc), answers, stepCap);
-        // Not open: a run is live, the failure names another task, or you moved on. Nothing changes.
-        if (view.state !== 'question' || view.question.id !== id) return '';
-        const q = view.question;
+        // Not open: a run is live, the failure names another task, or you moved on. Nothing changes. (The
+        // old shape, a named mutation, answers the question it kept from the run's end instead.)
+        const kept = atEnd?.id === id && !live?.run && mutant('question-at-end') ? atEnd : undefined;
+        if (!kept && (view.state !== 'question' || view.question.id !== id)) return '';
+        const q = kept ?? (view as Extract<RunView, { state: 'question' }>).question;
         const inbox = await tx.doc(InboxDoc, rootId);
         const registry = await tx.doc(TurnsDoc);
         const asked = q.turn ?? turnOfInputs(live.runFailure?.inputs ?? [], registry);
@@ -930,6 +956,12 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         // Yes to cut-off steps: ask her to do them again. Yes otherwise, a Skip, or a No with a message
         // queued: a continue, which places the oldest queued item first. A No with nothing queued: nothing.
         const draft = yes && cutOff ? { type: 'input', content: againWords(q), requestId } : yes || cutOff || queued ? { type: 'continue', requestId } : undefined;
+        // A named mutation: the answer's check in this commit, its submission in a later one.
+        if (draft && mutant('split-answer')) {
+          answers.byTask[task] = { yes, kind: q.kind, turn: asked };
+          splitLater = draft;
+          return '';
+        }
         const started = draft ? String(await root.submit(tx, draft)) : '';
         if (started) {
           // The turn rule: a run belongs to the turn of the first input it places. A continue placing a
@@ -961,14 +993,22 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         keepNewest(answers.order, answers.byTask, task);
         return started;
       }, ctx);
+      if (splitLater) {
+        const later = splitLater;
+        splitLater = undefined;
+        const s2 = mutant('split-answer') ? String(await root.submit(later, ctx)) : '';
+        return s2 ? turnFor(await harness.submission(Number(s2), ctx)) : undefined;
+      }
       return sid ? turnFor(await harness.submission(Number(sid), ctx)) : undefined;
     },
     async queued() {
       const live: any = await harness.snapshot(LiveDoc, rootId, ctx);
       if (live?.run) return undefined;
-      const first = oldestQueued(await harness.snapshot(InboxDoc, rootId, ctx));
+      const inbox: any = await harness.snapshot(InboxDoc, rootId, ctx);
+      const first = mutant('per-message-send-now') ? newestQueued(inbox) : oldestQueued(inbox);
       if (!first) return undefined;
       if ((await viewNow()).state === 'question') return undefined;
+      if (live?.runFailure && mutant('hide-send-now')) return undefined;
       return { submission: first, failure: live?.runFailure ? String(live.runFailure.taskId) : null };
     },
     async sendNow(offer, requestId) {
@@ -982,7 +1022,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
         const inbox = await tx.doc(InboxDoc, rootId);
         const view = await viewIn(tx);
         const failure = live?.runFailure ? String(live.runFailure.taskId) : null;
-        const holds = !live?.run && failure === offer.failure && view.state !== 'question' && status === 'queued' && oldestQueued(inbox) === offer.submission;
+        const holds = !live?.run && failure === offer.failure && view.state !== 'question' && status === 'queued' && (mutant('per-message-send-now') ? newestQueued(inbox) : oldestQueued(inbox)) === offer.submission;
         let sent = '';
         if (holds) {
           sent = String(await root.submit(tx, { type: 'continue', requestId }));
@@ -1029,7 +1069,7 @@ export async function openJournal(options: JournalOptions): Promise<Journal> {
       const visible: boolean = await harness.commit(async (tx: any) => {
         const live = await tx.doc(LiveDoc, rootId);
         const inbox = await tx.doc(InboxDoc, rootId);
-        const quiet = !live?.run && !live?.runFailure && (inbox?.items ?? []).length === 0;
+        const quiet = !live?.run && (!live?.runFailure || mutant('remark-no-failure-check')) && ((inbox?.items ?? []).length === 0 || mutant('remark-no-inbox-check'));
         const data = { text, sources, request: key };
         const note = `[${options.persona.name} said this on her own, not in reply to a message: "${text}"]`;
         await root.submit(tx, {
