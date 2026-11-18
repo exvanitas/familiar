@@ -95,6 +95,33 @@ describe('a server tool in the turn loop', () => {
     await two.journal.close();
   });
 
+  it('killed mid-call, then reopened with no server tools at all: still the Run again question, and nothing runs', async () => {
+    const world = nodeWorld();
+    const store = memorySettingsStore();
+    const script = (r: ModelRequest): FakeReply => {
+      const last = r.messages.at(-1);
+      if (last?.role === 'tool') return { text: `Done. (${last.content.slice(0, 80)})` };
+      return { text: 'On it.', toolCalls: [{ id: 'call-1', name: 'fakeserver__slow', arguments: { ms: 20_000 } }] };
+    };
+    const one = await life(world, store, undefined, script);
+    void one.journal.send('Please wait a while.', 'turn-1');
+    for (let i = 0; i < 500 && slowCalls(one.port) < 1; i++) await sleep(10);
+    expect(slowCalls(one.port)).toBe(1);
+    one.journal.kill();
+    await one.port.closeAll();
+    // The server isn't started this time: the turn loop holds no wrapper for the cut-off call.
+    const two = await turnLoop(world, [], script);
+    const sent = await two.journal.send('Please wait a while.', 'turn-1');
+    if (!sent.replied) throw new Error('not replied');
+    const end = await two.journal.turn(sent.turn.id).wait();
+    expect(end.status).toBe('asks');
+    const questions = await two.journal.questions();
+    expect(questions).toHaveLength(1);
+    expect(questions[0]).toMatchObject({ kind: 'rerun', tool: 'fakeserver__slow' });
+    expect(questions[0]!.text).toMatch(/^fakeserver__slow was cut off/);
+    await two.journal.close();
+  });
+
   it('"always" runs a call only while the conversation holds no outside content; after a server result, and a changed tool, it asks, with the facts read now (G12, r19 #15)', async () => {
     const world = nodeWorld();
     const store = memorySettingsStore();

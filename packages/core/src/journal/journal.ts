@@ -621,10 +621,13 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       const id = String(api.taskId);
       const tool = tools.get(call.name);
       const interrupted = (result.diagnostics ?? []).some((d: any) => d.code === 'interrupted');
+      // A server's call is known by its name too: the `__` namespace is server tools' alone (5.9), so a
+      // cut-off call whose wrapper this open doesn't hold (its server not started) still gets Run again.
+      const server = tool ? tool.kind === 'server' : String(call.name).includes('__');
       await harness.commit(async (tx: any) => {
         const consent = await tx.doc(ConsentDoc);
         if (consent.cards[id]) delete consent.cards[id];
-        if (!interrupted || !tool) return;
+        if (!interrupted || (!tool && !server)) return;
         // One record per interrupted step, under the task that runs this round: the task runFailure will
         // name once the park hook stops it. Written again unchanged if a kill makes the round run again.
         const records = await tx.doc(InterruptionsDoc);
@@ -632,7 +635,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const live = await tx.doc(LiveDoc, rootId);
         const turn = turnKeyOf(live, await tx.doc(TurnsDoc));
         records.steps[id] =
-          tool.kind === 'server'
+          server || !tool
             ? { step: id, task: String(live?.run?.taskId ?? ''), kind: 'rerun', tool: call.name, arguments: call.arguments, turn, text: `${call.name} was cut off when the app closed, and may have partially run.` }
             : { step: id, task: String(live?.run?.taskId ?? ''), kind: 'redo', tool: call.name, arguments: call.arguments, turn, text: `I was ${tool.doing(call.arguments)} when the app closed. Do it now?` };
       }, ctx);
