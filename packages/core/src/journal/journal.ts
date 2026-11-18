@@ -499,7 +499,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
   const runIdentity = async () => identityOf(await harness.snapshot(LiveDoc, rootId, ctx));
 
   /** The view (view.ts) from committed state. */
-  let atEnd: Question | undefined;
+  // State kept only for a named mutation, made only in the test build: the app build folds it away.
+  const kept: { atEnd?: Question } | undefined = __FAMILIAR_MUTATIONS__ ? {} : undefined;
   const viewNow = async (): Promise<RunView> =>
     runView(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(InterruptionsDoc, ctx), await harness.snapshot(AnswersDoc, ctx), stepCap);
   /** The view inside a commit. */
@@ -831,7 +832,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     // placement after an error. Behind the build flag, so the app build reads nothing here.
     if (__FAMILIAR_MUTATIONS__ && wasRunning && !live?.run && live?.runFailure) {
       void viewNow().then((v) => {
-        if (v.state === 'question') atEnd = v.question;
+        if (v.state === 'question' && kept) kept.atEnd = v.question;
       });
       if ((__FAMILIAR_MUTATIONS__ && mutant('auto-placement'))) void harness.snapshot(InboxDoc, rootId, ctx).then((inbox: any) => (oldestQueued(inbox) ? root.submit({ type: 'continue' }, ctx) : undefined)).catch(() => undefined);
     }
@@ -957,7 +958,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
   const questions = async (): Promise<readonly Question[]> => {
     const view = await viewNow();
     // The old shape, as a named mutation: the question recorded when the run ended, kept until answered.
-    if (atEnd && (__FAMILIAR_MUTATIONS__ && mutant('question-at-end'))) return (await harness.snapshot(AnswersDoc, ctx))?.byTask?.[atEnd.id.slice(4)] ? [] : [atEnd];
+    if (__FAMILIAR_MUTATIONS__ && kept?.atEnd && mutant('question-at-end')) return (await harness.snapshot(AnswersDoc, ctx))?.byTask?.[kept.atEnd.id.slice(4)] ? [] : [kept.atEnd];
     // A named mutation: the open question shown under another identity (its run's first input, not the
     // task that stopped), so what you answer isn't the question that's open.
     if (view.state === 'question' && (__FAMILIAR_MUTATIONS__ && mutant('question-wrong-id'))) {
@@ -1055,10 +1056,10 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const view = runView(live, await tx.doc(InterruptionsDoc), answers, stepCap);
         // Not open: a run is live, the failure names another task, or you moved on. Nothing changes. (The
         // old shape, a named mutation, answers the question it kept from the run's end instead.)
-        const kept = atEnd?.id === id && !live?.run && (__FAMILIAR_MUTATIONS__ && mutant('question-at-end')) ? atEnd : undefined;
+        const fromEnd = __FAMILIAR_MUTATIONS__ && kept?.atEnd?.id === id && !live?.run && mutant('question-at-end') ? kept.atEnd : undefined;
         // (A named mutation answers whatever question is open, whichever one the answer was for.)
-        if (!kept && (view.state !== 'question' || (view.question.id !== id && !(__FAMILIAR_MUTATIONS__ && mutant('answer-any-question'))))) return '';
-        const q = kept ?? (view as Extract<RunView, { state: 'question' }>).question;
+        if (!fromEnd && (view.state !== 'question' || (view.question.id !== id && !(__FAMILIAR_MUTATIONS__ && mutant('answer-any-question'))))) return '';
+        const q = fromEnd ?? (view as Extract<RunView, { state: 'question' }>).question;
         const inbox = await tx.doc(InboxDoc, rootId);
         const registry = await tx.doc(TurnsDoc);
         const asked = q.turn ?? turnOfInputs(live.runFailure?.inputs ?? [], registry);
