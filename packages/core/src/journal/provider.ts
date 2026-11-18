@@ -11,6 +11,8 @@ import { createProvider } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai/utils/transcript';
 import type { ChatMessage, ModelError, ModelPort, ModelRequest, ToolSpec } from '../model/port.ts';
+import { mutant } from '../mutations.ts';
+import { SOURCES_FIELD } from './provenance.ts';
 
 const API = 'familiar-port';
 const ZERO_USAGE = {
@@ -29,12 +31,6 @@ const ERROR_PREFIX = 'familiar.model-error:';
  * `toModelRequest` hands it back on the next turn exactly as it came.
  */
 export const REPLAY_FIELD = 'familiarReplay';
-/**
- * Where a reply keeps the key of its request's outside record (docs/mcp-design.md 5.6), stored with the
- * reply like the replay: the gate reads it to know whether the request that made a call was outside.
- * Never sent anywhere.
- */
-export const REQUEST_FIELD = 'familiarRequest';
 
 function hex(text: string): string {
   return Array.from(new TextEncoder().encode(text), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -122,6 +118,12 @@ export interface PortProviderOptions {
   readonly modelId: string;
   readonly contextWindow?: number;
   readonly maxTokens?: number;
+  /**
+   * The request's outside sources (docs/mcp-design.md 5.6), from pi-durable's own context for it and the
+   * request as built: stamped on the reply, which carries them for good. Without it a reply has none
+   * recorded, and counts as outside.
+   */
+  readonly sources?: (messages: readonly unknown[], request: ModelRequest) => Promise<readonly string[]>;
 }
 
 /** `port` is asked for at each request, so the journal can put caps around it once its store is open. */
@@ -173,6 +175,8 @@ export function portProvider(port: () => ModelPort | Promise<ModelPort>, options
     void (async () => {
       out.push({ type: 'start', partial: snap() });
       const request = toModelRequest(requestModel, context, streamOptions);
+      // Worked out before the request is sent, from exactly what it sends.
+      const sources = options.sources ? [...(await options.sources(context.messages, request))] : undefined;
       const model = await port();
       for await (const event of model.stream(request, streamOptions?.signal)) {
         if (event.type === 'text' || event.type === 'thinking') {
@@ -204,7 +208,7 @@ export function portProvider(port: () => ModelPort | Promise<ModelPort>, options
             stopReason: reason,
             usage: { ...ZERO_USAGE, input, output, totalTokens: input + output },
             ...(event.replay ? { [REPLAY_FIELD]: event.replay } : {}),
-            ...(event.request ? { [REQUEST_FIELD]: event.request } : {})
+            ...(sources ? { [SOURCES_FIELD]: __FAMILIAR_MUTATIONS__ && mutant('reply-sources-empty') ? [] : sources } : {})
           };
           out.push({ type: 'done', reason, message });
           out.end(message);

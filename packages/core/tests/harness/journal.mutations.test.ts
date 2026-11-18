@@ -40,7 +40,9 @@ describe('every named journal mutation fails its check, beside its unmutated twi
         const twinFails = JOURNAL_CHECKS[check]!(twin);
         const prefix = mutant.firstHit - 1;
         // The same history up to the first hit: the steps, and every commit's submissions, entries and documents.
-        const commits = (j: typeof mutant) => JSON.stringify(j.log.filter((c) => c.step <= prefix).map((c) => [c.step, c.submissions.map((x) => [x.type, x.status, x.requestId ?? null]), c.entries.map((x) => [x.kind, x.model, x.data]), c.docs, c.docValues]));
+        // Wall-clock times (the clock is real, offset) are the one thing a twin can't share: each reads as T,
+        // the base-36 time in a reservation's id and a step's measured duration too.
+        const commits = (j: typeof mutant) => JSON.stringify(j.log.filter((c) => c.step <= prefix).map((c) => [c.step, c.submissions.map((x) => [x.type, x.status, x.requestId ?? null]), c.entries.map((x) => [x.kind, x.model, x.data]), c.docs, c.docValues])).replace(/\b1\d{12}\b/g, 'T').replace(/"r[0-9a-z]{8,9}-/g, '"rT-').replace(/\\"durationMs\\":\d+/g, 'D');
         const same = JSON.stringify(mutant.steps.slice(0, prefix)) === JSON.stringify(twin.steps.slice(0, prefix)) && commits(mutant) === commits(twin);
         tried.push(`seed ${seed}: twin ${twinFails.length ? 'fails' : 'passes'}, prefix ${same ? 'same' : 'differs'}`);
         if (!twinFails.length && same) return;

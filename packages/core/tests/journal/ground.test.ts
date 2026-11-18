@@ -4,7 +4,7 @@
 // that never starts a run. All against the real pi-durable 1.5.2 on a fake IndexedDB.
 
 import { describe, expect, it } from 'vitest';
-import { alternate, decodeFailure, encodeModelError, OutsideDoc, runView, TurnsDoc, type ChatMessage, type Journal, type ModelRequest } from '../../src/index.ts';
+import { alternate, decodeFailure, encodeModelError, runView, SummarizedDoc, TurnsDoc, type ChatMessage, type Journal, type ModelRequest } from '../../src/index.ts';
 import type { FakeReply } from '../../src/testing/index.ts';
 import { nodeWorld, type NodeWorld } from './node-env.ts';
 import { openFor, type Env, type OpenOptions } from './scenarios.ts';
@@ -327,13 +327,11 @@ describe('2.1: her line', () => {
     await journal.close();
   });
 
-  it('into a quiet chat: model-visible, as a note that merges with your next message; its outside record and sources are written', async () => {
+  it('into a quiet chat: model-visible, as a note that merges with your next message; its sources are written', async () => {
     const { journal, model } = await journalOf({ script: (r) => (r.tools.length === 0 && r.system === 'Say one short line.' ? { text: 'The kettle!' } : { text: `answer to ${lastUser(r)}` }) });
     const said = await journal.remark(prompt);
     expect(said).toEqual({ text: 'The kettle!', visible: true, sources: ['server:weather'] });
     expect(model.requests[0]).toMatchObject({ tools: [], system: 'Say one short line.' });
-    const outside: any = await journal.read(OutsideDoc);
-    expect(Object.values(outside.requests)).toEqual([expect.objectContaining({ sources: ['server:weather'] })]);
     expect((await journal.transcript()).at(-1)).toMatchObject({ kind: 'familiar.remark', text: 'The kettle!' });
     // Nothing ran: no run, no question.
     expect((await inspectOf(journal)).submissions.filter((s: any) => s.type !== 'write')).toEqual([]);
@@ -436,9 +434,8 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
     expect(await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say something.' }], sources })).toMatchObject({ visible: true });
     const t = await journal.send('Look it up.', 'a');
     if (t.replied) await t.turn.wait();
-    const outside: any = await journal.read(OutsideDoc);
     await journal.close();
-    return { cards, ran, outside };
+    return { cards, ran };
   }
 
   it('a remark made from a server result carries its source: the next request is outside, "always" asks, and the card offers no Always', async () => {
@@ -447,8 +444,6 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
     expect(r.cards[0]).toMatchObject({ always: false, facts: { server: 'srv', tool: 'look' } });
     expect(r.ran).toHaveLength(1);
     expect(r.ran[0]).toMatchObject({ by: 'asked', outside: true });
-    // The turn's requests have outside records naming the remark's source.
-    expect(Object.entries(r.outside.requests).filter(([k, v]: [string, any]) => k.startsWith('request:') && v.sources.includes('server:weather')).length).toBeGreaterThan(0);
   });
 
   it('the control: the same remark without sources leaves the conversation inside, and "always" runs it without asking', async () => {
@@ -520,10 +515,9 @@ describe('5.6: outside content survives a compaction', () => {
     await say('Look it up.', 'look-2');
     expect(cards).toHaveLength(1);
     expect(cards[0]).toMatchObject({ always: false });
-    // Both halves: the kept range was read (its server result), and the summary counts as outside although
-    // every record from before it is gone.
-    const outside: any = await journal.read(OutsideDoc);
-    expect(outside.requests[outside.order.at(-1)].sources).toEqual(['compacted', 'server:srv']);
+    // The summary's sources were recorded by the hook, before it was asked for.
+    const summarized: any = await journal.read(SummarizedDoc);
+    expect(summarized.recorded).toBe(true);
     await journal.close();
   }, 120_000);
 });

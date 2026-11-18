@@ -1,5 +1,5 @@
 // The journal facade: the turn loop on pi-durable. Everything pi-durable is behind these exports.
-export { AnswersDoc, InterruptionsDoc, journalSettings, openJournal, OutsideDoc, SendNowDoc, systemClock } from './journal.ts';
+export { AnswersDoc, InterruptionsDoc, journalSettings, openJournal, SendNowDoc, SummarizedDoc, systemClock } from './journal.ts';
 export { TurnsDoc } from './turns.ts';
 export type { AmbientState, CapsSetup, ConsentCard, ConsentPort, Journal, JournalClock, JournalOptions, Question, Remark, RemarkPrompt, SendNowOffer, SendResult, Turn, TurnEnd, Notification, NotifierPort, WakePort } from './journal.ts';
 export { journalUsageStore, LedgerDoc } from './ledger.ts';

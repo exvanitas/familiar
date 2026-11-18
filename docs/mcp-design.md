@@ -69,7 +69,7 @@ A moment, or a reminder's remark, is made like this:
 
 1. **The decider asks for a line**, as [persona-traits.md](persona-traits.md) defines it.
 2. **Core makes one model request with no tools**, through `cappedPort`, so the caps count it. The ledger needs a turn key for its reservation, so the request gets its own key (`moment:<random>`), which is never resumable: its reservation settles when the call returns, or becomes a spent record at its deadline if the app dies ([turn-design.md](turn-design.md#durable-cap-reservations)). A paused cap means she stays quiet, with no question and no line. A moment ends silently; a reminder's delivery stands.
-3. **Core writes the request's outside record** (5.6) before sending, as for any request. Her remark's sources are the union of the sources of what her prompt included.
+3. **Her line's sources** (5.6) are the union of the sources of what her prompt included. The note that puts her line into the conversation carries them.
 4. **One commit writes her line.** It reads `pi.live` and the inbox (`tx.doc(InboxDoc, root.id)`, pi-durable's typed handle) before its admission, then writes through `root.submit(tx, …)`:
    - if no run is live, the inbox is empty and `runFailure` is unset: a write with `model`. pi-durable appends it and starts no run;
    - otherwise: a display-only write, appended at once, busy or idle, which never restarts failed work.
@@ -676,13 +676,23 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
   - **A refused durable revoke is reported.** The revoke's answer is its durable write's outcome. If the owner refuses the write (busy, or a change's cleanup unfinished) or the store loses it, Settings is told: "Revoked for now, but not saved: it comes back when Familiar restarts. Try again." The overlay holds until then.
 - **Until step 8's choices UI**, the journal isn't fed the owner's choices, and every server tool asks.
 
-### 5.6 The outside record
+### 5.6 Outside sources, carried by each message
 
-- **One immutable record per request**, written by core from the request's assembled input before it's sent. A missing or unreadable record counts as outside. The reply keeps its request's record key, and the gate reads the record of the request whose reply made the call, found by the call's id.
-- **Every entry carries its sources.** A server result carries its server, and so does an unreviewed tool's description. Any entry made while handling an outside request carries that request's sources: her replies, compaction summaries, notes and reminders written then, and her remark (2.1).
-- **Stored notes and reminders keep their sources**, and every read or delivery of them carries them. A request is outside if any entry in its assembled input carries a source. While it's outside, "always" doesn't apply, and a card offers no Always.
-- **"Always" follows the call's own request record**, not a rescan at the time of the call. A call is judged by the request whose reply made it: so a later call in the same round, after a server result came back, still gets "always" if its own request was clean, and the next request (which carries that result) is outside.
-- **A compaction keeps the taint.** The gate reads the kept range behind the newest summary too, and the record store keeps a durable "ever outside" flag, set by the first request with a source and never evicted. A summary made after it is outside, however many source-free requests have come since, so the 256-record cap can't drop the taint.
+Provenance holds by construction: every message the model can see carries its own sources, written in the commit that writes it. Nothing re-derives the conversation's window afterwards, and no record of it is kept beside pi-durable's.
+
+- **A request's sources** are the union over the messages it actually sends, from pi-durable's own context for that request (the messages `toModelRequest` is handed), plus the server of every tool it offers that the person hasn't reviewed as it is now, whose description is the server's word. They're worked out before the request is sent.
+- **Each kind of message has one rule** (`journal/provenance.ts`):
+  - a reply carries its request's sources inline, as a `familiarSources` list on the stored message;
+  - a server tool's result carries its server, from its `__` name;
+  - a built-in's result carries `details.sources`: the sources of the stored data it read, which a built-in read must name (`step.readFrom`), or its result counts as outside. A result the harness or the gate wrote itself (no such tool, bad arguments, refused, cut off) carries none;
+  - her line's note carries `familiarSources` beside its data (2.1);
+  - a compaction summary carries the summarized set (below);
+  - the person's own messages, and pi-durable's system messages (Familiar's instructions and the tool list), carry none.
+- **Missing counts as outside.** A reply, result or note with no sources recorded, or a message of a kind the rule doesn't know, stands for `unrecorded`, which is a source.
+- **"Always" follows the call's own request.** The gate reads the sources the calling reply carries, found through the tool task's own input (the reply's entry), with no scan and no bound. A nested call, or a reply with no such call or no sources, is outside. So a later call in the same round, after a server result came back, still gets "always" if its own request was clean, and the next request, which carries that result, is outside. A reply made with outside input carries it on, so once a conversation's context holds outside content, every later reply does too, until a compaction summarizes it, and the summary then carries it.
+- **A summary carries what it summarized.** pi-durable builds the summary's message itself, so it can hold no field of Familiar's. Instead, one `beforeCompact` hook, which decides nothing, records the sources of exactly the entries the summary replaces, by the same rule, into the summarized set (`familiar.summarized`) before the summary is asked for. The set only grows. That is exact, not merely cautious: the head marker, the earlier summary, is among the replaced entries, and a summary carries the one before it forward. A summary while no hook has recorded the set counts as outside. A compaction that fails after its hook ran leaves its range in context, where each message's own rule counts it; the hook runs again after a crash and adds the same set.
+- **The ground it stands on, pinned by tests** (`tests/journal/provenance.test.ts`): entries never change and compaction never removes them; a reply's `familiarSources` survives a restart unchanged; a built-in result's `details` reach the next request's context; and every model-visible message Familiar writes carries its sources. While a request is outside, "always" doesn't apply, and a card offers no Always.
+- **Stored notes and reminders keep their sources.** A built-in write is handed its request's sources (`step.sources`) to keep with what it stores, so a later read names them. No built-in note or reminder store ships yet; the first one keeps them.
 - **An acknowledgement is decided once**, after its commit wins, so two sends of one request id run the decider once. One resent after its record has left the newest 256 gets a quiet decision: no new reaction, and never a second reply.
 
 ### 5.7 Messages from other windows, and reserved headers
@@ -735,7 +745,7 @@ Each check names a test (T1 to T14), a harness check (H1 to H14), or the walk (W
 | G9 | The last check and the handoff are one synchronous step, and the body and its headers are the decision's | 3.6 | T2 (check, then an `await`, then hand off); H3 (an `await` before the handoff with a revoke in it; the body from the model's arguments); H11 (mirror `Mcp-Param-*` from another call's arguments; truncate an over-long header) |
 | G10 | A yes covers only what the card showed | The card's facts are stored when it's made (5.5) | T7 (h), and H3 under S1 (mint from the step id; ignore the fingerprint) |
 | G11 | A revoke holds at once | The overlay, read synchronously by `send` (5.5) | T2, T3 (the revoke waits for the owner) |
-| G12 | "Always" never acts on outside content | The outside record, her remark included (5.6, 2.1) | T9 (a remark without sources) |
+| G12 | "Always" never acts on outside content | Each message's own sources, her line's included (5.6, 2.1) | T9 (a remark without sources); a reply stored with no sources; a summary recorded without its sources |
 | G13 | A client message carries no authority | Presentation id and button only; drafts validated by core (5.7) | T10 (accept a client's fingerprint; honour a button the card didn't offer) |
 | G14 | One exchange per server, cleanup included, across Stop and Start | The per-server slot and the barrier (3.1, 3.4) | H1 (free the slot at the response, before cleanup; admit while draining; send page n+1 before page n drains; key the slot per run, then Stop and Start during a drain, S8); W |
 | G15 | Only Familiar's own messages reach the wire, and nothing reaches a stopping run | A tagged serializer of six kinds, narrowed by the run's era; no SDK; the closed mark (3.2, 3.4) | H2 (a `DELETE` at Stop; a remote cancel; a pong after its exchange ended; the local cancel after the seal; no closed mark at Stop, S11); H12 (a modern run builds `initialized`, answers a stray ping or sends a session id; a retry after `input_required`) |
@@ -917,6 +927,8 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `hide-send-now`: hide Send now after a fault | H8 |
 | `remark-no-failure-check`: drop the `runFailure` check from her line | H9 |
 | `answers-by-step`: card answers keyed by step id, not presentation | T7 (i) |
+| `reply-sources-empty`: a reply, or her line's note, stored with no sources | G12, in `tests/journal/provenance.test.ts` |
+| `summary-sources-dropped`: the summarized set recorded without what the summary replaced | G12, in `tests/journal/provenance.test.ts` |
 
 **Mutations with no control, and why:**
 
@@ -963,7 +975,7 @@ States are deduplicated exactly: a set of the canonical state's JSON, compared b
 | T6 | Names over successive catalogs: random adds and removes of servers whose labels clash; `<key>__<tool>` maps to one server and tool for the whole history | `tests/mcp/names.property.test.ts` |
 | T7 | A bound yes through the journal: a server call killed mid-call is interrupted, with Run again, and never sent again; "always" runs a call only while nothing outside is in the conversation; a changed tool asks again, with the facts read now; one server's "always" never allows another's saved tool; (h) the catalog changes while the card is shown, and the yes mints nothing; (i) S9, a duplicated Yes from the first card answers nothing on the second; (j) two identical calls, each approved on its own card, each go out once | `tests/mcp/journal.test.ts`, `tests/mcp/client.test.ts`, `tests/mcp/t-suite.test.ts` |
 | T8 | Test while running is refused | `tests/mcp/t-suite.test.ts` |
-| T9 | The outside record, her remark included: a remark made while a server result is in context carries that server's source, the next request is outside, "always" asks, and the card offers no Always. The control: the same remark without sources | `tests/journal/ground.test.ts` |
+| T9 | Each message's own sources, her line's included: a remark made while a server result is in context carries that server's source, the next request is outside, "always" asks, and the card offers no Always. The control: the same remark without sources | `tests/journal/ground.test.ts` |
 | T10 | Messages from other windows: a card answer carries a presentation id and a button, nothing else is read, a button not offered is a Skip, and each presentation answers once; a setup can't give Familiar's own headers, in any case | `tests/mcp/windows.test.ts` |
 | T11 | One exchange per server, and everything it causes: a remote server that ignores cancellation and trickles; a local server that stops reading with a call larger than the pipe; a priming event then an early end; a large result in many raw chunks reaching the caller whole before the POST is cancelled; local cancel writes held in their exchange. The pass build adds the exe's write bound with the renderer killed, and the runner's `net.total-deadline` | `tests/mcp/wire.test.ts`, `tests/mcp/wire-modern.test.ts` |
 | T12 | Reservations: one fresh grant for one ref of a saved server, held until acknowledged by its id and ref, used once; a grant never acknowledged holds the owner until the exe restarts, and is nothing after | `tests/mcp/windows.test.ts` |

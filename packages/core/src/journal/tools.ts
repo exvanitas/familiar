@@ -14,6 +14,7 @@ import { defineDoc, defineTool } from '@earendil-works/pi-durable';
 import { mintDecision, type CardFacts } from '../mcp/decision.ts';
 import type { JsonValue } from '../model/port.ts';
 import type { JsonSchema } from '../model/port.ts';
+import { UNRECORDED } from './provenance.ts';
 
 export type ToolKind = 'read' | 'write' | 'effect' | 'server';
 
@@ -50,6 +51,16 @@ export interface ToolStep {
    * are matched by their order within the step, so a rerun must make them in the same order.
    */
   write<T extends JsonValue>(change: (tx: WriteTx) => T | Promise<T>): Promise<T>;
+  /**
+   * The outside sources of the request that made this call (5.6), for a write to keep with what it stores,
+   * so a later read of it carries them on.
+   */
+  readonly sources: readonly string[];
+  /**
+   * Names the sources of stored data this run read (5.6): its result carries them, so the request that
+   * reads the result is outside if they are. A built-in read that never says counts as outside.
+   */
+  readFrom(sources: readonly string[]): void;
 }
 
 export interface FamiliarTool {
@@ -99,6 +110,8 @@ export type AllowedBy = 'always' | 'asked';
     bound to consent, and whether the request carried outside content. */
 export interface Allowed {
   readonly allowedBy: AllowedBy;
+  /** The outside sources of the request that made the call: what its reply carries (5.6). */
+  readonly sources?: readonly string[];
   readonly facts?: CardFacts;
   readonly outside?: boolean;
 }
@@ -116,17 +129,26 @@ export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
       // The gate again, inside the tool: a call pi-durable recovers after a crash (a read or a built-in
       // write, run again) never passes `beforeTool`, so it's checked here against today's policy.
       const verdict = await gate?.({ name: tool.name, arguments: args, ...(typeof api?.callId === 'string' ? { id: api.callId } : {}) }, api, context);
-      if (verdict && 'refused' in verdict) return { isError: true, output: [{ type: 'text', text: verdict.refused }] };
+      if (verdict && 'refused' in verdict) return { isError: true, output: [{ type: 'text', text: verdict.refused }], details: { sources: [] } };
       // The gate mints here, inside the execute, from the facts it checked: a tool bound to consent gets
       // its one-use decision, or nothing runs.
       let decision: unknown;
       if (tool.consent) {
         const facts = verdict?.facts;
         decision = facts && verdict ? mintDecision(facts, String(api.taskId), verdict.allowedBy, verdict.outside ?? true) : undefined;
-        if (!decision) return { isError: true, output: [{ type: 'text', text: 'Familiar had no consent it could bind to this exact call, so it was not sent.' }] };
+        if (!decision) return { isError: true, output: [{ type: 'text', text: 'Familiar had no consent it could bind to this exact call, so it was not sent.' }], details: { sources: [] } };
       }
       let writes = 0;
+      // A read says what it read; anything else reads nothing stored, so its words are the person's, the
+      // model's (whose sources are already in the request), or the tool's own.
+      const read = new Set<string>();
+      let said = false;
       const step: ToolStep = {
+        sources: verdict?.sources ?? [UNRECORDED],
+        readFrom: (sources) => {
+          said = true;
+          for (const s of sources) read.add(String(s));
+        },
         id: String(api.taskId),
         signal: context?.abortSignal,
         ...(verdict ? { allowedBy: verdict.allowedBy } : {}),
@@ -144,7 +166,8 @@ export function toDurableTool(tool: FamiliarTool, gate?: Gate) {
         }
       };
       const out = await tool.run(args, step);
-      return { output: [{ type: 'text', text: out }] };
+      if (tool.kind === 'read' && !said) read.add(UNRECORDED);
+      return { output: [{ type: 'text', text: out }], details: { sources: [...read].sort() } };
     }
   } as any);
 }

@@ -179,6 +179,10 @@ async function within<T>(p: Promise<T>, fallback: T, ms = 2000): Promise<T> {
 /** One seeded run. */
 export async function journalRun(seed: number, options: JOptions = {}): Promise<JRun> {
   mutations.set(options.mutation ? [options.mutation] : []);
+  // The run's random ids (a card's presentation, a reservation's id, her line's key) come from the seed, so
+  // a mutant and its twin write the same ones and the twin rule can compare what they wrote.
+  const random = Math.random;
+  Math.random = rng(seed * 104729 + 17);
   const d = new JDriver(seed, options.mutation, options.turnTokens ?? TURN_TOKENS);
   try {
     await d.open();
@@ -186,6 +190,7 @@ export async function journalRun(seed: number, options: JOptions = {}): Promise<
     else await d.randomActions(options.steps ?? 40);
     await d.close();
   } finally {
+    Math.random = random;
     mutations.clear();
   }
   return { log: d.rec.log, evidence: d.evidence, steps: d.steps, firstHit: d.firstHit, stepCap: STEP_CAP, problems: d.problems };

@@ -11,7 +11,7 @@ import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
 import { nodeNetPort } from './node-net.ts';
 import { callWithYes } from '../../src/testing/consent.ts';
-import { createCardDesk, OutsideDoc, type ConsentCard, type ConsentPort } from '../../src/index.ts';
+import { createCardDesk, type ConsentCard, type ConsentPort } from '../../src/index.ts';
 import { mutations } from '../../src/mutations.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
@@ -194,9 +194,6 @@ describe('a server tool in the turn loop', () => {
     expect(cards).toHaveLength(1);
     expect(cards[0]!).toMatchObject({ always: false, facts: { tool: 'echo' } });
     expect(echoCalls(one.port)).toBe(1);
-    // The request's own outside record names the server, from its tool list alone.
-    const outside: any = await one.journal.read(OutsideDoc);
-    expect(Object.entries(outside.requests).some(([k, v]: [string, any]) => k.startsWith('request:') && v.sources.includes('server:fakeserver'))).toBe(true);
     await one.journal.close();
   });
 

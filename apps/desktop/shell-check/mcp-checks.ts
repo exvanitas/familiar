@@ -37,7 +37,7 @@ import { escapedCopyCheck } from './escaped.ts';
 
 interface Typed { head: string; tail: string; length: number }
 
-const noWrites: ToolStep = { id: 'mcp-check', write: async () => fail('a server tool made a built-in write') };
+const noWrites: ToolStep = { id: 'mcp-check', sources: [], readFrom: () => {}, write: async () => fail('a server tool made a built-in write') };
 // Each call goes through `send` with a decision, as the journal's gate would mint after a Yes.
 const run = (t: ServerTool | undefined, args: object) => (t ? runWithYes(t, args, noWrites) : Promise.reject(new Error('no such tool')));
 const TOOLS = 11;
