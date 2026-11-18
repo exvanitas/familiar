@@ -460,6 +460,74 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
 
 /* ---------- 2.7: the recovered-run gate ---------- */
 
+describe('5.6: outside content survives a compaction', () => {
+  it('a server result in the range a compaction keeps, then 300 requests with no sources: "always" still asks', async () => {
+    const { IDBFactory } = await import('fake-indexeddb');
+    const { openJournal, openJournalStore, decideByRules } = await import('../../src/index.ts');
+    const { createFakeModel } = await import('../../src/testing/index.ts');
+    const { memoryOwner } = await import('./node-env.ts');
+    const { sha256 } = await import('../../src/mcp/hash.ts');
+    const { isSummary } = await import('./pi-durable-world.ts');
+    const cards: any[] = [];
+    let summaries = 0;
+    const tool = {
+      name: 'srv__look',
+      description: 'A server tool.',
+      inputSchema: { type: 'object', properties: {} },
+      kind: 'server' as const,
+      doing: () => 'looking on the server',
+      consent: { facts: () => ({ server: 'srv', tool: 'look', run: 'r1', launch: 'L', fingerprint: 'F', canonical: '{}', hash: sha256('{}') }) },
+      run: async () => 'looked'
+    };
+    // Every reply reports a context near the window, so a long history is summarized inside the turn.
+    const big = { inputTokens: 9000, outputTokens: 5 };
+    const model = createFakeModel((r: ModelRequest) => {
+      if (isSummary(r)) return (summaries++, { text: 'SUMMARY' });
+      if (r.system === 'One line.') return { text: 'Hi.' };
+      // Her lines merge into the user message before yours (2.1), so it ends with yours.
+      if (lastUser(r).endsWith('Look it up.') && r.messages.at(-1)?.role !== 'tool') return { toolCalls: [{ id: `c${r.messages.length}`, name: 'srv__look', arguments: {} }], usage: big };
+      return { text: 'Done.', usage: big };
+    });
+    const journal = await openJournal({
+      store: await openJournalStore(`f42-${Math.random()}`, { indexedDB: new IDBFactory() as any }),
+      owner: memoryOwner(),
+      model,
+      modelId: 'fake-1',
+      caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
+      tools: [tool as any],
+      policy: () => ({ perTool: { srv__look: 'allow' } }),
+      wake: { wakeAt: () => {} },
+      notifier: { notify: () => {} },
+      consent: { ask: async (card) => { cards.push(card); return true; } },
+      presence: { report: () => {} },
+      persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
+      decider: { decide: async (event, context) => decideByRules(event, context) },
+      ambient: () => ({ persona: { sketch: 'kind', interests: [] }, chattiness: 'medium', doNotDisturb: false, fullscreen: false, sentAway: false, chatInFront: true, teaserDue: false }),
+      resendDelayMs: 50
+    });
+    const say = async (text: string, id: string) => {
+      const t = await journal.send(text, id);
+      if (t.replied) await t.turn.wait();
+    };
+    for (let k = 0; k < 2; k++) await say(`Earlier notes ${k}: ${'lorem ipsum dolor sit amet '.repeat(1800)}`, `e${k}`);
+    // A clean chat: "always" runs the call, and its result is the server's word from here on.
+    await say('Look it up.', 'look-1');
+    expect(cards).toEqual([]);
+    await say(`Later notes: ${'lorem ipsum dolor sit amet '.repeat(1800)}`, 'later');
+    expect(summaries).toBeGreaterThan(0);
+    // 300 requests with no sources of their own (her lines), more than the outside records keep.
+    for (let i = 0; i < 300; i++) await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say something.' }], sources: [] });
+    await say('Look it up.', 'look-2');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ always: false });
+    // Both halves: the kept range was read (its server result), and the summary counts as outside although
+    // every record from before it is gone.
+    const outside: any = await journal.read(OutsideDoc);
+    expect(outside.requests[outside.order.at(-1)].sources).toEqual(['compacted', 'server:srv']);
+    await journal.close();
+  }, 120_000);
+});
+
 describe('2.7: a run recovered after a restart never gets server tools', () => {
   it('its server call is refused in words and never starts; the next message\'s run can call it', async () => {
     const world = nodeWorld();

@@ -208,10 +208,11 @@ export const AnswersDoc = defineJournalDoc<Answers>('familiar.answers', () => ({
 /** Each Send now by its request id: the submission it was shown for, and the continue it started. */
 export const SendNowDoc = defineJournalDoc<{ byRequest: Record<string, { submission: string; sent?: string }>; order: string[] }>('familiar.send-now', () => ({ byRequest: {}, order: [] }));
 /**
- * The outside record: one per request Familiar makes outside a turn (her line), written before the
- * request is sent and never changed. A request is outside if any of its input carries a source.
+ * The outside record: one per request (a turn's, or her line's), written before the request is sent and
+ * never changed. A request is outside if any of its input carries a source. The newest 256 are kept;
+ * `everOutside`, set by the first record with a source, is kept for good, for summaries (5.6).
  */
-export const OutsideDoc = defineJournalDoc<{ requests: Record<string, { sources: string[]; at: number }>; order: string[] }>('familiar.outside', () => ({ requests: {}, order: [] }));
+export const OutsideDoc = defineJournalDoc<{ requests: Record<string, { sources: string[]; at: number }>; order: string[]; everOutside?: true }>('familiar.outside', () => ({ requests: {}, order: [] }));
 const RemarkEntry = 'familiar.remark';
 /** Records kept per document before the oldest go. */
 const KEEP_RECORDS = 256;
@@ -378,24 +379,33 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
   // "go on", by its id in the turn registry (turns.ts).
   const turnOf = async (): Promise<string> => turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
   /**
-   * The sources of everything in the conversation's current context, newest first back to its start (the
-   * newest head marker): a server tool's result carries its server, her remark the sources it was made
-   * from. A context that starts at a compaction summary counts as outside if any request ever was, since a
-   * summary made while handling outside content carries it (5.6). A request is outside if this is not empty.
+   * The sources of everything in the conversation's current context, newest first back to its start: a
+   * server tool's result carries its server, her remark the sources it was made from. A compaction's
+   * marker (the newest entry with a head) starts the context at its head, so the entries it kept verbatim,
+   * between its head and itself, are read too. Its summary counts as outside if any request ever was,
+   * since a summary made while handling outside content carries it (5.6): read from the outside
+   * document's durable flag, which no number of later requests evicts. Not empty: the request is outside.
    */
   const contextSources = async (): Promise<string[]> => {
     const out = new Set<string>();
+    let floor: number | undefined;
     let cursor: unknown;
     for (let pages = 0; pages < 64; pages++) {
       const page = await root.entries({ order: 'descending' }, 100, cursor, ctx);
       for (const e of page.items) {
+        if (floor !== undefined && Number(e.id) < floor) return [...out].sort();
         if (e.kind === RemarkEntry) for (const src of e.data?.sources ?? []) out.add(String(src));
         const m = e.model?.[0];
         if (m?.role === 'toolResult' && typeof m.toolName === 'string' && m.toolName.includes('__')) out.add(`server:${m.toolName.slice(0, m.toolName.indexOf('__'))}`);
         if (e.head !== undefined || e.kind === 'pi.compaction') {
           const records: any = await harness.snapshot(OutsideDoc, ctx);
-          if (Object.values(records?.requests ?? {}).some((r: any) => (r.sources ?? []).length > 0)) out.add('compacted');
-          return [...out].sort();
+          if (records?.everOutside || Object.values(records?.requests ?? {}).some((r: any) => (r.sources ?? []).length > 0)) out.add('compacted');
+          // The newest marker sets where the context starts; with no head to read, it starts here.
+          if (floor === undefined) {
+            const head = Number(e.head);
+            if (e.head === undefined || !Number.isFinite(head) || head > Number(e.id)) return [...out].sort();
+            floor = head;
+          }
         }
       }
       if (!page.next) break;
@@ -418,6 +428,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     await harness.commit(async (tx: any) => {
       const doc = await tx.doc(OutsideDoc);
       doc.requests[key] = { sources: [...sources].sort(), at: clock.now() };
+      // Kept for good: the records go after 256, but a summary made now carries what was outside.
+      if (sources.size > 0) doc.everOutside = true;
       keepNewest(doc.order, doc.requests, key);
     }, ctx);
     return key;
@@ -1162,6 +1174,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       await harness.commit(async (tx: any) => {
         const doc = await tx.doc(OutsideDoc);
         if (!doc.requests[key]) doc.requests[key] = { sources, at: clock.now() };
+        if (sources.length > 0) doc.everOutside = true;
         keepNewest(doc.order, doc.requests, key);
       }, ctx);
       // One request, no tools, through the caps under its own key: never resumable, so its reservation
