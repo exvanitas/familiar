@@ -29,18 +29,28 @@ describe('Stop during a native start', () => {
       },
       async stop(run) {
         stops.push(run);
-        queueMicrotask(() => emits.get(run)!({ t: 'exit', code: 0 }));
+        // The exit comes later, on its own timer, never in the stop's own step.
+        setTimeout(() => emits.get(run)!({ t: 'exit', code: 0 }), 20);
       },
       async forget() {}
     };
     const link = new ServerLink('s', { processes: port }, realClock, { ended: () => {} });
     const started = link.start(local, 'L');
     await sleep(5);
-    await link.stop();
+    let stopped = false;
+    const stopping = link.stop().then(() => (stopped = true));
+    await sleep(10);
+    // Stop waits out the pending native start: nothing is stopped yet, and Stop hasn't answered.
+    expect(stopped).toBe(false);
     held = false;
     release();
+    await sleep(5);
+    expect(stops).toEqual(['p9']);
+    expect(stopped).toBe(false);
+    await stopping;
     const r = await started;
     expect(r.ok).toBe(false);
+    // One native stop, and the exit came before Stop answered.
     expect(stops).toEqual(['p9']);
     // The exit was awaited before the start answered: the next Start is admitted at once.
     const again = await link.start(local, 'L');
@@ -87,5 +97,37 @@ describe('Stop with a live local exchange', () => {
     emit({ t: 'exit', code: 0 });
     await stopping;
     expect((await call).kind).toBe('interrupted');
+  });
+});
+
+describe('Stop during the handshake', () => {
+  it('answers only after the exit, which comes on a later timer, with exactly one native stop', async () => {
+    let emit!: (e: ProcessEvent) => void;
+    const stops: string[] = [];
+    let exited = false;
+    const port: ProcessPort = {
+      async start(_s, on) {
+        emit = on;
+        return { run: 'p1' };
+      },
+      // initialize is never answered: the handshake is under way when Stop comes.
+      async write() {},
+      async stop(run) {
+        stops.push(run);
+        setTimeout(() => {
+          exited = true;
+          emit({ t: 'exit', code: 0 });
+        }, 30);
+      },
+      async forget() {}
+    };
+    const link = new ServerLink('s', { processes: port }, realClock, { ended: () => {} });
+    const started = link.start(local, 'L');
+    await sleep(5);
+    await link.stop();
+    expect(exited).toBe(true);
+    expect((await started).ok).toBe(false);
+    await sleep(40);
+    expect(stops).toEqual(['p1']);
   });
 });

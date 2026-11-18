@@ -655,7 +655,7 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **A server Stop during a call** answers the call "interrupted": the run ends under it (3.11).
 - **A start reads the committed launch** in the same synchronous step as its admission. Edits need Stopped.
 - **Nothing is ever resent.** A call while not Ready is refused "not running", and a call is never sent again on any path.
-- **Stop waits** for the exe's answer and the exit, with no deadline of its own. A start the exe never answers stays Starting, holding the owner, until a restart. That's unbounded by design.
+- **Stop waits** for the exe's answer and the exit, with no deadline of its own: a local Stop answers only once the process has exited. A Stop while the native start is still pending waits that start out first; the start then stops what it started. Each run is stopped natively once, whoever asks first (Stop, or the run's own end). A stop the exe refuses answers once the run has ended, and its writes and the slot still wait for the exit. A start the exe never answers stays Starting, holding the owner, until a restart. That's unbounded by design.
 - **One exchange per server** (3.4). A call's timeout, or stopping the call, ends that call only.
 - **Test runs only while Stopped:** an admitted start, the tool list, then a stop. A failed Test leaves the server Stopped. "Mark reviewed" after it is a change.
 - **Mark reviewed is bound to what Test showed.** Each tool is marked reviewed at the fingerprint Test showed it with, never at whatever the saved list holds when the change lands. A tool a run lists changed between Test and the press stays unreviewed, and asks to be reviewed again. Settings passes Test's report; a bare tool name means the fingerprint the last Test of that server showed, and a name that Test didn't show is marked nothing.
@@ -888,13 +888,15 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `remote-cancel`: send a cancel to a remote server | H2 |
 | `local-cancel-after-seal` | H2 (a write after the terminal event) |
 | `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
+| `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |
+| `stop-twice`: Stop and the run's end each ask the exe to stop the process | H2 under S11, during initialize |
 | `no-write-bound`: no interim page bound on a local write | H1 under S18 |
 | `release-on-refused-cancel`: free the slot on a refused `net_cancel` or stop | H1 |
 | `publish-stale-walk`: publish a walk's catalog though `list_changed` came during it | H3 under S14 |
 | `decoder-per-chunk`: a new decoder for each read | H10 |
 | `cr-forgets-pair`: an LF after a read-ending CR read as an empty line | H10 |
 | `late-detach`: detach a held helper at 1.5 s | H4 under S8, pass build |
-| `drop-pong-before-flood`: drop a ping silently before a flood | H13 |
+| `drop-pong-before-flood`: drop a ping silently before a flood | H13, remote and local |
 | `mirror-wrong-value`: a mirrored value that isn't the body's | H11 |
 | `era-change-on-recovery`: a re-handshake's modern refusal turns the run modern | H12 under S15 |
 | `end-on-refresh-404`: end the run on a refresh page's 404 | H14 under S16 |

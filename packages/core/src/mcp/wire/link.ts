@@ -123,6 +123,10 @@ interface Run {
   /** Resolves when the exe says a local run's process has exited. */
   readonly exit: Promise<void>;
   sawExit: () => void;
+  /** Resolves when a local run's native start has answered, whether or not a process came of it. */
+  readonly launched: Promise<void>;
+  /** The one native stop of a local run's process: asked once, whoever asks first (Stop, or the run's end). */
+  stopCall?: Promise<void>;
   /** Stop has begun: set synchronously before Stop awaits anything, so no exchange is admitted after it. */
   closing?: boolean;
   nextId: number;
@@ -214,7 +218,9 @@ export class ServerLink {
     const over = new Promise<void>((r) => (finish = r));
     let sawExit!: () => void;
     const exit = new Promise<void>((r) => (sawExit = r));
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, changes: 0, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit };
+    let launchedNow!: () => void;
+    const launched = new Promise<void>((r) => (launchedNow = r));
+    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, changes: 0, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit, launched };
     this.run = run;
     if (target.where === 'local') {
       const processes = this.ports.processes!;
@@ -223,13 +229,16 @@ export class ServerLink {
         run.process = started.run;
       } catch (e) {
         run.ended = true;
+        run.finish();
+        launchedNow();
         options.launched?.();
         return { ok: false, failure: startFailure(e, target.setup.program, target.setup.secrets) };
       }
+      launchedNow();
       // Stopped while the exe was still starting it: the process it then started is stopped here, and its
       // exit awaited, before the start answers, so the next Start meets no orphan.
       if (run.closing || (run.ended && !run.exited)) {
-        await this.ports.processes!.stop(run.process).catch(() => {});
+        await this.stopProcess(run).catch(() => {});
         await run.exit;
         this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
         options.launched?.();
@@ -291,9 +300,20 @@ export class ServerLink {
       if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
     }
     // The run's end answers a call in flight "interrupted, it may have partly run" (3.11).
-    if (run.target.where === 'local' && run.process !== undefined) {
-      // Waits for the exe's answer and the exit, with no deadline of its own (5.4).
-      await this.ports.processes!.stop(run.process).catch(() => {});
+    if (run.target.where === 'local') {
+      // A native start still pending is waited out first: the start itself then stops what it started.
+      if (run.process === undefined) await run.launched;
+      if (run.process === undefined) return;
+      // Waits for the exe's answer and the exit, with no deadline of its own (5.4): Stop answers only once
+      // the process is gone. One native stop per run, whoever asks first. A stop the exe refuses answers
+      // once the run has ended; its writes, and the slot, still wait for the exit (H1).
+      if (!run.exited) {
+        const asked = await this.stopProcess(run).then(
+          () => true,
+          () => false
+        );
+        await (asked && !(__FAMILIAR_MUTATIONS__ && mutant('stop-before-exit')) ? run.exit : run.over);
+      }
       await run.over;
       return;
     }
@@ -952,10 +972,16 @@ export class ServerLink {
       // when the exe says the process has exited, not before, so a blocked write keeps the slot (H1).
       // Remote requests end through net_cancel.
       // A refused stop releases nothing: the writes end only when the exe says the process has exited.
-      if (run.process !== undefined && !run.exited) void this.ports.processes!.stop(run.process).catch(() => ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel')) ? this.releaseWrites(run) : undefined));
+      if (run.process !== undefined && !run.exited) void this.stopProcess(run).catch(() => ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel')) ? this.releaseWrites(run) : undefined));
       else this.releaseWrites(run);
     }
     if (report) this.events.ended(run.id, failure);
+  }
+
+  /** The run's one native stop: asked the first time, the same answer after. */
+  private stopProcess(run: Run): Promise<void> {
+    if ((__FAMILIAR_MUTATIONS__ && mutant('stop-twice'))) return this.ports.processes!.stop(run.process!);
+    return (run.stopCall ??= this.ports.processes!.stop(run.process!));
   }
 
   /** A local run's process is gone: its exchange's writes have ended. */
