@@ -345,7 +345,7 @@ The machine is a pure function (`wire/exchange.ts`): the state and one input giv
 
 **The closed mark at Stop.** `stop()` marks the run closed synchronously, before any await, for local and remote servers alike, and in the same step ends the run's live exchange ("interrupted"). A local Stop then waits for the exe and the exit, and in that window nothing reaches the stopping server: every admission path (a walk's next page, a handshake step, `send`, an idle ping's pong) refuses a closed run, and the ended exchange sends no pong and takes no reply. Its writes still end only at the exit. A Stop that comes while the exe is still starting a local server is met when the start returns: the process it started is stopped, and its exit awaited, before the start answers, so the next Start meets no orphan.
 
-**Cleanup the exe refused.** A refused `net_cancel` is tried again 1, 2 and 4 s later; after that the run ends ("Familiar couldn't end a request to the server"), and the request stays counted. A refused `server_stop` releases nothing. The slot never frees on cleanup the exe didn't confirm.
+**Cleanup the exe refused.** A refused `net_cancel` is tried again 1, 2 and 4 s later; after that the run ends ("Familiar couldn't end a request to the server. Restart Familiar to use it again."), and the request stays counted. The slot is then held for good: every later Start and Stop answers with those words, and an exchange waiting for the slot (a start parked between its handshake's steps) stops waiting at once with them. A refused `server_stop` releases nothing. The slot never frees on cleanup the exe didn't confirm.
 
 **The barrier.** The next exchange starts only from Idle. So a server never has two exchanges' native requests open at once. That holds for pages, handshake steps, calls, and a Stop followed by a Start, cleanup included. At most 3 native requests are ever open per remote server (the request and two pongs), and at most 4 per local server, counting a Stop's cancel write beside them. The barrier's bound is on native lifetimes: each request or write ends within its native bound. How long a server takes to answer is the call's own time limit, not the barrier's.
 
@@ -658,7 +658,7 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **Nothing is ever resent.** A call while not Ready is refused "not running", and a call is never sent again on any path.
 - **Stop waits** for the exe's answer and the exit, with no deadline of its own: a local Stop answers only once the process has exited. A Stop while the native start is still pending waits that start out first; the start then stops what it started. Each run is stopped natively once, whoever asks first (Stop, or the run's own end). A stop the exe refuses answers once the run has ended, and its writes and the slot still wait for the exit. A start the exe never answers stays Starting, holding the owner, until a restart. That's unbounded by design.
 - **One exchange per server** (3.4). A call's timeout, or stopping the call, ends that call only.
-- **Test runs only while Stopped:** an admitted start, the tool list, then a stop. A failed Test leaves the server Stopped. "Mark reviewed" after it is a change.
+- **Test runs only while Stopped:** an admitted start, the tool list, then a stop. A failed Test leaves the server Stopped. Test acts on its own run only: a Stop (or a Stop and a Start) while its catalog write is saving means Test reports no success, and Test's own stop never touches a run started since. A catalog write that fails stops the run it was for, and the start answers failed in words; it never throws. "Mark reviewed" after it is a change.
 - **Mark reviewed is bound to what Test showed.** Each tool is marked reviewed at the fingerprint Test showed it with, never at whatever the saved list holds when the change lands. A tool a run lists changed between Test and the press stays unreviewed, and asks to be reviewed again. Settings passes Test's report; a bare tool name means the fingerprint the last Test of that server showed, and a name that Test didn't show is marked nothing.
 
 ### 5.5 Consent: `ToolDecision`, the card's facts and the canonical form
@@ -893,6 +893,8 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `declarations-in-order`: declarations hashed in the order found | `tests/mcp/regress/walk.test.ts` |
 | `relaunch-on-answer`: the stdio relaunch after a list answered with a refusal | H12 under S22; `tests/mcp/regress/relaunch.test.ts` |
 | `relaunch-races-exit`: no wait for an exit that lags a closed pipe | `tests/mcp/regress/relaunch.test.ts` |
+| `forget-exhaustion`: after cleanup refused for good, Start answers the ordinary busy words | H1 under S24 |
+| `ready-after-stop`: a start answers ready though Stop came during its catalog write | H15 under S19 |
 | `media-prefix`: a media type read by its prefix (`application/jsonp` as JSON) | H10 under S21 |
 | `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |

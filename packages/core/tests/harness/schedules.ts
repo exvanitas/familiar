@@ -178,14 +178,17 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
-    // S24: the exe refuses every net_cancel: the run ends, the slot stays held, and Start says why (H1).
+    // S24: the exe refuses every net_cancel: the run ends, the slot stays held, and Stop and Start say why (H1).
     name: 'S24 cleanup refused for good',
     options: {
       mode: { ...quiet, refuseCancelAlways: true },
       schedule: (d) =>
         d.when('ready', () => d.idle(), () => {
           d.call('echo');
-          d.when('failed', () => d.client.get('s1')?.phase === 'failed', () => d.start());
+          d.when('failed', () => d.client.get('s1')?.phase === 'failed', () => {
+            d.stop();
+            d.start();
+          });
         })
     },
     expect: (r) => (r.evidence.filter((e) => e.what === 'start').length >= 2 ? undefined : 'no Start after the cleanup failed')

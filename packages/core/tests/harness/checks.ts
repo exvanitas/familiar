@@ -123,6 +123,8 @@ export const H1: Check = (r) => {
     if (later) problems.push(`H1: ${later.body!.method} went to a server whose cleanup the exe refused for good`);
     const start = r.evidence.find((e) => e.what === 'started' && addressOf(e.server) === x.server && e.step > x.start && e.failure);
     if (start && !/[Rr]estart/.test(start.words ?? '')) problems.push(`H1: after cleanup failed for good, Start said "${(start.words ?? '').slice(0, 60)}"`);
+    const stop = r.evidence.find((e) => e.what === 'stopped' && addressOf(e.server) === x.server && e.step > x.start);
+    if (stop && !/[Rr]estart/.test(stop.words ?? '')) problems.push(`H1: after cleanup failed for good, Stop said "${(stop.words ?? 'stopped').slice(0, 60)}"`);
   }
   // A call refused busy never goes out afterwards.
   for (const e of r.evidence) {

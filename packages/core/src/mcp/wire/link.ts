@@ -176,6 +176,11 @@ export class ServerLink {
   /** Native request id per handle, remote. */
   private readonly natives = new Map<string, string>();
   private readonly idle: (() => void)[] = [];
+  /** Cleanup the exe refused for good: the slot is held until Familiar restarts, and these are the words. */
+  private stuck?: Failure;
+  private stuckNow!: () => void;
+  /** Resolves when the slot is held for good: an exchange waiting for it stops waiting. */
+  private readonly stuckAt = new Promise<void>((r) => (this.stuckNow = r));
   private runs = 0;
 
   readonly serverId: string;
@@ -193,6 +198,11 @@ export class ServerLink {
   }
 
   /* ---------- the slot, for the lifecycle and the tests ---------- */
+
+  /** Set once cleanup the exe refused for good has left the slot held until a restart: the words. */
+  get held(): Failure | undefined {
+    return this.stuck;
+  }
 
   /** Whether an exchange holds the slot, Live or Draining. */
   get busy(): boolean {
@@ -217,6 +227,8 @@ export class ServerLink {
    */
   async start(target: Target, launch: string, options: { readonly era?: Era; readonly launched?: () => void } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
     if (this.busy && (__FAMILIAR_MUTATIONS__ && mutant('slot-per-run'))) this.slot = emptySlot;
+    // Held for good: a restart is the only way back, and the words say so (not "try again in a moment").
+    if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { ok: false, failure: this.stuck };
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
@@ -334,6 +346,7 @@ export class ServerLink {
   /** The tool list again (Test, or after list_changed). A failed walk ends the run. */
   async list(): Promise<readonly ListedTool[] | Failure> {
     const run = this.run;
+    if (this.stuck) return this.stuck;
     if (!run || run.ended || !run.ready) return { kind: 'failed', words: 'The server is not running.' };
     // One walk at a time: one under way (between its pages the slot is idle) answers busy too.
     if (this.busy || (run.walker && !(__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk')))) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
@@ -599,7 +612,8 @@ export class ServerLink {
     // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
     // past the step's deadline, whatever a server keeps sending.
     for (;;) {
-      if (!this.early(kind)) await Promise.race([this.drained(), deadline.over]);
+      if (!this.early(kind)) await Promise.race([this.drained(), deadline.over, ...((__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion')) ? [] : [this.stuckAt])]);
+      if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { end: { t: 'run-ended' } };
       if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended || run.closing) return { end: { t: 'run-ended' } };
       // A walk begun under a session the server has since ended: nothing more of it goes out.
@@ -803,8 +817,13 @@ export class ServerLink {
       () => {
         if ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel'))) return this.input({ t: 'released', handle });
         if (attempt < 3) return void this.clock.setTimer(() => this.cancel(handle, attempt + 1), 1000 * 2 ** attempt, { background: false });
+        // For good: the slot stays held until a restart. Every later Start, and an exchange waiting for the
+        // slot (a start parked between its handshake's steps), answers with these words.
+        const failure: Failure = { kind: 'protocol', words: "Familiar couldn't end a request to the server. Restart Familiar to use it again." };
+        this.stuck = failure;
         const run = this.run;
-        if (run && !run.ended) this.endRun(run, { kind: 'protocol', words: "Familiar couldn't end a request to the server. Restart Familiar to use it again." }, true);
+        if (run && !run.ended) this.endRun(run, failure, true);
+        this.stuckNow();
       }
     );
   }

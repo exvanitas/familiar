@@ -17,6 +17,7 @@ import { remoteHeaders } from './remote.ts';
 import { processSetupOf, remoteTargetOf, setupFingerprint } from './setup.ts';
 import type { Failure, ListedTool, Reply } from './types.ts';
 import { LINK_LIMITS, ServerLink, type LinkClock, type LinkLimits, type NetPort, type Target } from './wire/link.ts';
+import { mutant } from '../mutations.ts';
 
 export type Phase = 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed';
 
@@ -181,13 +182,36 @@ export class ServerRuntime {
     this.runId = run;
     this.set('ready');
     // The catalog write is an owner effect of its own (5.1): Ready is answered once it has settled, so the
-    // next start (startEnabled's, say) finds the owner free.
-    await this.onListed(r.tools, () => run === this.runId);
+    // next start (startEnabled's, say) finds the owner free. A write that fails stops the run it was for:
+    // a start never answers by throwing, and never leaves a run going that it didn't answer ready.
+    try {
+      await this.onListed(r.tools, () => run === this.runId);
+    } catch {
+      if (this.runId === run) await this.stop();
+      return { kind: 'failed', failure: { kind: 'failed', words: "Familiar couldn't save the server's tool list, so it was stopped. Try again." } };
+    }
+    // Stopped, or stopped and started again, while the write was saving: this start's run is over, and
+    // it says so; it never answers for another run.
+    if ((this.startToken !== mine || this.runId !== run) && !(__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop'))) return { kind: 'stopped' };
     return { kind: 'ready' };
+  }
+
+  /** The current run's id, while Ready. */
+  get runNow(): string | undefined {
+    return this.phaseNow === 'ready' ? this.runId : undefined;
+  }
+
+  /** Stops the run only if it is still `run`: never a run started since. */
+  async stopRun(run: string): Promise<Reply> {
+    if (this.runId !== run) return { kind: 'stopped' };
+    return this.stop();
   }
 
   /** Stops the run and waits for its end. */
   async stop(): Promise<Reply> {
+    // Cleanup the exe refused for good: the words say a restart is the way back.
+    const held = this.link.held;
+    if (held && (this.phaseNow === 'stopped' || this.phaseNow === 'failed')) return { kind: 'failed', failure: held };
     if (this.phaseNow === 'stopped' || this.phaseNow === 'failed') return { kind: 'stopped' };
     if (this.phaseNow !== 'ready' && this.phaseNow !== 'starting') return { kind: 'refused', words: `It is ${this.phaseNow}.` };
     this.startToken++;

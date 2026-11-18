@@ -223,7 +223,9 @@ export class McpClient {
     if (!rt || !s) return { ok: false, failure: { kind: 'failed', words: 'No server is saved with that id.' } };
     if (rt.phase !== 'stopped' && rt.phase !== 'failed') return { ok: false, failure: { kind: 'busy', words: 'Stop the server to test it. Test never disturbs a running server.' } };
     const r = await rt.start();
-    if (r.kind !== 'ready') {
+    // Test's own run: the one it stops at the end, and the only one it reports.
+    const run = r.kind === 'ready' ? rt.runNow : undefined;
+    if (r.kind !== 'ready' || (run === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop')))) {
       rt.settle();
       const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: 'The server was stopped before it was ready.' };
       return { ok: false, failure };
@@ -232,7 +234,7 @@ export class McpClient {
     const named = rt.tools.map(t => ({ t, n: modelName(s.key, t.name) }));
     const tools = named.filter(x => 'name' in x.n).map(({ t }) => ({ ...t, fresh: fresh(saved.get(t.name), t.fingerprint) }));
     const notOffered = [...rt.notOffered, ...named.flatMap(({ t, n }) => ('reason' in n ? [{ name: t.name, reason: n.reason }] : []))];
-    await rt.stop();
+    if (run !== undefined) await rt.stopRun(run);
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
     const reviewed = s.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
     this.shown.set(id, new Map(tools.map(t => [t.name, t.fingerprint])));
