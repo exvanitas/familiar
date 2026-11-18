@@ -962,7 +962,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 - **S7, two interrupted steps in one round, then a kill, then Run again:** one question lists both, and one answer settles both (T13).
 - **S8, Stop then Start while a remote call's POST is still in `net_cancel`** (H1; H4 in the pass build).
 - **S9, a duplicated Yes from the first card arriving after the changed tool's card is shown** (T7 (i)).
-- **S10, server saturation:** 8 server helpers detached and hung, then each of 24 servers holds a call, then chat fetches a model (H5).
+- **S10, server saturation:** 4 server helpers detached and hung, then each of 24 servers holds a call, then chat fetches a model with 24 server requests open (H5). At 8 detached helpers the exe admits no server request at all, so 8 would never reach saturation.
 - **S11, Stop during a walk, or while Ready, then a call, and Stop during a live local call:** nothing reaches the stopping run after Stop, and no reply read after it answers the call; and a local Stop during `initialize` or `initialized`, which answers only after the exit, with one native stop (H2).
 - **S12, calls during a session recovery:** each refused as the run not being Ready, until the re-handshake's list completes (H14).
 - **S13, a call's time limit, or its stop, ends that call only:** the run stays Ready (T5's named case).

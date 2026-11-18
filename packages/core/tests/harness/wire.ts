@@ -329,6 +329,8 @@ export interface NativeRec {
   refused?: 'busy';
   /** A net_cancel the exe refused once, the request kept alive. */
   refusedCancel?: boolean;
+  /** Remote: how many list_changed notifications on this request reached the client's reads. */
+  changesDelivered?: number;
   /** A model fetch: how many server requests were open when it was made. */
   openServer?: number;
   /** How many net_cancels the exe refused for it. */
@@ -528,6 +530,7 @@ export class FakeExe {
                 if (plan && !plan.sse && plan.messages[0]) {
                   const m = plan.messages[0];
                   if (m.method === 'ping' && !st.rec.delivered.has(m.id)) st.rec.delivered.set(m.id, this.sched.step * 1000);
+                  if (m.method === 'notifications/tools/list_changed') st.rec.changesDelivered = (st.rec.changesDelivered ?? 0) + 1;
                   if (plan.final === 0 && st.rec.final === undefined) st.rec.final = this.sched.step * 1000;
                 }
                 return w.resolve(new Uint8Array(0));
@@ -541,6 +544,10 @@ export class FakeExe {
                   const held: Msg[] | undefined = (st as any).holdMsgs;
                   const m = held ? held[k] : plan.sse ? plan.messages[k] : plan.messages[0];
                   if (m?.method === 'ping' && !st.rec.delivered.has(m.id)) st.rec.delivered.set(m.id, this.sched.step * 1000 + k);
+                  if (m?.method === 'notifications/tools/list_changed' && !((st as any).changesSeen ??= new Set<number>()).has(k)) {
+                    (st as any).changesSeen.add(k);
+                    st.rec.changesDelivered = (st.rec.changesDelivered ?? 0) + 1;
+                  }
                   if (!held && k === plan.final && st.rec.final === undefined) st.rec.final = this.sched.step * 1000 + k;
                 }
               });

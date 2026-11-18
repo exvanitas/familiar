@@ -569,7 +569,8 @@ export const H14: Check = (r) => {
   for (const x of posts) runs.set(`${x.server}:${runOf(r, x)}`, [...(runs.get(`${x.server}:${runOf(r, x)}`) ?? []), x]);
   for (const [, recs] of runs) {
     const firsts = recs.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor === undefined).length;
-    const changes = recs.filter((x) => x.final !== undefined && x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed')).length;
+    // Each list_changed that reached the client's reads, whether or not its stream got to its end.
+    const changes = recs.reduce((n, x) => n + (x.changesDelivered ?? 0), 0);
     const recoveries = recs.filter((x) => x.body?.method === 'initialize').length - 1;
     const tests = r.evidence.filter((e) => e.what === 'test').length;
     if (firsts > 1 + changes + Math.max(0, recoveries) + tests) problems.push(`H14: ${firsts} walks on a run with ${changes} list_changed and ${Math.max(0, recoveries)} recoveries`);

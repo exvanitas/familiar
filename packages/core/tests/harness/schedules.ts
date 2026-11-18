@@ -342,8 +342,9 @@ export const SCHEDULES: Named[] = [
     expect: (r) => (r.evidence.filter((e) => e.what === 'start').length === 2 && r.exe.log.some((x) => x.held && x.cancelAsked !== undefined) ? undefined : 'no Stop and Start over a held cancel')
   },
   {
-    // S10: 8 server helpers detached and hung, then every one of 24 servers holds a call, then chat fetches
-    // a model. The server cap keeps the servers to 24 of the 32, detached helpers included.
+    // S10: 4 server helpers detached and hung, then every one of 24 servers holds a call, then chat fetches
+    // a model with 24 server requests open. The server cap keeps the servers to 24 of the 32, detached
+    // helpers included (and at 8 detached helpers the exe admits no more server requests at all).
     name: 'S10 server saturation, then a model fetch',
     options: {
       build: 'pass',
@@ -355,12 +356,12 @@ export const SCHEDULES: Named[] = [
         const settled = (id: string) => d.idle(id) || d.client.get(id)?.phase === 'failed';
         const headed = (from: number) => d.exe.log.filter((x) => x.body?.method === 'tools/call').slice(from).every((x) => x.head !== undefined || x.refused);
         d.when('all ready', () => ids.every(settled), () => {
-          // Round one: 8 calls, stopped: their helpers are held and detached.
+          // Round one: 4 calls, stopped: their helpers are held and detached.
           const before = d.exe.log.filter((x) => x.body?.method === 'tools/call').length;
-          for (const id of ids.slice(0, 8)) d.call('slow', {}, false, id);
+          for (const id of ids.slice(0, 4)) d.call('slow', {}, false, id);
           d.when('held', () => headed(before), () => {
             d.stopAll();
-            d.when('detached', () => ids.slice(0, 8).every(settled), () => {
+            d.when('detached', () => ids.slice(0, 4).every(settled), () => {
               // Round two: every server holds a call.
               const from = d.exe.log.filter((x) => x.body?.method === 'tools/call').length;
               for (const id of ids) d.call('slow', {}, false, id);
