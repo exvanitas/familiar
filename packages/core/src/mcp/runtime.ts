@@ -92,10 +92,20 @@ export class ServerRuntime {
     if (record.removing) return { kind: 'refused', words: 'It is being removed.' };
     const setup = record.setup;
     if (setup.kind === 'remote' && setup.transport === 'sse') return { kind: 'failed', failure: { kind: 'protocol', words: "Legacy SSE servers are not supported. Use the server's Streamable HTTP address." } };
+    // The target is built before the admission, in the same synchronous step: a record that can't be
+    // launched fails here and holds nothing.
+    let target: Target;
+    let launch: string;
+    try {
+      target = setup.kind === 'local' ? { where: 'local', setup: processSetupOf(setup) } : { where: 'remote', address: setup.address ?? '', url: setup.url, headers: Object.entries(remoteHeaders(remoteTargetOf(setup))) };
+      launch = setupFingerprint(setup);
+    } catch {
+      const failure: Failure = { kind: 'failed', words: "Familiar can't read this server's saved setup, so it won't start it." };
+      this.set('failed', failure);
+      return { kind: 'failed', failure };
+    }
     const admitted = this.owner.admit('start', { start: true });
     if (!('release' in admitted)) return { kind: 'refused', words: admitted.ok ? '' : admitted.words };
-    const target: Target = setup.kind === 'local' ? { where: 'local', setup: processSetupOf(setup) } : { where: 'remote', address: setup.address ?? '', url: setup.url, headers: Object.entries(remoteHeaders(remoteTargetOf(setup))) };
-    this.set('starting');
     let released = false;
     const launched = () => {
       if (!released) {
@@ -104,8 +114,10 @@ export class ServerRuntime {
       }
     };
     let r;
+    // Everything after the admission is inside this block, so a throw anywhere still releases the owner.
     try {
-      r = await this.link.start(target, setupFingerprint(setup), { launched });
+      this.set('starting');
+      r = await this.link.start(target, launch, { launched });
       // A modern-only stdio server that ended its process after refusing the legacy opening: one more start
       // of the same setup, readmitted by the owner, era fixed to modern (3.9).
       if (!r.ok && r.relaunch === 'modern' && (this.phaseNow as Phase) === 'starting') {
@@ -116,7 +128,7 @@ export class ServerRuntime {
           r = { ok: false as const, failure: { kind: 'busy' as const, words: 'The setup changed. Press Start again.' } };
         } else {
           let once = false;
-          r = await this.link.start(target, setupFingerprint(setup), { era: 'modern', launched: () => (once ? undefined : ((once = true), again.release())) });
+          r = await this.link.start(target, launch, { era: 'modern', launched: () => (once ? undefined : ((once = true), again.release())) });
         }
       }
     } finally {

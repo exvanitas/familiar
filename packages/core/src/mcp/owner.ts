@@ -154,17 +154,26 @@ export function modelName(key: string, tool: string): { readonly name: string } 
 
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+const strings = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string');
+const pairs = (v: unknown): boolean => Array.isArray(v) && v.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string' && typeof p[1] === 'string');
+const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+/** A saved record, checked to its leaves, as a copy of its own: a caller changing it changes nothing saved. */
 function readServer(v: unknown): OwnedServer | undefined {
   if (!isObj(v) || !isObj(v.setup) || typeof v.key !== 'string' || typeof v.enabled !== 'boolean' || !isObj(v.limits) || !Array.isArray(v.tools)) return undefined;
   const s = v.setup as Record<string, unknown>;
   if (typeof s.id !== 'string' || typeof s.label !== 'string') return undefined;
   if (s.kind === 'local') {
-    if (typeof s.program !== 'string' || !Array.isArray(s.args) || typeof s.cwd !== 'string' || !Array.isArray(s.env) || !Array.isArray(s.secrets)) return undefined;
+    if (typeof s.program !== 'string' || !strings(s.args) || typeof s.cwd !== 'string' || !pairs(s.env) || !strings(s.secrets)) return undefined;
   } else if (s.kind === 'remote') {
-    if (typeof s.url !== 'string' || !Array.isArray(s.headers)) return undefined;
+    if (typeof s.url !== 'string' || !pairs(s.headers) || (s.transport !== 'http' && s.transport !== 'sse')) return undefined;
+    if (s.key !== undefined && !(isObj(s.key) && typeof s.key.header === 'string' && typeof s.key.prefix === 'string')) return undefined;
+    if (s.address !== undefined && typeof s.address !== 'string') return undefined;
   } else return undefined;
-  const tools = v.tools.filter((t): t is SavedTool => isObj(t) && typeof t.name === 'string' && typeof t.fingerprint === 'string');
-  return { setup: s as unknown as ServerSetup, key: v.key, enabled: v.enabled, limits: v.limits as ServerLimits, tools, ...(v.removing === true ? { removing: true as const } : {}) };
+  const limits = v.limits as Record<string, unknown>;
+  if ((limits.callMs !== undefined && typeof limits.callMs !== 'number') || (limits.initMs !== undefined && typeof limits.initMs !== 'number')) return undefined;
+  const tools = v.tools.filter((t): t is SavedTool => isObj(t) && typeof t.name === 'string' && typeof t.fingerprint === 'string' && (t.reviewed === undefined || typeof t.reviewed === 'string'));
+  return clone({ setup: s as unknown as ServerSetup, key: v.key, enabled: v.enabled, limits: limits as ServerLimits, tools, ...(v.removing === true ? { removing: true as const } : {}) });
 }
 
 function readChoice(v: unknown): ToolChoice | undefined {
@@ -231,10 +240,10 @@ export class Owner {
     return out;
   }
   get mark(): Mark | undefined {
-    return this.doc.mark;
+    return this.doc.mark && clone(this.doc.mark);
   }
   tombstones(): Readonly<Record<string, Tombstone>> {
-    return this.doc.tombstones;
+    return clone(this.doc.tombstones);
   }
   /** What Settings shows: nothing, "Saving…", or the restart words after 10 s. */
   saving(): { readonly what: string; readonly words: string } | undefined {
@@ -273,8 +282,10 @@ export class Owner {
   /** One commit: the change applied to a copy, written whole in one transaction, fenced by the revision. */
   private async commit(change: (d: Doc) => void): Promise<boolean> {
     if (this.unreadable) return false;
-    const next = JSON.parse(JSON.stringify(this.doc)) as Doc;
-    change(next);
+    const draft = clone(this.doc);
+    change(draft);
+    // Copied again after the change, so nothing a caller handed in (a setup, a choice) is held by reference.
+    const next = clone(draft);
     next.rev = this.doc.rev + 1;
     const rev = this.doc.rev;
     const written = await this.ports.store.putIf(OWNER_KEY, { v: OWNER_VERSION, value: next as unknown as JsonValue }, (cur) => (cur === undefined ? rev === 0 : isObj(cur.value) && cur.value.rev === rev));
