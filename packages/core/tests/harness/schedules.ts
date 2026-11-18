@@ -138,7 +138,7 @@ export const SCHEDULES: Named[] = [
     // S20: the walk a list_changed restarts meets a 404 on its first page: nothing goes without the session
     // id before the recovery's initialize, and no extra walk runs beside it (H14).
     name: 'S20 a 404 on the retry of a walk',
-    options: { mode: { ...quiet, changeOnList: true, session404: 'retry', listChanged: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
+    options: { mode: { ...quiet, changeOnList: true, changeOnListAt: 2, session404: 'retry', listChanged: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
     expect: (r) => (r.exe.log.some((x) => x.status === 404 && x.body?.method === 'tools/list') ? undefined : 'no 404 on a retried walk')
   },
   {

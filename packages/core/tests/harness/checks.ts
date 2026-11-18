@@ -58,14 +58,26 @@ function localPongKey(r: WireRun, rec: NativeRec): string {
 
 /** Which run of its server a native request belongs to: local, the process (an epoch); remote, the count
     of Starts made before it (a run lasts from one Start to its end, re-handshakes included). */
-function runOf(r: WireRun, x: NativeRec): number {
-  if (x.kind === 'write') return x.epoch;
-  // Only Starts the client admitted begin a run: a Start refused busy (its reply's words say so) doesn't.
+/** The Starts and Tests the client admitted on a server, in order: a Start refused busy doesn't begin a run. */
+function admittedStarts(r: WireRun, server: string): Evidence[] {
   const admitted = (e: Evidence) => {
     const reply = r.evidence.find((y) => y.what === 'started' && y.server === e.server && y.seq > e.seq);
     return !(reply?.failure === 'busy');
   };
-  return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && e.seq < x.seq && addressOf(e.server) === x.server && admitted(e)).length;
+  return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && addressOf(e.server) === server && admitted(e));
+}
+
+function runOf(r: WireRun, x: NativeRec): number {
+  if (x.kind === 'write') return x.epoch;
+  return admittedStarts(r, x.server).filter((e) => e.seq < x.seq).length;
+}
+
+/** Whether the run a request belongs to had answered its Start (or Test) ready before it. */
+function readyBefore(r: WireRun, x: NativeRec): boolean {
+  const s = admittedStarts(r, x.server)[runOf(r, x) - 1];
+  if (!s) return false;
+  const reply = r.evidence.find((y) => y.what === (s.what === 'start' ? 'started' : 'tested') && y.server === s.server && y.seq > s.seq);
+  return !!reply && reply.seq < x.seq && !reply.failure && (reply.report?.ok ?? true);
 }
 
 const addressOf = (server: string | undefined) => `addr-${(server ?? 's1').slice(1)}`;
@@ -585,7 +597,8 @@ export const H14: Check = (r) => {
     const drop = recs[i]!;
     if (drop.status !== 404) continue;
     const run = recs.filter((x) => sameRun(x, drop));
-    const wasReady = run.some((x) => x.seq < drop.seq && lastPage(x));
+    // Ready: its Start had answered ready (a walk's last page alone isn't, since a list_changed retries it).
+    const wasReady = readyBefore(r, drop);
     // A second drop before any page or call completed after the last recovery's own walk ends the run.
     const prior = run.filter((x) => x.seq < drop.seq && x.status === 404).at(-1);
     let second = false;

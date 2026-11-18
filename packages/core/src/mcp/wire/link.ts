@@ -116,6 +116,10 @@ interface Run {
   changes: number;
   /** A refresh walk is already scheduled for list_changed: a burst is one more walk. */
   relisting?: boolean;
+  /** The walk under way, if any: one walk owns the run's list at a time, its own retry absorbing list_changed. */
+  walker?: object;
+  /** Counts the server's ended sessions: a walk begun under an earlier one sends nothing more. */
+  session: number;
   ready: boolean;
   ended: boolean;
   /** A local run's process has exited (the exe said so). */
@@ -220,7 +224,7 @@ export class ServerLink {
     const exit = new Promise<void>((r) => (sawExit = r));
     let launchedNow!: () => void;
     const launched = new Promise<void>((r) => (launchedNow = r));
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, changes: 0, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit, launched };
+    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, changes: 0, session: 0, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit, launched };
     this.run = run;
     if (target.where === 'local') {
       const processes = this.ports.processes!;
@@ -328,7 +332,8 @@ export class ServerLink {
   async list(): Promise<readonly ListedTool[] | Failure> {
     const run = this.run;
     if (!run || run.ended || !run.ready) return { kind: 'failed', words: 'The server is not running.' };
-    if (this.busy) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
+    // One walk at a time: one under way (between its pages the slot is idle) answers busy too.
+    if (this.busy || (run.walker && !(__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk')))) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
     const { deadline, cancel } = this.deadline(run, this.limits.listMs);
     try {
       const r = await this.walk(run, deadline).catch((e: unknown) => ({ failure: unexpected(e) }));
@@ -495,32 +500,41 @@ export class ServerLink {
    * walk rather than leave a catalog Familiar knows is stale.
    */
   private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure; readonly session?: true }> {
-    for (let attempt = 0; ; attempt++) {
-      const at = run.changes;
-      run.stale = true;
-      const r = await this.walkOnce(run, deadline);
-      if (!('tools' in r)) return r;
-      if (run.changes !== at && !(__FAMILIAR_MUTATIONS__ && mutant('publish-stale-walk'))) {
-        if (attempt >= 2) return { failure: { kind: 'protocol', words: "The server's tools kept changing while Familiar listed them." } };
-        continue;
+    // This walk owns the run's list until it ends: a list_changed meanwhile only counts, and its retry
+    // absorbs it. A session the server ends meanwhile ends the walk before it sends anything more.
+    const me = {};
+    run.walker = me;
+    const session = run.session;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const at = run.changes;
+        run.stale = true;
+        const r = await this.walkOnce(run, deadline, session);
+        if (!('tools' in r)) return r;
+        if (run.changes !== at && !(__FAMILIAR_MUTATIONS__ && mutant('publish-stale-walk'))) {
+          if (attempt >= 2) return { failure: { kind: 'protocol', words: "The server's tools kept changing while Familiar listed them." } };
+          continue;
+        }
+        run.tools = r.tools;
+        run.declarations = r.declarations;
+        run.notOffered = r.notOffered;
+        run.stale = false;
+        return { tools: run.tools };
       }
-      run.tools = r.tools;
-      run.declarations = r.declarations;
-      run.notOffered = r.notOffered;
-      run.stale = false;
-      return { tools: run.tools };
+    } finally {
+      if (run.walker === me) run.walker = undefined;
     }
   }
 
   /** Pages of tools/list, each its own exchange through the barrier, at most 16, and 128 tools in all. */
-  private async walkOnce(run: Run, deadline: Deadline): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true }> {
+  private async walkOnce(run: Run, deadline: Deadline, session: number): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true }> {
     const raw: Record<string, unknown>[] = [];
     let cursor: string | undefined;
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) return { failure: { kind: 'protocol', words: `The server's tool list ran past ${MAX_PAGES} pages.` } };
       const id = run.nextId++;
       const msg: AdminMessage = { kind: 'list', id, ...(cursor !== undefined ? { cursor } : {}) };
-      const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where), deadline, 'tools/list');
+      const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where), deadline, 'tools/list', session);
       if (deadline.expired) return { failure: { kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." } };
       if (o.end.t !== 'done' || !o.response) return { failure: this.startWords(run, o.end), ...(o.end.t === 'session-ended' ? { session: true } : {}) };
       if (o.response.error) {
@@ -575,13 +589,15 @@ export class ServerLink {
   /* ---------- exchanges ---------- */
 
   /** One administrative exchange: waits for the slot to be Idle first (the walk's own pages, the handshake). */
-  private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, deadline: Deadline, method: string): Promise<Outcome> {
+  private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, deadline: Deadline, method: string, session?: number): Promise<Outcome> {
     // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
     // past the step's deadline, whatever a server keeps sending.
     for (;;) {
       if (!this.early(kind)) await Promise.race([this.drained(), deadline.over]);
       if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended || run.closing) return { end: { t: 'run-ended' } };
+      // A walk begun under a session the server has since ended: nothing more of it goes out.
+      if (session !== undefined && run.session !== session && !(__FAMILIAR_MUTATIONS__ && mutant('walk-across-recovery'))) return { end: { t: 'session-ended' } };
       const started = this.exchangeNow(run, kind, requestId, body, method);
       if (started) return started;
     }
@@ -892,11 +908,12 @@ export class ServerLink {
       run.changes++;
       // Idle: walk now; otherwise after the exchange that carried it. A burst is one more walk, and a walk
       // under way when it comes walks again on its own.
-      if (run.ready && !run.relisting) {
+      const beside = !!(__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk'));
+      if (run.ready && !run.relisting && (!run.walker || beside)) {
         run.relisting = true;
         void this.drained().then(() => {
           run.relisting = false;
-          return run.ended || !run.stale ? undefined : this.list();
+          return run.ended || !run.stale || (run.walker && !beside) ? undefined : this.list();
         });
       }
     }
@@ -925,6 +942,7 @@ export class ServerLink {
       return;
     }
     run.dropped = 1;
+    run.session++;
     if (!(__FAMILIAR_MUTATIONS__ && mutant('ready-during-recovery'))) {
       run.ready = false;
       run.stale = true;

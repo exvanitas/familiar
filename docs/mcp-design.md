@@ -888,6 +888,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `remote-cancel`: send a cancel to a remote server | H2 |
 | `local-cancel-after-seal` | H2 (a write after the terminal event) |
 | `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
+| `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |
 | `stop-twice`: Stop and the run's end each ask the exe to stop the process | H2 under S11, during initialize |
 | `no-write-bound`: no interim page bound on a local write | H1 under S18 |
@@ -934,6 +935,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 
 **Mutations with no control, and why:**
 
+- **`walk-across-recovery`**, letting a walk begun before a session's 404 send its next page after it. With one walk owning the list at a time, and calls refused while the catalog is stale, nothing else can meet a 404 while a walk waits between its pages, so no schedule reaches it. The guard stays, as defence in depth; S20 checks the path a second walk took before.
 - **`remark-no-inbox-check`**, dropping the empty-inbox check from her line. On pi-durable 1.5.2 no schedule can reach a failing state: a run's end places queued input, and a failure keeps `runFailure`, so an idle chat with no failure and input queued never exists while the `runFailure` check stands. The check stays, as defence in depth.
 - **A queued reset after a step cap**, and an `onYield` continuation. No reset or `onYield` path exists in Familiar to switch on. They're covered by 2.5's module-graph and hook pins only.
 - **`background-compaction`**, the default `backgroundTokens`. S6 runs it, but at the journal's 32,000-token window a background summary can't happen before a blocking one: the blocking threshold (32,000 − 16,384) is below pi-durable's default `keepRecentTokens` (20,000), so any history long enough to cut is past blocking first. In both builds the chat compacts only inside a turn, nothing is placed, and H7 holds. S6's evidence for a background summary landing in an idle, failed chat is pi-durable's own probe at a larger window (7.1), with the settings pins (2.5, row 1).
