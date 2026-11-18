@@ -64,9 +64,14 @@ export interface LinkLimits {
   /** A remote request's time to its head and between chunks. */
   readonly headersMs: number;
   readonly idleMs: number;
+  /**
+   * The interim local write bound (4.3): a write pending longer ends the run and stops the server, which
+   * has stopped reading. It goes when the exe's own write bound lands.
+   */
+  readonly writeMs: number;
 }
 
-export const LINK_LIMITS: LinkLimits = { startMs: 60_000, listMs: 30_000, pongMs: 5_000, headersMs: 120_000, idleMs: 15 * 60_000 };
+export const LINK_LIMITS: LinkLimits = { startMs: 60_000, listMs: 30_000, pongMs: 5_000, headersMs: 120_000, idleMs: 15 * 60_000, writeMs: 10_000 };
 export const MAX_PAGES = 16;
 export const MAX_SESSION_ID = 1024;
 const DROPPED_LINE = /^a stdout line over \d+ MiB was dropped$/;
@@ -248,7 +253,14 @@ export class ServerLink {
       if (!('tools' in listed)) {
         // A modern-only stdio server that ended its process after refusing (rmcp does, B2): one relaunch
         // with the era fixed to modern, readmitted by the caller.
-        const relaunch = refusedOnStdio && run.ended && !deadline.expired;
+        // The pipe can close before the exe reports the exit: a write refused then is the pipe closing, so
+        // the exit is awaited, within 2 s and the start's deadline, before deciding.
+        if (refusedOnStdio && !run.ended && !deadline.expired && !(__FAMILIAR_MUTATIONS__ && mutant('relaunch-races-exit'))) {
+          let stop: (() => void) | undefined;
+          await Promise.race([run.exit, deadline.over, new Promise<void>((r) => (stop = this.clock.setTimer(r, 2_000, { background: false })))]);
+          stop?.();
+        }
+        const relaunch = refusedOnStdio && (run.ended || !!run.exited) && !deadline.expired;
         this.endRun(run, listed.failure, false);
         return { ok: false, failure: listed.failure, ...(relaunch ? { relaunch: 'modern' as const } : {}) };
       }
@@ -629,9 +641,17 @@ export class ServerLink {
       queueMicrotask(() => this.input({ t: 'released', handle }));
       return;
     }
+    // The page's watchdog on this write: past the bound, the server has stopped reading.
+    const watchdog = (__FAMILIAR_MUTATIONS__ && mutant('no-write-bound'))
+      ? undefined
+      : this.clock.setTimer(() => this.endRun(run, { kind: 'protocol', words: 'The server stopped reading what Familiar sent, so it was stopped.' }, true), this.limits.writeMs, { background: false });
     this.ports.processes!.write(run.process, enc.encode(`${text}\n`)).then(
-      () => this.input({ t: 'released', handle }),
+      () => {
+        watchdog?.();
+        this.input({ t: 'released', handle });
+      },
       (err: unknown) => {
+        watchdog?.();
         if (request) this.input({ t: 'terminal', n: request.n, end: { t: 'native', kind: kindText(err) } });
         this.input({ t: 'released', handle });
       }
@@ -724,12 +744,22 @@ export class ServerLink {
     );
   }
 
-  private cancel(handle: string): void {
+  /**
+   * net_cancel, and the handle released only when the exe says the request has ended. A refusal is tried
+   * again (1, 2, then 4 s later); after that the run ends, and the request stays counted, so the slot never
+   * frees on cleanup the exe didn't confirm.
+   */
+  private cancel(handle: string, attempt = 0): void {
     const id = this.natives.get(handle);
     if (id === undefined) return this.input({ t: 'released', handle });
     this.ports.net!.cancel(id).then(
       () => this.input({ t: 'released', handle }),
-      () => this.input({ t: 'released', handle })
+      () => {
+        if ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel'))) return this.input({ t: 'released', handle });
+        if (attempt < 3) return void this.clock.setTimer(() => this.cancel(handle, attempt + 1), 1000 * 2 ** attempt, { background: false });
+        const run = this.run;
+        if (run && !run.ended) this.endRun(run, { kind: 'protocol', words: "Familiar couldn't end a request to the server. Restart Familiar to use it again." }, true);
+      }
     );
   }
 
@@ -917,7 +947,8 @@ export class ServerLink {
       // A local run that ends with its process still running stops it, whatever ended it; its writes end
       // when the exe says the process has exited, not before, so a blocked write keeps the slot (H1).
       // Remote requests end through net_cancel.
-      if (run.process !== undefined && !run.exited) void this.ports.processes!.stop(run.process).catch(() => this.releaseWrites(run));
+      // A refused stop releases nothing: the writes end only when the exe says the process has exited.
+      if (run.process !== undefined && !run.exited) void this.ports.processes!.stop(run.process).catch(() => ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel')) ? this.releaseWrites(run) : undefined));
       else this.releaseWrites(run);
     }
     if (report) this.events.ended(run.id, failure);

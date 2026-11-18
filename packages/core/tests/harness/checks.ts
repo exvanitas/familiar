@@ -1,7 +1,7 @@
 // The independent checks (docs/mcp-design.md 7.2). Each reads only the fake exe's log, the fake server's
 // own record and the driver's evidence log, never the client's state.
 
-import { DETACH_MS, EXE_SERVER_CAP, type Evidence, type NativeRec, type WireRun } from './wire.ts';
+import { DETACH_MS, EXE_SERVER_CAP, INTERIM_WRITE_MS, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 
 export type Check = (r: WireRun) => string[];
 
@@ -87,6 +87,13 @@ export const H1: Check = (r) => {
     const s = e.step;
     if (inPlay(r, e.server ?? 's1', s) || r.evidence.some((o) => (o.what === 'start' || o.what === 'stop') && o.step >= s - 1 && o.step <= s && o !== e)) continue;
     problems.push(busy ? `H1: ${e.token} refused busy at step ${s} with nothing of its server in play` : `H1: the start timed out at step ${s} with nothing of its server in play`);
+  }
+  // The interim write bound (4.3): no local write stays pending past it (with a second's slack for the
+  // stop's own exit), however long the run goes on.
+  for (const x of r.exe.log) {
+    if (x.kind !== 'write' || x.startAt === undefined) continue;
+    const waited = (x.endAt ?? r.sched.now) - x.startAt;
+    if (waited > INTERIM_WRITE_MS + 1_000) problems.push(`H1: a local write pending ${waited} ms, past the interim bound`);
   }
   // A call refused busy never goes out afterwards.
   for (const e of r.evidence) {

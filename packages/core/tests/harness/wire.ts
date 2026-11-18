@@ -37,6 +37,8 @@ export const EXE_TOTAL = 32;
 export const EXE_SERVER_CAP = 24;
 /** The pass build's detach bound for a held helper, and how long the harness holds one. */
 export const DETACH_MS = 2_000;
+/** The page's interim bound on a local write (4.3), as the contract gives it. */
+export const INTERIM_WRITE_MS = 10_000;
 export const HELPER_HELD_MS = 120_000;
 
 /* ---------- the server's script, per seed ---------- */
@@ -70,6 +72,8 @@ export interface Mode {
   readonly changeOnList: boolean;
   /** How often a cancelled request's helper is held, for any time (H4). */
   readonly holdHelpers: number;
+  /** How often the exe refuses a net_cancel once, keeping the request alive. */
+  readonly refuseCancel: number;
   /** Which requests' helpers may be held: any, or only calls (S8, S10). */
   readonly holdWhich: 'any' | 'calls';
 }
@@ -97,6 +101,7 @@ export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
     oneChunk: false,
     changeOnList: false,
     modernAfterDrop: false,
+    refuseCancel: r() < 0.1 ? 0.3 : 0,
     holdHelpers: r() < 0.2 ? 0.5 : 0,
     holdWhich: 'any',
     ...over
@@ -236,7 +241,8 @@ export interface NativeRec {
   readonly server: string;
   /** What the server answered (remote), for the harness's own reading of catalogs. */
   plan?: Plan;
-  /** Fake-clock times: the cancel asked, the cancel returned (H4). */
+  /** Fake-clock times: a write's start; the cancel asked, the cancel returned (H4). */
+  startAt?: number;
   cancelAt?: number;
   endAt?: number;
   /** A helper held at cancel; detached by the pass build; when the helper itself ended. */
@@ -245,6 +251,8 @@ export interface NativeRec {
   terminated?: number;
   /** Refused by the exe before it started. */
   refused?: 'busy';
+  /** A net_cancel the exe refused once, the request kept alive. */
+  refusedCancel?: boolean;
   readonly method: string;
   readonly body: Msg | undefined;
   readonly headers: Record<string, string>;
@@ -448,10 +456,21 @@ export class FakeExe {
           });
         }),
       cancel: (id: string) =>
-        new Promise<void>((resolve) => {
+        new Promise<void>((resolve, refuse) => {
           const st = streams.get(id);
           if (!st) return resolve();
           const rec = st.rec;
+          // The exe may refuse a net_cancel and keep the request alive: once per request, as a passing fault.
+          if (!rec.refusedCancel && this.server.mode.refuseCancel && this.sched.random() < this.server.mode.refuseCancel) {
+            rec.refusedCancel = true;
+            if (rec.cancelAsked === undefined) {
+              rec.cancelAsked = this.sched.step;
+              rec.cancelAt = this.sched.now;
+            }
+            return void this.sched.add({ label: `cancel-refused:${rec.n}`, fire: () => refuse(Object.assign(new Error('refused'), { kind: 'failed' })) });
+          }
+          // The client's next try is a net_cancel of its own: its bound runs from now.
+          if (rec.refusedCancel) rec.cancelAt = this.sched.now;
           if (rec.cancelAsked === undefined) {
             rec.cancelAsked = this.sched.step;
             rec.cancelAt = this.sched.now;
@@ -517,6 +536,7 @@ export class FakeExe {
       this.exits.push({ epoch: p.epoch, step: this.sched.step });
       for (const w of p.writes.splice(0)) {
         w.rec.end ??= this.sched.step;
+        w.rec.endAt ??= this.sched.now;
         w.fail(Object.assign(new Error('gone'), { kind: 'not-running' }));
       }
       p.emit({ t: 'exit', code });
@@ -530,6 +550,7 @@ export class FakeExe {
         p.taken++;
         w.rec.arrived = this.sched.step;
         w.rec.end = this.sched.step;
+        w.rec.endAt = this.sched.now;
         w.done();
         const body = w.rec.body ?? {};
         this.server.arrivals.push({ body, headers: {}, method: 'POST', step: this.sched.step });
@@ -565,7 +586,7 @@ export class FakeExe {
           } catch {
             body = undefined;
           }
-          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, headers: {}, start: this.sched.step, delivered: new Map(), epoch: this.epoch };
+          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: this.epoch };
           this.log.push(rec);
           if (!p || p.exited) {
             rec.end = this.sched.step;

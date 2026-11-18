@@ -3,7 +3,7 @@
 
 import type { Driver, Mode, WireOptions } from './wire.ts';
 
-const quiet: Partial<Mode> = { where: 'remote', era: 'legacy', pings: 0, pingWithFinal: 0, session404: 'none', redirect: 0, earlyEnd: 0, staleId: 0, listChanged: 0, inputRequired: 0, holdHelpers: 0, pages: 1 };
+const quiet: Partial<Mode> = { where: 'remote', era: 'legacy', pings: 0, pingWithFinal: 0, session404: 'none', redirect: 0, earlyEnd: 0, staleId: 0, listChanged: 0, inputRequired: 0, holdHelpers: 0, refuseCancel: 0, pages: 1 };
 
 const callHeaded = (d: Driver, token: string) => d.exe.log.some((x) => x.body?.method === 'tools/call' && x.body.params?.arguments?.text === token && x.head !== undefined);
 const lastToken = (d: Driver) => d.exe.log.filter((x) => x.body?.method === 'tools/call').at(-1)?.body?.params?.arguments?.text as string | undefined;
@@ -89,6 +89,21 @@ function changeDuringWalk(pages: number, refresh: boolean): Named {
 }
 
 export const SCHEDULES: Named[] = [
+  {
+    // S18: a local server that stops reading, with a call written into the full pipe: the page's interim
+    // bound stops it within 10 s, its writes end at the exit, and the slot frees.
+    name: 'S18 a local server that stops reading',
+    options: {
+      mode: { ...quiet, where: 'local', stopReading: 1, pages: 2 },
+      schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo'))
+    },
+    expect: (r) => {
+      // A write the server never took (the call's, or a page's if it stopped earlier) ended at the stop.
+      const blocked = r.exe.log.filter((x) => x.kind === 'write' && x.startAt !== undefined && x.endAt !== undefined && x.endAt - x.startAt >= 9_000);
+      if (!blocked.length) return 'no write was held by the server';
+      return r.exe.exits.length ? undefined : 'the server was never stopped';
+    }
+  },
   {
     // S15: a call's 404, then the re-handshake meets a modern-only server: the run ends, still legacy.
     name: 'S15 a modern refusal on a re-handshake',

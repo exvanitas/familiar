@@ -69,6 +69,8 @@ const CONTROLS: Control[] = [
   { mutation: 'era-change-on-recovery', check: 'H12', named: 'S15' },
   { mutation: 'end-on-refresh-404', check: 'H14', named: 'S16' },
   { mutation: 'rearm-in-recovery', check: 'H14', named: 'S17' },
+  { mutation: 'no-write-bound', check: 'H1', named: 'S18' },
+  { mutation: 'release-on-refused-cancel', check: 'H1', mode: { where: 'remote', era: 'legacy', refuseCancel: 0.8, session404: 'none', redirect: 0, holdHelpers: 0 } },
   { mutation: 'decoder-per-chunk', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 0, session404: 'none', redirect: 0, earlyEnd: 0 } },
   { mutation: 'cr-forgets-pair', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 1, session404: 'none', redirect: 0, earlyEnd: 0 } }
 ];
