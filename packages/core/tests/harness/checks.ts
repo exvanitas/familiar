@@ -422,8 +422,9 @@ export const H13: Check = (r) => {
     const blocked = r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.start <= at && (y.end ?? Infinity) > at);
     // Another exchange live on the same run when an idle ping comes: it waits for no one, so it's departure 2.
     const busyElsewhere = p.id.startsWith('i') && r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method && y.body.id !== undefined && y.start <= at && (r.exe.responded.get(`${y.epoch}:${y.body.id}`) ?? Infinity) >= at);
-    // Stop ends the live exchange in its own step, so a ping that comes after it meets a drain.
-    const stopped = r.evidence.some((e) => e.what === 'stop' && e.step <= at && !r.exe.exits.some((t) => t.epoch === carrier.epoch && t.step < e.step));
+    // Stop, or any end of the run that asks the exe to stop the process, ends the live exchange in its own
+    // step, so a ping that comes after it meets a drain.
+    const stopped = r.evidence.some((e) => e.what === 'stop' && e.step <= at && !r.exe.exits.some((t) => t.epoch === carrier.epoch && t.step < e.step)) || r.exe.stopsAsked.some((t) => t.epoch === carrier.epoch && t.step <= at);
     if (draining || blocked || busyElsewhere || stopped) continue; // departure 2
     problems.push(`H13: local ping ${p.id} got no pong and no departure`);
   }

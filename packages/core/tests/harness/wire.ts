@@ -316,6 +316,8 @@ export class FakeExe {
   readonly build: 'prepass' | 'pass';
   /** Local: when each response line reached the client, by epoch and request id. */
   readonly responded = new Map<string, number>();
+  /** Local: when the client asked the exe to stop each process run, by epoch. */
+  readonly stopsAsked: { epoch: number; step: number }[] = [];
   /** Local: when each process run exited, by epoch. */
   readonly exits: { epoch: number; step: number }[] = [];
   /** Local: when each ping line reached the client. */
@@ -633,6 +635,8 @@ export class FakeExe {
           take(run, w);
         }),
       stop: async (run) => {
+        const asked = live.get(run);
+        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step });
         this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) });
       },
       forget: async () => {}
