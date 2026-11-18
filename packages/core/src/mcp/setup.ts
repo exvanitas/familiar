@@ -223,13 +223,14 @@ export function secretRefs(s: ServerSetup): string[] {
 
 /**
  * What "always for this" binds to: the command, arguments, folder and plain settings with the secret
- * names, or the address with its transport and headers. A new command, address or version changes it,
+ * names, or the address with its transport, headers, and where its key goes (the header and the prefix
+ * before the key). A new command, address, key prefix or version changes it,
  * and every tool of the server goes back to ask. Secret values aren't in it, so a renewed key asks
  * nothing.
  */
 export function setupFingerprint(s: ServerSetup): string {
   const bound = s.kind === 'local'
     ? { kind: 'local', program: s.program, args: s.args, cwd: s.cwd, env: [...s.env].map(([k, v]) => [k.toUpperCase(), v]).sort(), secrets: [...s.secrets].map(n => n.toUpperCase()).sort() }
-    : { kind: 'remote', url: s.url, transport: s.transport, headers: [...s.headers].map(([k, v]) => [k.toLowerCase(), v]).sort(), key: s.key ? s.key.header.toLowerCase() : null, address: s.address ?? null };
+    : { kind: 'remote', url: s.url, transport: s.transport, headers: [...s.headers].map(([k, v]) => [k.toLowerCase(), v]).sort(), key: s.key ? { header: s.key.header.toLowerCase(), prefix: s.key.prefix } : null, address: s.address ?? null };
   return sha256(canonicalJson(bound));
 }

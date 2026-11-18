@@ -4,6 +4,7 @@
 
 import { canonicalJson, sha256 } from './hash.ts';
 import type { Failure, ListedTool } from './types.ts';
+import type { HeaderDeclaration } from './wire/headers.ts';
 
 export const MAX_TOOLS = 128;
 export const MAX_SCHEMA_DEPTH = 32;
@@ -26,10 +27,20 @@ export function effectiveDescription(t: { description?: string; title?: string }
   return t.description ?? t.title ?? '';
 }
 
-/** A tool's fingerprint: SHA-256 of its name, title, effective description and input schema, in
-    canonical JSON. A new or changed fingerprint is a new tool. Call it only on a tool `checkTools` passed. */
-export function toolFingerprint(t: { name: string; title?: string; description?: string; inputSchema: unknown }): string {
-  return sha256(canonicalJson({ name: t.name, title: t.title ?? '', description: effectiveDescription(t), inputSchema: t.inputSchema }));
+/**
+ * A tool's fingerprint: SHA-256 of its name, title, effective description and input schema, in canonical
+ * JSON, plus, on a modern remote run, its header declarations (5.11): the arguments that run mirrors into
+ * headers. The same tool from a legacy run and from a modern one, or with other declarations, is another
+ * tool. A new or changed fingerprint is a new tool. Call it only on a tool `checkTools` passed.
+ */
+export function toolFingerprint(t: { name: string; title?: string; description?: string; inputSchema: unknown }, declarations?: readonly HeaderDeclaration[]): string {
+  return sha256(canonicalJson({ name: t.name, title: t.title ?? '', description: effectiveDescription(t), inputSchema: t.inputSchema, ...(declarations ? { modern: { headers: declarations } } : {}) }));
+}
+
+export interface CatalogOptions {
+  /** A modern remote run's header declarations, by tool name: given, every tool's fingerprint covers its own
+      (none declared is an empty list, still unlike a legacy run's). */
+  readonly declarations?: ReadonlyMap<string, readonly HeaderDeclaration[]>;
 }
 
 /** Walks a value without recursion, counting nodes and depth, and stops at the first bound. */
@@ -56,7 +67,7 @@ const readOnly = (a: unknown) => (a !== null && typeof a === 'object' ? (a as { 
 
 export type RawTool = Readonly<Record<string, unknown>> & { readonly name?: unknown };
 
-export function checkTools(raw: readonly RawTool[]): ListedTool[] {
+export function checkTools(raw: readonly RawTool[], options: CatalogOptions = {}): ListedTool[] {
   if (raw.length > MAX_TOOLS) throw new CatalogError(`The server lists ${raw.length} tools. Familiar takes at most ${MAX_TOOLS}.`);
   const seen = new Set<string>();
   let total = 0;
@@ -79,7 +90,7 @@ export function checkTools(raw: readonly RawTool[]): ListedTool[] {
     if (size > MAX_TOOL_BYTES) throw new CatalogError(`The tool ${t.name.slice(0, 64)} is described in ${size} bytes. Familiar takes at most ${MAX_TOOL_BYTES} for one tool.`);
     total += size;
     if (total > MAX_CATALOG_BYTES) throw new CatalogError(`The server's tools are described in more than ${MAX_CATALOG_BYTES} bytes, more than Familiar takes.`);
-    out.push({ ...tool, fingerprint: toolFingerprint(tool) });
+    out.push({ ...tool, fingerprint: toolFingerprint(tool, options.declarations ? (options.declarations.get(tool.name) ?? []) : undefined) });
   }
   return out;
 }

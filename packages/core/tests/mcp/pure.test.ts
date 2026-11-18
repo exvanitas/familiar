@@ -11,7 +11,7 @@ import { posixPaths, windowsPaths } from '../../src/mcp/native-rules.ts';
 import { REPO, testPaths } from './fake.ts';
 import { callResult, resultText as textOf } from '../../src/mcp/wire/parse.ts';
 const resultText = (r: Record<string, unknown>) => textOf(callResult(r));
-import { secretValueProblem, setupFingerprint, touchesAMarker, type LocalSetup } from '../../src/mcp/setup.ts';
+import { secretValueProblem, setupFingerprint, touchesAMarker, type LocalSetup, type RemoteSetup } from '../../src/mcp/setup.ts';
 import { unpinned } from '../../src/mcp/unpinned.ts';
 import { remoteFailure, startFailure } from '../../src/mcp/words.ts';
 
@@ -116,6 +116,24 @@ describe('fingerprints', () => {
     for (const changed of [{ args: ['a@1.0.1'] }, { program: 'uvx' }, { cwd: 'C:\\v' }, { env: [['A', '1'], ['B', '3']] as [string, string][] }, { secrets: ['S'] }]) {
       expect(setupFingerprint({ ...s, ...changed })).not.toBe(fp);
     }
+  });
+
+  it("a remote setup's fingerprint covers where its key goes, prefix included: a new prefix drops \"always\"", () => {
+    const r: RemoteSetup = { kind: 'remote', id: 'r', label: 'R', url: 'https://h.example/mcp', transport: 'http', headers: [], key: { header: 'Authorization', prefix: 'Bearer ' } };
+    const fp = setupFingerprint(r);
+    expect(setupFingerprint({ ...r, label: 'Renamed', key: { header: 'authorization', prefix: 'Bearer ' } })).toBe(fp);
+    expect(setupFingerprint({ ...r, key: { header: 'Authorization', prefix: 'Token ' } })).not.toBe(fp);
+    expect(setupFingerprint({ ...r, key: { header: 'X-API-Key', prefix: 'Bearer ' } })).not.toBe(fp);
+  });
+
+  it("a modern remote run's tool fingerprint covers its header declarations and era: the same tool listed by a legacy run, or with other declarations, is another tool", () => {
+    const raw = [{ name: 'look', description: 'Looks.', inputSchema: { type: 'object', properties: { region: { type: 'string', 'x-mcp-header': 'Region' } } } }];
+    const legacy = checkTools(raw)[0]!.fingerprint;
+    const modern = checkTools(raw, { declarations: new Map([['look', [{ path: ['region'], name: 'Region', type: 'string' }]]]) })[0]!.fingerprint;
+    const none = checkTools(raw, { declarations: new Map() })[0]!.fingerprint;
+    const other = checkTools(raw, { declarations: new Map([['look', [{ path: ['region'], name: 'Zone', type: 'string' }]]]) })[0]!.fingerprint;
+    expect(legacy).toBe(toolFingerprint(raw[0]!));
+    expect(new Set([legacy, modern, none, other]).size).toBe(4);
   });
 });
 
