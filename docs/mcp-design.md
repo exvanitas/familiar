@@ -107,6 +107,8 @@ A question is a view over that record (`journal/view.ts`):
 
 **The interruption records.** When a cut-off effect or server call becomes a `redo` or `rerun` question, the `afterTools` hook stores one record per interrupted step (which tool, what it was doing, the step id), grouped under the run's task id. The hook then stops the run with `abortTask` ([turn-design.md](turn-design.md#parked-waits)). A run whose task is aborted ends with reason `aborted` and keeps its inbox. The records are inert unless `runFailure` names their task. If the app dies between the records and the abort, pi-durable resumes the task, the calls are still interrupted, and the hook writes the same records again and aborts. If it dies before the records, nothing is shown.
 
+**A server call whose wrapper is absent on reopen.** A journal reopened without the server's tools (its server not started yet, say) holds no wrapper for a server call that was cut off. The call is still known as a server's by its name, since the `__` namespace is server tools' alone (5.9). So it still gets a `rerun` record and the Run again or Skip question, as it would with the wrapper. Nothing runs again either way: a Run again goes to the model, and a call to a tool its request didn't offer is unavailable until the server is started.
+
 **Several interrupted steps in one round make one question.** In a sequential round an interrupted call commits its result and the next call still starts, and `afterTools` runs once, after every call. So two uncertain effects can share one task. The question lists every interrupted step of that task, and one answer settles all of them: Run again redoes every listed step; Skip skips every one, and the gate refuses each listed tool for the rest of the turn. One question per task keeps "open" exactly the view of pi-durable's record, which names one task. Per-step answers would need an open or closed state per step that `runFailure` can't give, which would be state Familiar holds.
 
 **The answer record**, written by the answer's own commit (2.3), keyed by `runFailure.taskId`. It closes the question even when the answer starts nothing.
@@ -609,12 +611,13 @@ If either unverified item turns out true (certificate fetches outside the saved 
   | Remove | Stop (awaited). Record set to removing, plus a mark, in one commit. `server_forget` or `address_remove`. `secret_delete` each. Delete the record and its choices, keep the tombstone, clear the mark, in one commit | After the first commit: "Removing; cleanup not finished" |
   | Enable, Disable | Commit, answer, release. Then a separate start or stop | The start's failure doesn't undo the enable |
   | Limits, mark reviewed, a choice | One commit | Not saved |
+  | Catalog write: the tools a run listed, saved as the tools last seen | Admitted like any other effect, in the same synchronous step as the check that the listing's run is still the server's run. One commit. A start answers Ready once its own catalog write has settled, so the next start finds the owner free | Never queued. Skipped when the owner is busy or the run is gone: the list is read again at the next listing, and until then a tool missing from it only reads as unreviewed. Admitted while a change's cleanup is unfinished, as starts are, since it changes no setup |
 
   Steps after the commit are idempotent. A change saved with its cleanup unfinished keeps its mark, and every other change is refused until Retry, or a restart's repair, finishes it. Starts of other servers are still admitted then, since no effect is in flight.
 - **The address identity is the exe's.** Core keeps its own copy of the exe's URL normalization (case, punycode, default ports, one trailing dot, trailing slashes), and a drift test checks it against the exe's source. So `https://x` and `https://x:443` are one server, and a second is refused.
 - **Native starts** are admitted by the owner, and count as the effect in flight until they return a run id or a failure. While a start's dialog is open, nothing else durable goes anywhere.
 - **Fail closed:**
-  - an unreadable choice loads as "ask" for its tool, never as empty. That loosens a lost "never" to "ask", which still needs your Yes on a card for every call. It never loosens to "always";
+  - an unreadable choice loads as an explicit "ask" for its tool, never as empty, since an empty choice is a built-in's default, which for some is allow. That loosens a lost "never" to "ask", which still needs your Yes on a card for every call. It never loosens to "always";
   - an unreadable server record isn't started or overwritten;
   - a record of another version loads nothing, and nothing is written;
   - a missing secret stops the start, and the refusal lists all of the setup's secrets.
@@ -643,6 +646,7 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **Stop waits** for the exe's answer and the exit, with no deadline of its own. A start the exe never answers stays Starting, holding the owner, until a restart. That's unbounded by design.
 - **One exchange per server** (3.4). A call's timeout, or stopping the call, ends that call only.
 - **Test runs only while Stopped:** an admitted start, the tool list, then a stop. A failed Test leaves the server Stopped. "Mark reviewed" after it is a change.
+- **Mark reviewed is bound to what Test showed.** Each tool is marked reviewed at the fingerprint Test showed it with, never at whatever the saved list holds when the change lands. A tool a run lists changed between Test and the press stays unreviewed, and asks to be reviewed again. Settings passes Test's report; a bare tool name means the fingerprint the last Test of that server showed, and a name that Test didn't show is marked nothing.
 
 ### 5.5 Consent: `ToolDecision`, the card's facts and the canonical form
 
@@ -656,11 +660,13 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **The arguments are the ones `beforeTool` receives**, after pi-durable's repair and coercion. `execute` gets exactly those, and no hook may replace them.
 - **The canonical form** is one function, used by the card, the stored answer, the mint and the body (3.6): `JSON.stringify` of the parsed value with object keys sorted by plain string order at every level, arrays kept in order, `undefined` keys dropped, and `-0` written as `0`. A value outside plain JSON is refused before a card is made.
 - **Revokes hold at once.** A tightening (always to ask, anything to never) takes effect in an in-memory overlay that `send` reads synchronously, whatever the owner is doing. Its durable write is tried after. "Never" from either the overlay or the saved choice wins.
+  - **"Ask" is saved as an explicit ask**, never as no choice. For a built-in that runs without asking, or a built-in read, no choice means its default, allow. The overlay's "ask" likewise sets ask.
+  - **A refused durable revoke is reported.** The revoke's answer is its durable write's outcome. If the owner refuses the write (busy, or a change's cleanup unfinished) or the store loses it, Settings is told: "Revoked for now, but not saved: it comes back when Familiar restarts. Try again." The overlay holds until then.
 - **Until step 8's choices UI**, the journal isn't fed the owner's choices, and every server tool asks.
 
 ### 5.6 The outside record
 
-- **One immutable record per request**, written by core from the request's assembled input before it's sent. A missing or unreadable record counts as outside.
+- **One immutable record per request**, written by core from the request's assembled input before it's sent. A missing or unreadable record counts as outside. The reply keeps its request's record key, and the gate reads the record of the request whose reply made the call, found by the call's id.
 - **Every entry carries its sources.** A server result carries its server, and so does an unreviewed tool's description. Any entry made while handling an outside request carries that request's sources: her replies, compaction summaries, notes and reminders written then, and her remark (2.1).
 - **Stored notes and reminders keep their sources**, and every read or delivery of them carries them. A request is outside if any entry in its assembled input carries a source. While it's outside, "always" doesn't apply, and a card offers no Always.
 

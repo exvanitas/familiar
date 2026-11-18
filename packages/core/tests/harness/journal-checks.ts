@@ -163,11 +163,8 @@ export const JOURNAL_CHECKS: Record<string, JCheck> = { H6, H7, H8, H9 };
 export const JOURNAL_WITNESSES: Record<string, (r: JRun) => boolean> = {
   'H6 a due question': (r) => r.evidence.some((e) => e.what === 'shown' && due(r.log, e.at ?? 0)),
   'H6 a due pause': (r) => r.evidence.some((e) => e.what === 'shown' && due(r.log, e.at ?? 0)?.paused),
-  'H7 a late answer to an earlier question': (r) => {
-    const shown = new Map<string, number>();
-    for (const e of r.evidence) if (e.what === 'shown') for (const q of e.questions ?? []) if (!shown.has(q.id)) shown.set(q.id, e.step);
-    return r.evidence.some((e, i) => e.what === 'answer' && e.question !== undefined && r.evidence.slice(0, i).filter((x) => x.what === 'shown').at(-1)?.questions?.[0]?.id !== e.question);
-  },
+  'H7 a late answer to an earlier question': (r) =>
+    r.evidence.some((e, i) => e.what === 'answer' && e.question !== undefined && r.evidence.slice(0, i).filter((x) => x.what === 'shown').at(-1)?.questions?.[0]?.id !== e.question),
   'H6 a superseded question': (r) => {
     const { endings } = history(r.log, Infinity);
     return endings.some((x) => (x.reason === 'turn_limit' || x.interrupted) && r.log.some((c) => c.seq > x.seq && startsRun(c)));
