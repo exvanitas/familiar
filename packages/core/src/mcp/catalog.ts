@@ -5,6 +5,9 @@
 import { canonicalJson, sha256 } from './hash.ts';
 import type { Failure, ListedTool } from './types.ts';
 import type { HeaderDeclaration } from './wire/headers.ts';
+import { mutant } from '../mutations.ts';
+
+const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 export const MAX_TOOLS = 128;
 export const MAX_SCHEMA_DEPTH = 32;
@@ -34,7 +37,9 @@ export function effectiveDescription(t: { description?: string; title?: string }
  * tool. A new or changed fingerprint is a new tool. Call it only on a tool `checkTools` passed.
  */
 export function toolFingerprint(t: { name: string; title?: string; description?: string; inputSchema: unknown }, declarations?: readonly HeaderDeclaration[]): string {
-  return sha256(canonicalJson({ name: t.name, title: t.title ?? '', description: effectiveDescription(t), inputSchema: t.inputSchema, ...(declarations ? { modern: { headers: declarations } } : {}) }));
+  // In a fixed order (by path, then header name): the order a schema's keys came in changes nothing.
+  const headers = declarations && !(__FAMILIAR_MUTATIONS__ && mutant('declarations-in-order')) ? [...declarations].sort((a, b) => cmp(a.path.join('\u0000'), b.path.join('\u0000')) || cmp(a.name, b.name)) : declarations;
+  return sha256(canonicalJson({ name: t.name, title: t.title ?? '', description: effectiveDescription(t), inputSchema: t.inputSchema, ...(headers ? { modern: { headers } } : {}) }));
 }
 
 export interface CatalogOptions {
@@ -67,7 +72,12 @@ const readOnly = (a: unknown) => (a !== null && typeof a === 'object' ? (a as { 
 
 export type RawTool = Readonly<Record<string, unknown>> & { readonly name?: unknown };
 
-export function checkTools(raw: readonly RawTool[], options: CatalogOptions = {}): ListedTool[] {
+/** The bounds alone, over every tool a server lists, offered or not: throws a CatalogError at the first. */
+export function boundTools(raw: readonly RawTool[]): void {
+  checkTools(raw, {}, false);
+}
+
+export function checkTools(raw: readonly RawTool[], options: CatalogOptions = {}, fingerprint = true): ListedTool[] {
   if (raw.length > MAX_TOOLS) throw new CatalogError(`The server lists ${raw.length} tools. Familiar takes at most ${MAX_TOOLS}.`);
   const seen = new Set<string>();
   let total = 0;
@@ -90,7 +100,7 @@ export function checkTools(raw: readonly RawTool[], options: CatalogOptions = {}
     if (size > MAX_TOOL_BYTES) throw new CatalogError(`The tool ${t.name.slice(0, 64)} is described in ${size} bytes. Familiar takes at most ${MAX_TOOL_BYTES} for one tool.`);
     total += size;
     if (total > MAX_CATALOG_BYTES) throw new CatalogError(`The server's tools are described in more than ${MAX_CATALOG_BYTES} bytes, more than Familiar takes.`);
-    out.push({ ...tool, fingerprint: toolFingerprint(tool, options.declarations ? (options.declarations.get(tool.name) ?? []) : undefined) });
+    if (fingerprint) out.push({ ...tool, fingerprint: toolFingerprint(tool, options.declarations ? (options.declarations.get(tool.name) ?? []) : undefined) });
   }
   return out;
 }

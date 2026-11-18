@@ -8,7 +8,7 @@
 // through the exe's net_fetch, read with net_read, ended with net_cancel; a local one is one server_write
 // of a line. What comes back is checked (parse.ts) and fed to the machine as inputs, in order.
 
-import { checkTools, CatalogError, MAX_TOOLS } from '../catalog.ts';
+import { boundTools, checkTools, CatalogError, MAX_TOOLS } from '../catalog.ts';
 import type { ProcessEvent, ProcessPort, ProcessSetup } from '../process.ts';
 import { LastOutput } from '../last-output.ts';
 import type { CallOutcome, Failure, ListedTool } from '../types.ts';
@@ -553,13 +553,15 @@ export class ServerLink {
       cursor = p.nextCursor;
       if (cursor === undefined) break;
     }
-    // Names are checked over every listed tool, before any is scanned: one that isn't offered still can't
-    // share a name with one that is.
-    const names = new Set<string>();
-    for (const t of raw) {
-      if (typeof t.name !== 'string') continue;
-      if (names.has(t.name)) return { failure: { kind: 'protocol', words: `The server lists two tools named ${cutText(t.name, 64)}, so Familiar can't tell them apart.` } };
-      names.add(t.name);
+    // Every listed tool is bounded before any is scanned (names, shape, bytes, the whole list): one that
+    // isn't offered still can't share a name with one that is, nor outgrow the bounds unchecked.
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('bound-offered-only'))) {
+      try {
+        boundTools(raw as never);
+      } catch (e) {
+        if (e instanceof CatalogError) return { failure: e.failure };
+        throw e;
+      }
     }
     // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
     // rules isn't offered, and Test says why (3.5). The tool's fingerprint covers its declarations and the
@@ -571,7 +573,7 @@ export class ServerLink {
       if (run.era === 'modern' && run.target.where === 'remote') {
         const scan = scanDeclarations(t.inputSchema);
         if (!scan.ok) {
-          notOffered.push({ name: cutText(String(t.name), 128), reason: scan.reason });
+          notOffered.push({ name: cutText(String(t.name), 128), reason: cutText(scan.reason, 200) });
           continue;
         }
         if (typeof t.name === 'string') declarations.set(t.name, scan.declarations);

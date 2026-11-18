@@ -2,6 +2,8 @@
 // one more walk, and an oversized list fails the start instead of throwing out of it.
 import { describe, expect, it } from 'vitest';
 import { ServerLink, type Target } from '../../../src/mcp/wire/link.ts';
+import { toolFingerprint } from '../../../src/mcp/catalog.ts';
+import { mutations } from '../../../src/mutations.ts';
 import { fakeNet, fakeProcess, initResult, json, listResult, realClock, sse } from '../wire-fakes.ts';
 
 const remote: Target = { where: 'remote', address: 'a1', url: 'https://h.example/mcp', headers: [] };
@@ -108,5 +110,76 @@ describe("a modern remote run's fingerprints", () => {
       prints.push(link.current!.tools[0]!.fingerprint);
     }
     expect(prints[0]).not.toBe(prints[1]);
+  });
+});
+
+/** A modern remote server that lists the given tools on one page. */
+function modernListing(tools: unknown[]) {
+  return fakeNet((b) => {
+    if (b.method === 'initialize') return { ...json({ jsonrpc: '2.0', id: b.id, error: { code: -32022, message: 'x', data: { supported: ['2026-07-28'] } } }), status: 400 };
+    return json({ jsonrpc: '2.0', id: b.id, result: { resultType: 'complete', tools } });
+  });
+}
+
+describe('every listed tool is bounded before any is scanned', () => {
+  const big = () => modernListing([{ name: 'big', description: 'd'.repeat(70 * 1024), inputSchema: { type: 'object', properties: { n: { type: 'number', 'x-mcp-header': 'N' } } } }, { name: 'fine', inputSchema: { type: 'object' } }]);
+  it('a tool whose declaration is faulty still counts against the bounds: past 64 KiB, the start fails', async () => {
+    const link = new ServerLink('s', { net: big().port }, realClock, { ended: () => {} });
+    const r = await link.start(remote, 'L');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.failure.words).toMatch(/at most 65536 for one tool/);
+  });
+
+  it('the control: bounding only the offered tools (the named mutation) lets it reach Ready', async () => {
+    mutations.set(['bound-offered-only']);
+    try {
+      const link = new ServerLink('s', { net: big().port }, realClock, { ended: () => {} });
+      expect((await link.start(remote, 'L')).ok).toBe(true);
+      expect(mutations.hits('bound-offered-only')).toBeGreaterThan(0);
+    } finally {
+      mutations.clear();
+    }
+  });
+
+  it("a tool that isn't offered has its reason cut, never the server's whole text", async () => {
+    const net = modernListing([{ name: 'odd', inputSchema: { type: 'object', properties: { ['p'.repeat(3000)]: { type: 'number', 'x-mcp-header': 'N' } } } }, { name: 'fine', inputSchema: { type: 'object' } }]);
+    const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
+    expect((await link.start(remote, 'L')).ok).toBe(true);
+    const reason = link.current!.notOffered[0]!.reason;
+    expect([...reason].length).toBeLessThanOrEqual(200);
+  });
+
+  it('a list built to make the declaration scan quadratic fails at the bounds, at once', async () => {
+    // One tool: 30,000 declarations and 30,000 refs, under the response's own size bound.
+    const properties: Record<string, unknown> = {};
+    for (let i = 0; i < 30_000; i++) properties[`p${i}`] = { type: 'string', 'x-mcp-header': `H${i}` };
+    const refs = Array.from({ length: 30_000 }, (_, i) => ({ $ref: `#/$defs/d${i}` }));
+    const net = modernListing([{ name: 'slow', inputSchema: { type: 'object', properties: { ...properties, r: { anyOf: refs } }, $defs: {} } }]);
+    const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
+    const t0 = performance.now();
+    const r = await link.start(remote, 'L');
+    expect(r.ok).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(3000);
+  }, 20_000);
+});
+
+describe('a fingerprint and the order of a schema', () => {
+  const declared = (order: 'ab' | 'ba') => {
+    const a = { type: 'string', 'x-mcp-header': 'A' };
+    const b = { type: 'string', 'x-mcp-header': 'B' };
+    const properties = order === 'ab' ? { a, b } : { b, a };
+    const declarations = Object.keys(properties).map((k) => ({ path: [k], name: k.toUpperCase(), type: 'string' as const }));
+    return toolFingerprint({ name: 'look', inputSchema: { type: 'object', properties } }, declarations);
+  };
+  it('the same tool with its properties in another order has one fingerprint', () => {
+    expect(declared('ab')).toBe(declared('ba'));
+  });
+  it('the control: declarations hashed in the order found (the named mutation) differ', () => {
+    mutations.set(['declarations-in-order']);
+    try {
+      expect(declared('ab')).not.toBe(declared('ba'));
+    } finally {
+      mutations.clear();
+    }
   });
 });

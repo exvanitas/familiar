@@ -71,30 +71,80 @@ export function scanDeclarations(schema: unknown): ScanResult {
   const fault = visit(schema, [], true);
   if (fault) return { ok: false, reason: numberFault ?? fault };
   if (numberFault) return { ok: false, reason: numberFault };
+  if (out.length === 0) return { ok: true, declarations: out };
   // A declaration may not be a `$ref` target, nor inside one: another part of the schema could then carry
-  // the same argument under another path.
-  const refs = localRefs(schema);
+  // the same argument under another path. Each ref is resolved to the node it names; one Familiar can't
+  // resolve fails the tool, closed. Linear: the targets go in a set, and each declaration looks up its own
+  // node and its ancestors.
+  const targets = refTargets(schema);
+  if (typeof targets === 'string') return { ok: false, reason: targets };
   for (const d of out) {
-    const pointer = `#${d.path.map((k) => `/properties/${k.replace(/~/g, '~0').replace(/\//g, '~1')}`).join('')}`;
-    if (refs.some((r) => pointer === r || pointer.startsWith(`${r}/`))) return { ok: false, reason: `${where(d.path)}: x-mcp-header may not sit on a $ref target` };
+    const node = d.path.flatMap((k) => ['properties', k]);
+    for (let i = 0; i <= node.length; i++) {
+      if (i % 2 === 1) continue;
+      if (targets.has(pointerOf(node.slice(0, i)))) return { ok: false, reason: `${where(d.path)}: x-mcp-header may not sit on a $ref target` };
+    }
   }
   return { ok: true, declarations: out };
 }
 
-/** Every local `$ref` (`#…`) anywhere in a schema, bounded by the schema's own bounds checked earlier. */
-function localRefs(schema: unknown): string[] {
-  const out: string[] = [];
-  const walk = (n: unknown): void => {
-    if (n === null || typeof n !== 'object') return;
-    if (Array.isArray(n)) return n.forEach(walk);
-    for (const [k, v] of Object.entries(n as Record<string, unknown>)) {
-      if (k === '$ref' && typeof v === 'string' && v.startsWith('#')) out.push(v === '#' ? '' : v);
-      else walk(v);
+/** Schema keywords whose value is a schema, a list of schemas, or a map of them: where a `$ref` is a ref. */
+const ONE = ['additionalProperties', 'unevaluatedProperties', 'propertyNames', 'items', 'contains', 'unevaluatedItems', 'not', 'if', 'then', 'else'];
+const LIST = ['prefixItems', 'allOf', 'anyOf', 'oneOf'];
+const MAP = ['properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions'];
+
+const pointerOf = (keys: readonly string[]) => keys.map((k) => `/${k.replace(/~/g, '~0').replace(/\//g, '~1')}`).join('');
+
+/**
+ * The node each `$ref` in a schema names, as a JSON Pointer from the root (`''` is the root): `$ref`s are
+ * read only where a schema sits, never inside data (`default`, `examples`, `const`, `enum`). A pointer
+ * fragment is percent-decoded and unescaped; a plain-name fragment is looked up among the `$anchor`s. Any
+ * other form (another document, an unknown anchor, a pointer that names nothing) is a reason, not a set.
+ */
+function refTargets(schema: unknown): Set<string> | string {
+  const refs: string[] = [];
+  const anchors = new Map<string, string>();
+  const nodes = new Set<string>();
+  const stack: [unknown, string[]][] = [[schema, []]];
+  while (stack.length) {
+    const [n, keys] = stack.pop()!;
+    if (n === null || typeof n !== 'object' || Array.isArray(n)) continue;
+    const s = n as Record<string, unknown>;
+    nodes.add(pointerOf(keys));
+    if (typeof s.$ref === 'string') refs.push(s.$ref);
+    else if (s.$ref !== undefined) return 'a $ref that is not a string';
+    if (typeof s.$anchor === 'string') anchors.set(s.$anchor, pointerOf(keys));
+    if (s.$dynamicRef !== undefined || s.$dynamicAnchor !== undefined || s.$recursiveRef !== undefined) return 'a dynamic $ref, which Familiar does not resolve';
+    for (const k of ONE) if (s[k] !== undefined) stack.push([s[k], [...keys, k]]);
+    for (const k of LIST) if (Array.isArray(s[k])) (s[k] as unknown[]).forEach((c, i) => stack.push([c, [...keys, k, String(i)]]));
+    for (const k of MAP) {
+      const m = s[k];
+      if (m !== null && typeof m === 'object' && !Array.isArray(m)) for (const [name, c] of Object.entries(m as Record<string, unknown>)) stack.push([c, [...keys, k, name]]);
     }
-  };
-  walk(schema);
-  return out.map((r) => (r === '' ? '#' : r));
+  }
+  const out = new Set<string>();
+  for (const ref of refs) {
+    if (!ref.startsWith('#')) return `a $ref to another document (${cutRef(ref)}), which Familiar does not resolve`;
+    let fragment: string;
+    try {
+      fragment = decodeURIComponent(ref.slice(1));
+    } catch {
+      return `a $ref Familiar can't read (${cutRef(ref)})`;
+    }
+    if (fragment === '' || fragment.startsWith('/')) {
+      const target = pointerOf(fragment.split('/').slice(1).map((k) => k.replace(/~1/g, '/').replace(/~0/g, '~')));
+      if (!nodes.has(target)) return `a $ref to no schema in it (${cutRef(ref)})`;
+      out.add(target);
+    } else {
+      const target = anchors.get(fragment);
+      if (target === undefined) return `a $ref to an anchor it doesn't have (${cutRef(ref)})`;
+      out.add(target);
+    }
+  }
+  return out;
 }
+
+const cutRef = (ref: string) => (ref.length > 40 ? `${ref.slice(0, 40)}…` : ref).replace(/[\u0000-\u001f\u007f\ud800-\udfff]/g, '?');
 
 /** Whether a string is well-formed UTF-16: a lone surrogate would turn into U+FFFD on the wire. */
 export function wellFormed(s: string): boolean {

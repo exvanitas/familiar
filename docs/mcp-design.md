@@ -363,13 +363,14 @@ The machine is a pure function (`wire/exchange.ts`): the state and one input giv
 - **on a modern remote run**, each tool's `inputSchema` is scanned for `x-mcp-header` declarations, following the TypeScript SDK's scanner exactly:
   - **Where a declaration may sit:** only on a property reached from the root by a chain of `properties` keys.
   - **Where it may not:** anywhere under `items`, `additionalProperties`, `oneOf`, `anyOf`, `allOf`, `not`, `if`, `then`, `else`, `$defs` or a `$ref` target, or at the root. A declaration found there makes the tool invalid.
+  - **A `$ref` names a node, however it's written.** Refs are read only where a schema sits, never inside data (`default`, `examples`, `const`, `enum`). A pointer fragment is percent-decoded and unescaped, and a plain-name fragment is looked up among the `$anchor`s. A ref Familiar can't resolve (another document, an unknown anchor, a pointer to nothing, a dynamic ref) makes the tool invalid, closed. The targets go in a set, and each declaration looks up its own node and its ancestors, so the check is linear.
   - **Its value:** a non-empty string that's a valid RFC 9110 token, unique case-insensitively within the tool.
   - **Its type:** the property's `type` must be `string`, `integer` or `boolean`. A `number`, any other type, or none makes the tool invalid.
 
-  An invalid tool is not offered, and Test lists it with the scanner's reason. Each declaration found is kept with the tool (its path, its header name and its type), and the declarations are part of the tool's fingerprint, since they change what goes on the wire. On stdio nothing is mirrored, so nothing is scanned;
+  An invalid tool is not offered, and Test lists it with the scanner's reason, cut to 200 characters. Each declaration found is kept with the tool (its path, its header name and its type), and the declarations are part of the tool's fingerprint, since they change what goes on the wire. They enter it sorted by path, then header name, so the order a schema's keys came in changes nothing. On stdio nothing is mirrored, so nothing is scanned;
 - modern `tools/list` results also carry `ttlMs` and `cacheScope`. Both are read leniently and ignored: the catalog's refresh points are Familiar's (start, Test).
 
-Every listed tool counts toward the 128 before any is kept, across pages, and names are checked across all of them, offered or not, before the modern scan. Anything thrown while reading a start, a refresh or a recovery ends the run in words; nothing a server sends can throw out of them.
+Every listed tool counts toward the 128 before any is kept, across pages, and every bound (names, shape, bytes, the whole list) is checked over all of them, offered or not, before the modern scan. Anything thrown while reading a start, a refresh or a recovery ends the run in words; nothing a server sends can throw out of them.
 
 **`list_changed` during a walk.** Each run counts the `list_changed` notifications it reads. A walk publishes its catalog only if none came while it ran; otherwise it walks again from the first page, within the same deadline, and after three tries fails rather than keep a catalog Familiar knows is stale. A notification on a Ready run schedules one walk after the exchange that carried it, so a burst is one more walk.
 
@@ -888,6 +889,8 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `remote-cancel`: send a cancel to a remote server | H2 |
 | `local-cancel-after-seal` | H2 (a write after the terminal event) |
 | `no-stop-fence`: no closed mark at Stop | H2 under S11, local, during a walk and while Ready |
+| `bound-offered-only`: the catalog bounds over offered tools only | `tests/mcp/regress/walk.test.ts` |
+| `declarations-in-order`: declarations hashed in the order found | `tests/mcp/regress/walk.test.ts` |
 | `media-prefix`: a media type read by its prefix (`application/jsonp` as JSON) | H10 under S21 |
 | `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |

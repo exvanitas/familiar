@@ -41,6 +41,35 @@ describe('3.5: the x-mcp-header scan', () => {
     for (const s of bad) expect(scanDeclarations(s).ok, JSON.stringify(s)).toBe(false);
     expect(scanDeclarations({ type: 'object', properties: { n: { type: 'number', 'x-mcp-header': 'N' } } })).toMatchObject({ ok: false, reason: expect.stringMatching(/string, integer or boolean property, not number/) });
   });
+
+  describe('a $ref names a node, however it is written', () => {
+    const decl = (extra: Record<string, unknown>) => ({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X', ...(extra.anchor ? { $anchor: extra.anchor } : {}) }, y: extra.y ?? { type: 'string' } }, ...(extra.root ?? {}) });
+    it('a declaration that is a $ref target is refused: plain, percent-encoded, escaped, or through an anchor', () => {
+      for (const ref of ['#/properties/x', '#/properties/%78', '#/properties/x%2F'.slice(0, -3), '#/%70roperties/x']) expect(scanDeclarations(decl({ y: { $ref: ref } })), ref).toMatchObject({ ok: false, reason: expect.stringMatching(/\$ref target/) });
+      expect(scanDeclarations(decl({ anchor: 'alias', y: { $ref: '#alias' } }))).toMatchObject({ ok: false, reason: expect.stringMatching(/\$ref target/) });
+      // An ancestor as the target, through the root.
+      expect(scanDeclarations(decl({ y: { $ref: '#' } }))).toMatchObject({ ok: false });
+    });
+    it("a $ref Familiar can't resolve fails the tool closed", () => {
+      for (const ref of ['https://h.example/s.json#/properties/x', '#nowhere', '#/properties/zz', '#%E0%A4%A']) expect(scanDeclarations(decl({ y: { $ref: ref } })).ok, ref).toBe(false);
+    });
+    it('a $ref inside data (default, examples, const, enum) is data, not a ref', () => {
+      const data = { y: { type: 'object', default: { $ref: '#/properties/x' }, examples: [{ $ref: '#/properties/x' }], const: { $ref: '#' }, enum: [{ $ref: '#/properties/x' }] } };
+      expect(scanDeclarations(decl(data))).toMatchObject({ ok: true, declarations: [{ name: 'X' }] });
+    });
+    it('a $ref to another node leaves the declaration alone', () => {
+      expect(scanDeclarations(decl({ y: { $ref: '#/$defs/d' }, root: { $defs: { d: { type: 'string' } } } }))).toMatchObject({ ok: true });
+    });
+    it('many declarations and many refs scan in linear time', () => {
+      const properties: Record<string, unknown> = {};
+      for (let i = 0; i < 60; i++) properties[`p${i}`] = { type: 'string', 'x-mcp-header': `H${i}` };
+      const $defs: Record<string, unknown> = { d: { type: 'string' } };
+      const refs = Array.from({ length: 3500 }, () => ({ $ref: '#/$defs/d' }));
+      const t0 = performance.now();
+      expect(scanDeclarations({ type: 'object', properties: { ...properties, many: { anyOf: refs } }, $defs }).ok).toBe(true);
+      expect(performance.now() - t0).toBeLessThan(500);
+    });
+  });
 });
 
 describe('3.6: the header codec', () => {
