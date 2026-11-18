@@ -1,0 +1,142 @@
+// The journal's independent checks, H6 to H9 (docs/mcp-design.md 7.2). They read the commit log and the
+// evidence log only. H6 keeps its own history of endings from the submissions' own settlements; it never
+// reads `runFailure` to judge `runFailure`.
+
+import type { JCommit, JRun } from './journal.ts';
+
+export type JCheck = (r: JRun) => string[];
+
+/** A run starts in a commit when one is live after it that wasn't before (a new run id). */
+const runId = (live: any) => (live?.run ? JSON.stringify([live.run.taskId ?? null, live.run.first ?? null, live.run.inputs ?? null]) : undefined);
+export const startsRun = (c: JCommit) => !!c.livePost?.run && runId(c.livePost) !== runId(c.livePre);
+const endsRun = (c: JCommit) => !!c.livePre?.run && (!c.livePost?.run || runId(c.livePost) !== runId(c.livePre));
+
+/** An ending that leaves inputs unanswered, from the submissions' own records: its commit and reason. */
+interface Ending {
+  readonly seq: number;
+  readonly reason: string;
+  /** An aborted run whose steps were cut off: the harness saw an interruption record written in its run. */
+  readonly interrupted: boolean;
+}
+
+function history(log: JCommit[], upTo: number) {
+  const endings: Ending[] = [];
+  const starts: number[] = [];
+  const answers: number[] = [];
+  let lastStart = 0;
+  for (const c of log) {
+    if (c.seq > upTo) break;
+    if (c.answered.length) answers.push(c.seq);
+    const unanswered = c.submissions.filter((s) => s.status === 'unanswered');
+    if (unanswered.length && endsRun(c)) {
+      const reason = unanswered[0]!.reason ?? '';
+      const interrupted = log.some((x) => x.seq >= lastStart && x.seq <= c.seq && x.interrupted.length > 0);
+      endings.push({ seq: c.seq, reason, interrupted });
+    }
+    if (startsRun(c)) {
+      starts.push(c.seq);
+      lastStart = c.seq;
+    }
+  }
+  return { endings, starts, answers };
+}
+
+/** Whether a question is due at commit `upTo`, by the independent history. */
+export function due(log: JCommit[], upTo: number): Ending | undefined {
+  const { endings, starts, answers } = history(log, upTo);
+  const last = endings.at(-1);
+  if (!last) return undefined;
+  if (starts.some((s) => s > last.seq)) return undefined;
+  // A start in the ending's own commit (a successor) supersedes it too.
+  const own = log.find((c) => c.seq === last.seq);
+  if (own && own.livePost?.run) return undefined;
+  if (answers.some((a) => a > last.seq)) return undefined;
+  // Which endings ask: the step cap, and a run whose steps were cut off. Your own Stop and an error don't.
+  if (last.reason === 'turn_limit') return last;
+  if (last.reason === 'aborted' && last.interrupted) return last;
+  return undefined;
+}
+
+/** H6: a question is shown exactly when one is due, after every step. */
+export const H6: JCheck = (r) => {
+  const problems: string[] = [];
+  for (const e of r.evidence) {
+    if (e.what !== 'shown') continue;
+    const d = due(r.log, e.at ?? 0);
+    const shown = (e.questions ?? []).length > 0;
+    if (shown && !d) problems.push(`H6: step ${e.step} shows "${e.questions![0]!.text.slice(0, 40)}", which isn't due`);
+    if (!shown && d) problems.push(`H6: step ${e.step} shows no question, though the ending at commit ${d.seq} (${d.reason}) is due one`);
+  }
+  return problems.slice(0, 3);
+};
+
+/** H7: every run start is in a commit holding your message, an answer to an open question, a Send now of
+    the oldest queued item, or pi-durable's own boundary after a run that ended answered. */
+export const H7: JCheck = (r) => {
+  const problems: string[] = [];
+  const mine = new Set(r.evidence.filter((e) => e.what === 'send').map((e) => e.requestId));
+  const sendNows = r.evidence.filter((e) => e.what === 'send-now');
+  for (const c of r.log) {
+    if (!startsRun(c)) continue;
+    // Your message, admitted in this very commit (a message closes an open question and places the
+    // oldest queued input, which may be an earlier one), not one placed later from the queue on its own.
+    if (c.submissions.some((s) => s.requestId !== undefined && mine.has(s.requestId) && !r.log.some((x) => x.seq < c.seq && x.submissions.some((y) => y.id === s.id)))) continue;
+    // An answer recorded in this commit, while the independent history had its question due.
+    if (c.answered.length && due(r.log.filter((x) => x.seq < c.seq), c.seq - 1)) continue;
+    // A Send now recorded in this commit, whose offered submission was the oldest queued before it.
+    if (c.sentNow.length) {
+      const oldest = (c.inboxPre?.items ?? []).find((i: any) => i.mode !== 'write');
+      if (oldest && sendNows.some((e) => c.sentNow.includes(e.requestId!) && e.offer?.submission === String(oldest.id))) continue;
+      problems.push(`H7: commit ${c.seq} started a run from a Send now whose submission wasn't the oldest queued`);
+      continue;
+    }
+    // pi-durable's own boundary: the previous run ended in this commit with nothing left unanswered.
+    if (c.livePre?.run && !c.submissions.some((s) => s.status === 'unanswered')) continue;
+    problems.push(`H7: commit ${c.seq} (step ${c.step}) started a run on no act of yours`);
+  }
+  return problems.slice(0, 3);
+};
+
+/** H8: after every step, an idle conversation with queued input and no question shows Send now. */
+export const H8: JCheck = (r) => {
+  const problems: string[] = [];
+  for (const e of r.evidence) {
+    if (e.what !== 'shown') continue;
+    const c = [...r.log].reverse().find((x) => x.seq <= (e.at ?? 0));
+    if (!c || c.livePost?.run) continue;
+    const queued = (c.inboxPost?.items ?? []).some((i: any) => i.mode !== 'write');
+    if (queued && !(e.questions ?? []).length && !e.sendNow) problems.push(`H8: step ${e.step}: idle, a message queued, no question, and no Send now`);
+  }
+  return problems.slice(0, 3);
+};
+
+/** H9: her line is model-visible only into a quiet chat (no run, nothing queued, no failure), and never in
+    a commit that starts a run. */
+export const H9: JCheck = (r) => {
+  const problems: string[] = [];
+  for (const c of r.log) {
+    const line = c.entries.find((e) => e.kind === 'familiar.remark');
+    if (!line) continue;
+    if (startsRun(c)) problems.push(`H9: her line in commit ${c.seq} started a run`);
+    if (!line.model) continue;
+    const quiet = !c.livePre?.run && !c.livePre?.runFailure && !(c.inboxPre?.items ?? []).length;
+    if (!quiet) problems.push(`H9: her line in commit ${c.seq} went to the model though the chat wasn't quiet`);
+  }
+  return problems.slice(0, 3);
+};
+
+export const JOURNAL_CHECKS: Record<string, JCheck> = { H6, H7, H8, H9 };
+
+/** Each check's witness: a step where its condition was in play. */
+export const JOURNAL_WITNESSES: Record<string, (r: JRun) => boolean> = {
+  'H6 a due question': (r) => r.evidence.some((e) => e.what === 'shown' && due(r.log, e.at ?? 0)),
+  'H6 a superseded question': (r) => {
+    const { endings } = history(r.log, Infinity);
+    return endings.some((x) => (x.reason === 'turn_limit' || x.interrupted) && r.log.some((c) => c.seq > x.seq && startsRun(c)));
+  },
+  'H7 a run started by an answer': (r) => r.log.some((c) => startsRun(c) && c.answered.length > 0),
+  'H7 a run started by Send now': (r) => r.log.some((c) => startsRun(c) && c.sentNow.length > 0),
+  'H8 Send now shown': (r) => r.evidence.some((e) => e.what === 'shown' && e.sendNow),
+  'H9 her line, visible': (r) => r.log.some((c) => c.entries.some((e) => e.kind === 'familiar.remark' && e.model)),
+  'H9 her line, display only': (r) => r.log.some((c) => c.entries.some((e) => e.kind === 'familiar.remark' && !e.model))
+};
