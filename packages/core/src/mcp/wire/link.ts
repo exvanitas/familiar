@@ -16,6 +16,7 @@ import { exitFailure, protocolFailure, remoteFailure, startFailure } from '../wo
 import { emptySlot, step, type Effect, type End, type ExchangeKind, type Input, type Slot } from './exchange.ts';
 import { frame, frameCall, LEGACY_VERSIONS, legacyVersion, MODERN_VERSION, type AdminMessage, type Era, type RpcId } from './framing.ts';
 import { HEADER_WORDS, paramHeaders, scanDeclarations, type HeaderDeclaration } from './headers.ts';
+import { mutant } from '../../mutations.ts';
 import { callResult, EventStream, initializeResult, Invalid, listResult, MAX_HANDSHAKE_BYTES, MAX_MESSAGE_BYTES, parseMessage, resultText, type Inbound } from './parse.ts';
 
 /** The exe's fetch, as core uses it: one request per id, its head, its body pulled, and its end. */
@@ -87,6 +88,8 @@ interface Deadline {
 interface Outcome {
   readonly end: End;
   readonly response?: Extract<Inbound, { t: 'response' }>;
+  /** Remote initialize: the session id its answer's head carried, success or not. */
+  readonly offered?: string;
 }
 
 interface Run {
@@ -112,6 +115,8 @@ interface Run {
   readonly last: LastOutput;
   /** Why the run ended, once it has. */
   failure?: Failure;
+  /** The last call's body and arguments (for named mutations only). */
+  lastCall?: { readonly body: string; readonly args: string };
   /** Resolves when the run has ended. */
   readonly over: Promise<void>;
   finish: () => void;
@@ -187,6 +192,7 @@ export class ServerLink {
    * runs under one deadline; past it the local process is stopped, or the remote run ends.
    */
   async start(target: Target, launch: string, options: { readonly era?: Era; readonly launched?: () => void } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
+    if (this.busy && mutant('slot-per-run')) this.slot = emptySlot;
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
@@ -242,6 +248,10 @@ export class ServerLink {
       await run.over;
       return;
     }
+    if (mutant('delete-at-stop')) {
+      const t = run.target as Extract<Target, { where: 'remote' }>;
+      void this.ports.net!.fetch({ id: randomId(), address: t.address, url: t.url, method: 'DELETE' as 'POST', headers: this.headers(run, undefined) }, new Uint8Array(0)).catch(() => {});
+    }
     this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
   }
 
@@ -290,17 +300,22 @@ export class ServerLink {
     // Modern remote: the headers come from the same decision as the body, in this same step (3.6).
     let extra: (readonly [string, string])[] | undefined;
     if (run.era === 'modern' && run.target.where === 'remote') {
-      const params = paramHeaders(run.declarations.get(name) ?? [], JSON.parse(canonicalArguments), this.headers(run, 'tools/call').length + 1);
+      const mirrored = run.lastCall && mutant('mirror-previous-call') ? run.lastCall.args : canonicalArguments;
+      const params = paramHeaders(run.declarations.get(name) ?? [], JSON.parse(mirrored), this.headers(run, 'tools/call').length + 1);
       if (!params.ok) return Promise.resolve({ kind: 'error', reason: 'protocol', words: HEADER_WORDS });
       extra = [['Mcp-Name', name], ...params.headers];
     }
     const id = run.nextId++;
     const body = frameCall(id, name, canonicalArguments, run.era, run.target.where);
+    run.lastCall = { body, args: canonicalArguments };
     const outcome = this.exchangeNow(run, 'call', id, body, 'tools/call', extra);
     if (!outcome) return undefined;
     const n = this.slot.ex!.n;
     const timer = this.clock.setTimer(() => this.input({ t: 'terminal', n, end: { t: 'timeout' } }), ms, { background: false });
-    const onAbort = () => this.input({ t: 'terminal', n, end: { t: 'stopped' } });
+    const onAbort = () => {
+      this.input({ t: 'terminal', n, end: { t: 'stopped' } });
+      if (run.target.where === 'remote' && mutant('remote-cancel')) this.post(run, `${n}:cancel`, JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }), undefined);
+    };
     signal.addEventListener('abort', onAbort, { once: true });
     return outcome.then((o) => {
       timer?.();
@@ -331,7 +346,13 @@ export class ServerLink {
       }
       if (run.era === 'modern') {
         const type = r.result?.resultType;
-        if (type === 'input_required') return { kind: 'result', text: "The server asked for input Familiar can't give.", isError: true };
+        if (type === 'input_required') {
+          if (run.lastCall && mutant('retry-after-input-required')) {
+            const again = run.lastCall.body;
+            void this.drained().then(() => this.exchangeNow(run, 'call', run.nextId++, again, 'tools/call'));
+          }
+          return { kind: 'result', text: "The server asked for input Familiar can't give.", isError: true };
+        }
         if (type === undefined) return { kind: 'error', reason: 'protocol', words: 'The server sent a result without its resultType, which the protocol requires.' };
         if (type !== 'complete') return { kind: 'result', text: `The server sent a result Familiar can't use (${String(type).slice(0, 40)}).`, isError: true };
       }
@@ -368,9 +389,12 @@ export class ServerLink {
     if (r.error) {
       // The opening's classifier (3.3): a -32022 naming 2026-07-28 and no legacy version Familiar speaks
       // makes this run modern. There's no new exchange: no discover, no initialized, straight to the list.
-      if (modernRefusal(r.error)) {
+      if (modernRefusal(r.error) || mutant('modern-on-any-error')) {
         run.era = 'modern';
-        delete run.sessionId;
+        if (init.offered !== undefined && mutant('session-id-on-modern')) run.sessionId = init.offered;
+        else delete run.sessionId;
+        // The mutant keeps sending initialized on a modern run.
+        if (mutant('initialized-on-modern')) await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where), deadline, 'notifications/initialized');
         return undefined;
       }
       return refusedWords(r.error);
@@ -487,7 +511,7 @@ export class ServerLink {
       case 'ended': {
         const p = this.pending.get(e.n);
         if (!p) return;
-        p.done({ end: e.end, ...(p.response ? { response: p.response } : {}) });
+        p.done({ end: e.end, ...(p.response ? { response: p.response } : {}), ...(p.offeredSession !== undefined ? { offered: p.offeredSession } : {}) });
         // The first page or call after a re-handshake that completes without a 404 rearms the bound (3.8).
         if (e.end.t === 'done' && (p.kind === 'list' || p.kind === 'call')) p.run.dropped = 0;
         if (e.end.t === 'session-ended') this.sessionDropped(p.run);
@@ -581,6 +605,7 @@ export class ServerLink {
       // Modern: the version and the method on every request; no session, ever.
       set('MCP-Protocol-Version', MODERN_VERSION);
       if (method) set('Mcp-Method', method);
+      if (run.sessionId) set('Mcp-Session-Id', run.sessionId);
       return h;
     }
     if (run.version) set('MCP-Protocol-Version', run.version);
@@ -629,7 +654,7 @@ export class ServerLink {
   private async response(run: Run, p: Pending, id: string, head: NetHead): Promise<void> {
     const live = () => this.slot.ex?.n === p.n && this.slot.ex.phase === 'live';
     if (!live()) return;
-    if (head.redirected || (head.status >= 300 && head.status < 400)) return this.input({ t: 'terminal', n: p.n, end: { t: 'redirected', status: head.status } });
+    if ((head.redirected || (head.status >= 300 && head.status < 400)) && !mutant('ignore-redirected')) return this.input({ t: 'terminal', n: p.n, end: { t: 'redirected', status: head.status } });
     if (head.status === 404 && p.carriedSession) return this.input({ t: 'terminal', n: p.n, end: { t: 'session-ended' } });
     const type = (head.headers.find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? '').toLowerCase();
     if (head.status === 202 && p.kind === 'initialized') return this.input({ t: 'completed', n: p.n });
@@ -698,7 +723,7 @@ export class ServerLink {
     const live = ex && ex.phase === 'live' ? this.pending.get(ex.n) : undefined;
     const mine = live && live.run === run && (!remote || live === on) ? live : undefined;
     if (m.t === 'response') {
-      if (!mine || mine.requestId === undefined || m.id !== mine.requestId) return false;
+      if (!mine || mine.requestId === undefined || (m.id !== mine.requestId && !mutant('accept-any-response-id'))) return false;
       mine.response = m;
       if (mine.kind === 'initialize' && !m.error && mine.offeredSession !== undefined) run.sessionId = mine.offeredSession;
       this.input({ t: 'completed', n: mine.n });
@@ -706,8 +731,15 @@ export class ServerLink {
     }
     if (m.t === 'request') {
       // Only a legacy ping is answered; any other request gets no reply (Familiar declares no capabilities).
+      if (m.method === 'ping' && run.era === 'modern' && remote && on && mutant('answer-stray-ping-modern')) {
+        this.post(run, `${on.n}:pong:stray`, JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} }), undefined);
+        return false;
+      }
       if (m.method !== 'ping' || run.era !== 'legacy') return false;
-      if (mine) this.input({ t: 'ping', n: mine.n, id: m.id });
+      if (mine && mutant('pong-in-microtask')) {
+        const n = mine.n;
+        queueMicrotask(() => this.input({ t: 'ping', n, id: m.id }));
+      } else if (mine) this.input({ t: 'ping', n: mine.n, id: m.id });
       else if (!remote && !this.busy) this.idlePing(run, m.id);
       else if (ex && ex.phase === 'draining' && !remote) this.input({ t: 'ping', n: ex.n, id: m.id });
       return false;
@@ -737,14 +769,15 @@ export class ServerLink {
    */
   private sessionDropped(run: Run): void {
     if (run.ended) return;
-    if (run.dropped > 0 || !run.ready) {
+    if ((run.dropped > 0 && !mutant('rehandshake-every-404')) || !run.ready) {
       this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
       return;
     }
     run.dropped = 1;
     run.ready = false;
     run.stale = true;
-    delete run.sessionId;
+    const resend = run.lastCall && mutant('resend-404-call') ? run.lastCall.body : undefined;
+    if (!mutant('keep-old-session-id')) delete run.sessionId;
     delete run.version;
     void (async () => {
       const { deadline, cancel } = this.deadline(run, this.limits.startMs);
@@ -757,6 +790,10 @@ export class ServerLink {
         if (!('tools' in listed)) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
         run.ready = true;
         this.events.listed?.(run.id, run.tools);
+        if (resend) {
+          await this.drained();
+          void this.exchangeNow(run, 'call', run.nextId++, resend, 'tools/call');
+        }
       } finally {
         cancel?.();
       }

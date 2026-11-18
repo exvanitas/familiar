@@ -10,6 +10,7 @@ import type { JournalClock } from '../journal/journal.ts';
 import type { SettingsStore } from '../settings/store.ts';
 import { canonicalArguments, markUsed, usable, type CardFacts, type ToolDecision } from './decision.ts';
 import { addressIdentity, modelName, Owner, type Outcome } from './owner.ts';
+import { mutant } from '../mutations.ts';
 import type { PathRules } from './native-rules.ts';
 import type { Draft } from './paste.ts';
 import type { ProcessPort } from './process.ts';
@@ -296,7 +297,7 @@ export class McpClient {
           setupFingerprint: setupFingerprint(s.setup),
           fresh: fresh(saved.get(listed.name), listed.fingerprint),
           facts: args => this.facts(server.id, listed.name, args),
-          send: (decision, signal) => this.send(decision, signal)
+          send: (decision, signal, raw) => this.send(decision, signal, raw)
         }));
       }
     }
@@ -321,7 +322,7 @@ export class McpClient {
    * outside content; a Yes not turned to "never"); and the exchange slot is Idle. Then it marks the decision
    * used, builds the body from the decision alone, and hands it off.
    */
-  send(decision: ToolDecision, signal: AbortSignal): Promise<CallOutcome> {
+  send(decision: ToolDecision, signal: AbortSignal, raw?: unknown): Promise<CallOutcome> {
     const refuse = (reason: Extract<CallOutcome, { kind: 'error' }>['reason'], words: string): Promise<CallOutcome> => Promise.resolve({ kind: 'error', reason, words });
     if (!usable(decision)) return refuse('changed', 'That call had no consent of its own, or it was used already, so it was not sent.');
     if (signal.aborted) return Promise.resolve({ kind: 'stopped' });
@@ -338,10 +339,15 @@ export class McpClient {
     if (decision.by === 'always' && (decision.outside || overlay === 'ask' || !(choice?.policy === 'allow' && choice.fingerprint === decision.fingerprint && choice.setupFingerprint === decision.launch))) {
       return refuse('changed', `Your "always" for ${decision.tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`);
     }
-    if (rt.link.busy) return refuse('busy', 'The server is busy with another request. Try again in a moment.');
     const ms = Math.min(CALL_MS_MAX, Math.max(CALL_MS_MIN, record.limits.callMs ?? CALL_MS));
+    // Named mutations: queue behind a live exchange, a gap between the checks and the handoff, or a body
+    // from the model's own arguments instead of the decision's.
+    if (rt.link.busy && mutant('queue-call')) return rt.link.drained().then(() => (markUsed(decision), rt.link.handoff(decision.tool, decision.canonical, signal, ms) ?? refuse('busy', 'busy')));
+    if (rt.link.busy) return refuse('busy', 'The server is busy with another request. Try again in a moment.');
+    if (mutant('await-before-handoff')) return Promise.resolve().then(() => (markUsed(decision), rt.link.handoff(decision.tool, decision.canonical, signal, ms) ?? refuse('busy', 'busy')));
+    const canonical = raw !== undefined && mutant('body-from-model-args') ? (canonicalArguments(raw)?.canonical ?? decision.canonical) : decision.canonical;
     markUsed(decision);
-    const sent = rt.link.handoff(decision.tool, decision.canonical, signal, ms);
+    const sent = rt.link.handoff(decision.tool, canonical, signal, ms);
     return sent ?? refuse('busy', 'The server is busy with another request. Try again in a moment.');
   }
 

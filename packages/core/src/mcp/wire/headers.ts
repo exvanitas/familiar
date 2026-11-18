@@ -22,6 +22,8 @@ const NAMED = new Set(['patternProperties', 'dependentSchemas', '$defs', 'defini
 export const MAX_HEADER_BYTES = 8 * 1024;
 export const MAX_HEADERS = 64;
 
+import { mutant } from '../../mutations.ts';
+
 const where = (path: readonly string[]) => (path.length ? path.join('.') : 'the root');
 
 /** Scans a tool's input schema. Invalid: not offered, and Test lists the reason. */
@@ -141,7 +143,11 @@ export function paramHeaders(declarations: readonly HeaderDeclaration[], args: u
     }
     const name = `Mcp-Param-${d.name}`;
     const value = encodeValue(text);
-    if (new TextEncoder().encode(`${name}: ${value}`).length > MAX_HEADER_BYTES) return { ok: false };
+    if (new TextEncoder().encode(`${name}: ${value}`).length > MAX_HEADER_BYTES) {
+      if (!mutant('truncate-header')) return { ok: false };
+      out.push([name, value.slice(0, MAX_HEADER_BYTES - name.length - 2)]);
+      continue;
+    }
     out.push([name, value]);
   }
   if (out.length + others > MAX_HEADERS) return { ok: false };

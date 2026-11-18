@@ -14,11 +14,12 @@
 // remote request's POST is cancelled then; a pong already handed off is left to reach its head, within
 // its own bounds, and is cancelled at its head, so a pong sent just before the final reply still arrives.
 
+import { mutant } from '../../mutations.ts';
 import type { Era, RpcId, Where } from './framing.ts';
 
 export type ExchangeKind = 'initialize' | 'initialized' | 'list' | 'call' | 'pong';
 
-/** At most this many pongs awaiting their head (remote) or write (local), and in all, per exchange. */
+/** At most this many pongs whose native request (remote) or write (local) hasn't ended, and in all, per exchange. */
 export const MAX_PONGS_OUT = 2;
 export const MAX_PONGS = 32;
 
@@ -48,7 +49,7 @@ export interface Exchange {
   readonly open: readonly string[];
   /** Remote handles whose net_cancel has been asked. */
   readonly cancelled: readonly string[];
-  /** Pong handles before their head (remote) or their write's end (local). */
+  /** Pong handles whose native request (remote) or write (local) hasn't ended yet. */
   readonly pongsOut: readonly string[];
   readonly pongsTotal: number;
   /** Ping ids this exchange answered. */
@@ -109,7 +110,7 @@ function terminate(slot: Slot, ex: Exchange, end: End, effects: Effect[]): Step 
   let open = ex.open;
   const out: Effect[] = [...effects];
   // A local call ended by Stop or its time limit: notifications/cancelled is the last send.
-  if (ex.where === 'local' && ex.kind === 'call' && (end.t === 'stopped' || end.t === 'timeout') && ex.requestId !== undefined) {
+  if (ex.where === 'local' && ex.kind === 'call' && (end.t === 'stopped' || end.t === 'timeout') && ex.requestId !== undefined && !mutant('local-cancel-after-seal')) {
     const handle = `${ex.n}:cancel`;
     out.push({ t: 'send', handle, message: 'cancel', requestId: ex.requestId });
     open = [...open, handle];
@@ -122,8 +123,13 @@ function terminate(slot: Slot, ex: Exchange, end: End, effects: Effect[]): Step 
       out.push({ t: 'cancel', handle: req });
       cancelled = [...cancelled, req];
     }
+    if (ex.pongsOut.length && mutant('cancel-pongs-at-drain')) {
+      for (const h of ex.pongsOut) if (!cancelled.includes(h)) out.push({ t: 'cancel', handle: h });
+      cancelled = [...cancelled, ...ex.pongsOut];
+    }
   }
   out.push({ t: 'ended', n: ex.n, kind: ex.kind, end });
+  if (open.length && mutant('free-slot-at-response')) return { slot: { next: slot.next }, effects: [...out, { t: 'idle', n: ex.n }] };
   return settle(slot, { ...ex, phase: 'draining', open, cancelled, end }, out);
 }
 
@@ -131,7 +137,7 @@ export function step(slot: Slot, input: Input): Step {
   const ex = slot.ex;
   switch (input.t) {
     case 'admit': {
-      if (ex) return { slot, effects: [{ t: 'busy' }] };
+      if (ex && !(ex.phase === 'draining' && mutant('admit-while-draining'))) return { slot, effects: [{ t: 'busy' }] };
       const n = slot.next;
       const handle = `${n}:req`;
       const fresh: Exchange = { n, kind: input.kind, where: input.where, era: input.era, ...(input.requestId !== undefined ? { requestId: input.requestId } : {}), phase: 'live', open: [handle], cancelled: [], pongsOut: [], pongsTotal: 0, answered: [] };
@@ -149,7 +155,7 @@ export function step(slot: Slot, input: Input): Step {
       if (!ex || ex.n !== input.n || ex.era !== 'legacy') return { slot, effects: [] };
       if (ex.answered.includes(input.id)) return { slot, effects: [] };
       // Sealed: no send of any kind. Locally that's departure 2; a remote stream is parsed no further.
-      if (ex.phase !== 'live') return { slot, effects: ex.where === 'local' ? [{ t: 'departure', n: ex.n, id: input.id, departure: 2 }] : [] };
+      if (ex.phase !== 'live' && !mutant('pong-after-end')) return { slot, effects: ex.where === 'local' ? [{ t: 'departure', n: ex.n, id: input.id, departure: 2 }] : [] };
       if (ex.pongsOut.length >= MAX_PONGS_OUT || ex.pongsTotal >= MAX_PONGS) {
         return terminate(slot, ex, { t: 'flood' }, [{ t: 'departure', n: ex.n, id: input.id, departure: 1 }]);
       }
@@ -159,14 +165,20 @@ export function step(slot: Slot, input: Input): Step {
     }
     case 'pong-head': {
       if (!ex || !ex.open.includes(input.handle) || ex.cancelled.includes(input.handle)) return { slot, effects: [] };
-      // A pong's body is never read: it's cancelled at its head.
-      return { slot: { ...slot, ex: { ...ex, pongsOut: without(ex.pongsOut, input.handle), cancelled: [...ex.cancelled, input.handle] } }, effects: [{ t: 'cancel', handle: input.handle }] };
+      // A pong's body is never read: it's cancelled at its head. It stays outstanding until its native
+      // request has ended, so the request and two pongs are all an exchange ever has open.
+      return { slot: { ...slot, ex: { ...ex, cancelled: [...ex.cancelled, input.handle] } }, effects: [{ t: 'cancel', handle: input.handle }] };
     }
     case 'released': {
       if (!ex || !ex.open.includes(input.handle)) return { slot, effects: [] };
-      const released: Exchange = { ...ex, open: without(ex.open, input.handle), pongsOut: without(ex.pongsOut, input.handle) };
+      let released: Exchange = { ...ex, open: without(ex.open, input.handle), pongsOut: without(ex.pongsOut, input.handle) };
+      // The mutant's late cancel: sent after the seal, when the request's write ends.
+      if (released.phase === 'draining' && released.where === 'local' && released.kind === 'call' && (released.end?.t === 'stopped' || released.end?.t === 'timeout') && !released.open.includes(`${ex.n}:cancel`) && input.handle === `${ex.n}:req` && released.requestId !== undefined && mutant('local-cancel-after-seal')) {
+        released = { ...released, open: [...released.open, `${ex.n}:cancel`] };
+        return { slot: { ...slot, ex: released }, effects: [{ t: 'send', handle: `${ex.n}:cancel`, message: 'cancel', requestId: released.requestId }] };
+      }
       // A local write-only exchange completes when its own write does.
-      if (released.phase === 'live' && released.where === 'local' && writeOnly(released.kind) && input.handle === `${ex.n}:req`) return terminate(slot, released, { t: 'done' }, []);
+      if (released.phase === 'live' && released.where === 'local' && writeOnly(released.kind) && input.handle === `${ex.n}:req` && !mutant('write-only-on-response')) return terminate(slot, released, { t: 'done' }, []);
       return settle(slot, released, []);
     }
   }

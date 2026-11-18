@@ -56,7 +56,7 @@ export interface ServerTool extends FamiliarTool {
 }
 
 /** The client's send: the only way a call reaches a server, with a gate-minted decision. */
-export type Sender = (decision: ToolDecision, signal: AbortSignal) => Promise<CallOutcome>;
+export type Sender = (decision: ToolDecision, signal: AbortSignal, raw?: unknown) => Promise<CallOutcome>;
 
 const MAX_DESCRIPTION = 2000;
 
@@ -88,11 +88,12 @@ export function serverTool(input: {
     fresh: input.fresh,
     consent: { facts: input.facts },
     doing: () => `calling ${listed.name} on ${server.label}`,
-    async run(_args: unknown, step: ToolStep): Promise<string> {
+    async run(args: unknown, step: ToolStep): Promise<string> {
       // The call is the gate's decision, minted in this execute from the card's stored facts or a standing
       // "always": its body is built from the decision, never from these arguments.
       if (!step.decision) throw new Error(`No consent was given for this call, so Familiar didn't send it.`);
-      const outcome = await send(step.decision as ToolDecision, step.signal ?? new AbortController().signal);
+      // `args` goes along only for the harness's named mutation that builds the body from them.
+      const outcome = await send(step.decision as ToolDecision, step.signal ?? new AbortController().signal, args);
       return outcomeText(server.label, listed.name, outcome);
     }
   };
