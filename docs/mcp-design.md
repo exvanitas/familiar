@@ -630,7 +630,7 @@ If either unverified item turns out true (certificate fetches outside the saved 
 - **Native starts** are admitted by the owner, and count as the effect in flight until they return a run id or a failure. While a start's dialog is open, nothing else durable goes anywhere.
 - **Fail closed:**
   - an unreadable choice loads as an explicit "ask" for its tool, never as empty, since an empty choice is a built-in's default, which for some is allow. That loosens a lost "never" to "ask", which still needs your Yes on a card for every call. It never loosens to "always";
-  - an unreadable server record isn't started or overwritten;
+  - an unreadable server record isn't started or overwritten, and keeps its address: repair's sweep and an Add's two address checks (its URL's identity, and the id the exe gives back) read every record raw, so a new server never shares an unreadable one's address;
   - a record of another version, or one whose shape can't be read at all, loads nothing, and nothing is written. Then no choice loads, so no built-in falls back to its default allow: every tool asks, built-ins included, until a restart reads the record. A revoke to never still denies, from the overlay (5.5), though it can't be saved;
   - a missing secret stops the start, and the refusal lists all of the setup's secrets.
 
