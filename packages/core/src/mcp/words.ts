@@ -37,8 +37,10 @@ const KIND: Record<string, Failure['kind']> = {
 };
 
 /** A refused or failed local start, in plain words. */
-export function startFailure(e: unknown, program: string): Failure {
+export function startFailure(e: unknown, program: string, secrets: readonly string[] = []): Failure {
   const kind = kindOf(e);
+  // Fail closed (5.1): a secret the setup names isn't in Credential Manager, so it doesn't start.
+  if (kind === 'no-key') return { kind: 'refused', words: `A secret this server needs isn't saved${secrets.length ? ` (${secrets.join(', ')})` : ''}. Type it in Settings, then start it again.` };
   if (kind === 'not-found') return { kind: 'not-found', words: `Familiar couldn't find the program "${program}". ${missingProgram(program)}` };
   if (kind && START[kind]) return { kind: KIND[kind] ?? 'failed', words: START[kind]! };
   return { kind: 'failed', words: "The server couldn't be started." };

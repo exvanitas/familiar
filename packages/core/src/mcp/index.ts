@@ -1,5 +1,5 @@
 // The MCP client. See docs/mcp-design.md.
-export { CALL_MS, CALL_MS_MAX, CALL_MS_MIN, McpClient } from './client.ts';
+export { BUILT_IN, CALL_MS, CALL_MS_MAX, CALL_MS_MIN, McpClient } from './client.ts';
 export type { AddressPort, McpClientOptions, SecretPort, ServerStatus, TestedTool, TestReport } from './client.ts';
 export { canonicalJson, sha256 } from './hash.ts';
 export { ServerRuntime } from './runtime.ts';

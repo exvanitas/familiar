@@ -106,7 +106,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     if (!report.ok) return fail('Test: ' + report.failure.words);
     ok(report.tools.length === TOOLS && report.tools.every(t => t.fresh), `Test listed ${report.tools.length} tools, ${report.tools.filter(t => t.fresh).length} fresh`);
     ok(client.get(id)?.phase === 'stopped', 'Test left the server running: ' + client.get(id)?.phase);
-    const record = JSON.stringify(await store.get(`mcp.server.${id}`));
+    const record = JSON.stringify(((await store.get('mcp.owner'))?.value as any)?.servers?.[id]);
     ok(record.includes('FAKE_SECRET') && !record.includes('typed-later') && leaks([record]) === 0, 'the saved setup holds a secret value');
     await client.markReviewed(id, report.tools.map(t => t.name));
     // Looked for while the start is under way; one that came would be refused.
@@ -206,7 +206,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     const model = await run(tool('print_secret'), {});
     await sleep(500);
     ok(heard.some(l => l.includes('the secret is [hidden]')), "the server's log line never came back blanked");
-    const kept = [JSON.stringify(client.list()), JSON.stringify(await store.get(`mcp.server.${id}`))];
+    const kept = [JSON.stringify(client.list()), JSON.stringify(await store.get('mcp.owner'))];
     const n = leaks([...heard, model, ...kept]);
     ok(n === 0, `${n} texts carry the key`);
     return `the key typed into Settings came back [hidden] in the reply, the model's text and all ${heard.length} lines core heard; nothing core keeps holds it. Literal copies only: see security.mcp.secret-json-escaped`;
@@ -223,7 +223,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(answer.kind === 'interrupted', 'the call in flight: ' + JSON.stringify(answer));
     const status = await shell.secretStatus(`server:${id}:FAKE_SECRET`);
     ok(!status.present, 'the secret is still in Credential Manager');
-    ok((await store.get(`mcp.server.${id}`)) === undefined, 'the saved setup is still there');
+    ok(client.owner.server(id) === undefined && ((await store.get('mcp.owner'))?.value as any)?.servers?.[id] === undefined, 'the saved setup is still there');
     ok(client.list().length === 0, 'the client still lists it');
     await sleep(1000);
     const left = await step<{ count: number }>('node-children');

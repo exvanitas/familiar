@@ -15,7 +15,11 @@ import type { Draft } from './paste.ts';
 import type { ProcessPort } from './process.ts';
 import { ServerRuntime, type Phase } from './runtime.ts';
 import { fresh, type SavedTool, type ServerLimits } from './saved.ts';
-import { choiceKey, serverTool, toolChanges, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
+import { choiceKey, serverTool, toolChanges, toolPolicies, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
+import type { GatePolicy, ToolPolicy } from '../journal/gate.ts';
+
+/** The server id built-in tools' choices are kept under: no saved server can have it (ids are non-empty). */
+export const BUILT_IN = '';
 import { secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 import { unpinned, type Unpinned } from './unpinned.ts';
@@ -233,6 +237,31 @@ export class McpClient {
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
     const r = await this.owner.choose(serverId, tool, choice);
     if (!r.ok) throw new Error(r.words);
+  }
+
+  /**
+   * The gate's policy for a turn (journal's `policy`): each server wrapper's from its own identity, and each
+   * built-in's from the owner's choice under the built-in id, the revoke overlay on top. Read at each call.
+   */
+  policy(wrappers: readonly ServerTool[]): GatePolicy {
+    const choices = this.owner.choices();
+    const perTool: Record<string, ToolPolicy> = { ...toolPolicies(wrappers, choices) };
+    for (const [key, c] of Object.entries(choices)) {
+      const [server, tool] = JSON.parse(key) as [string, string];
+      if (server === BUILT_IN) perTool[tool] = c.policy;
+    }
+    for (const w of wrappers) this.tighten(perTool, w.name, choiceKey(w.server.id, w.serverName));
+    for (const [key] of this.overlay) {
+      const [server, tool] = JSON.parse(key) as [string, string];
+      if (server === BUILT_IN) this.tighten(perTool, tool, key);
+    }
+    return { perTool };
+  }
+
+  private tighten(perTool: Record<string, ToolPolicy>, name: string, key: string): void {
+    const o = this.overlay.get(key);
+    if (o === 'never') perTool[name] = 'deny';
+    else if (o === 'ask' && perTool[name] === 'allow') delete perTool[name];
   }
 
   /** The person's choices, from the owner. */

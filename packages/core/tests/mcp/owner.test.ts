@@ -200,3 +200,16 @@ describe('5.1: failing closed', () => {
     expect(await store.get(OWNER_KEY)).toEqual({ v: 2, value: { future: true } });
   });
 });
+
+describe('5.1: the owner keeps built-in choices too', () => {
+  it("the gate's policy carries server and built-in choices, with the revoke overlay on top at once", async () => {
+    const { McpClient, BUILT_IN } = await import('../../src/mcp/client.ts');
+    const t = ports();
+    const client = await McpClient.open({ store: t.p.store, processes: { start: async () => ({ run: 'x' }), write: async () => {}, stop: async () => {}, forget: async () => {} }, net: { fetch: async () => { throw new Error('no'); }, read: async () => new Uint8Array(0), cancel: async () => {} }, addresses: t.p.addresses, secrets: t.p.secrets, clock: { now: () => 0, setTimer: () => undefined } });
+    await client.choose(BUILT_IN, 'note_add', { policy: 'deny', fingerprint: '', setupFingerprint: '' });
+    await client.choose(BUILT_IN, 'look', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    expect(client.policy([])).toEqual({ perTool: { note_add: 'deny', look: 'allow' } });
+    client.revoke(BUILT_IN, 'look', 'ask');
+    expect(client.policy([]).perTool).toEqual({ note_add: 'deny' });
+  });
+});

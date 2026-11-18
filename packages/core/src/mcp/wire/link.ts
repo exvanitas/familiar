@@ -200,7 +200,7 @@ export class ServerLink {
       } catch (e) {
         run.ended = true;
         options.launched?.();
-        return { ok: false, failure: startFailure(e, target.setup.program) };
+        return { ok: false, failure: startFailure(e, target.setup.program, target.setup.secrets) };
       }
       // The exe answered: the owner's native start is over (5.1).
       options.launched?.();

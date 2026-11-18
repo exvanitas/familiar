@@ -262,3 +262,9 @@ describe("the runner's own options only (r20 #7)", () => {
   ];
   for (const [program, args, what] of cases) it(`${program} ${args.join(' ')}`, () => expect(unpinned(program, args)?.what).toBe(what));
 });
+
+describe('a missing secret (5.1, fail closed)', () => {
+  it('stops the start, with the secrets named', () => {
+    expect(startFailure({ kind: 'no-key', message: 'no-key' }, 'npx', ['API_TOKEN'])).toEqual({ kind: 'refused', words: "A secret this server needs isn't saved (API_TOKEN). Type it in Settings, then start it again." });
+  });
+});
