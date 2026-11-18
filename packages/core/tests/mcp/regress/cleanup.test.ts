@@ -33,7 +33,9 @@ describe('cleanup the exe refused', () => {
 
   it('a rejected server_stop keeps the run\'s writes open until an exit is seen', async () => {
     const proc = fakeProcess((m) => (m.method === 'tools/call' ? 'hold' : m.method === 'initialize' ? [JSON.stringify(initResult(m.id))] : m.method === 'tools/list' ? [JSON.stringify(listResult(m.id, ['look']))] : []));
+    let stopsTried = 0;
     proc.port.stop = async () => {
+      stopsTried++;
       throw Object.assign(new Error('nope'), { kind: 'failed' });
     };
     // The write bound ends the run and asks the exe to stop the process, which it refuses.
@@ -41,6 +43,8 @@ describe('cleanup the exe refused', () => {
     await link.start(local, 'L');
     void link.handoff('look', '{}', new AbortController().signal, 60_000);
     await sleep(150);
+    // The stop was asked, and refused, before any exit: and the slot is still held.
+    expect(stopsTried).toBeGreaterThan(0);
     expect(link.busy).toBe(true);
     proc.exit(0);
     await sleep(10);

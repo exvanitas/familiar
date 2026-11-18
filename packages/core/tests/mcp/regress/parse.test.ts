@@ -82,10 +82,13 @@ describe('a status other than 2xx', () => {
   it('a media type neither JSON nor an event stream is refused', async () => {
     const net = fakeNet((b) => {
       if (b.method === 'initialize') return { ...json(initResult(b.id)), headers: [['content-type', 'text/html']] };
+      if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
       return json(listResult(b.id, ['look']));
     });
     const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
     expect((await link.start(remote, 'L')).ok).toBe(false);
+    // Refused at initialize itself: the HTML-labelled answer was never read, so nothing followed it.
+    expect(net.log.map((x) => x.body?.method)).toEqual(['initialize']);
   });
 });
 

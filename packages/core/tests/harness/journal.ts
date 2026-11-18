@@ -26,9 +26,11 @@ export interface JCommit {
   readonly inboxPre: any;
   readonly inboxPost: any;
   readonly submissions: { id: string; type: string; status: string; reason?: string; detail?: unknown; requestId?: string }[];
-  readonly entries: { id: string; kind: string; model: boolean }[];
+  readonly entries: { id: string; kind: string; model: boolean; data: string }[];
   /** Familiar's documents this commit wrote, by kind. */
   readonly docs: string[];
+  /** Familiar's documents this commit wrote, with their values after it (for the twin rule). */
+  readonly docValues: Record<string, string>;
   /** Answer records this commit added (task ids), and Send now records (request ids). */
   readonly answered: string[];
   /** Send now records (SendNowDoc.byRequest) this commit wrote: the request, the offered submission, and
@@ -62,7 +64,7 @@ function recorder() {
             const answersPre = Object.keys(docOf('familiar.answers')?.byTask ?? {});
             const sentPre = Object.keys(docOf('familiar.send-now')?.byRequest ?? {});
             const stepsPre = Object.keys(docOf('familiar.interruptions')?.steps ?? {});
-            const c: JCommit = { seq: Number(seq), life, step: stepNow, livePre, livePost: undefined, inboxPre, inboxPost: undefined, submissions: [], entries: [], docs: [], answered: [], sentNow: [], interrupted: [] };
+            const c: JCommit = { seq: Number(seq), life, step: stepNow, livePre, livePost: undefined, inboxPre, inboxPost: undefined, submissions: [], entries: [], docs: [], docValues: {}, answered: [], sentNow: [], interrupted: [] };
             for (const w of batches[index]!) {
               if (w.type === 'document.create') {
                 kinds.set(String(w.record.id), w.record.kind);
@@ -77,13 +79,14 @@ function recorder() {
                 const detail = w.value.detail ?? w.value.settlement?.detail;
                 c.submissions.push({ id: String(w.value.id), type: w.value.type ?? w.value.draft?.type, status: w.value.status, reason: w.value.reason ?? w.value.settlement?.reason, ...(detail !== undefined ? { detail } : {}), requestId: w.value.requestId ?? w.value.draft?.requestId });
               } else if (w.type === 'entry') {
-                c.entries.push({ id: String(w.value.id), kind: w.value.kind, model: w.value.model !== undefined });
+                c.entries.push({ id: String(w.value.id), kind: w.value.kind, model: w.value.model !== undefined, data: JSON.stringify([w.value.data ?? null, w.value.model ?? null]) });
               }
             }
             c.answered.push(...Object.keys(docOf('familiar.answers')?.byTask ?? {}).filter((k) => !answersPre.includes(k)));
             c.interrupted.push(...Object.keys(docOf('familiar.interruptions')?.steps ?? {}).filter((k) => !stepsPre.includes(k)));
             const byRequest = docOf('familiar.send-now')?.byRequest ?? {};
             c.sentNow.push(...Object.keys(byRequest).filter((k) => !sentPre.includes(k)).map((k) => ({ request: k, submission: String(byRequest[k].submission), ...(byRequest[k].sent ? { sent: String(byRequest[k].sent) } : {}) })));
+            for (const k of c.docs) c.docValues[k] = JSON.stringify(docOf(k) ?? null);
             (c as any).livePost = structuredClone(liveOf());
             (c as any).inboxPost = structuredClone(inboxOf());
             log.push(c);

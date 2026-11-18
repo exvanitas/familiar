@@ -12,6 +12,7 @@ import { nodeStub } from '../scripts/node-stub.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const coreSrc = join(root, '..', '..', 'packages', 'core', 'src');
+const coreIndex = join(coreSrc, 'index.ts');
 
 function files(dir: string): string[] {
   return readdirSync(dir).flatMap((f) => {
@@ -26,7 +27,9 @@ const NAMES = [...new Set(files(coreSrc).filter((f) => !f.endsWith('mutations.ts
 /** The app's pages, built as scripts/build.ts builds them, with the given define. */
 async function pages(define: Record<string, string>, minifySyntax = true): Promise<string> {
   const r = await build({
-    entryPoints: { core: `${root}src/app/core.ts`, chat: `${root}src/app/chat.ts`, settings: `${root}src/app/settings.ts` },
+    // The app's pages, and core's whole index beside them, so the journal (which no page opens yet) is in the
+    // scan too, and both sentinels can be found in the test build.
+    entryPoints: { core: `${root}src/app/core.ts`, chat: `${root}src/app/chat.ts`, settings: `${root}src/app/settings.ts`, index: coreIndex },
     outdir: `${root}dist/probe-mutations`,
     bundle: true, format: 'esm', target: 'chrome120', legalComments: 'none', logLevel: 'silent', write: false, define, minifySyntax, plugins: [nodeStub]
   });
@@ -43,6 +46,9 @@ describe('the app build and the named mutations', () => {
 
   it('the control: the same pages with the constant true carry them, so the scan can see', async () => {
     const text = await pages({ __FAMILIAR_MUTATIONS__: 'true' });
+    // Each sentinel by name, so the scan is shown to see the mutation-only state, not only some names.
+    expect(text).toContain('lastCall');
+    expect(text).toContain('atEnd');
     expect(found(text).length).toBeGreaterThan(NAMES.length / 2);
   }, 60_000);
 });

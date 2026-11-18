@@ -87,6 +87,8 @@ describe('an oversized tool list', () => {
     const link = new ServerLink('s', { net: s.net.port }, realClock, { ended: () => {} });
     const r = await link.start(remote, 'L');
     expect(r.ok).toBe(false);
+    // Bounded before anything more is asked: the second page's 200 tools already pass 128, so no third.
+    expect(s.lists()).toBe(2);
   });
 });
 

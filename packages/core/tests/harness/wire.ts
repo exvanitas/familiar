@@ -59,7 +59,7 @@ export interface Mode {
   readonly staleId: number;
   readonly listChanged: number;
   readonly pages: number;
-  readonly session404: 'none' | 'once' | 'twice' | 'again' | 'always' | 'calls' | 'refresh';
+  readonly session404: 'none' | 'once' | 'twice' | 'again' | 'always' | 'calls' | 'refresh' | 'retry';
   /** After a session drop, the server has turned modern-only: its re-handshake is refused -32022 (S15). */
   readonly modernAfterDrop: boolean;
   readonly redirect: number;
@@ -80,6 +80,18 @@ export interface Mode {
   readonly holdHelpers: number;
   /** How often the exe refuses a net_cancel once, keeping the request alive. */
   readonly refuseCancel: number;
+  /** The exe refuses every net_cancel of a call, keeping it alive (cleanup exhausted). */
+  readonly refuseCancelAlways: boolean;
+  /** How often an answer comes with a media type other than the two exact ones: lookalike or oversized. */
+  readonly oddMedia: number;
+  /** A local modern-only server answers its list -32022, then exits. */
+  readonly modernListExit: boolean;
+  /** Relisting gives the same tools with their properties in another order, after a list_changed that
+      changes nothing else. */
+  readonly reorder: boolean;
+  /** With changeOnList: which first page of a session carries the list_changed (1, the initial walk's;
+      2, the first refresh's). */
+  readonly changeOnListAt?: number;
   /** Which requests' helpers may be held: any, or only calls (S8, S10). */
   readonly holdWhich: 'any' | 'calls';
 }
@@ -108,6 +120,10 @@ export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
     changeOnList: false,
     modernAfterDrop: false,
     refuseCancel: r() < 0.1 ? 0.3 : 0,
+    refuseCancelAlways: false,
+    oddMedia: 0,
+    modernListExit: false,
+    reorder: false,
     holdHelpers: r() < 0.2 ? 0.5 : 0,
     holdWhich: 'any',
     ...over
@@ -133,6 +149,7 @@ const tools = (era: Mode['era'], variant: string) => [
   ...(era !== 'legacy'
     ? [
         { name: 'mirror', description: 'Mirror.', inputSchema: { type: 'object', properties: { text: { type: 'string' }, region: { type: 'string', 'x-mcp-header': 'Region' } } } },
+        { name: 'mirror3', description: 'Mirror, with a $ref in its data.', inputSchema: { type: 'object', properties: { text: { type: 'string' }, region: { type: 'string', 'x-mcp-header': 'Region' }, opts: { type: 'object', default: { $ref: '#/properties/region' }, examples: [{ $ref: '#/properties/region' }] } } } },
         { name: 'mirror2', description: 'Mirror, typed.', inputSchema: { type: 'object', properties: { text: { type: 'string' }, count: { type: 'integer', 'x-mcp-header': 'Count' }, flag: { type: 'boolean', 'x-mcp-header': 'Flag' } } } }
       ]
     : [])
@@ -151,6 +168,10 @@ export class ScriptedServer {
   readonly arrivals: { body: Msg; headers: Record<string, string>; method: string; step: number; followed?: boolean }[] = [];
   private lastId: unknown;
   private changedThisSession = -1;
+  private changedSince = false;
+  private readonly firstPages = new Map<number, number>();
+  /** Set once the server has answered in a way after which it exits (modernListExit). */
+  exitAfter = false;
   private lists: number | undefined;
   /** Its tools' variant: a list_changed it sends changes the echo tool's description (S1). */
   variant = 'a';
@@ -190,6 +211,8 @@ export class ScriptedServer {
         (m.session404 === 'calls' && body.method === 'tools/call') ||
         // The first page after the initial walk (a refresh) drops it (S16).
         (m.session404 === 'refresh' && this.drops === 0 && body.method === 'tools/list' && (this.lists ?? 0) >= 1 && body.params?.cursor === undefined) ||
+        // The first page of the walk a list_changed made the client start again (a 404 on its retry).
+        (m.session404 === 'retry' && this.drops === 0 && body.method === 'tools/list' && this.changedSince && body.params?.cursor === undefined) ||
         (m.session404 === 'once' && this.drops === 0 && body.method === 'tools/call') ||
         (m.session404 === 'twice' && this.drops < 2 && body.method !== 'notifications/initialized') ||
         // A call drops the session, then the first page after the re-handshake drops it again.
@@ -204,19 +227,26 @@ export class ScriptedServer {
     if (!body.method) return { status: 202, sse: false, messages: [], final: -1 };
     if (m.era === 'modern' && !modernReq) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'no', data: { supported: [MODERN] } } }]);
     const complete = modernReq ? { resultType: 'complete' } : {};
-    if (body.method === 'tools/list' && m.changeOnList && !modernReq && this.changedThisSession !== this.session) {
+    if (body.method === 'tools/list' && body.params?.cursor === undefined) this.firstPages.set(this.session, (this.firstPages.get(this.session) ?? 0) + 1);
+    if (body.method === 'tools/list' && m.changeOnList && !modernReq && this.changedThisSession !== this.session && (this.firstPages.get(this.session) ?? 0) >= (m.changeOnListAt ?? 1)) {
       this.changedThisSession = this.session;
+      this.changedSince = true;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
       const listed = { jsonrpc: '2.0', id: body.id, result: { tools: page === 0 ? tools(m.era, this.variant) : [], ...next } };
       this.variant = this.variant === 'a' ? 'b' : 'a';
       return { status: 200, sse: true, messages: [{ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, listed], final: 1 };
     }
+    if (body.method === 'tools/list' && m.modernListExit && modernReq) {
+      this.exitAfter = true;
+      return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: ['2030-01-01'] } } }]);
+    }
     if (body.method === 'tools/list') {
       if (body.params?.cursor === undefined) this.lists = (this.lists ?? 0) + 1;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
-      return json([{ jsonrpc: '2.0', id: body.id, result: { tools: page === 0 ? tools(m.era, this.variant) : [], ...next, ...complete } }]);
+      const listed = page === 0 ? tools(m.era, this.variant) : [];
+      return json([{ jsonrpc: '2.0', id: body.id, result: { tools: m.reorder ? listed.map((t) => shuffled(t, this.r)) : listed, ...next, ...complete } }]);
     }
     if (body.method === 'tools/call') {
       const msgs: Msg[] = [];
@@ -225,14 +255,14 @@ export class ScriptedServer {
       const n = m.pings === 40 ? 40 : m.pings;
       if (!modernReq) for (let i = 0; i < n; i++) msgs.push(this.ping(on));
       if (!modernReq && this.r() < m.listChanged) {
-        this.variant = this.variant === 'a' ? 'b' : 'a';
+        if (!m.reorder) this.variant = this.variant === 'a' ? 'b' : 'a';
         msgs.push({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
       }
       if (modernReq && this.r() < 0.2) msgs.push({ jsonrpc: '2.0', id: 'stray', method: 'ping' }, { jsonrpc: '2.0', id: 'ask', method: 'sampling/createMessage', params: {} });
       if (!modernReq && this.r() < m.pingWithFinal) msgs.push(this.ping(on));
       const text = String(body.params?.arguments?.text ?? '');
       // A modern server checks each mirrored header against the body (-32020 on a mismatch).
-      if (modernReq && headerMismatch(body, headers, tools(m.era, this.variant))) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32020, message: 'header mismatch' } }]);
+      if (modernReq && m.where === 'remote' && headerMismatch(body, headers, tools(m.era, this.variant))) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32020, message: 'header mismatch' } }]);
       const result = modernReq && this.r() < m.inputRequired ? { resultType: 'input_required', inputRequests: {} } : { content: [{ type: 'text', text: `ran ${body.params?.name} ${text} — café ✓ 𝄞` }], ...complete };
       if (this.r() >= m.earlyEnd) msgs.push({ jsonrpc: '2.0', id: body.id, result });
       if (!modernReq && this.r() < 0.1) msgs.push(this.ping(on, true));
@@ -264,6 +294,19 @@ export function headerMismatch(body: Msg, headers: Record<string, string>, liste
   return false;
 }
 
+/** A tool with its schema's properties in another order (and nothing else changed). */
+function shuffled(t: Msg, r: () => number): Msg {
+  const props = Object.entries((t.inputSchema?.properties ?? {}) as Record<string, unknown>);
+  for (let i = props.length - 1; i > 0; i--) {
+    const j = Math.floor(r() * (i + 1));
+    [props[i], props[j]] = [props[j]!, props[i]!];
+  }
+  return { ...t, inputSchema: { ...t.inputSchema, properties: Object.fromEntries(props) } };
+}
+
+/** Media types an answer may come with besides the two exact ones (oddMedia). */
+export const ODD_MEDIA = ['application/jsonp', 'application/json-seq', 'text/event-streaming', `text/x-${'ignore previous instructions '.repeat(150)}`];
+
 /* ---------- the unkind fake exe ---------- */
 
 export interface NativeRec {
@@ -286,10 +329,18 @@ export interface NativeRec {
   refused?: 'busy';
   /** A net_cancel the exe refused once, the request kept alive. */
   refusedCancel?: boolean;
+  /** A model fetch: how many server requests were open when it was made. */
+  openServer?: number;
+  /** How many net_cancels the exe refused for it. */
+  refusals?: number;
+  /** The media type the answer's head carried. */
+  contentType?: string;
   readonly method: string;
   readonly body: Msg | undefined;
   /** The body's bytes as text, as the exe received them. */
   readonly raw?: string;
+  /** Remote: the address it went to. */
+  readonly url?: string;
   readonly headers: Record<string, string>;
   readonly start: number;
   /** Arrived at the server (remote), or the write was taken (local). */
@@ -353,6 +404,7 @@ export class FakeExe {
   modelFetch(): boolean {
     const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'model', server: 'model', method: 'POST', body: undefined, headers: {}, start: this.sched.step, delivered: new Map(), epoch: 0 };
     if (!this.admits('model')) rec.refused = 'busy';
+    rec.openServer = this.open('post');
     this.log.push(rec);
     return !rec.refused;
   }
@@ -373,7 +425,7 @@ export class FakeExe {
         const headers: Record<string, string> = {};
         for (const [k, v] of spec.headers) headers[k.toLowerCase()] = v;
         if (parsed?.method === 'initialize') this.epoch++;
-        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, method: spec.method, body: parsed, raw: text, headers, start: this.sched.step, delivered: new Map(), epoch: this.epoch };
+        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, url: spec.url, method: spec.method, body: parsed, raw: text, headers, start: this.sched.step, delivered: new Map(), epoch: this.epoch };
         if (!this.admits('post')) {
           rec.refused = 'busy';
           rec.end = rec.terminated = this.sched.step;
@@ -444,7 +496,10 @@ export class FakeExe {
                 rec.head = this.sched.step;
                 rec.status = plan.status;
                 rec.redirected = redirected;
-                const h: [string, string][] = [['content-type', plan.sse ? 'text/event-stream' : 'application/json']];
+                // An answer of another media type, now and then: a lookalike, or one oversized.
+                const odd = this.server.mode.oddMedia && plan.messages.length && this.sched.random() < this.server.mode.oddMedia ? ODD_MEDIA[Math.floor(this.sched.random() * ODD_MEDIA.length)] : undefined;
+                rec.contentType = odd ?? (plan.sse ? 'text/event-stream' : 'application/json');
+                const h: [string, string][] = [['content-type', rec.contentType]];
                 if (plan.session) h.push(['mcp-session-id', plan.session]);
                 resolve({ status: plan.status, statusText: '', headers: h, url: '', redirected });
               }
@@ -499,12 +554,10 @@ export class FakeExe {
           if (!st) return resolve();
           const rec = st.rec;
           // The exe may refuse a net_cancel and keep the request alive: once per request, as a passing fault.
-          if (!rec.refusedCancel && this.server.mode.refuseCancel && this.sched.random() < this.server.mode.refuseCancel) {
+          // A refused request stays alive as it was, delivering what it would: refused isn't cancelled.
+          if ((this.server.mode.refuseCancelAlways && rec.body?.method === 'tools/call') || (!rec.refusedCancel && this.server.mode.refuseCancel && this.sched.random() < this.server.mode.refuseCancel)) {
             rec.refusedCancel = true;
-            if (rec.cancelAsked === undefined) {
-              rec.cancelAsked = this.sched.step;
-              rec.cancelAt = this.sched.now;
-            }
+            rec.refusals = (rec.refusals ?? 0) + 1;
             return void this.sched.add({ label: `cancel-refused:${rec.n}`, fire: () => refuse(Object.assign(new Error('refused'), { kind: 'failed' })) });
           }
           // The client's next try is a net_cancel of its own: its bound runs from now.
@@ -547,7 +600,7 @@ export class FakeExe {
 
   processes(): ProcessPort {
     let runs = 0;
-    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number }>();
+    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; bounded?: boolean }>();
     const flush = (run: string) => {
       const p = live.get(run)!;
       if (p.flushing || !p.out.length) return;
@@ -583,7 +636,15 @@ export class FakeExe {
       const p = live.get(run)!;
       this.sched.add({ label: `write-done:${w.rec.n}`, fire: () => {
         if (p.exited || !p.writes.includes(w)) return;
-        if (this.server.mode.stopReading && p.taken >= 4) return; // it stopped reading: the write never ends
+        if (this.server.mode.stopReading && p.taken >= 4) {
+          // It stopped reading: the write never ends. In the pass build the exe's own write bound ends the
+          // run 10 s later (the process killed); in the pre-pass build only the page's bound does.
+          if (this.build === 'pass' && !p.bounded) {
+            p.bounded = true;
+            this.sched.timer(() => exit(run, null), 10_000);
+          }
+          return;
+        }
         p.writes.splice(p.writes.indexOf(w), 1);
         p.taken++;
         w.rec.arrived = this.sched.step;
@@ -598,6 +659,14 @@ export class FakeExe {
         if (this.server.mode.hold && body.method === 'tools/call' && body.params?.name === 'slow') return;
         const plan = this.server.answer(body, {}, `w${w.rec.n}`);
         w.rec.plan = plan;
+        // A server that answers and then exits (modernListExit): the exit comes a little after its line.
+        if (this.server.exitAfter) {
+          this.server.exitAfter = false;
+          for (const m of plan.messages) p.out.push(JSON.stringify(m));
+          flush(run);
+          this.sched.add({ label: `exit-after:${run}`, fire: () => this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) }) });
+          return;
+        }
         for (const m of plan.messages) p.out.push(JSON.stringify(m));
         if (this.server.mode.idlePings && this.sched.random() < this.server.mode.idlePings) {
           this.server.pings.push({ id: `i${w.rec.n}`, on: `w${w.rec.n}`, afterFinal: false });
@@ -644,12 +713,35 @@ export class FakeExe {
   }
 }
 
+/* ---------- a store whose next write can be held ---------- */
+
+export type HoldableStore = ReturnType<typeof memorySettingsStore> & { holdNext: boolean; release?: () => void };
+
+function holdable(inner: ReturnType<typeof memorySettingsStore>): HoldableStore {
+  const store = { ...inner, holdNext: false } as HoldableStore;
+  const gate = async () => {
+    if (!store.holdNext) return;
+    store.holdNext = false;
+    await new Promise<void>((r) => (store.release = () => {
+      store.release = undefined;
+      r();
+    }));
+  };
+  store.put = async (k, r) => (await gate(), inner.put(k, r));
+  store.putIf = async (k, r, g) => (await gate(), inner.putIf(k, r, g));
+  return store;
+}
+
 /* ---------- the driver and its evidence ---------- */
 
 export interface Evidence {
   readonly seq: number;
   readonly step: number;
-  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'start' | 'started' | 'model';
+  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered';
+  /** Test's report: whether it listed, and the tool names it showed. */
+  readonly report?: { readonly ok: boolean; readonly tools: readonly string[] };
+  /** The reply's own words (a refused Start's, say). */
+  readonly words?: string;
   readonly failure?: string;
   /** The arguments the person's Yes was for, as the driver made them (H3 builds its own canonical form). */
   readonly args?: unknown;
@@ -696,8 +788,9 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
     if (firstHit === undefined && options.mutation && mutations.hits(options.mutation) > 0) firstHit = step;
   });
   let addresses = 0;
+  const store = holdable(memorySettingsStore());
   const client = await McpClient.open({
-    store: memorySettingsStore(),
+    store,
     processes: exe.processes(),
     net: exe.net(),
     addresses: { add: async () => ({ id: `addr-${++addresses}` }), remove: async () => {} },
@@ -711,7 +804,7 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
     const setup = mode.where === 'remote' ? { kind: 'remote' as const, id, label: `Scripted ${id}`, url: `https://${id}.example/mcp`, transport: 'http' as const, headers: [] } : { kind: 'local' as const, id, label: `Scripted ${id}`, program: 'node', args: [], cwd: '/', env: [], secrets: [] };
     await client.add({ setup, problems: [] });
   }
-  const d = new Driver(sched, client, evidence, next, exe, server);
+  const d = new Driver(sched, client, evidence, next, exe, server, store);
   for (const id of ids) sched.add({ label: `start:${id}`, fire: () => d.start(id) });
   if (options.schedule) options.schedule(d);
   else d.random(10);
@@ -731,7 +824,10 @@ export class Driver {
   readonly exe: FakeExe;
   readonly server: ScriptedServer;
 
-  constructor(sched: Scheduler, client: McpClient, evidence: Evidence[], tick: () => number, exe: FakeExe, server: ScriptedServer) {
+  readonly store: HoldableStore;
+
+  constructor(sched: Scheduler, client: McpClient, evidence: Evidence[], tick: () => number, exe: FakeExe, server: ScriptedServer, store: HoldableStore) {
+    this.store = store;
     this.sched = sched;
     this.client = client;
     this.evidence = evidence;
@@ -765,18 +861,19 @@ export class Driver {
   }
 
   /** A card shown now: its facts, kept for a Yes that may come later (S1). */
-  card(tool: string, extra: Record<string, unknown> = {}, id = 's1'): { token: string; facts: NonNullable<ReturnType<McpClient['facts']>> } | undefined {
+  card(tool: string, extra: Record<string, unknown> = {}, id = 's1'): { token: string; facts: NonNullable<ReturnType<McpClient['facts']>>; args: Record<string, unknown> } | undefined {
     const token = `t${++this.n}`;
-    const facts = this.client.facts(id, tool, { text: token, ...extra });
+    const args = { text: token, ...extra };
+    const facts = this.client.facts(id, tool, args);
     if (!facts) return undefined;
-    this.note({ what: 'card', token, tool, body: facts.canonical, server: id });
-    return { token, facts };
+    this.note({ what: 'card', token, tool, body: facts.canonical, args, server: id });
+    return { token, facts, args };
   }
 
   /** The Yes on a card shown earlier, and the call it allows. */
-  yes(card: { token: string; facts: NonNullable<ReturnType<McpClient['facts']>> }, id = 's1'): void {
+  yes(card: { token: string; facts: NonNullable<ReturnType<McpClient['facts']>>; args: Record<string, unknown> }, id = 's1'): void {
     const decision = mintDecision(card.facts, card.token, 'asked', false)!;
-    this.note({ what: 'yes', token: card.token, tool: card.facts.tool, body: card.facts.canonical, server: id });
+    this.note({ what: 'yes', token: card.token, tool: card.facts.tool, body: card.facts.canonical, args: card.args, server: id });
     const stop = new AbortController();
     this.calls.set(card.token, stop);
     this.note({ what: 'call', token: card.token, tool: card.facts.tool, server: id });
@@ -792,6 +889,18 @@ export class Driver {
     }
   }
 
+  /** A call under a saved "always", as the journal's gate would mint it with nothing outside in context. */
+  always(tool: string, extra: Record<string, unknown> = {}, id = 's1'): void {
+    const token = `t${++this.n}`;
+    const args = { text: token, ...extra };
+    const facts = this.client.facts(id, tool, args);
+    if (!facts) return void this.note({ what: 'not-offered', tool, server: id });
+    const decision = mintDecision(facts, token, 'always', false)!;
+    this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id });
+    this.note({ what: 'call', token, tool, server: id });
+    void this.client.send(decision, new AbortController().signal).then((outcome) => this.note({ what: 'outcome', token, tool, outcome, server: id }));
+  }
+
   /** A model fetch, as chat makes one (H5). */
   model(): void {
     const ok = this.exe.modelFetch();
@@ -804,12 +913,30 @@ export class Driver {
 
   start(id = 's1'): void {
     this.note({ what: 'start', server: id });
-    void this.client.start(id).then((reply) => this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind } : {}), ok: reply.kind === 'ready' }));
+    void this.client.start(id).then((reply) => this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' }));
   }
 
+  /** Stop, and when it answered: a local Stop answers only after the process has exited. */
   stop(id = 's1'): void {
     this.note({ what: 'stop', server: id });
-    void this.client.stop(id);
+    void this.client.stop(id).then((reply) => this.note({ what: 'stopped', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}) }));
+  }
+
+  /** Test, as Settings runs it: its report, with the tools it showed. */
+  test(id = 's1'): void {
+    this.note({ what: 'test', server: id });
+    void this.client.test(id).then(
+      (report) => this.note({ what: 'tested', server: id, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] } }),
+      (e: unknown) => this.note({ what: 'tested', server: id, failure: 'threw', words: String(e).slice(0, 80) })
+    );
+  }
+
+  /** The store's next write waits until `release()` (a catalog write held, say). */
+  holdNextWrite(): void {
+    this.store.holdNext = true;
+  }
+  releaseWrite(): void {
+    this.store.release?.();
   }
 
   /** A call with a fresh Yes: a unique token in its arguments, so every handoff names its decision. */
@@ -817,7 +944,11 @@ export class Driver {
     const token = `t${++this.n}`;
     const args = { text: token, ...extra };
     const facts = this.client.facts(id, tool, args);
-    if (!facts) return;
+    if (!facts) {
+      // No card can be shown: on a Ready, settled run, the tool isn't offered.
+      if (this.idle(id) && this.client.tools().some((t) => t.server.id === id)) this.note({ what: 'not-offered', tool, server: id });
+      return;
+    }
     const decision = mintDecision(facts, token, 'asked', false)!;
     this.note({ what: 'card', token, tool, body: facts.canonical, server: id });
     this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id });
@@ -857,7 +988,8 @@ export class Driver {
         else if (action === 'mirror') {
           const y = this.sched.random();
           if (y < 0.6) this.call('mirror', { region: MIRROR_VECTORS[Math.floor(this.sched.random() * MIRROR_VECTORS.length)] });
-          else this.call('mirror2', { count: [0, 7, -12, 2 ** 31][Math.floor(this.sched.random() * 4)], flag: this.sched.random() < 0.5 });
+          else if (y < 0.8) this.call('mirror2', { count: [0, 7, -12, 2 ** 31][Math.floor(this.sched.random() * 4)], flag: this.sched.random() < 0.5 });
+          else this.call('mirror3', { region: 'eu-2' });
         }
         else if (action === 'revoke') this.call('echo', {}, true);
         else {

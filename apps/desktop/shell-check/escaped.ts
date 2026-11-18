@@ -22,31 +22,37 @@ const failWith = (words: string): never => {
   throw new EscapedFailure(words);
 };
 
-export async function escapedCopyCheck(client: McpClient, heard: readonly string[], serverId: string, typed: TypedKey, sleep: (ms: number) => Promise<void>): Promise<string> {
+export async function escapedCopyCheck(client: McpClient, heard: readonly string[], written: readonly string[], serverId: string, typed: TypedKey, sleep: (ms: number) => Promise<void>): Promise<string> {
   const started = await client.start(serverId);
-  if (started.kind !== 'ready') failWith(`the quoted-key server didn't start: ${JSON.stringify(started).slice(0, 160)}`);
+  if (started.kind !== 'ready') failWith(`the quoted-key server didn't start: ${started.kind === 'failed' ? started.failure.kind : started.kind}`);
   // The server holds the key the driver typed: its length, and its quote.
   const shape = await callWithYes(client, serverId, 'secret_shape', {});
   const want = `length=${typed.length} quote=true`;
-  if (shape.kind !== 'result' || shape.text !== want) failWith(`the server holds another key than the one typed: ${JSON.stringify(shape).slice(0, 160)}, not ${want}`);
+  if (shape.kind !== 'result' || shape.text !== want) failWith(`the server holds another key than the one typed: ${shape.kind === 'result' && /^length=\d+ quote=(true|false)$/.test(shape.text) ? shape.text : shape.kind}, not ${want}`);
   const from = heard.length;
+  const wrote = written.length;
   const r = await callWithYes(client, serverId, 'print_secret', {});
-  if (r.kind !== 'result' || !r.text.startsWith('The secret is ')) failWith(`print_secret didn't answer: ${JSON.stringify(r).slice(0, 160)}`);
+  if (r.kind !== 'result' || !r.text.startsWith('The secret is ')) failWith(`print_secret didn't answer: ${r.kind}`);
   await sleep(300);
   const after = heard.slice(from);
-  // The reply line itself reached what this check reads.
-  const replied = after.some((line) => {
+  // The reply line itself reached what this check reads: the response to this very request, by its id.
+  const parse = (line: string) => {
     try {
-      const m = JSON.parse(line);
-      return m && 'result' in m && Array.isArray(m.result?.content) && String(m.result.content[0]?.text ?? '').startsWith('The secret is ');
+      return JSON.parse(line);
     } catch {
-      return false;
+      return undefined;
     }
+  };
+  const request = written.slice(wrote).map(parse).find((m) => m?.method === 'tools/call' && m.params?.name === 'print_secret');
+  const replied = request !== undefined && after.some((line) => {
+    const m = parse(line);
+    return m && m.id === request.id && 'result' in m && Array.isArray(m.result?.content) && String(m.result.content[0]?.text ?? '').startsWith('The secret is ');
   });
   if (!replied) failWith("print_secret's reply line never reached what the check reads");
   const text = (r as { text: string }).text;
   const literal = text.includes(typed.head) && text.includes(typed.tail);
-  if (!literal && text !== 'The secret is [hidden].') failWith(`print_secret's answer is neither the key nor [hidden]: ${JSON.stringify(text.slice(0, 80))}`);
+  // Words here go to the CI log: lengths only, never any of the text, which may hold part of the key.
+  if (!literal && text !== 'The secret is [hidden].') failWith(`print_secret's answer is neither the key nor [hidden] (${[...text].length} characters)`);
   const leaked = [JSON.stringify(r), ...after].filter((t) => t.includes(typed.head) || t.includes(typed.tail)).length;
   if (leaked) failWith(`${ESCAPED_GAP}: in ${leaked} texts, unblanked; the pre-release native pass blanks escaped forms`);
   return 'a key holding a quote came back blanked in its JSON-escaped form too';

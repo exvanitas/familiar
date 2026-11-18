@@ -40,7 +40,7 @@ describe('every named journal mutation fails its check, beside its unmutated twi
         const twinFails = JOURNAL_CHECKS[check]!(twin);
         const prefix = mutant.firstHit - 1;
         // The same history up to the first hit: the steps, and every commit's submissions, entries and documents.
-        const commits = (j: typeof mutant) => JSON.stringify(j.log.filter((c) => c.step <= prefix).map((c) => [c.step, c.submissions.map((x) => [x.type, x.status, x.requestId ?? null]), c.entries.map((x) => [x.kind, x.model]), c.docs]));
+        const commits = (j: typeof mutant) => JSON.stringify(j.log.filter((c) => c.step <= prefix).map((c) => [c.step, c.submissions.map((x) => [x.type, x.status, x.requestId ?? null]), c.entries.map((x) => [x.kind, x.model, x.data]), c.docs, c.docValues]));
         const same = JSON.stringify(mutant.steps.slice(0, prefix)) === JSON.stringify(twin.steps.slice(0, prefix)) && commits(mutant) === commits(twin);
         tried.push(`seed ${seed}: twin ${twinFails.length ? 'fails' : 'passes'}, prefix ${same ? 'same' : 'differs'}`);
         if (!twinFails.length && same) return;

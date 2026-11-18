@@ -3,7 +3,7 @@
 // first step where the switch changed behaviour. Since the twin's identical prefix passes, the mutant's
 // failure lies at or after that step. A mutation with no such seed is a broken control and fails the build.
 import { describe, expect, it } from 'vitest';
-import { PASS_CHECKS } from './checks.ts';
+import { handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
 import { wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
 
@@ -96,12 +96,20 @@ describe('every named wire mutation fails its check, beside its unmutated twin',
         const prefix = mutant.firstHit - 1;
         // The same history up to the first hit: the scheduler's choices, and every native handoff with its
         // bytes, not only the labels.
-        const natives = (w: typeof mutant) => JSON.stringify(w.exe.log.filter((x) => x.start <= prefix).map((x) => [x.kind, x.server, x.start, x.raw ?? null]));
-        const same = JSON.stringify(mutant.sched.log.slice(0, prefix)) === JSON.stringify(twin.sched.log.slice(0, prefix)) && natives(mutant) === natives(twin);
+        const same = JSON.stringify(mutant.sched.log.slice(0, prefix)) === JSON.stringify(twin.sched.log.slice(0, prefix)) && handoffHistory(mutant, prefix) === handoffHistory(twin, prefix);
         tried.push(`seed ${seed}: twin ${twinFails.length ? 'fails' : 'passes'}, prefix ${same ? 'same' : 'differs'}`);
         if (!twinFails.length && same) return;
       }
       expect.fail(`${c.mutation}: no seed where ${c.check} fails only in the mutant (${tried.slice(0, 4).join('; ') || 'the switch never fired or the check never failed'})`);
     }, 120_000);
   }
+});
+
+describe('the twin comparison itself', () => {
+  it('counts two histories that differ only in one header as different', async () => {
+    const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });
+    const b = { ...a, exe: { ...a.exe, log: a.exe.log.map((x, i) => (i === 1 ? { ...x, headers: { ...x.headers, 'mcp-session-id': 'other' } } : x)) } } as typeof a;
+    expect(handoffHistory(a, a.sched.step)).not.toBe(handoffHistory(b, a.sched.step));
+    expect(handoffHistory(a, a.sched.step)).toBe(handoffHistory({ ...a }, a.sched.step));
+  });
 });

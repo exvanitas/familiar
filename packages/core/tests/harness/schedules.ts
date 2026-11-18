@@ -16,6 +16,18 @@ export interface Named {
 }
 
 /** S11: Stop during the walk, or while Ready, then a call; nothing reaches the stopping run after Stop. */
+/** S11 during the handshake: a local Stop while initialize, or initialized, is in flight. */
+function stopInHandshake(step: 'initialize' | 'notifications/initialized'): Named {
+  return {
+    name: `S11 Stop during ${step}, local`,
+    options: {
+      mode: { ...quiet, where: 'local' },
+      schedule: (d) => d.when('handshaking', () => d.exe.log.some((x) => x.body?.method === step), () => d.stop())
+    },
+    expect: (r) => (r.evidence.some((e) => e.what === 'stop') ? undefined : 'no Stop made')
+  };
+}
+
 function stopFence(where: 'local' | 'remote', during: 'walk' | 'ready'): Named {
   return {
     name: `S11 Stop ${during === 'walk' ? 'during a walk' : 'while Ready'}, ${where}`,
@@ -89,6 +101,101 @@ function changeDuringWalk(pages: number, refresh: boolean): Named {
 }
 
 export const SCHEDULES: Named[] = [
+  {
+    // S26: a refresh whose own page carries list_changed: the walk tries again, and that's the only extra
+    // walk (H14's walk count).
+    name: 'S26 list_changed on a refresh page',
+    options: { mode: { ...quiet, changeOnList: true, changeOnListAt: 2, listChanged: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
+    expect: (r) => (r.exe.log.filter((x) => x.body?.method === 'tools/list').length >= 3 ? undefined : 'no refresh carrying list_changed')
+  },
+  {
+    // S19: Test, with its catalog write held; then Stop, then Start; then the write lands. Test acts on its
+    // own run only (H15).
+    name: 'S19 Stop and Start during Test',
+    options: {
+      mode: { ...quiet, where: 'local' },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.stop();
+          d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
+            // The server's tools changed meanwhile, so Test's listing makes a catalog write, which is held.
+            d.server.variant = d.server.variant === 'a' ? 'b' : 'a';
+            d.holdNextWrite();
+            d.test();
+            d.when('testing', () => !!d.store.release, () => {
+              d.stop();
+              d.when('stopped again', () => d.client.get('s1')?.phase !== 'stopping', () => {
+                d.start();
+                d.when('restarted', () => d.evidence.filter((e) => e.what === 'start').length >= 2, () => d.releaseWrite());
+              });
+            });
+          });
+        })
+    },
+    expect: (r) => (r.evidence.some((e) => e.what === 'tested') ? undefined : 'Test never answered')
+  },
+  {
+    // S20: the walk a list_changed restarts meets a 404 on its first page: nothing goes without the session
+    // id before the recovery's initialize, and no extra walk runs beside it (H14).
+    name: 'S20 a 404 on the retry of a walk',
+    options: { mode: { ...quiet, changeOnList: true, session404: 'retry', listChanged: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
+    expect: (r) => (r.exe.log.some((x) => x.status === 404 && x.body?.method === 'tools/list') ? undefined : 'no 404 on a retried walk')
+  },
+  {
+    // S21: answers of other media types, lookalike and oversized: never read, and no header text in words (H10).
+    name: 'S21 answers of other media types',
+    options: { mode: { ...quiet, oddMedia: 0.5 } },
+    expect: (r) => (r.exe.log.some((x) => x.contentType && x.contentType !== 'application/json' && x.contentType !== 'text/event-stream') ? undefined : 'no odd media type sent')
+  },
+  {
+    // S22: a local modern-only server answers its list -32022, then exits: a definitive refusal, no relaunch (H12).
+    name: 'S22 a modern list refused, then an exit',
+    options: { mode: { ...quiet, where: 'local', era: 'modern', modernListExit: true }, schedule: () => {} },
+    expect: (r) => (r.exe.exits.length ? undefined : 'the server never exited')
+  },
+  {
+    // S23: a modern server that relists its tools with their properties in another order: a saved "always"
+    // made on the first listing still holds after a Stop and Start (H3: nothing lost to key order).
+    name: 'S23 a relist in another property order',
+    options: {
+      mode: { ...quiet, reorder: true, era: 'modern' },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          const tool = d.client.tools().find((t) => t.serverName === 'mirror2');
+          if (!tool) return;
+          void d.client.choose('s1', 'mirror2', { policy: 'allow', fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint }).then(() => {
+            d.stop();
+            d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
+              d.start();
+              d.when('ready again', () => d.idle() && d.evidence.some((e) => e.what === 'started' && e.ok && e.seq > [...d.evidence].reverse().find((x) => x.what === 'start')!.seq), () => d.always('mirror2', { count: 7, flag: true }));
+            });
+          });
+        })
+    },
+    expect: (r) => {
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.tool === 'mirror2')?.outcome;
+      return out?.kind === 'result' ? undefined : `the "always" call after a reordered relist came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
+    // S24: the exe refuses every net_cancel: the run ends, the slot stays held, and Start says why (H1).
+    name: 'S24 cleanup refused for good',
+    options: {
+      mode: { ...quiet, refuseCancelAlways: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('echo');
+          d.when('failed', () => d.client.get('s1')?.phase === 'failed', () => d.start());
+        })
+    },
+    expect: (r) => (r.evidence.filter((e) => e.what === 'start').length >= 2 ? undefined : 'no Start after the cleanup failed')
+  },
+  {
+    // S25: a modern tool whose only $ref is in its default and examples data stays offered, and is called (H11).
+    name: 'S25 a $ref in schema data',
+    options: { mode: { ...quiet, era: 'modern' }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('mirror3', { region: 'eu-2' })) },
+    expect: (r) => (r.evidence.some((e) => (e.what === 'call' || e.what === 'not-offered') && e.tool === 'mirror3') ? undefined : 'mirror3 never tried')
+  },
   {
     // S18: a local server that stops reading, with a call written into the full pipe: the page's interim
     // bound stops it within 10 s, its writes end at the exit, and the slot frees.
@@ -176,6 +283,8 @@ export const SCHEDULES: Named[] = [
     },
     expect: (r) => (r.evidence.filter((e) => e.what === 'call').length > 2 ? undefined : 'no call tried during the recovery')
   },
+  stopInHandshake('initialize'),
+  stopInHandshake('notifications/initialized'),
   stopFence('local', 'walk'),
   stopFence('local', 'ready'),
   stopFence('remote', 'walk'),

@@ -301,7 +301,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
       ok(d.shown && report.ok, 'the quoted-key server did not start');
       // Measured, then judged (escaped.ts): the known gap's exact words only when the escaped copy came
       // back; the server not Ready, another key stored or the reply never heard each have other words.
-      return await escapedCopyCheck(client, heard, added.id, k, sleep);
+      return await escapedCopyCheck(client, heard, written, added.id, k, sleep);
     } finally {
       await client.remove(added.id).catch(() => {});
     }

@@ -60,8 +60,15 @@ function localPongKey(r: WireRun, rec: NativeRec): string {
     of Starts made before it (a run lasts from one Start to its end, re-handshakes included). */
 function runOf(r: WireRun, x: NativeRec): number {
   if (x.kind === 'write') return x.epoch;
-  return r.evidence.filter((e) => e.what === 'start' && e.seq < x.seq && `addr-${(e.server ?? 's1').slice(1)}` === x.server).length;
+  // Only Starts the client admitted begin a run: a Start refused busy (its reply's words say so) doesn't.
+  const admitted = (e: Evidence) => {
+    const reply = r.evidence.find((y) => y.what === 'started' && y.server === e.server && y.seq > e.seq);
+    return !(reply?.failure === 'busy');
+  };
+  return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && e.seq < x.seq && addressOf(e.server) === x.server && admitted(e)).length;
 }
+
+const addressOf = (server: string | undefined) => `addr-${(server ?? 's1').slice(1)}`;
 
 /** H1: per server, the native requests of two different exchanges are never open at once, and at most 3. */
 export const H1: Check = (r) => {
@@ -95,6 +102,15 @@ export const H1: Check = (r) => {
     if (x.kind !== 'write' || x.startAt === undefined) continue;
     const waited = (x.endAt ?? r.sched.now) - x.startAt;
     if (waited > CONTRACT_INTERIM_WRITE_MS + 1_000) problems.push(`H1: a local write pending ${waited} ms, past the interim bound`);
+  }
+  // Cleanup the exe refused for good (four refused net_cancels): the slot stays held, nothing more goes to
+  // that server, and a Start says the restart is needed, not "try again in a moment".
+  for (const x of r.exe.log) {
+    if ((x.refusals ?? 0) < 4) continue;
+    const later = r.exe.log.find((y) => y.kind === 'post' && y.server === x.server && y.seq > x.seq && y.body && !isPong(y.body));
+    if (later) problems.push(`H1: ${later.body!.method} went to a server whose cleanup the exe refused for good`);
+    const start = r.evidence.find((e) => e.what === 'started' && addressOf(e.server) === x.server && e.step > x.start && e.failure);
+    if (start && !/[Rr]estart/.test(start.words ?? '')) problems.push(`H1: after cleanup failed for good, Start said "${(start.words ?? '').slice(0, 60)}"`);
   }
   // A call refused busy never goes out afterwards.
   for (const e of r.evidence) {
@@ -186,6 +202,21 @@ export const H2: Check = (r) => {
     }
   }
   for (const [id, n] of pongs) if (n > 1) problems.push(`H2: ${n} pongs for ${id}`);
+  // A local Stop answers only once the process has exited, and each run is stopped natively once.
+  if (r.server.mode.where === 'local') {
+    for (const e of r.evidence) {
+      if (e.what !== 'stop') continue;
+      const answered = r.evidence.find((y) => y.what === 'stopped' && y.server === e.server && y.seq > e.seq);
+      if (!answered) continue;
+      const epoch = r.exe.log.filter((x) => x.kind === 'write' && x.seq < e.seq).at(-1)?.epoch;
+      if (epoch === undefined) continue;
+      const exit = r.exe.exits.find((t) => t.epoch === epoch);
+      if (!exit || exit.step > answered.step) problems.push(`H2: a local Stop answered at step ${answered.step}, before its process exited${exit ? ` at ${exit.step}` : ''}`);
+    }
+    const perEpoch = new Map<number, number>();
+    for (const t of r.exe.stopsAsked) perEpoch.set(t.epoch, (perEpoch.get(t.epoch) ?? 0) + 1);
+    for (const [epoch, n] of perEpoch) if (n > 1) problems.push(`H2: run ${epoch} was stopped natively ${n} times`);
+  }
   // Nothing reaches a run after its Stop: no request, notification or pong of that run starts once the
   // Stop was made.
   for (const e of r.evidence) {
@@ -246,9 +277,11 @@ function staleCatalogCalls(r: WireRun): string[] {
   for (const c of recs) {
     if (c.final === undefined || !c.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed')) continue;
     const d = Math.floor(c.final / 1000);
-    const relisted = recs.find((x) => x.epoch === c.epoch && x.body?.method === 'tools/list' && x.start >= d && x.final !== undefined && !x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
-    const until = relisted ? Math.floor(relisted.final! / 1000) : Infinity;
-    const call = recs.find((x) => x.epoch === c.epoch && isCall(x.body) && x.start > d && x.start <= until);
+    // The relist: a walk from page 1 started after the notification, complete (its last page back whole).
+    const firstPage = recs.find((x) => x.server === c.server && x.epoch === c.epoch && x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.start >= d && !x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+    const lastPage = firstPage && recs.find((x) => x.server === c.server && x.seq >= firstPage.seq && x.body?.method === 'tools/list' && x.final !== undefined && !x.plan?.messages.some((m) => m.result?.nextCursor !== undefined));
+    const until = lastPage ? Math.floor(lastPage.final! / 1000) : Infinity;
+    const call = recs.find((x) => x.server === c.server && x.epoch === c.epoch && isCall(x.body) && x.start > d && x.start <= until);
     if (call) problems.push(`H3: ${tokenOf(call.body)} went out on a catalog a list_changed had made stale`);
   }
   return problems;
@@ -279,17 +312,34 @@ function canonical(v: unknown): string {
     message (an empty JSON body is the server's own invalid answer). */
 function wroteValid(r: WireRun, token: string): boolean {
   const rec = r.exe.log.find((x) => isCall(x.body) && tokenOf(x.body) === token);
-  return !!rec?.plan && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0);
+  const exact = !rec?.contentType || rec.contentType === 'application/json' || rec.contentType === 'text/event-stream';
+  return !!rec?.plan && exact && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0);
 }
 
 /** H10: a late or stale response never reaches a caller: a call's result names its own token, and comes
     through exactly as the server wrote it, its multibyte characters whole however the bytes were split. */
 export const H10: Check = (r) => {
+  const extra: string[] = [];
+  for (const x of r.exe.log) {
+    if (x.kind !== 'post' || !x.contentType) continue;
+    const exact = x.contentType === 'application/json' || x.contentType === 'text/event-stream';
+    if (exact) continue;
+    // Only the two exact media types are read: an answer of any other type never comes back as a result.
+    const out = isCall(x.body) ? r.evidence.find((e) => e.what === 'outcome' && e.token === tokenOf(x.body))?.outcome : undefined;
+    if (out?.kind === 'result') extra.push(`H10: ${tokenOf(x.body)}'s answer, of type ${x.contentType.slice(0, 30)}, was read`);
+    // And no server header text past 40 characters reaches any words.
+    if (x.contentType.length > 40) {
+      const piece = x.contentType.slice(0, 41);
+      const leaked = r.evidence.find((e) => JSON.stringify(e.outcome ?? e.words ?? '').includes(piece));
+      if (leaked) extra.push(`H10: a server's ${x.contentType.length}-character content type reached the words of ${leaked.token ?? leaked.what}`);
+    }
+  }
   const results = r.evidence.filter((e) => e.what === 'outcome' && e.outcome?.kind === 'result' && !e.outcome.isError);
   return [
     ...results.filter((e) => !(e.outcome as { text: string }).text.includes(e.token!)).map((e) => `H10: ${e.token} answered with another call's result: ${(e.outcome as { text: string }).text.slice(0, 40)}`),
     ...results.filter((e) => (e.outcome as { text: string }).text.includes(e.token!) && !(e.outcome as { text: string }).text.includes('— café ✓ 𝄞')).map((e) => `H10: ${e.token}'s result came through changed: ${JSON.stringify((e.outcome as { text: string }).text.slice(-24))}`),
     // The scripted server writes only valid answers: one read as invalid was split or decoded wrong.
+    ...extra,
     ...r.evidence.filter((e) => e.what === 'outcome' && e.outcome?.kind === 'error' && /couldn't read/.test(e.outcome.words) && wroteValid(r, e.token!)).map((e) => `H10: ${e.token}'s valid answer was read as invalid: ${(e.outcome as { words: string }).words.slice(0, 60)}`)
   ].slice(0, 3);
 };
@@ -317,10 +367,15 @@ export const H11: Check = (r) => {
     if (x.headers['mcp-method'] !== 'tools/call') problems.push('H11: Mcp-Method missing on a call');
     if (x.headers['mcp-name'] !== b.params?.name) problems.push('H11: Mcp-Name differs from the body');
     // The schema as the server listed it last before this call, scanned by the harness's own scanner.
-    const listing = recs.filter((y) => y.server === x.server && runOf(r, y) === runOf(r, x) && y.body?.method === 'tools/list' && y.seq < x.seq && y.plan).at(-1);
-    const listed = listing?.plan?.messages.find((m) => m.result?.tools)?.result.tools as any[] | undefined;
-    const schema = listed?.find((t) => t.name === b.params?.name)?.inputSchema ?? {};
-    for (const d of declared(schema)) {
+    // The run's whole catalog, every page of the last walk before this call.
+    const pages = recs.filter((y) => y.server === x.server && runOf(r, y) === runOf(r, x) && y.body?.method === 'tools/list' && y.seq < x.seq && y.plan);
+    const firstOfLast = pages.map((y, i) => [y, i] as const).filter(([y]) => y.body?.params?.cursor === undefined).at(-1)?.[1] ?? 0;
+    const listed = pages.slice(firstOfLast).flatMap((y) => (y.plan?.messages.find((m) => m.result?.tools)?.result.tools as any[] | undefined) ?? []);
+    const schema = listed.find((t) => t.name === b.params?.name)?.inputSchema ?? {};
+    const decls = declared(schema);
+    // No header beyond the declared ones.
+    for (const k of Object.keys(x.headers)) if (k.startsWith('mcp-param-') && !decls.some((d) => `mcp-param-${d.name.toLowerCase()}` === k)) problems.push(`H11: an undeclared header ${k}`);
+    for (const d of decls) {
       let v: any = b.params?.arguments;
       for (const k of d.path) v = v !== null && typeof v === 'object' && Object.hasOwn(v, k) ? v[k] : undefined;
       const header = x.headers[`mcp-param-${d.name.toLowerCase()}`];
@@ -336,14 +391,18 @@ export const H11: Check = (r) => {
   }
   // A value that can't be mirrored faithfully (a lone surrogate) or past 8 KiB once encoded makes no request.
   for (const e of r.evidence) {
-    if (e.what !== 'yes' || (e.tool !== 'mirror' && e.tool !== 'mirror2')) continue;
+    if (e.what !== 'yes' || !String(e.tool).startsWith('mirror')) continue;
     const region = (e.args as any)?.region;
     if (typeof region !== 'string') continue;
     const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(region);
-    const tooLong = Buffer.byteLength(`=?base64?${Buffer.from(region, 'utf8').toString('base64')}?=`) > 8 * 1024;
+    // The client's own rule: plain visible ASCII goes as it is; anything else is the base64 sentinel.
+    const plain = region !== '' && region === region.trim() && /^[\x20-\x7e\t]*$/.test(region) && !(region.startsWith('=?base64?') && region.endsWith('?='));
+    const tooLong = Buffer.byteLength(plain ? region : `=?base64?${Buffer.from(region, 'utf8').toString('base64')}?=`) > 8 * 1024;
     // Only a modern remote run mirrors: elsewhere the value goes in the body alone.
     if ((lone || tooLong) && recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token && modernRun(x))) problems.push(`H11: ${e.token}'s value can't be mirrored, and a request went out`);
   }
+  // A $ref inside a schema's data (default, examples) is data, never a position: mirror3 stays offered.
+  for (const e of r.evidence) if (e.what === 'not-offered' && e.tool === 'mirror3' && r.server.mode.era !== 'legacy') problems.push('H11: mirror3, whose only $ref is in its data, was not offered');
   return problems.slice(0, 3);
 };
 
@@ -377,6 +436,14 @@ export const H12: Check = (r) => {
       if (x.kind === 'post' && x.body?.method === 'notifications/cancelled') problems.push('H12: a remote cancel on a modern run');
     }
   }
+  // A local start relaunched (a new process with no Start between) only when its modern list got no
+  // JSON-RPC answer: a definitive refusal ends the start, with no relaunch.
+  for (const x of r.exe.log) {
+    if (x.kind !== 'write' || x.body?.method !== 'tools/list' || !x.plan?.messages.some((m) => m.id === x.body!.id && m.error)) continue;
+    const next = r.exe.log.find((y) => y.kind === 'write' && y.epoch > x.epoch);
+    const restarted = next && r.evidence.some((e) => (e.what === 'start' || e.what === 'test') && e.seq > x.seq && e.seq < next.seq);
+    if (next && !restarted) problems.push('H12: a start relaunched after its modern list was answered with a refusal');
+  }
   // No request follows an input_required answer for the same call.
   for (const e of r.evidence) {
     if (e.what !== 'outcome' || !(e.outcome?.kind === 'result' && /asked for input/.test(e.outcome.text))) continue;
@@ -403,12 +470,9 @@ export const H13: Check = (r) => {
     const post = r.exe.log.find((x) => x.kind === 'post' && x.delivered.has(p.id));
     if (post) {
       if (post.final !== undefined && post.delivered.get(p.id)! > post.final) continue; // departure 5
-      // Departure 1 covers the ping that flooded and those after it, never one before a ping that got a pong.
-      if (/too many pings/.test(words(tokenOf(post.body)))) {
-        const mine = post.delivered.get(p.id)!;
-        const laterAnswered = [...post.delivered].some(([id, d]) => d > mine && handed.has(id));
-        if (!laterAnswered) continue;
-      }
+      // Departure 1, judged at the ping's own delivery: the flood rule held then (two pongs outstanding, or
+      // 32 handed off), or a flood ping came before it on this stream.
+      if (/too many pings/.test(words(tokenOf(post.body))) && floodAt(r, [...post.delivered], post.delivered.get(p.id)!, handed)) continue;
       problems.push(`H13: ping ${p.id} on request ${post.n} got no pong and no departure`);
       continue;
     }
@@ -416,7 +480,9 @@ export const H13: Check = (r) => {
     if (at === undefined) continue; // never reached the client
     const carrier = r.exe.log.find((x) => `w${x.n}` === p.on);
     if (!carrier) continue;
-    if (/too many pings/.test(words(tokenOf(carrier.body)))) continue; // departure 1
+    // Departure 1, judged at the ping's own delivery, as remotely.
+    const carried = r.server.pings.filter((q) => q.on === p.on && r.exe.pingDelivered.has(q.id)).map((q) => [q.id, r.exe.pingDelivered.get(q.id)! * 1000] as [string, number]);
+    if (/too many pings/.test(words(tokenOf(carrier.body))) && floodAt(r, carried, at * 1000, handed)) continue;
     const responded = r.exe.responded.get(`${carrier.epoch}:${carrier.body?.id}`);
     const draining = (responded !== undefined && responded < at) || r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method === 'notifications/cancelled' && y.start <= at);
     const blocked = r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.start <= at && (y.end ?? Infinity) > at);
@@ -430,6 +496,19 @@ export const H13: Check = (r) => {
   }
   return problems.slice(0, 3);
 };
+
+/** Whether a ping delivered at `d` (step × 1000 + order) on a stream met the flood rule: at that moment two
+    of the stream's pongs were outstanding or 32 were handed off, or an earlier ping on it already had. */
+function floodAt(r: WireRun, delivered: readonly [string, number][], d: number, handed: ReadonlySet<string>): boolean {
+  const pongOf = (id: string) => r.exe.log.find((x) => isPong(x.body) && String(x.body!.id) === id);
+  const at = (t: number) => {
+    const before = delivered.filter(([id, when]) => when < t && handed.has(id)).map(([id]) => pongOf(id)).filter((x): x is NativeRec => !!x);
+    const outstanding = before.filter((x) => (x.end ?? Infinity) * 1000 > t).length;
+    return outstanding >= 2 || before.length >= 32;
+  };
+  // This ping, or an earlier unanswered one that flooded, met the rule.
+  return at(d) || delivered.some(([id, when]) => when < d && !handed.has(id) && at(when));
+}
 
 /** Departure 6, logged, never judged: what happened natively to each handed-off pong. */
 export function pongFates(r: WireRun): Record<string, number> {
@@ -461,6 +540,26 @@ export const H5: Check = (r) =>
 /** H14: no call reaches the server twice; after a 404, initialize with no session id, then the new one. */
 export const H14: Check = (r) => {
   const problems: string[] = [];
+  const posts = r.exe.log.filter((x) => x.kind === 'post');
+  // From a 404 on a run with a session until its recovery's initialize, nothing goes without the session id
+  // (nor with it): the run's next request is that initialize.
+  for (const drop of posts.filter((x) => x.status === 404 && x.headers['mcp-session-id'] !== undefined)) {
+    const reinit = posts.find((x) => x.server === drop.server && x.seq > drop.seq && x.body?.method === 'initialize');
+    const between = posts.filter((x) => x.server === drop.server && x.seq > drop.seq && (!reinit || x.seq < reinit.seq) && x.body && !isPong(x.body) && x.body.method !== 'notifications/cancelled' && runOf(r, x) === runOf(r, drop));
+    const bare = between.find((x) => x.headers['mcp-session-id'] === undefined);
+    if (bare && reinit) problems.push(`H14: a ${bare.body!.method} without the session id between a 404 and its recovery's initialize`);
+  }
+  // No walk beside one: per run, the walks started (first pages) are the run's first, one per list_changed
+  // read since, and one per recovery; never one more.
+  const runs = new Map<string, NativeRec[]>();
+  for (const x of posts) runs.set(`${x.server}:${runOf(r, x)}`, [...(runs.get(`${x.server}:${runOf(r, x)}`) ?? []), x]);
+  for (const [, recs] of runs) {
+    const firsts = recs.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor === undefined).length;
+    const changes = recs.filter((x) => x.final !== undefined && x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed')).length;
+    const recoveries = recs.filter((x) => x.body?.method === 'initialize').length - 1;
+    const tests = r.evidence.filter((e) => e.what === 'test').length;
+    if (firsts > 1 + changes + Math.max(0, recoveries) + tests) problems.push(`H14: ${firsts} walks on a run with ${changes} list_changed and ${Math.max(0, recoveries)} recoveries`);
+  }
   // The exe's own redirect follow (the pre-pass contract, 4.3) is the exe's, not the client's.
   const calls = r.server.arrivals.filter((a) => isCall(a.body) && !a.followed);
   const seen = new Map<string, number>();
@@ -480,7 +579,7 @@ export const H14: Check = (r) => {
   }
   const recs = r.exe.log.filter((x) => x.kind === 'post');
   // Per run (one Start to its end), never per initialize: a re-handshake belongs to the run it recovers.
-  const sameRun = (a: NativeRec, b: NativeRec) => runOf(r, a) === runOf(r, b);
+  const sameRun = (a: NativeRec, b: NativeRec) => a.server === b.server && runOf(r, a) === runOf(r, b);
   const lastPage = (x: NativeRec) => x.body?.method === 'tools/list' && x.final !== undefined && x.status === 200 && !x.plan?.messages.some((m) => m.result?.nextCursor !== undefined);
   for (let i = 0; i < recs.length; i++) {
     const drop = recs[i]!;
@@ -507,7 +606,7 @@ export const H14: Check = (r) => {
     if (!next) {
       // An empty history after a recoverable 404 is a missed re-handshake, unless Stop came or the run hit
       // its step bound first.
-      const stopped = r.evidence.some((e) => e.what === 'stop' && e.seq > drop.seq);
+      const stopped = r.evidence.some((e) => e.what === 'stop' && e.seq > drop.seq && addressOf(e.server) === drop.server);
       // In the pre-pass build a held helper keeps the 404's own cleanup past the re-handshake's deadline
       // (H4's measured limitation): the recovery times out before it can send.
       const heldCleanup = drop.held && r.exe.build === 'prepass';
@@ -524,7 +623,7 @@ export const H14: Check = (r) => {
   // call is handed off (F02).
   for (let i = 0; i < recs.length; i++) {
     if (recs[i]!.status !== 404) continue;
-    const listed = recs.find((x) => x.seq > recs[i]!.seq && x.body?.method === 'tools/list' && x.final !== undefined);
+    const listed = recs.find((x) => x.seq > recs[i]!.seq && x.server === recs[i]!.server && x.body?.method === 'tools/list' && x.final !== undefined);
     const until = listed ? Math.floor(listed.final! / 1000) : Infinity;
     const during = recs.filter((x) => x.seq > recs[i]!.seq && isCall(x.body) && x.start < until && x.epoch === (recs.find((y) => y.seq > recs[i]!.seq && y.body?.method === 'initialize')?.epoch ?? -1));
     if (during.length) problems.push(`H14: ${tokenOf(during[0]!.body)} handed off while the session was being recovered`);
@@ -538,7 +637,33 @@ export const H14: Check = (r) => {
   return problems.slice(0, 3);
 };
 
-export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14 };
+/** H15: Test acts on its own run only. Between a Test and its report, the only native stop is of the run
+    Test started; a Test that met a Stop doesn't report success; a report that lists names them from its run. */
+export const H15: Check = (r) => {
+  const problems: string[] = [];
+  for (const t of r.evidence) {
+    if (t.what !== 'test') continue;
+    const done = r.evidence.find((e) => e.what === 'tested' && e.server === t.server && e.seq > t.seq);
+    if (!done) continue;
+    // Local: Test's run is the first process started after it was asked.
+    const own = r.exe.log.find((x) => x.kind === 'write' && x.seq > t.seq)?.epoch;
+    for (const s of r.exe.stopsAsked) {
+      if (s.step < t.step || s.step > done.step) continue;
+      if (own !== undefined && s.epoch !== own) problems.push(`H15: Test stopped run ${s.epoch}, not its own run ${own}`);
+    }
+    const stopped = r.evidence.some((e) => e.what === 'stop' && e.server === t.server && e.seq > t.seq && e.seq < done.seq);
+    if (stopped && done.report?.ok) problems.push(`H15: a Test that met a Stop reported success (${done.report.tools.length} tools)`);
+    if (done.report?.ok && !done.report.tools.length) problems.push('H15: Test reported success with no tools');
+  }
+  return problems.slice(0, 3);
+};
+
+/** Every native handoff up to a step, whole: kind, server, method, URL, headers and bytes (the twin rule). */
+export function handoffHistory(r: WireRun, upTo: number): string {
+  return JSON.stringify(r.exe.log.filter((x) => x.start <= upTo).map((x) => [x.kind, x.server, x.method, x.url ?? null, Object.entries(x.headers).sort(), x.start, x.raw ?? null]));
+}
+
+export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14, H15 };
 export const PASS_CHECKS: Record<string, Check> = { ...WIRE_CHECKS, H4, H5 };
 
 /** Each check's witness (7.2): a step where its condition was in play and could have failed. */
@@ -559,6 +684,7 @@ export const WITNESSES: Record<string, (r: WireRun) => boolean> = {
 };
 export const PASS_WITNESSES: Record<string, (r: WireRun) => boolean> = {
   'H4 a held helper detached': (r) => r.exe.log.some((x) => x.detached),
-  [`H5 a saturation (${CONTRACT_SERVER_CAP} server requests open)`]: (r) => r.exe.peakServer >= CONTRACT_SERVER_CAP && r.evidence.some((e) => e.what === 'model')
+  // The model fetch made at the saturation itself, not merely some fetch in a run that peaked.
+  [`H5 a saturation (${CONTRACT_SERVER_CAP} server requests open)`]: (r) => r.exe.log.some((x) => x.kind === 'model' && (x.openServer ?? 0) >= CONTRACT_SERVER_CAP)
 };
 export type { Evidence };

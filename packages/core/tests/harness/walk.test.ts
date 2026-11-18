@@ -49,13 +49,12 @@ function apply(s: State, input: Input | { t: 'restart' }, where: Where): { next:
   let effects: readonly ReturnType<typeof step>['effects'][number][] = [];
   if (input.t === 'restart') {
     // Stop and Start of the same server, as the link does them: Stop ends the live exchange in its own step
-    // (the slot is the server's, so a drain carries on); under the mutation the new run gets a fresh slot.
+    // (the slot is the server's, so a drain carries on).
     if (slot.ex && slot.ex.phase === 'live') {
       const r = step(slot, { t: 'terminal', n: slot.ex.n, end: { t: 'run-ended' } });
       slot = r.slot;
       effects = r.effects;
     }
-    if (slotPerRun) slot = { next: slot.next };
   } else {
     const r = step(slot, input);
     slot = r.slot;
@@ -80,7 +79,6 @@ function apply(s: State, input: Input | { t: 'restart' }, where: Where): { next:
   return { next: { slot, open, admits: s.admits + (input.t === 'admit' && !effects.some((e) => e.t === 'busy') ? 1 : 0), pings: s.pings + (input.t === 'ping' ? 1 : 0) }, problems };
 }
 
-let slotPerRun = false;
 
 /** The inputs that can come next: the world's native events, the person's, the server's. */
 function inputs(s: State, where: Where, era: Era): (Input | { t: 'restart' })[] {
@@ -189,18 +187,17 @@ describe('W: the exchange machine, every interleaving', () => {
     ['free-slot-at-response', 'remote', 'legacy', /^H1/],
     ['admit-while-draining', 'remote', 'legacy', /^H1/],
     ['page-before-drain', 'remote', 'modern', /^H1/],
-    ['write-only-on-response', 'local', 'legacy', /^liveness/],
-    ['slot-per-run', 'remote', 'legacy', /^H1/]
+    ['write-only-on-response', 'local', 'legacy', /^liveness/]
   ];
+  // slot-per-run is the link's (a Start resets the slot), not the machine's: its control runs through
+  // ServerLink in the wire harness (wire.mutations.test.ts, under S8), never as a reset W makes itself.
   for (const [mutation, where, era, fails] of CONTROLS) {
     it(`fails under ${mutation}`, () => {
       mutations.set([mutation]);
-      slotPerRun = mutation === 'slot-per-run';
       try {
         const w = walk(where, era);
         expect(w.problems.find((p) => fails.test(p)), w.problems[0]).toBeDefined();
       } finally {
-        slotPerRun = false;
         mutations.clear();
       }
     });

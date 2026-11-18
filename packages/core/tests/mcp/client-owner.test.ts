@@ -142,7 +142,8 @@ describe('5.1: a saved setup, as the owner keeps it', () => {
 
 describe('5.4: one start at a time owns the phase', () => {
   for (const variant of ['net-held', 'net-cancel-late'] as const) {
-    it(`a start stopped and started again before it settles: the earlier answers stopped and never sets the later start's phase (${variant})`, async () => {
+    // net-cancel-late is a preserved-behaviour control: it held before the start tokens too, and stays.
+    it(`a start stopped and started again before it settles: the earlier answers stopped and never sets the later start's phase (${variant === 'net-cancel-late' ? 'net-cancel-late, a preserved behaviour' : variant})`, async () => {
       const store = memorySettingsStore();
       let fetches = 0;
       let releaseA!: () => void;

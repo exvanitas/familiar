@@ -33,7 +33,7 @@ function world(blankEscaped: boolean, stored = KEY) {
         onEvent(e);
       })
   };
-  return { port, heard };
+  return { port, heard, written: inner.written };
 }
 
 async function added(port: ProcessPort) {
@@ -43,20 +43,28 @@ async function added(port: ProcessPort) {
   return { client, id };
 }
 
-const outcome = (p: Promise<string>) => p.then((w) => ({ pass: w }), (e: Error) => ({ fail: e.message }));
+// No failure's words ever carry part of the key: they go to the CI log.
+const outcome = (p: Promise<string>) =>
+  p.then(
+    (w) => ({ pass: w }),
+    (e: Error) => {
+      if (!e.message.startsWith(ESCAPED_GAP)) for (const piece of [typed.head, typed.tail, KEY.slice(0, 6), KEY.slice(-6)]) expect(e.message).not.toContain(piece);
+      return { fail: e.message };
+    }
+  );
 
 describe('security.mcp.secret-json-escaped, its positive control', () => {
   it('fails with the known gap\'s words where only literal copies are blanked', async () => {
     const w = world(false);
     const { client, id } = await added(w.port);
-    const r = await outcome(escapedCopyCheck(client, w.heard, id, typed, sleep));
+    const r = await outcome(escapedCopyCheck(client, w.heard, w.written, id, typed, sleep));
     expect(r).toMatchObject({ fail: expect.stringMatching(new RegExp(`^${ESCAPED_GAP}: `)) });
   }, 30_000);
 
   it('passes where the escaped form is blanked too', async () => {
     const w = world(true);
     const { client, id } = await added(w.port);
-    expect(await outcome(escapedCopyCheck(client, w.heard, id, typed, sleep))).toMatchObject({ pass: expect.any(String) });
+    expect(await outcome(escapedCopyCheck(client, w.heard, w.written, id, typed, sleep))).toMatchObject({ pass: expect.any(String) });
   }, 30_000);
 
   it('a server that never starts, or holds another key, fails with other words', async () => {
@@ -65,11 +73,29 @@ describe('security.mcp.secret-json-escaped, its positive control', () => {
       throw Object.assign(new Error('refused'), { kind: 'declined' });
     };
     const a = await added(dead.port);
-    const r1 = await outcome(escapedCopyCheck(a.client, dead.heard, a.id, typed, sleep));
+    const r1 = await outcome(escapedCopyCheck(a.client, dead.heard, dead.written, a.id, typed, sleep));
     expect(r1).toMatchObject({ fail: expect.not.stringMatching(new RegExp(`^${ESCAPED_GAP}`)) });
     expect(r1).toMatchObject({ fail: expect.stringMatching(/didn't start/) });
     const other = world(false, 'fkABCDEFGHIJKLMNOPQRSTUVWXY');
     const b = await added(other.port);
-    expect(await outcome(escapedCopyCheck(b.client, other.heard, b.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/another key/) });
+    expect(await outcome(escapedCopyCheck(b.client, other.heard, other.written, b.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/another key/) });
+  }, 30_000);
+
+  it("a stray line that looks like the reply, with another id, isn't the reply; a key one character short fails in words with no part of it", async () => {
+    // The server's reply never reaches what the check reads; only a lookalike line with another id does.
+    const w = world(true);
+    const fake = { ...w.port, start: (setup: Parameters<ProcessPort['start']>[0], onEvent: Parameters<ProcessPort['start']>[1]) => w.port.start(setup, (e) => {
+      if (e.t !== 'exit' && /"result":\{"content":\[\{"type":"text","text":"The secret is /.test(e.line)) {
+        w.heard.pop();
+        w.heard.push(JSON.stringify({ jsonrpc: '2.0', id: 999, result: { content: [{ type: 'text', text: 'The secret is [hidden].' }] } }));
+      }
+      onEvent(e);
+    }) };
+    const a = await added(fake);
+    expect(await outcome(escapedCopyCheck(a.client, w.heard, w.written, a.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/reply line never reached/) });
+    // The server holds the key less its last character: told by length, never by content.
+    const short = world(false, KEY.slice(0, -1));
+    const b = await added(short.port);
+    expect(await outcome(escapedCopyCheck(b.client, short.heard, short.written, b.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/another key/) });
   }, 30_000);
 });
