@@ -477,7 +477,7 @@ The same POST through the guarded fetch, with these differences:
 - **A local call that's stopped or times out** sends `notifications/cancelled` for its id, as the spec advises, as the terminal step's last send, made before the exchange is sealed (3.4). The exchange drains once that write completes or the run ends. A late response to the cancelled id is dropped by id.
 - **The write bound is the exe's** (section 4). A write pending past 10 s ends the job, and the run goes to Failed with "It stopped reading what Familiar sent".
 - **A run that ends ends its process.** A local run that ends for any reason, a reported one included, stops its process, and its pending writes end at the exit.
-- **stderr lines**, and stray stdout lines (3.10), are kept for the server's last output: the last 40 lines, at most 16 KiB.
+- **stderr lines**, and stray stdout lines (3.10), are kept for the server's last output: the last 40 lines, at most 16 KiB counted in UTF-8 bytes. Text cut to a bound (an error message, a line) is cut by character, never inside one.
 - **A modern stdio run** uses the same `_meta` envelope, with no headers and no mirroring. It keeps the `notifications/cancelled` write, which stdio sends in either era. There are no pings.
   - **A modern refusal on stdio takes one of two paths, chosen at run time.** Some servers keep the pipe after refusing and serve modern requests on it (the TypeScript SDK's `serveStdio`); others exit before their loop (an rmcp stdio binary). So after a modern refusal the client goes on to `tools/list`:
     - **If the answer comes,** the run goes on. An answer that refuses (a `-32022`, or any JSON-RPC error) is the server's word: the start fails, with no relaunch, even if the process exits after it.

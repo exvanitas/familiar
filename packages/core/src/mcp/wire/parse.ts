@@ -78,7 +78,7 @@ export function parseMessage(text: string, maxBytes = MAX_MESSAGE_BYTES): Inboun
   }
   const e = v.error;
   if (!isObject(e) || !Number.isInteger(e.code) || typeof e.message !== 'string') throw new Invalid('a bad error object');
-  return { t: 'response', id: v.id as RpcId, error: { code: e.code as number, message: e.message.slice(0, MAX_ERROR_MESSAGE), ...('data' in e ? { data: e.data } : {}) } };
+  return { t: 'response', id: v.id as RpcId, error: { code: e.code as number, message: cutText(e.message, MAX_ERROR_MESSAGE), ...('data' in e ? { data: e.data } : {}) } };
 }
 
 /* ---------- the event stream ---------- */

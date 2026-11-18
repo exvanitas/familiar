@@ -157,3 +157,21 @@ describe('the declaration scan and the mirrored values', () => {
     expect(paramHeaders(ctor.declarations, {}, 0)).toEqual({ ok: true, headers: [] });
   });
 });
+
+describe('cuts by character, and bounds by byte', () => {
+  it("an error message cut at its bound never ends in half a character", async () => {
+    const { parseMessage } = await import('../../../src/mcp/wire/parse.ts');
+    const { wellFormed } = await import('../../../src/mcp/wire/headers.ts');
+    const m = parseMessage(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -1, message: `${'a'.repeat(1023)}😀 and more` } }));
+    if (m.t !== 'response' || !m.error) throw new Error('not an error response');
+    expect(wellFormed(m.error.message)).toBe(true);
+    expect(m.error.message.length).toBeLessThanOrEqual(1024);
+  });
+
+  it("the server's last output is bounded in bytes: eight long lines of CJK text keep at most 16 KiB", async () => {
+    const { LastOutput, LAST_BYTES } = await import('../../../src/mcp/last-output.ts');
+    const last = new LastOutput();
+    for (let i = 0; i < 8; i++) last.push('字'.repeat(2000));
+    expect(new TextEncoder().encode(last.text()!).length).toBeLessThanOrEqual(LAST_BYTES);
+  });
+});
