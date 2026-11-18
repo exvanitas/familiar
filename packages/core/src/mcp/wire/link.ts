@@ -304,6 +304,8 @@ export class ServerLink {
         this.events.listed?.(run.id, r.tools);
         return r.tools;
       }
+      // A 404 on a page: the session's recovery is under way (3.8), and decides the run's end.
+      if ('session' in r && r.session && !(__FAMILIAR_MUTATIONS__ && mutant('end-on-refresh-404'))) return r.failure;
       this.endRun(run, r.failure, true);
       return r.failure;
     } finally {
@@ -417,7 +419,7 @@ export class ServerLink {
 
   /* ---------- the handshake and the walk ---------- */
 
-  private async handshake(run: Run, deadline: Deadline): Promise<Failure | undefined> {
+  private async handshake(run: Run, deadline: Deadline, opening = true): Promise<Failure | undefined> {
     const id = run.nextId++;
     const init = await this.exchange(run, 'initialize', id, frame({ kind: 'initialize', id }, 'legacy', run.target.where), deadline, 'initialize');
     if (deadline.expired) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
@@ -426,7 +428,9 @@ export class ServerLink {
     if (r.error) {
       // The opening's classifier (3.3): a -32022 naming 2026-07-28 and no legacy version Familiar speaks
       // makes this run modern. There's no new exchange: no discover, no initialized, straight to the list.
-      if (modernRefusal(r.error) || (__FAMILIAR_MUTATIONS__ && mutant('modern-on-any-error'))) {
+      // Only on a run's opening: a re-handshake never changes an established run's era. There, the refusal
+      // ends the run, and Start opens a new one.
+      if (opening && (modernRefusal(r.error) || (__FAMILIAR_MUTATIONS__ && mutant('modern-on-any-error')))) {
         run.era = 'modern';
         if (init.offered !== undefined && (__FAMILIAR_MUTATIONS__ && mutant('session-id-on-modern'))) run.sessionId = init.offered;
         else delete run.sessionId;
@@ -454,7 +458,7 @@ export class ServerLink {
    * again, from the first page, within the same deadline, and a server whose tools keep changing fails the
    * walk rather than leave a catalog Familiar knows is stale.
    */
-  private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure }> {
+  private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure; readonly session?: true }> {
     for (let attempt = 0; ; attempt++) {
       const at = run.changes;
       run.stale = true;
@@ -473,7 +477,7 @@ export class ServerLink {
   }
 
   /** Pages of tools/list, each its own exchange through the barrier, at most 16, and 128 tools in all. */
-  private async walkOnce(run: Run, deadline: Deadline): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure }> {
+  private async walkOnce(run: Run, deadline: Deadline): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true }> {
     const raw: Record<string, unknown>[] = [];
     let cursor: string | undefined;
     for (let page = 1; ; page++) {
@@ -482,7 +486,7 @@ export class ServerLink {
       const msg: AdminMessage = { kind: 'list', id, ...(cursor !== undefined ? { cursor } : {}) };
       const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where), deadline, 'tools/list');
       if (deadline.expired) return { failure: { kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." } };
-      if (o.end.t !== 'done' || !o.response) return { failure: this.startWords(run, o.end) };
+      if (o.end.t !== 'done' || !o.response) return { failure: this.startWords(run, o.end), ...(o.end.t === 'session-ended' ? { session: true } : {}) };
       if (o.response.error) {
         if (run.era === 'modern' && o.response.error.code === -32022) return { failure: refusedWords(o.response.error) };
         return { failure: { kind: 'protocol', words: `The server refused to list its tools: ${o.response.error.message}` } };
@@ -585,7 +589,8 @@ export class ServerLink {
         if (!p) return;
         p.done({ end: e.end, ...(p.response ? { response: p.response } : {}), ...(p.offeredSession !== undefined ? { offered: p.offeredSession } : {}) });
         // The first page or call after a re-handshake that completes without a 404 rearms the bound (3.8).
-        if (e.end.t === 'done' && (p.kind === 'list' || p.kind === 'call')) p.run.dropped = 0;
+        // Rearmed only by a page or call after the recovery, not by the re-handshake's own walk.
+        if (e.end.t === 'done' && (p.kind === 'list' || p.kind === 'call') && (p.run.ready || (__FAMILIAR_MUTATIONS__ && mutant('rearm-in-recovery')))) p.run.dropped = 0;
         if (e.end.t === 'session-ended') this.sessionDropped(p.run);
         return;
       }
@@ -867,7 +872,7 @@ export class ServerLink {
     void (async () => {
       const { deadline, cancel } = this.deadline(run, this.limits.startMs);
       try {
-        const failure = run.ended ? undefined : await this.handshake(run, deadline);
+        const failure = run.ended ? undefined : await this.handshake(run, deadline, !!(__FAMILIAR_MUTATIONS__ && mutant('era-change-on-recovery')));
         if (run.ended) return;
         if (failure) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
         const listed = await this.walk(run, deadline);

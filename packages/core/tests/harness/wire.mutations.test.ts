@@ -65,7 +65,10 @@ const CONTROLS: Control[] = [
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop during a walk, local' },
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' },
   { mutation: 'ready-during-recovery', check: 'H14', named: 'S12' },
-  { mutation: 'publish-stale-walk', check: 'H3', named: 'S14 list_changed during the initial walk' }
+  { mutation: 'publish-stale-walk', check: 'H3', named: 'S14 list_changed during the initial walk' },
+  { mutation: 'era-change-on-recovery', check: 'H12', named: 'S15' },
+  { mutation: 'end-on-refresh-404', check: 'H14', named: 'S16' },
+  { mutation: 'rearm-in-recovery', check: 'H14', named: 'S17' }
 ];
 
 const MAX_SEEDS = 150;

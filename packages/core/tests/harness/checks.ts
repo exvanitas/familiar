@@ -55,6 +55,13 @@ function localPongKey(r: WireRun, rec: NativeRec): string {
   return key;
 }
 
+/** Which run of its server a native request belongs to: local, the process (an epoch); remote, the count
+    of Starts made before it (a run lasts from one Start to its end, re-handshakes included). */
+function runOf(r: WireRun, x: NativeRec): number {
+  if (x.kind === 'write') return x.epoch;
+  return r.evidence.filter((e) => e.what === 'start' && e.seq < x.seq && `addr-${(e.server ?? 's1').slice(1)}` === x.server).length;
+}
+
 /** H1: per server, the native requests of two different exchanges are never open at once, and at most 3. */
 export const H1: Check = (r) => {
   const problems: string[] = [];
@@ -300,21 +307,28 @@ export const H11: Check = (r) => {
 /** H12: a run's requests all have one era's framing, and modern only after a modern refusal. */
 export const H12: Check = (r) => {
   const problems: string[] = [];
-  const byEpoch = new Map<number, NativeRec[]>();
-  for (const x of r.exe.log) byEpoch.set(x.epoch, [...(byEpoch.get(x.epoch) ?? []), x]);
-  for (const [, recs] of byEpoch) {
+  // Per run (one Start to its end), so a re-handshake inside a run is judged with it.
+  const byRun = new Map<string, NativeRec[]>();
+  for (const x of r.exe.log) {
+    if (x.kind === 'model') continue;
+    const k = `${x.server}:${runOf(r, x)}`;
+    byRun.set(k, [...(byRun.get(k) ?? []), x]);
+  }
+  for (const [, recs] of byRun) {
     const modern = recs.filter((x) => x.body?.params?._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28' || x.headers['mcp-protocol-version'] === '2026-07-28');
     if (!modern.length) {
       if (recs.some((x) => x.headers['mcp-method'] !== undefined || x.headers['mcp-name'] !== undefined)) problems.push('H12: a legacy run sent a modern header');
       continue;
     }
     if (r.server.mode.era !== 'modern') problems.push('H12: a run turned modern though the server never refused the legacy opening');
-    const first = Math.min(...modern.map((x) => x.seq));
     const opening = Math.min(...recs.map((x) => x.seq));
     for (const x of recs) {
       if (x.body?.method === 'notifications/initialized') problems.push('H12: initialized on a modern run');
       if (x.body?.method === 'initialize' && x.seq !== opening) problems.push('H12: initialize after a modern opening');
-      if (x.seq <= first) continue;
+      if (x.seq === opening) continue;
+      // Every frame after the opening is modern: a run's era never changes.
+      const isModern = x.body?.params?._meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28' || x.headers['mcp-protocol-version'] === '2026-07-28';
+      if (!isModern && x.body?.method && x.body.method !== 'initialize' && x.body.method !== 'notifications/cancelled') problems.push(`H12: a legacy ${x.body.method} in a run that turned modern`);
       if (isPong(x.body)) problems.push('H12: a pong on a modern run');
       if (x.headers['mcp-session-id'] !== undefined) problems.push('H12: a session id on a modern run');
       if (x.kind === 'post' && x.body?.method === 'notifications/cancelled') problems.push('H12: a remote cancel on a modern run');
@@ -414,13 +428,43 @@ export const H14: Check = (r) => {
     if (out?.kind === 'result') problems.push(`H14: ${tokenOf(x.body)} came back as a result through a redirect`);
   }
   const recs = r.exe.log.filter((x) => x.kind === 'post');
+  // Per run (one Start to its end), never per initialize: a re-handshake belongs to the run it recovers.
+  const sameRun = (a: NativeRec, b: NativeRec) => runOf(r, a) === runOf(r, b);
+  const lastPage = (x: NativeRec) => x.body?.method === 'tools/list' && x.final !== undefined && x.status === 200 && !x.plan?.messages.some((m) => m.result?.nextCursor !== undefined);
   for (let i = 0; i < recs.length; i++) {
-    if (recs[i]!.status !== 404) continue;
-    const after = recs.slice(i + 1).filter((x) => x.body && !isPong(x.body));
+    const drop = recs[i]!;
+    if (drop.status !== 404) continue;
+    const run = recs.filter((x) => sameRun(x, drop));
+    const wasReady = run.some((x) => x.seq < drop.seq && lastPage(x));
+    // A second drop before any page or call completed after the last recovery's own walk ends the run.
+    const prior = run.filter((x) => x.seq < drop.seq && x.status === 404).at(-1);
+    let second = false;
+    if (prior) {
+      const reinit = run.find((x) => x.seq > prior.seq && x.body?.method === 'initialize');
+      const walked = reinit ? run.find((x) => x.seq > reinit.seq && lastPage(x)) : undefined;
+      const completedAfter = walked ? run.some((x) => x.seq > walked.seq && x.seq < drop.seq && (x.body?.method === 'tools/list' || x.body?.method === 'tools/call') && x.status === 200 && x.final !== undefined) : false;
+      second = !completedAfter;
+    }
+    const after = run.filter((x) => x.seq > drop.seq && x.body && !isPong(x.body));
+    if (second || !wasReady) {
+      const restart = r.evidence.find((e) => e.what === 'start' && e.seq > drop.seq);
+      const more = after.filter((x) => !restart || x.seq < restart.seq);
+      if (more.length) problems.push(`H14: after ${second ? 'a second 404 with nothing completed since the recovery' : 'a 404 before the run was Ready'}, ${more[0]!.body!.method} was still sent`);
+      continue;
+    }
     const next = after[0];
-    if (!next) continue;
+    if (!next) {
+      // An empty history after a recoverable 404 is a missed re-handshake, unless Stop came or the run hit
+      // its step bound first.
+      const stopped = r.evidence.some((e) => e.what === 'stop' && e.seq > drop.seq);
+      // In the pre-pass build a held helper keeps the 404's own cleanup past the re-handshake's deadline
+      // (H4's measured limitation): the recovery times out before it can send.
+      const heldCleanup = drop.held && r.exe.build === 'prepass';
+      if (!stopped && !heldCleanup && r.sched.step < 1500) problems.push('H14: after a 404 on a Ready run, no re-handshake');
+      continue;
+    }
     if (next.body?.method !== 'initialize') {
-      if (next.body?.method === 'tools/call' && next.seq > recs[i]!.seq) problems.push(`H14: after a 404, ${next.body.method} before a fresh initialize`);
+      problems.push(`H14: after a 404, ${next.body?.method} before a fresh initialize`);
       continue;
     }
     if (next.headers['mcp-session-id'] !== undefined) problems.push('H14: the re-handshake carried the old session id');
@@ -439,19 +483,6 @@ export const H14: Check = (r) => {
     const tried = r.evidence.filter((e) => e.what === 'call' && e.step > from && e.step < until).map((e) => e.token);
     const busy = r.evidence.filter((e) => e.what === 'outcome' && tried.includes(e.token) && e.outcome?.kind === 'error' && e.outcome.reason === 'busy');
     if (busy.length) problems.push(`H14: ${busy[0]!.token}, tried during the recovery, was refused only as busy: the run still said Ready`);
-  }
-  // A 404 before any page or call has completed since the last re-handshake ends the run: nothing more is
-  // sent until the person starts it again.
-  for (let i = 0; i < recs.length; i++) {
-    if (recs[i]!.status !== 404) continue;
-    const prior = recs.slice(0, i).reverse().find((x) => x.status === 404);
-    if (!prior) continue;
-    const between = recs.filter((x) => x.seq > prior.seq && x.seq < recs[i]!.seq);
-    const completed = between.some((x) => (x.body?.method === 'tools/list' || x.body?.method === 'tools/call') && x.status === 200 && x.final !== undefined);
-    if (completed) continue;
-    const restart = r.evidence.find((e) => e.what === 'start' && e.seq > recs[i]!.seq);
-    const after = recs.filter((x) => x.seq > recs[i]!.seq && x.body && !isPong(x.body) && (!restart || x.seq < restart.seq));
-    if (after.length) problems.push(`H14: after a second 404 with nothing completed between, ${after[0]!.body!.method} was still sent`);
   }
   return problems.slice(0, 3);
 };

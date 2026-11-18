@@ -89,6 +89,32 @@ function changeDuringWalk(pages: number, refresh: boolean): Named {
 }
 
 export const SCHEDULES: Named[] = [
+  {
+    // S15: a call's 404, then the re-handshake meets a modern-only server: the run ends, still legacy.
+    name: 'S15 a modern refusal on a re-handshake',
+    options: { mode: { ...quiet, session404: 'once', modernAfterDrop: true }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
+    expect: (r) => (r.exe.log.filter((x) => x.body?.method === 'initialize').length === 2 ? undefined : 'no re-handshake')
+  },
+  {
+    // S16: the first 404 on a refresh page (a list_changed brings the refresh): one fresh initialize, the run kept.
+    name: 'S16 a 404 on a refresh page',
+    options: { mode: { ...quiet, session404: 'refresh', listChanged: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
+    expect: (r) => (r.exe.log.some((x) => x.status === 404 && x.body?.method === 'tools/list') ? undefined : 'no 404 on a refresh page')
+  },
+  {
+    // S17: every call 404s, pages never do: the second call's 404 ends the run (one re-handshake per drop,
+    // never two in a row).
+    name: 'S17 a 404 on every call',
+    options: {
+      mode: { ...quiet, session404: 'calls' },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('echo');
+          d.when('recovered', () => d.exe.log.filter((x) => x.body?.method === 'initialize').length === 2 && d.idle(), () => d.call('echo'));
+        })
+    },
+    expect: (r) => (r.exe.log.filter((x) => x.status === 404).length === 2 ? undefined : 'not two 404s')
+  },
   changeDuringWalk(1, false),
   changeDuringWalk(3, false),
   changeDuringWalk(1, true),

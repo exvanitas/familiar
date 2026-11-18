@@ -33,7 +33,9 @@ export interface Mode {
   readonly staleId: number;
   readonly listChanged: number;
   readonly pages: number;
-  readonly session404: 'none' | 'once' | 'twice' | 'again' | 'always';
+  readonly session404: 'none' | 'once' | 'twice' | 'again' | 'always' | 'calls' | 'refresh';
+  /** After a session drop, the server has turned modern-only: its re-handshake is refused -32022 (S15). */
+  readonly modernAfterDrop: boolean;
   readonly redirect: number;
   readonly idlePings: number;
   readonly stopReading: number;
@@ -76,6 +78,7 @@ export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
     hold: false,
     oneChunk: false,
     changeOnList: false,
+    modernAfterDrop: false,
     holdHelpers: r() < 0.2 ? 0.5 : 0,
     holdWhich: 'any',
     ...over
@@ -114,6 +117,7 @@ export class ScriptedServer {
   readonly arrivals: { body: Msg; headers: Record<string, string>; method: string; step: number; followed?: boolean }[] = [];
   private lastId: unknown;
   private changedThisSession = -1;
+  private lists: number | undefined;
   /** Its tools' variant: a list_changed it sends changes the echo tool's description (S1). */
   variant = 'a';
 
@@ -134,6 +138,7 @@ export class ScriptedServer {
     const modernReq = body.params?._meta?.['io.modelcontextprotocol/protocolVersion'] === MODERN;
     const json = (messages: Msg[], status = 200, extra: Partial<Plan> = {}): Plan => ({ status, sse: messages.length > 1 || this.r() < m.sse, messages, final: messages.findIndex((x) => x.id === body.id && ('result' in x || 'error' in x)), ...extra });
     if (body.method === 'initialize') {
+      if (m.modernAfterDrop && this.drops > 0) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: [MODERN] } } }], 400);
       if (m.era === 'legacy' && this.r() < m.initError) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32603, message: 'internal error' } }]);
       if (m.era === 'modern') {
         const refusal = { jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: [MODERN], requested: body.params?.protocolVersion } } };
@@ -147,6 +152,10 @@ export class ScriptedServer {
     if (m.where === 'remote' && this.sessionIdNow && headers['mcp-session-id'] !== undefined) {
       const drop =
         m.session404 === 'always' ||
+        // Every call drops the session; pages never do (S17).
+        (m.session404 === 'calls' && body.method === 'tools/call') ||
+        // The first page after the initial walk (a refresh) drops it (S16).
+        (m.session404 === 'refresh' && this.drops === 0 && body.method === 'tools/list' && (this.lists ?? 0) >= 1 && body.params?.cursor === undefined) ||
         (m.session404 === 'once' && this.drops === 0 && body.method === 'tools/call') ||
         (m.session404 === 'twice' && this.drops < 2 && body.method !== 'notifications/initialized') ||
         // A call drops the session, then the first page after the re-handshake drops it again.
@@ -170,6 +179,7 @@ export class ScriptedServer {
       return { status: 200, sse: true, messages: [{ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, listed], final: 1 };
     }
     if (body.method === 'tools/list') {
+      if (body.params?.cursor === undefined) this.lists = (this.lists ?? 0) + 1;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
       return json([{ jsonrpc: '2.0', id: body.id, result: { tools: page === 0 ? tools(m.era, this.variant) : [], ...next, ...complete } }]);
