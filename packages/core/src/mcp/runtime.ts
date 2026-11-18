@@ -85,6 +85,10 @@ export class ServerRuntime {
   get tools(): readonly ListedTool[] {
     return this.phaseNow === 'ready' ? (this.link.current?.tools ?? []) : [];
   }
+  /** Tools the run listed but doesn't offer, with why (a modern header declaration that breaks the rules). */
+  get notOffered(): readonly { readonly name: string; readonly reason: string }[] {
+    return this.link.current?.notOffered ?? [];
+  }
   /** The run id and its launch while Ready. */
   get run(): { readonly id: string; readonly launch: string } | undefined {
     const c = this.link.current;
@@ -109,7 +113,13 @@ export class ServerRuntime {
     const target: Target = setup.kind === 'local' ? { where: 'local', setup: processSetupOf(setup) } : { where: 'remote', address: setup.address ?? '', url: setup.url, headers: Object.entries(remoteHeaders(remoteTargetOf(setup))) };
     if (setup.kind === 'remote' && setup.transport === 'sse') return { kind: 'failed', failure: { kind: 'protocol', words: 'Legacy SSE servers are not supported. Use the server\'s Streamable HTTP address.' } };
     this.set('starting');
-    const r = await this.link.start(target, setupFingerprint(setup));
+    let r = await this.link.start(target, setupFingerprint(setup));
+    // A modern-only stdio server that ended its process after refusing the legacy opening: one more start
+    // of the same setup, readmitted here (the committed launch, no change in flight), era fixed to modern.
+    if (!r.ok && r.relaunch === 'modern' && (this.phaseNow as Phase) === 'starting') {
+      if (this.changing || this.record !== record) r = { ok: false, failure: { kind: 'busy', words: 'Familiar is saving another change. Press Start again.' } };
+      else r = await this.link.start(target, setupFingerprint(setup), { era: 'modern' });
+    }
     if ((this.phaseNow as Phase) !== 'starting') {
       // Stopped or removed while starting: the run was ended there.
       if (r.ok) await this.link.stop();

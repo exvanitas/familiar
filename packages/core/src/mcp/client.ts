@@ -76,7 +76,7 @@ export interface TestedTool extends ListedTool {
 }
 
 export type TestReport =
-  | { readonly ok: true; readonly tools: readonly TestedTool[]; readonly changes: ToolChanges; readonly unpinned?: Unpinned }
+  | { readonly ok: true; readonly tools: readonly TestedTool[]; readonly changes: ToolChanges; readonly unpinned?: Unpinned; readonly notOffered?: readonly { readonly name: string; readonly reason: string }[] }
   | { readonly ok: false; readonly failure: Failure };
 
 const randomIncarnation = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, '0')).join('');
@@ -191,11 +191,12 @@ export class McpClient {
     }
     const saved = new Map(e.setup.tools.map(t => [t.name, t]));
     const tools = e.tools.map(t => ({ ...t, fresh: fresh(saved.get(t.name), t.fingerprint) }));
+    const notOffered = e.notOffered;
     await e.stop();
     const setup = e.setup.setup;
     const flag = setup.kind === 'local' ? unpinned(setup.program, setup.args) : undefined;
     const reviewed = e.setup.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
-    return { ok: true, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}) };
+    return { ok: true, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}), ...(notOffered.length ? { notOffered } : {}) };
   }
 
   /** The person has seen these tools' names and descriptions as they are now. */

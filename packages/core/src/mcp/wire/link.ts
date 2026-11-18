@@ -14,7 +14,8 @@ import { LastOutput } from '../last-output.ts';
 import type { CallOutcome, Failure, ListedTool } from '../types.ts';
 import { exitFailure, protocolFailure, remoteFailure, startFailure } from '../words.ts';
 import { emptySlot, step, type Effect, type End, type ExchangeKind, type Input, type Slot } from './exchange.ts';
-import { frame, frameCall, LEGACY_VERSIONS, MODERN_VERSION, type AdminMessage, type Era, type RpcId } from './framing.ts';
+import { frame, frameCall, LEGACY_VERSIONS, legacyVersion, MODERN_VERSION, type AdminMessage, type Era, type RpcId } from './framing.ts';
+import { HEADER_WORDS, paramHeaders, scanDeclarations, type HeaderDeclaration } from './headers.ts';
 import { callResult, EventStream, initializeResult, Invalid, listResult, MAX_HANDSHAKE_BYTES, MAX_MESSAGE_BYTES, parseMessage, resultText, type Inbound } from './parse.ts';
 
 /** The exe's fetch, as core uses it: one request per id, its head, its body pulled, and its end. */
@@ -76,6 +77,12 @@ export interface LinkEvents {
   listed?(run: string, tools: readonly ListedTool[]): void;
 }
 
+/** A start's, a walk's or a re-handshake's deadline: every step of it races it, the slot's waits included. */
+interface Deadline {
+  expired: boolean;
+  readonly over: Promise<void>;
+}
+
 /** What one exchange gave back. */
 interface Outcome {
   readonly end: End;
@@ -92,6 +99,10 @@ interface Run {
   /** The process run id the exe gave, for a local server. */
   process?: string;
   tools: readonly ListedTool[];
+  /** Modern remote: each offered tool's header declarations. */
+  declarations: Map<string, readonly HeaderDeclaration[]>;
+  /** Tools listed but not offered, with why (Test shows them). */
+  notOffered: readonly { readonly name: string; readonly reason: string }[];
   stale: boolean;
   ready: boolean;
   ended: boolean;
@@ -120,6 +131,10 @@ interface Pending {
   carriedSession?: boolean;
   /** Remote initialize: the session id its successful answer offers. */
   offeredSession?: string;
+  /** The JSON-RPC method, for the modern era's `Mcp-Method`. */
+  readonly method?: string;
+  /** Modern tools/call: `Mcp-Name` and the `Mcp-Param-*` headers, built from the decision. */
+  readonly extra?: readonly (readonly [string, string])[];
 }
 
 const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -154,9 +169,9 @@ export class ServerLink {
   get busy(): boolean {
     return this.slot.ex !== undefined;
   }
-  get current(): { readonly run: string; readonly era: Era; readonly ready: boolean; readonly stale: boolean; readonly tools: readonly ListedTool[]; readonly sessionId?: string; readonly version?: string; readonly launch: string } | undefined {
+  get current(): { readonly run: string; readonly era: Era; readonly ready: boolean; readonly stale: boolean; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[]; readonly sessionId?: string; readonly version?: string; readonly launch: string } | undefined {
     const r = this.run;
-    return r && !r.ended ? { run: r.id, era: r.era, ready: r.ready, stale: r.stale, tools: r.tools, launch: r.launch, ...(r.sessionId ? { sessionId: r.sessionId } : {}), ...(r.version ? { version: r.version } : {}) } : undefined;
+    return r && !r.ended ? { run: r.id, era: r.era, ready: r.ready, stale: r.stale, tools: r.tools, notOffered: r.notOffered, launch: r.launch, ...(r.sessionId ? { sessionId: r.sessionId } : {}), ...(r.version ? { version: r.version } : {}) } : undefined;
   }
   /** Resolves when the slot is next Idle. */
   drained(): Promise<void> {
@@ -171,11 +186,11 @@ export class ServerLink {
    * tool list. Refused busy while the slot holds an exchange (a Stop's drain included). The whole start
    * runs under one deadline; past it the local process is stopped, or the remote run ends.
    */
-  async start(target: Target, launch: string): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure }> {
+  async start(target: Target, launch: string, options: { readonly era?: Era } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: 'legacy', tools: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish };
+    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish };
     this.run = run;
     if (target.where === 'local') {
       const processes = this.ports.processes!;
@@ -188,22 +203,22 @@ export class ServerLink {
       }
       if (run.ended) return { ok: false, failure: this.exitWords(run) };
     }
-    let expired = false;
-    const cancel = this.clock.setTimer(() => {
-      expired = true;
-      const ex = this.slot.ex;
-      if (ex && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'timeout' } });
-    }, this.limits.startMs, { background: false });
+    const { deadline, cancel } = this.deadline(run, this.limits.startMs);
     try {
-      const failure = await this.handshake(run, () => expired);
+      // A modern relaunch skips the opening: the era was decided by the refusal on the first start.
+      const failure = run.era === 'modern' ? undefined : await this.handshake(run, deadline);
       if (failure) {
         this.endRun(run, failure, false);
         return { ok: false, failure };
       }
-      const listed = await this.walk(run, () => expired);
+      const refusedOnStdio = run.era === 'modern' && options.era === undefined && target.where === 'local';
+      const listed = await this.walk(run, deadline);
       if (!('tools' in listed)) {
+        // A modern-only stdio server that ended its process after refusing (rmcp does, B2): one relaunch
+        // with the era fixed to modern, readmitted by the caller.
+        const relaunch = refusedOnStdio && run.ended && !deadline.expired;
         this.endRun(run, listed.failure, false);
-        return { ok: false, failure: listed.failure };
+        return { ok: false, failure: listed.failure, ...(relaunch ? { relaunch: 'modern' as const } : {}) };
       }
       run.ready = true;
       return { ok: true, run: run.id, tools: run.tools };
@@ -231,14 +246,9 @@ export class ServerLink {
     const run = this.run;
     if (!run || run.ended || !run.ready) return { kind: 'failed', words: 'The server is not running.' };
     if (this.busy) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
-    let expired = false;
-    const cancel = this.clock.setTimer(() => {
-      expired = true;
-      const ex = this.slot.ex;
-      if (ex && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'timeout' } });
-    }, this.limits.listMs, { background: false });
+    const { deadline, cancel } = this.deadline(run, this.limits.listMs);
     try {
-      const r = await this.walk(run, () => expired);
+      const r = await this.walk(run, deadline);
       if ('tools' in r) {
         this.events.listed?.(run.id, r.tools);
         return r.tools;
@@ -248,6 +258,19 @@ export class ServerLink {
     } finally {
       cancel?.();
     }
+  }
+
+  /** A deadline for a start, a walk or a re-handshake: when it passes, the step under way ends. */
+  private deadline(run: Run, ms: number): { readonly deadline: Deadline; readonly cancel: () => void } {
+    let fire!: () => void;
+    const deadline: Deadline = { expired: false, over: new Promise<void>((r) => (fire = r)) };
+    const cancel = this.clock.setTimer(() => {
+      deadline.expired = true;
+      fire();
+      const ex = this.slot.ex;
+      if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run && ex.kind !== 'pong') this.input({ t: 'terminal', n: ex.n, end: { t: 'timeout' } });
+    }, ms, { background: false });
+    return { deadline, cancel: () => cancel?.() };
   }
 
   /* ---------- calls: the synchronous handoff ---------- */
@@ -260,9 +283,16 @@ export class ServerLink {
   handoff(name: string, canonicalArguments: string, signal: AbortSignal, ms: number): Promise<CallOutcome> | undefined {
     const run = this.run;
     if (!run || run.ended || !run.ready || run.stale || this.busy) return undefined;
+    // Modern remote: the headers come from the same decision as the body, in this same step (3.6).
+    let extra: (readonly [string, string])[] | undefined;
+    if (run.era === 'modern' && run.target.where === 'remote') {
+      const params = paramHeaders(run.declarations.get(name) ?? [], JSON.parse(canonicalArguments), this.headers(run, 'tools/call').length + 1);
+      if (!params.ok) return Promise.resolve({ kind: 'error', reason: 'protocol', words: HEADER_WORDS });
+      extra = [['Mcp-Name', name], ...params.headers];
+    }
     const id = run.nextId++;
     const body = frameCall(id, name, canonicalArguments, run.era, run.target.where);
-    const outcome = this.exchangeNow(run, 'call', id, body);
+    const outcome = this.exchangeNow(run, 'call', id, body, 'tools/call', extra);
     if (!outcome) return undefined;
     const n = this.slot.ex!.n;
     const timer = this.clock.setTimer(() => this.input({ t: 'terminal', n, end: { t: 'timeout' } }), ms, { background: false });
@@ -285,7 +315,22 @@ export class ServerLink {
     const end = o.end;
     if (end.t === 'done' && o.response) {
       const r = o.response;
-      if (r.error) return { kind: 'result', text: `The server answered with an error: ${r.error.message}`, isError: true };
+      if (r.error) {
+        if (run.era === 'modern' && r.error.code === -32022) {
+          // The server changed its mind about the era: the run ends, with its versions in words.
+          this.endRun(run, refusedWords(r.error), true);
+          return { kind: 'interrupted' };
+        }
+        if (run.era === 'modern' && r.error.code === -32020) return { kind: 'result', text: "The server said the call's headers didn't match its body. Familiar didn't send it again.", isError: true };
+        if (run.era === 'modern' && r.error.code === -32021) return { kind: 'result', text: "The server asked for something Familiar didn't offer. Familiar didn't send it again.", isError: true };
+        return { kind: 'result', text: `The server answered with an error: ${r.error.message}`, isError: true };
+      }
+      if (run.era === 'modern') {
+        const type = r.result?.resultType;
+        if (type === 'input_required') return { kind: 'result', text: "The server asked for input Familiar can't give.", isError: true };
+        if (type === undefined) return { kind: 'error', reason: 'protocol', words: 'The server sent a result without its resultType, which the protocol requires.' };
+        if (type !== 'complete') return { kind: 'result', text: `The server sent a result Familiar can't use (${String(type).slice(0, 40)}).`, isError: true };
+      }
       try {
         const result = callResult(r.result ?? {}, run.era);
         return { kind: 'result', text: resultText(result), isError: result.isError };
@@ -310,13 +355,22 @@ export class ServerLink {
 
   /* ---------- the handshake and the walk ---------- */
 
-  private async handshake(run: Run, expired: () => boolean): Promise<Failure | undefined> {
+  private async handshake(run: Run, deadline: Deadline): Promise<Failure | undefined> {
     const id = run.nextId++;
-    const init = await this.exchange(run, 'initialize', id, frame({ kind: 'initialize', id }, 'legacy', run.target.where));
-    if (expired()) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
+    const init = await this.exchange(run, 'initialize', id, frame({ kind: 'initialize', id }, 'legacy', run.target.where), deadline, 'initialize');
+    if (deadline.expired) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
     if (init.end.t !== 'done' || !init.response) return this.startWords(run, init.end);
     const r = init.response;
-    if (r.error) return refusedWords(r.error);
+    if (r.error) {
+      // The opening's classifier (3.3): a -32022 naming 2026-07-28 and no legacy version Familiar speaks
+      // makes this run modern. There's no new exchange: no discover, no initialized, straight to the list.
+      if (modernRefusal(r.error)) {
+        run.era = 'modern';
+        delete run.sessionId;
+        return undefined;
+      }
+      return refusedWords(r.error);
+    }
     let info;
     try {
       info = initializeResult(r.result ?? {});
@@ -324,14 +378,14 @@ export class ServerLink {
       return { kind: 'protocol', words: `The server's answer to the handshake was wrong: ${(e as Error).message}.`, ...(run.last.text() ? { lastOutput: run.last.text()! } : {}) };
     }
     run.version = info.protocolVersion;
-    const sent = await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where));
-    if (expired()) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
+    const sent = await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where), deadline, 'notifications/initialized');
+    if (deadline.expired) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
     if (sent.end.t !== 'done') return this.startWords(run, sent.end);
     return undefined;
   }
 
   /** Pages of tools/list, each its own exchange through the barrier, at most 16. */
-  private async walk(run: Run, expired: () => boolean): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure }> {
+  private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure }> {
     run.stale = true;
     const raw: Record<string, unknown>[] = [];
     let cursor: string | undefined;
@@ -339,10 +393,13 @@ export class ServerLink {
       if (page > MAX_PAGES) return { failure: { kind: 'protocol', words: `The server's tool list ran past ${MAX_PAGES} pages.` } };
       const id = run.nextId++;
       const msg: AdminMessage = { kind: 'list', id, ...(cursor !== undefined ? { cursor } : {}) };
-      const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where));
-      if (expired()) return { failure: { kind: 'timed-out', words: "The server's tool list didn't arrive in time." } };
+      const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where), deadline, 'tools/list');
+      if (deadline.expired) return { failure: { kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." } };
       if (o.end.t !== 'done' || !o.response) return { failure: this.startWords(run, o.end) };
-      if (o.response.error) return { failure: { kind: 'protocol', words: `The server refused to list its tools: ${o.response.error.message}` } };
+      if (o.response.error) {
+        if (run.era === 'modern' && o.response.error.code === -32022) return { failure: refusedWords(o.response.error) };
+        return { failure: { kind: 'protocol', words: `The server refused to list its tools: ${o.response.error.message}` } };
+      }
       let p;
       try {
         p = listResult(o.response.result ?? {}, run.era);
@@ -353,8 +410,27 @@ export class ServerLink {
       cursor = p.nextCursor;
       if (cursor === undefined) break;
     }
+    // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
+    // rules isn't offered, and Test says why (3.5). The declarations come from the schema, which the
+    // fingerprint already covers.
+    const offered: Record<string, unknown>[] = [];
+    const notOffered: { name: string; reason: string }[] = [];
+    const declarations = new Map<string, readonly HeaderDeclaration[]>();
+    for (const t of raw) {
+      if (run.era === 'modern' && run.target.where === 'remote') {
+        const scan = scanDeclarations(t.inputSchema);
+        if (!scan.ok) {
+          notOffered.push({ name: String(t.name).slice(0, 128), reason: scan.reason });
+          continue;
+        }
+        if (typeof t.name === 'string') declarations.set(t.name, scan.declarations);
+      }
+      offered.push(t);
+    }
     try {
-      run.tools = checkTools(raw as never);
+      run.tools = checkTools(offered as never);
+      run.declarations = declarations;
+      run.notOffered = notOffered;
     } catch (e) {
       if (e instanceof CatalogError) return { failure: e.failure };
       throw e;
@@ -366,23 +442,25 @@ export class ServerLink {
   /* ---------- exchanges ---------- */
 
   /** One administrative exchange: waits for the slot to be Idle first (the walk's own pages, the handshake). */
-  private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string): Promise<Outcome> {
-    // A local idle ping can take the slot between two of the walk's own steps: wait for it too.
+  private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, deadline: Deadline, method: string): Promise<Outcome> {
+    // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
+    // past the step's deadline, whatever a server keeps sending.
     for (;;) {
-      await this.drained();
+      await Promise.race([this.drained(), deadline.over]);
+      if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended) return { end: { t: 'run-ended' } };
-      const started = this.exchangeNow(run, kind, requestId, body);
+      const started = this.exchangeNow(run, kind, requestId, body, method);
       if (started) return started;
     }
   }
 
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
-  private exchangeNow(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string): Promise<Outcome> | undefined {
+  private exchangeNow(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, method?: string, extra?: readonly (readonly [string, string])[]): Promise<Outcome> | undefined {
     if (this.busy) return undefined;
     let resolve!: (o: Outcome) => void;
     const promise = new Promise<Outcome>((r) => (resolve = r));
     const n = this.slot.next;
-    this.pending.set(n, { n, kind, run, ...(requestId !== undefined ? { requestId } : {}), body, done: resolve });
+    this.pending.set(n, { n, kind, run, ...(requestId !== undefined ? { requestId } : {}), body, done: resolve, ...(method ? { method } : {}), ...(extra ? { extra } : {}) });
     this.input({ t: 'admit', kind, where: run.target.where, era: run.era, ...(requestId !== undefined ? { requestId } : {}) });
     return promise;
   }
@@ -484,7 +562,7 @@ export class ServerLink {
 
   /* ---------- remote ---------- */
 
-  private headers(run: Run, kind: 'request' | 'pong' | 'notification'): [string, string][] {
+  private headers(run: Run, method: string | undefined): [string, string][] {
     const t = run.target as Extract<Target, { where: 'remote' }>;
     // Reserved names never come from a setup (5.7): refused when it's saved, and dropped here too.
     const h: [string, string][] = t.headers.filter(([k]) => !reservedHeader(k)).map(([k, v]) => [k, v]);
@@ -495,9 +573,14 @@ export class ServerLink {
     };
     set('Content-Type', 'application/json');
     set('Accept', 'application/json, text/event-stream');
+    if (run.era === 'modern') {
+      // Modern: the version and the method on every request; no session, ever.
+      set('MCP-Protocol-Version', MODERN_VERSION);
+      if (method) set('Mcp-Method', method);
+      return h;
+    }
     if (run.version) set('MCP-Protocol-Version', run.version);
     if (run.sessionId) set('Mcp-Session-Id', run.sessionId);
-    void kind;
     return h;
   }
 
@@ -512,7 +595,7 @@ export class ServerLink {
       address: t.address,
       url: t.url,
       method: 'POST',
-      headers: this.headers(run, pong ? 'pong' : 'request'),
+      headers: [...this.headers(run, request?.method), ...(request?.extra ?? []).map(([k, v]) => [k, v] as [string, string])],
       maxBytes: request?.kind === 'initialize' ? MAX_HANDSHAKE_BYTES : 2 * MAX_MESSAGE_BYTES,
       headersMs: pong ? this.limits.pongMs : this.limits.headersMs,
       idleMs: pong ? this.limits.pongMs : this.limits.idleMs
@@ -548,14 +631,16 @@ export class ServerLink {
     if (head.status === 202 && p.kind === 'initialized') return this.input({ t: 'completed', n: p.n });
     const ok = head.status >= 200 && head.status < 300;
     // The opening's classifier (3.3): a JSON-RPC error body for this request decides first, whatever the status.
-    if (!ok && p.kind !== 'initialize') return this.input({ t: 'terminal', n: p.n, end: { t: 'http', status: head.status } });
+    // Legacy: a status other than 2xx decides. Modern: a JSON-RPC error body for the request is read first.
+    if (!ok && p.kind !== 'initialize' && run.era !== 'modern') return this.input({ t: 'terminal', n: p.n, end: { t: 'http', status: head.status } });
     if (p.kind === 'initialize' && run.target.where === 'remote' && ok) {
       const sid = head.headers.filter(([k]) => k.toLowerCase() === 'mcp-session-id');
       if (sid.length > 1 || (sid.length === 1 && !/^[\x21-\x7e]{1,1024}$/.test(sid[0]![1]))) return this.input({ t: 'terminal', n: p.n, end: { t: 'invalid', why: 'a session id Familiar can\'t use' } });
       // Adopted only if the answer turns out to be a successful initialize (below).
       if (sid[0]) p.offeredSession = sid[0][1];
     }
-    const events = type.startsWith('text/event-stream') ? new EventStream(p.kind === 'initialize' ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES) : undefined;
+    const small = p.kind === 'initialize' || !ok;
+    const events = type.startsWith('text/event-stream') ? new EventStream(small ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES) : undefined;
     let json = '';
     try {
       for (;;) {
@@ -566,7 +651,7 @@ export class ServerLink {
           for (const data of events.push(chunk)) if (this.remoteMessage(run, p, data)) return;
         } else {
           json += new TextDecoder().decode(chunk, { stream: true });
-          if (json.length > (p.kind === 'initialize' ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES)) throw new Invalid('a response past its size bound');
+          if (json.length > (small ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES)) throw new Invalid('a response past its size bound');
         }
       }
       if (events) {
@@ -586,7 +671,7 @@ export class ServerLink {
   private remoteMessage(run: Run, p: Pending, text: string, status?: number): boolean {
     let m: Inbound;
     try {
-      m = parseMessage(text, p.kind === 'initialize' ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES);
+      m = parseMessage(text, p.kind === 'initialize' || status !== undefined ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES);
     } catch (err) {
       if (status !== undefined) {
         this.input({ t: 'terminal', n: p.n, end: { t: 'http', status } });
@@ -658,18 +743,12 @@ export class ServerLink {
     delete run.sessionId;
     delete run.version;
     void (async () => {
-      let expired = false;
-      const cancel = this.clock.setTimer(() => {
-        expired = true;
-        const ex = this.slot.ex;
-        if (ex && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'timeout' } });
-      }, this.limits.startMs, { background: false });
+      const { deadline, cancel } = this.deadline(run, this.limits.startMs);
       try {
-        await this.drained();
-        const failure = run.ended ? undefined : await this.handshake(run, () => expired);
+        const failure = run.ended ? undefined : await this.handshake(run, deadline);
         if (run.ended) return;
         if (failure) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
-        const listed = await this.walk(run, () => expired);
+        const listed = await this.walk(run, deadline);
         if (run.ended) return;
         if (!('tools' in listed)) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
         run.ready = true;
@@ -709,6 +788,13 @@ export class ServerLink {
     if (end.t === 'http') return remoteFailure({ code: end.status });
     return { kind: 'protocol', words: endWords(end), ...(run.last.text() ? { lastOutput: run.last.text()! } : {}) };
   }
+}
+
+/** A -32022 whose list names 2026-07-28 and no legacy version Familiar speaks: the server is modern-only. */
+export function modernRefusal(error: { code: number; data?: unknown }): boolean {
+  if (error.code !== -32022) return false;
+  const supported = (error.data as { supported?: unknown } | undefined)?.supported;
+  return Array.isArray(supported) && supported.every((v) => typeof v === 'string') && supported.includes(MODERN_VERSION) && !supported.some((v) => legacyVersion(v));
 }
 
 /** A refused handshake, with the server's own versions in words when it named them. */
