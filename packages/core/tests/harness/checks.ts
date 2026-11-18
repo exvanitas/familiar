@@ -5,7 +5,7 @@ import type { Evidence, NativeRec, WireRun } from './wire.ts';
 
 export type Check = (r: WireRun) => string[];
 
-const isPong = (b: any): b is any => !!b && b.method === undefined && 'result' in b && b.id !== undefined;
+const isPong = (b: any): boolean => !!b && b.method === undefined && 'result' in b && b.id !== undefined;
 const isCall = (b: any) => b?.method === 'tools/call';
 const tokenOf = (b: any) => String(b?.params?.arguments?.text ?? '');
 
