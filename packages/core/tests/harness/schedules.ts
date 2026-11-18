@@ -34,7 +34,41 @@ function stopFence(where: 'local' | 'remote', during: 'walk' | 'ready'): Named {
   };
 }
 
+/** S13, T5's named case: a call's time limit, or its Stop, ends that call only; the run stays Ready and
+    the next call goes out on it, with no new handshake. */
+function endsThatCallOnly(where: 'local' | 'remote', how: 'stop' | 'time-limit'): Named {
+  return {
+    name: `S13 a call's ${how === 'stop' ? 'Stop' : 'time limit'} ends that call only, ${where}`,
+    options: {
+      mode: { ...quiet, where, hold: true, sse: 1 },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('slow');
+          const token = lastToken(d)!;
+          const sent = () => d.exe.log.some((x) => x.body?.params?.arguments?.text === token && (x.kind === 'write' ? x.end !== undefined : x.head !== undefined));
+          // A Stop once it's under way; a time limit is the call's own timer, picked when nothing else moves.
+          if (how === 'stop') d.when('under way', sent, () => d.stopCall());
+          d.when('ended', () => d.evidence.some((e) => e.what === 'outcome' && e.token === token) && d.idle(), () => d.call('echo'));
+        })
+    },
+    expect: (r) => {
+      const outs = r.evidence.filter((e) => e.what === 'outcome').map((e) => e.outcome!);
+      const first = outs[0];
+      const ended = how === 'stop' ? first?.kind === 'stopped' : first?.kind === 'timed-out';
+      const handshakes = r.exe.log.filter((x) => x.body?.method === 'initialize').length;
+      if (!ended) return `the slow call ended ${JSON.stringify(first)}`;
+      if (outs[1]?.kind !== 'result') return `the next call came back ${JSON.stringify(outs[1])}`;
+      if (handshakes !== 1) return `${handshakes} handshakes: the run didn't stay`;
+      return undefined;
+    }
+  };
+}
+
 export const SCHEDULES: Named[] = [
+  endsThatCallOnly('local', 'stop'),
+  endsThatCallOnly('local', 'time-limit'),
+  endsThatCallOnly('remote', 'stop'),
+  endsThatCallOnly('remote', 'time-limit'),
   {
     // F02: a call tried at every step while a dropped session is recovered: each refused, none sent.
     name: 'S12 calls during a session recovery',

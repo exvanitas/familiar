@@ -42,7 +42,7 @@ export interface Mode {
   readonly pingWithFinal: number;
   /** A legacy server whose initialize fails for another reason (H12's control). */
   readonly initError: number;
-  /** A call's stream opens and then says nothing more (S8, S10). */
+  /** A slow call's stream opens and then says nothing more (S8, S10, S13). */
   readonly hold: boolean;
   /** Each answer in one chunk (S2: a ping in the same chunk as the final reply). */
   readonly oneChunk: boolean;
@@ -320,7 +320,7 @@ export class FakeExe {
             const full = lines.join('');
             // Chunk boundaries anywhere (one chunk in S2's mode); a held call's stream says nothing.
             let i = 0;
-            if (this.server.mode.hold && parsed?.method === 'tools/call') {
+            if (this.server.mode.hold && parsed?.method === 'tools/call' && parsed.params?.name === 'slow') {
               // A held call: its pings, if any, then nothing more.
               const pings = plan.messages.filter((m) => m.method === 'ping').map((m) => `data: ${JSON.stringify(m)}\n\n`);
               if (pings.length && plan.sse) st.chunks.push(pings.join(''));
@@ -372,7 +372,7 @@ export class FakeExe {
               st.waiting = undefined;
               const next = st.chunks.shift();
               if (next === undefined) {
-                if (this.server.mode.hold && st.rec.body?.method === 'tools/call') return void (st.waiting = w); // never ends
+                if (this.server.mode.hold && st.rec.body?.method === 'tools/call' && st.rec.body.params?.name === 'slow') return void (st.waiting = w); // never ends
                 // A JSON body's one message reaches the client only at the body's end.
                 const plan = st.plan;
                 if (plan && !plan.sse && plan.messages[0]) {
@@ -486,6 +486,8 @@ export class FakeExe {
         this.server.arrivals.push({ body, headers: {}, method: 'POST', step: this.sched.step });
         if (body.method === 'notifications/cancelled' || ('result' in body && body.method === undefined)) return;
         if (body.method === 'tools/call' && body.params?.name === 'crash') return exit(run, 3);
+        // A held slow call: the server takes it and says nothing more.
+        if (this.server.mode.hold && body.method === 'tools/call' && body.params?.name === 'slow') return;
         const plan = this.server.answer(body, {}, `w${w.rec.n}`);
         w.rec.plan = plan;
         for (const m of plan.messages) p.out.push(JSON.stringify(m));
@@ -612,7 +614,7 @@ export class Driver {
   private readonly calls = new Map<string, AbortController>();
   readonly sched: Scheduler;
   readonly client: McpClient;
-  private readonly evidence: Evidence[];
+  readonly evidence: Evidence[];
   private readonly tick: () => number;
   readonly exe: FakeExe;
   readonly server: ScriptedServer;
