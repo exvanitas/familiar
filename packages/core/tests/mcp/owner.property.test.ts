@@ -45,7 +45,12 @@ function ports(store: SettingsStore, exe: Exe, budget: { left: number }): OwnerP
           exe.adds.push(url);
           return { id };
         }),
-      remove: (id) => gate(async () => void exe.addresses.delete(id)),
+      // As the exe answers (address_remove): an address it doesn't hold, removed before a kill cut off
+      // the done commit, is refused `not-saved`, never quietly deleted again.
+      remove: (id) =>
+        gate(async () => {
+          if (!exe.addresses.delete(id)) throw { kind: 'not-saved', message: 'no such address' };
+        }),
       list: () => gate(async () => [...exe.addresses].map(([id, url]) => ({ id, kind: 'server', url })))
     },
     secrets: { delete: (ref) => gate(async () => void exe.deletedSecrets.add(ref)) },

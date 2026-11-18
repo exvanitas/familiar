@@ -74,6 +74,9 @@ export type Outcome = { readonly ok: true } | { readonly ok: false; readonly wor
 const ok: Outcome = { ok: true };
 const no = (words: string): Outcome => ({ ok: false, words });
 
+/** The exe's refusal of an address it doesn't hold (`address_remove` of an absent id): `{ kind: 'not-saved' }`. */
+const notSaved = (e: unknown): boolean => e !== null && typeof e === 'object' && (e as { kind?: unknown }).kind === 'not-saved';
+
 /* ---------- B6: the exe's address identity ---------- */
 
 /** A removed server's id stays its tombstone's for good: never saved again, so nothing of it carries over. */
@@ -409,7 +412,11 @@ export class Owner {
         await this.commit((d) => (d.tombstones[id] = { ...d.tombstones[id]!, secrets: { ...d.tombstones[id]!.secrets, [ref]: true } }));
       }
       if (stone.address && !stone.address.done) {
-        await this.ports.addresses.remove(stone.address.id);
+        // Idempotent: a removal a kill cut off before this done commit left the address gone, and the exe
+        // answers a second one `not-saved`. That's the step done.
+        await this.ports.addresses.remove(stone.address.id).catch((e: unknown) => {
+          if (!notSaved(e)) throw e;
+        });
         await this.commit((d) => (d.tombstones[id] = { ...d.tombstones[id]!, address: { id: stone.address!.id, done: true } }));
       }
     } catch {

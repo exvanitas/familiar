@@ -151,6 +151,37 @@ describe('5.2 and 5.3: repair in a fresh start', () => {
     expect(t.log.filter((l) => l.startsWith('address_add'))).toHaveLength(1);
   });
 
+  it("a remote removal cut off after address_remove, before its done commit: repair takes the exe's not-saved for the gone address as done", async () => {
+    const store = memorySettingsStore();
+    const addresses = new Set<string>();
+    const removals: string[] = [];
+    // The exe's own answer: removing an address it doesn't hold is refused `not-saved` (address_remove).
+    const exe: OwnerPorts['addresses'] = {
+      add: async () => (addresses.add('addr-1'), { id: 'addr-1' }),
+      remove: async (id) => {
+        removals.push(id);
+        if (!addresses.delete(id)) throw { kind: 'not-saved', message: 'no such address' };
+      },
+      list: async () => [...addresses].map((id) => ({ id, kind: 'server', url: 'https://h.example/mcp' }))
+    };
+    let dead = false;
+    const dying: SettingsStore = { ...store, putIf: (k, r, g) => (dead ? new Promise<boolean>(() => {}) : store.putIf(k, r, g)) };
+    const one = await Owner.open({ ...ports(store).p, store: dying, addresses: { ...exe, remove: async (id) => { await exe.remove(id); dead = true; } } });
+    expect(await one.add(remote('r1'))).toEqual({ ok: true });
+    void one.remove('r1', async () => {});
+    for (let i = 0; i < 50 && !dead; i++) await new Promise((r) => setTimeout(r, 1));
+    expect(dead).toBe(true);
+    // A fresh exe: the address is gone, the mark and the unfinished tombstone stay.
+    const two = await Owner.open({ ...ports(store).p, addresses: exe });
+    expect(two.mark).toEqual({ kind: 'remove', server: 'r1' });
+    expect(await two.repair()).toEqual({ ok: true });
+    expect(two.mark).toBeUndefined();
+    expect(two.server('r1')).toBeUndefined();
+    expect(two.tombstones().r1).toEqual({ key: 'remote' });
+    expect(await two.add(local('l2'))).toEqual({ ok: true });
+    expect(removals).toEqual(['addr-1', 'addr-1']);
+  });
+
   it('a removal cut off mid-cleanup: the next start finishes it from where it stopped', async () => {
     const store = memorySettingsStore();
     let forgetFails = true;
