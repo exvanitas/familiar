@@ -300,7 +300,7 @@ export const SCENARIOS: readonly Scenario[] = [
   // A server tool, started: never repeated on its own. Reported as interrupted, with Run again.
   toolKill('server-started', 'server-started', 'server_lookup', { q: 'trains' }),
 
-  // The same, with the tool set to always allow, and a model that calls it again on its own, with a new id,
+  // The same, with the tool marked "may run on its own", and a model that calls it again on its own, with a new id,
   // as soon as it sees the interruption. The turn ends instead: the model gets no request, and nothing
   // runs until the person picks Run again.
   toolKill(
@@ -317,7 +317,7 @@ export const SCENARIOS: readonly Scenario[] = [
       return { asksBefore, startsBefore, rerun, startsAfter: env.counters.get('starts:server_lookup') };
     },
     (env) => ({
-      policy: { perTool: { server_lookup: 'allow' } },
+      policy: { perTool: { server_lookup: 'own' } },
       script: (r) => {
         const last = r.messages.at(-1);
         if (last?.role === 'user' && last.content.startsWith('Run ')) return { toolCalls: [{ id: 'call-3', name: 'server_lookup', arguments: { q: 'trains' } }] };
@@ -343,7 +343,7 @@ export const SCENARIOS: readonly Scenario[] = [
       return { after, startsAfter: env.counters.get('starts:server_lookup'), reissued: env.counters.get('reissue-asked') };
     },
     (env) => ({
-      policy: { perTool: { server_lookup: 'allow' } },
+      policy: { perTool: { server_lookup: 'own' } },
       script: (r) => {
         const last = r.messages.at(-1);
         if (lastIsTool(r) && /may have partially run/.test(last!.content)) {

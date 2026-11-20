@@ -68,12 +68,12 @@ export const CHECKS: Record<string, Check> = {
     }
   },
   'server-reissue': {
-    title: 'a server tool always allowed, cut off, is not called again on its own: the model gets no chance until Run again',
+    title: 'a server tool that may run on its own, cut off, is not called again unasked: the model gets no chance until Run again',
     verify(s) {
       expect(s.end).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
       expect(s.asksBefore).toBe(0);
       expect(s.startsBefore).toBe(1);
-      // Run again: the person's answer. Now it runs, always allowed, without a card.
+      // Run again: the person's answer. Now it runs, under its grant, without a card.
       expect(s.rerun).toMatchObject({ status: 'answered' });
       expect(s.startsAfter).toBe(2);
     }

@@ -596,7 +596,10 @@ export class FakeExe {
             const bounds: number[] | undefined = (st as any).bounds;
             const sent: number = (st as any).sent ?? 0;
             const whole = plan && (plan.sse || (st as any).holdMsgs) && bounds ? bounds.filter((b) => b <= sent).length : 0;
-            rec.endedAt = this.sched.step * 1000 + whole;
+            // Never past the stream's own terminal message: one delivered after it in the same chunk came after
+            // the client's end, not before it.
+            const terminal = plan && !(st as any).holdMsgs && plan.final !== undefined ? plan.final : Infinity;
+            rec.endedAt = this.sched.step * 1000 + Math.min(whole, terminal);
           }
           // The exe may refuse a net_cancel and keep the request alive: once per request, as a passing fault.
           // A refused request stays alive as it was, delivering what it would: refused isn't cancelled.
@@ -854,7 +857,11 @@ function holdable(inner: ReturnType<typeof memorySettingsStore>): HoldableStore 
 export interface Evidence {
   readonly seq: number;
   readonly step: number;
-  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered';
+  /** The scheduler's clock when it was noted, in ms. */
+  readonly at?: number;
+  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant';
+  /** On a `yes` minted from a saved grant: the fingerprint it was given on (H3 holds the call to it). */
+  readonly grant?: string;
   /** Test's report: whether it listed, and the tool names it showed. */
   readonly report?: { readonly ok: boolean; readonly tools: readonly string[] };
   /** The reply's own words (a refused Start's, say). */
@@ -1021,6 +1028,14 @@ export class Driver {
     }
   }
 
+  /** The person's "may run on its own" for a tool as it is listed now; H3 dates the grant by this step. */
+  grantOwn(tool: string, id = 's1'): Promise<unknown> | undefined {
+    const t = this.client.tools().find((x) => x.serverName === tool && x.server.id === id);
+    if (!t) return undefined;
+    this.note({ what: 'grant', tool, server: id, grant: t.fingerprint });
+    return this.client.choose(id, tool, { policy: 'own', fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint });
+  }
+
   /** A call under a saved "may run on its own", as the journal's gate would mint it. */
   own(tool: string, extra: Record<string, unknown> = {}, id = 's1'): void {
     const token = `t${++this.n}`;
@@ -1028,7 +1043,8 @@ export class Driver {
     const facts = this.client.facts(id, tool, args);
     if (!facts) return void this.note({ what: 'not-offered', tool, server: id });
     const decision = mintDecision(facts, token, 'own');
-    this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id });
+    // A grant, not a Yes: H3 holds it to the grant's own fingerprint, not to a card.
+    this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id, grant: facts.fingerprint });
     this.note({ what: 'call', token, tool, server: id });
     void this.client.send(decision, new AbortController().signal).then((outcome) => this.note({ what: 'outcome', token, tool, outcome, server: id }));
   }
@@ -1039,8 +1055,8 @@ export class Driver {
     this.note({ what: 'model', ok });
   }
 
-  private note(e: Omit<Evidence, 'seq' | 'step'>): Evidence {
-    const rec = { seq: this.tick(), step: this.sched.step, ...e };
+  private note(e: Omit<Evidence, 'seq' | 'step' | 'at'>): Evidence {
+    const rec = { seq: this.tick(), step: this.sched.step, at: this.sched.now, ...e };
     this.evidence.push(rec);
     return rec;
   }

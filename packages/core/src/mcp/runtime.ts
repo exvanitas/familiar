@@ -36,7 +36,7 @@ export class ServerRuntime {
   readonly link: ServerLink;
   private readonly owner: Owner;
   /** Hears a run's tool list, with whether that run is still this server's run; settles once it's saved. */
-  private readonly onListed: (tools: readonly ListedTool[], current: () => boolean) => Promise<void> | void;
+  private readonly onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void;
   /** What the start under way was asked as: an automatic start's relaunch rechecks the enabled flag. */
   private asked?: { readonly auto: boolean; readonly setup: OwnedServer['setup'] };
 
@@ -44,7 +44,7 @@ export class ServerRuntime {
   private readonly limits: { -readonly [K in keyof LinkLimits]: LinkLimits[K] };
   private readonly portLimits: Partial<LinkLimits> | undefined;
 
-  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean) => Promise<void> | void, transition?: LinkEvents['transition']) {
+  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void, transition?: LinkEvents['transition']) {
     this.id = id;
     this.owner = owner;
     this.onListed = onListed;
@@ -56,7 +56,7 @@ export class ServerRuntime {
       ended: () => onChange(),
       // The catalog write is an owner effect of its own (5.1); the start waits for it.
       listed: (run, tools) =>
-        Promise.resolve(this.onListed(tools, () => this.link.current?.run === run)).then(
+        Promise.resolve(this.onListed(tools, () => this.link.current?.run === run, run)).then(
           () => 'saved' as const,
           () => 'failed' as const
         ),

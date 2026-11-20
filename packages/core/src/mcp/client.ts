@@ -121,6 +121,7 @@ export class McpClient {
   private readonly reports = new Map<string, { readonly server: string; readonly shown: ReadonlyMap<string, string>; readonly listing: number }>();
   /** Counts each server's listings (every run's, Test's included): a report is the newest while none came after it. */
   private readonly listings = new Map<string, number>();
+  private readonly runListing = new Map<string, number>();
   private reportCount = 0;
   /** Grants a changed listing cleared in memory, still to be cleared durably. */
   private readonly clears = new Map<string, { readonly server: string; readonly tool: string; readonly fingerprint: string }>();
@@ -152,7 +153,7 @@ export class McpClient {
         this.owner,
         { processes: this.o.processes, net: this.o.net, clock: this.o.clock, ...(this.o.limits ? { limits: this.o.limits } : {}) },
         () => this.o.onChange?.(id),
-        (tools, current) => this.seen(id, tools, current),
+        (tools, current, run) => this.seen(id, tools, current, run),
         this.o.transition ? (event, state, slot) => this.o.transition!(id, event, state, slot) : undefined
       );
       this.runtimes.set(id, rt);
@@ -274,7 +275,7 @@ export class McpClient {
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
     const reviewed = s.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
     const report = `test-${++this.reportCount}-${Math.random().toString(36).slice(2, 10)}`;
-    this.reports.set(report, { server: id, shown: new Map(tools.map(t => [t.name, t.fingerprint])), listing: this.listings.get(id) ?? 0 });
+    this.reports.set(report, { server: id, shown: new Map(tools.map(t => [t.name, t.fingerprint])), listing: this.runListing.get(r.run) ?? this.listings.get(id) ?? 0 });
     for (const old of this.reports.keys()) if (this.reports.size > REPORTS_KEPT) this.reports.delete(old);
     return { ok: true, report, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}), ...(notOffered.length ? { notOffered } : {}) };
   }
@@ -471,8 +472,15 @@ export class McpClient {
   }
 
   /** A run's tool list, saved as the tools last seen while its run is current; what the person reviewed is kept. */
-  private async seen(id: string, now: readonly ListedTool[], current: () => boolean): Promise<void> {
-    this.listings.set(id, (this.listings.get(id) ?? 0) + 1);
+  private async seen(id: string, now: readonly ListedTool[], current: () => boolean, run?: string): Promise<void> {
+    const n = (this.listings.get(id) ?? 0) + 1;
+    this.listings.set(id, n);
+    // Which listing each run's was, so a Test report is dated by its own run's list, never by whatever
+    // listed by the time Test answered.
+    if (run !== undefined) {
+      this.runListing.set(run, n);
+      for (const old of this.runListing.keys()) if (this.runListing.size > REPORTS_KEPT) this.runListing.delete(old);
+    }
     // A "may run on its own" grant for a tool listed now with another fingerprint stops holding at once, in
     // memory, whatever the owner is doing; its durable clear follows (in the catalog write, or as soon as the
     // owner is free), so a tool that changes and changes back asks again (5.6).

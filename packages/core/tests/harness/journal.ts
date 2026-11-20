@@ -65,14 +65,18 @@ function recorder() {
             const sentPre = Object.keys(docOf('familiar.send-now')?.byRequest ?? {});
             const stepsPre = Object.keys(docOf('familiar.interruptions')?.steps ?? {});
             const c: JCommit = { seq: Number(seq), life, step: stepNow, livePre, livePost: undefined, inboxPre, inboxPost: undefined, submissions: [], entries: [], docs: [], docValues: {}, answered: [], sentNow: [], interrupted: [] };
+            // The documents this commit touched, by id: two of one kind (two tasks' step receipts) are two.
+            const touched = new Set<string>();
             for (const w of batches[index]!) {
               if (w.type === 'document.create') {
                 kinds.set(String(w.record.id), w.record.kind);
                 values.set(String(w.record.id), structuredClone(w.content.value));
+                touched.add(String(w.record.id));
                 if (!String(w.record.kind).startsWith('pi.')) c.docs.push(w.record.kind);
               } else if (w.type === 'document.change') {
                 const id = String(w.id);
                 values.set(id, w.content.kind === 'base' ? structuredClone(w.content.value) : applyImmutable(values.get(id), w.content.ops));
+                touched.add(id);
                 const k = kinds.get(id);
                 if (k && !k.startsWith('pi.')) c.docs.push(k);
               } else if (w.type === 'submission') {
@@ -86,7 +90,10 @@ function recorder() {
             c.interrupted.push(...Object.keys(docOf('familiar.interruptions')?.steps ?? {}).filter((k) => !stepsPre.includes(k)));
             const byRequest = docOf('familiar.send-now')?.byRequest ?? {};
             c.sentNow.push(...Object.keys(byRequest).filter((k) => !sentPre.includes(k)).map((k) => ({ request: k, submission: String(byRequest[k].submission), ...(byRequest[k].sent ? { sent: String(byRequest[k].sent) } : {}) })));
-            for (const k of c.docs) c.docValues[k] = JSON.stringify(docOf(k) ?? null);
+            for (const id of touched) {
+              const k = kinds.get(id);
+              if (k && !k.startsWith('pi.')) c.docValues[`${k}@${id}`] = JSON.stringify(values.get(id) ?? null);
+            }
             (c as any).livePost = structuredClone(liveOf());
             (c as any).inboxPost = structuredClone(inboxOf());
             log.push(c);

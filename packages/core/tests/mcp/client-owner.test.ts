@@ -492,15 +492,19 @@ describe('5.4: Mark reviewed on an old report brings back nothing removed', () =
     try {
     const store = memorySettingsStore();
     let names = ['x'];
+    // Each run its own process, routed by its run id, as the exe does.
+    const procs = new Map<string, ReturnType<typeof fakeProcess>>();
+    let n = 0;
     const port: ProcessPort = {
       async start(_setup, onEvent) {
         const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: names.map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) } })] : []));
-        (port as any).fp = fp;
+        const run = `r${++n}`;
+        procs.set(run, fp);
         await fp.port.start(_setup, onEvent);
-        return { run: `r${Math.random()}` };
+        return { run };
       },
-      write: async (_run, bytes) => (port as any).fp.port.write('p1', bytes),
-      stop: async () => (port as any).fp.port.stop('p1'),
+      write: async (run, bytes) => procs.get(run)!.port.write('p1', bytes),
+      stop: async (run) => procs.get(run)!.port.stop('p1'),
       forget: async () => {}
     };
     const client = await clientOf(store, port);

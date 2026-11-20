@@ -393,9 +393,7 @@ export const SCHEDULES: Named[] = [
       mode: { ...quiet, reorder: true, era: 'modern' },
       schedule: (d) =>
         d.when('ready', () => d.idle(), () => {
-          const tool = d.client.tools().find((t) => t.serverName === 'mirror2');
-          if (!tool) return;
-          void d.client.choose('s1', 'mirror2', { policy: 'own', fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint }).then(() => {
+          void d.grantOwn('mirror2')?.then(() => {
             d.stop();
             d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
               d.start();
@@ -433,9 +431,12 @@ export const SCHEDULES: Named[] = [
     options: { mode: { ...quiet, refuseCancelAlways: true, refuseCancelOf: 'initialize' }, schedule: () => {} },
     expect: (r) => {
       const init = r.exe.log.find((x) => x.body?.method === 'initialize');
+      const start = r.evidence.find((e) => e.what === 'start');
       const started = r.evidence.find((e) => e.what === 'started');
       if ((init?.refusals ?? 0) < 4) return 'the handshake\'s cleanup was never refused for good';
       if (!started) return 'the parked Start never answered';
+      // When, too: woken by the exhaustion, not by the start's own deadline (60 s here).
+      if (start?.at !== undefined && started.at !== undefined && started.at - start.at >= 30_000) return `the parked Start answered only after ${started.at - start.at} ms`;
       if (!/[Rr]estart/.test(started.words ?? '')) return `the parked Start answered "${(started.words ?? 'ready').slice(0, 60)}"`;
       if (r.exe.log.some((x) => x.body?.method === 'notifications/initialized')) return 'initialized went out over the held slot';
       return undefined;

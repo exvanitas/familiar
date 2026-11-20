@@ -126,11 +126,12 @@ export const H1: Check = (r) => {
     const stop = r.evidence.find((e) => e.what === 'stopped' && e.failure !== 'refused' && addressOf(e.server) === x.server && e.step > x.start);
     if (stop && !/[Rr]estart/.test(stop.words ?? '')) problems.push(`H1: after cleanup failed for good, Stop said "${(stop.words ?? 'stopped').slice(0, 60)}"`);
   }
-  // A call made in the step its server's Start answered Ready, after that answer, is never refused busy:
-  // Ready means the start's own exchanges have drained.
+  // The first call made in the step its server's Start answered Ready, after that answer, is never refused
+  // busy: Ready means the start's own exchanges have drained. (A second call in that step may wait behind the
+  // first, and is refused busy rightly.)
   for (const e of r.evidence) {
     if (e.what !== 'started' || !e.ok) continue;
-    const calls = r.evidence.filter((c) => c.what === 'call' && c.step === e.step && c.seq > e.seq && (c.server ?? 's1') === (e.server ?? 's1')).map((c) => c.token);
+    const calls = r.evidence.filter((c) => c.what === 'call' && c.step === e.step && c.seq > e.seq && (c.server ?? 's1') === (e.server ?? 's1')).map((c) => c.token).slice(0, 1);
     const refused = r.evidence.find((o) => o.what === 'outcome' && calls.includes(o.token) && o.outcome?.kind === 'error' && o.outcome.reason === 'busy');
     if (refused) problems.push(`H1: ${refused.token}, made as its Start answered Ready, was refused busy`);
   }
@@ -290,9 +291,12 @@ export const H3: Check = (r) => {
     used.add(t);
     const revoked = r.evidence.find((e) => e.what === 'revoke' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < x.seq);
     if (revoked) problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
-    // The tool as the server last listed it before the card, and before the handoff: a change between
-    // (a fingerprint change) means the Yes allowed something else (S1).
-    const card = r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
+    // The tool as the server last listed it before the card (for a call under a grant, before the grant was
+    // given), and before the handoff: a change between (a fingerprint change) means the Yes allowed
+    // something else (S1).
+    const given = yes.grant !== undefined ? [...r.evidence].reverse().find((e) => e.what === 'grant' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < yes.seq) : undefined;
+    if (yes.grant !== undefined && (!given || given.grant !== yes.grant)) problems.push(`H3: ${t} went out under a grant the person never gave for that version of ${yes.tool}`);
+    const card = given ?? r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
     const before = listedAt(r, x.server, card.step, yes.tool!);
     const now = listedAt(r, x.server, x.start, yes.tool!);
     if (before !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
@@ -330,7 +334,9 @@ function listedAt(r: WireRun, server: string, step: number, tool: string): strin
     if (at === undefined || at >= step) continue;
     const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
     if (!res) continue;
-    if (!found || at >= found.at) found = { at, def: JSON.stringify(res.tools?.find((d: any) => d.name === tool)) };
+    // Canonical, so a relist in another key order (S23) is the same tool, as the fingerprint has it.
+    const def = res.tools?.find((d: any) => d.name === tool);
+    if (!found || at >= found.at) found = { at, def: def === undefined ? undefined : canonical(def) };
   }
   return found?.def;
 }
@@ -422,18 +428,31 @@ export const H11: Check = (r) => {
       if (header !== expected) problems.push(`H11: Mcp-Param-${d.name} is "${String(header).slice(0, 30)}", the body says "${text.slice(0, 30)}"`);
     }
   }
-  // A value that can't be mirrored faithfully (a lone surrogate) or past 8 KiB once encoded makes no request.
+  // A value that can't be mirrored faithfully (a lone surrogate) or past 8 KiB once encoded makes no request:
+  // every argument the tool's listed schema declares, whatever its name, not one argument by name.
+  const schemaOf = (server: string | undefined, tool: string) => {
+    for (const y of [...recs, ...r.exe.log.filter((z) => z.kind !== 'post')].reverse()) {
+      if (y.server !== addressOf(server) || y.body?.method !== 'tools/list' || !y.plan) continue;
+      const def = (y.plan.messages.find((m) => m.result?.tools)?.result.tools as any[] | undefined)?.find((t) => t.name === tool);
+      if (def) return def.inputSchema;
+    }
+    return undefined;
+  };
   for (const e of r.evidence) {
     if (e.what !== 'yes' || !String(e.tool).startsWith('mirror')) continue;
-    const region = (e.args as any)?.region;
-    if (typeof region !== 'string') continue;
-    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(region);
-    // The client's own rule: plain visible ASCII goes as it is; anything else is the base64 sentinel.
-    const plain = region !== '' && region === region.trim() && /^[\x20-\x7e\t]*$/.test(region) && !(region.startsWith('=?base64?') && region.endsWith('?='));
-    // The whole header line, as the native 8 KiB bound counts it: its name and separator included.
-    const tooLong = Buffer.byteLength(`Mcp-Param-Region: ${plain ? region : `=?base64?${Buffer.from(region, 'utf8').toString('base64')}?=`}`) > 8 * 1024;
-    // Only a modern remote run mirrors: elsewhere the value goes in the body alone.
-    if ((lone || tooLong) && recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token && modernRun(x))) problems.push(`H11: ${e.token}'s value can't be mirrored, and a request went out`);
+    for (const d of declared(schemaOf(e.server, String(e.tool)))) {
+      let v: any = e.args;
+      for (const k of d.path) v = v !== null && typeof v === 'object' && Object.hasOwn(v, k) ? v[k] : undefined;
+      if (v === undefined || v === null) continue;
+      const text = typeof v === 'string' ? v : String(v);
+      const lone = typeof v === 'string' && /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(v);
+      // The client's own rule: plain visible ASCII goes as it is; anything else is the base64 sentinel.
+      const plain = typeof v !== 'string' || (v !== '' && v === v.trim() && /^[\x20-\x7e\t]*$/.test(v) && !(v.startsWith('=?base64?') && v.endsWith('?=')));
+      // The whole header line, as the native 8 KiB bound counts it: its name and separator included.
+      const tooLong = Buffer.byteLength(`Mcp-Param-${d.name}: ${plain ? text : `=?base64?${Buffer.from(text, 'utf8').toString('base64')}?=`}`) > 8 * 1024;
+      // Only a modern remote run mirrors: elsewhere the value goes in the body alone.
+      if ((lone || tooLong) && recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token && modernRun(x))) problems.push(`H11: ${e.token}'s ${d.name} can't be mirrored, and a request went out`);
+    }
   }
   // A $ref inside a schema's data (default, examples) is data, never a position: mirror3 stays offered.
   for (const e of r.evidence) if (e.what === 'not-offered' && e.tool === 'mirror3' && r.server.mode.era !== 'legacy') problems.push('H11: mirror3, whose only $ref is in its data, was not offered');

@@ -90,7 +90,7 @@ The order:
      - every other built-in, other reads included
      - a tool nobody knows
    - Deny wins, over the list too.
-   - A tool's own `asks` can only make it stricter: a listed tool, or one the person set to always allow, still asks if it says so.
+   - A tool's own `asks` can only make it stricter: a built-in on the run-without-asking list, or a server tool the person marked "may run on its own", still asks if it says so.
    - Step 8's Settings put the person's allow, ask or deny per tool on top, through `policy().perTool`.
 
 Tests (`journal.test.ts` › "the consent gate"):
@@ -120,7 +120,7 @@ Mutations that fail them:
   - Skip continues the turn without it. The gate refuses that tool for the rest of the turn.
   - Until the person answers, the gate refuses any other call of that tool too, as a second line.
   - Tests:
-    - `server-reissue`: the tool is always allowed, and a model that calls it again with a new id gets no request at all. It runs only after Run again.
+    - `server-reissue`: the tool may run on its own (the person's grant), and a model that calls it again with a new id gets no request at all. It runs only after Run again.
     - `server-skip`: a call made again after a skip doesn't run.
     - `redo-withheld` and `redo-denied`: a "Do it now?" Yes with consent withheld runs nothing, and with consent denied runs nothing.
   - Mutations that fail them:
@@ -137,7 +137,7 @@ Mutations that fail them:
 
 ## Bounds on tool calls
 
-The step cap counts replies, so on its own it doesn't bound how many calls one reply makes. Consent doesn't either, once a tool is always allowed. So `bounds.ts` sets two numbers, in one place:
+The step cap counts replies, so on its own it doesn't bound how many calls one reply makes. Consent doesn't either, for the built-ins that run unasked or a server tool that may run on its own. So `bounds.ts` sets two numbers, in one place:
 
 - `TOOL_CALLS_PER_REPLY`, 8: at most 8 calls of one model reply run.
 - `TOOL_CALLS_PER_TURN`, 32: at most 32 calls run in one turn, across every reply and every step-cap "go on". That Yes continues the steps but doesn't lift the 32.
@@ -150,7 +150,7 @@ Tests (`bounds.test.ts`):
 
 - A reply with 20 calls runs 8 and refuses 12, each with the reason, and there's one line in chat.
 - A turn of five replies of 8 calls, with a step cap of 3 (two "go on"s) and a kill in the middle, runs 32 and refuses the rest. The next message gets a new 32.
-- A property over 25 seeds: replies with 0 to 20 calls, reads and always-allowed effects, step caps of 2 to 5, and one to three kills mid-call. No reply runs more than 8, no turn more than 32, and no refused call ever runs.
+- A property over 25 seeds: replies with 0 to 20 calls, reads and effects that run unasked, step caps of 2 to 5, and one to three kills mid-call. No reply runs more than 8, no turn more than 32, and no refused call ever runs.
 - Three mutations fail them: dropping the reply check, dropping the turn check, and letting a "go on" start a new turn.
 
 ## Caps that pause, not fail
