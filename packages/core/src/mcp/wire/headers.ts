@@ -97,38 +97,55 @@ export function scanDeclarations(schema: unknown): ScanResult {
   return { ok: true, declarations: out };
 }
 
-/** Schema keywords whose value is a schema, a list of schemas, or a map of them: where a `$ref` is a ref. */
-const ONE = ['additionalProperties', 'unevaluatedProperties', 'propertyNames', 'items', 'contains', 'unevaluatedItems', 'not', 'if', 'then', 'else'];
-const LIST = ['prefixItems', 'allOf', 'anyOf', 'oneOf'];
-const MAP = ['properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions'];
+/** Keywords whose value is a map of schemas by name: its keys are names, never keywords. */
+const MAPS = new Set(['properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions', 'dependencies']);
+/** Keywords whose value is data, never a schema: a `$ref` inside them is data. */
+const DATA = new Set(['default', 'examples', 'const', 'enum']);
 
 const pointerOf = (keys: readonly string[]) => keys.map((k) => `/${k.replace(/~/g, '~0').replace(/\//g, '~1')}`).join('');
 
 /**
- * The node each `$ref` in a schema names, as a JSON Pointer from the root (`''` is the root): `$ref`s are
- * read only where a schema sits, never inside data (`default`, `examples`, `const`, `enum`). A pointer
- * fragment is percent-decoded and unescaped; a plain-name fragment is looked up among the `$anchor`s. Any
- * other form (another document, an unknown anchor, a pointer that names nothing) is a reason, not a set.
+ * The node each `$ref` in a schema names, as a JSON Pointer from the root (`''` is the root). The walk is
+ * generic: every keyword's value is walked as a schema position (an object a schema, an array a list of
+ * them, a boolean a schema too), whatever the keyword, except the data keywords (`default`, `examples`,
+ * `const`, `enum`); the known maps (`properties` and the like) are walked by name, so a property called
+ * `default` is still a schema. A pointer fragment is percent-decoded and unescaped; a plain-name fragment
+ * is looked up among the `$anchor`s. Anything Familiar can't scope is a reason, not a set, so the tool fails
+ * closed: another document, an unknown anchor, a pointer to no schema, a dynamic ref, a `$ref` that isn't a
+ * string, and a nested `$id` (or draft-04 `id`), which opens a resource of its own.
  */
 function refTargets(schema: unknown): Set<string> | string {
   const refs: string[] = [];
   const anchors = new Map<string, string>();
   const nodes = new Set<string>();
+  // [value, its keys from the root]
   const stack: [unknown, string[]][] = [[schema, []]];
   while (stack.length) {
     const [n, keys] = stack.pop()!;
-    if (n === null || typeof n !== 'object' || Array.isArray(n)) continue;
+    if (typeof n === 'boolean') {
+      nodes.add(pointerOf(keys));
+      continue;
+    }
+    if (Array.isArray(n)) {
+      n.forEach((c, i) => stack.push([c, [...keys, String(i)]]));
+      continue;
+    }
+    if (n === null || typeof n !== 'object') continue;
     const s = n as Record<string, unknown>;
     nodes.add(pointerOf(keys));
     if (typeof s.$ref === 'string') refs.push(s.$ref);
     else if (s.$ref !== undefined) return 'a $ref that is not a string';
+    if (keys.length > 0 && (typeof s.$id === 'string' || typeof s.id === 'string')) return 'a nested $id, a resource of its own, which Familiar does not scope';
     if (typeof s.$anchor === 'string') anchors.set(s.$anchor, pointerOf(keys));
     if (s.$dynamicRef !== undefined || s.$dynamicAnchor !== undefined || s.$recursiveRef !== undefined) return 'a dynamic $ref, which Familiar does not resolve';
-    for (const k of ONE) if (s[k] !== undefined) stack.push([s[k], [...keys, k]]);
-    for (const k of LIST) if (Array.isArray(s[k])) (s[k] as unknown[]).forEach((c, i) => stack.push([c, [...keys, k, String(i)]]));
-    for (const k of MAP) {
-      const m = s[k];
-      if (m !== null && typeof m === 'object' && !Array.isArray(m)) for (const [name, c] of Object.entries(m as Record<string, unknown>)) stack.push([c, [...keys, k, name]]);
+    for (const [k, v] of Object.entries(s)) {
+      if (DATA.has(k)) continue;
+      if (k === '$ref' || k === '$id' || k === '$anchor' || k === '$schema' || k === '$comment') continue;
+      if (MAPS.has(k) && v !== null && typeof v === 'object' && !Array.isArray(v)) {
+        for (const [name, c] of Object.entries(v as Record<string, unknown>)) stack.push([c, [...keys, k, name]]);
+        continue;
+      }
+      stack.push([v, [...keys, k]]);
     }
   }
   const out = new Set<string>();

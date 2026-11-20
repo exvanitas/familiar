@@ -58,6 +58,30 @@ describe('3.5: the x-mcp-header scan', () => {
       const data = { y: { type: 'object', default: { $ref: '#/properties/x' }, examples: [{ $ref: '#/properties/x' }], const: { $ref: '#' }, enum: [{ $ref: '#/properties/x' }] } };
       expect(scanDeclarations(decl(data))).toMatchObject({ ok: true, declarations: [{ name: 'X' }] });
     });
+    it('a $ref in any schema position is found: draft-07 tuple items, additionalItems, dependencies, a keyword Familiar has no name for, a property called default', () => {
+      const x = { type: 'string', 'x-mcp-header': 'X' };
+      const ref = { $ref: '#/properties/x' };
+      const cases: Record<string, unknown>[] = [
+        { type: 'object', properties: { x, list: { type: 'array', items: [ref] } } },
+        { type: 'object', properties: { x, list: { type: 'array', items: [{ type: 'string' }], additionalItems: ref } } },
+        { type: 'object', properties: { x }, dependencies: { y: ref } },
+        { type: 'object', properties: { x }, 'x-future': { nested: [ref] } },
+        { type: 'object', properties: { x, default: { type: 'object', properties: { inner: ref } } } }
+      ];
+      for (const c of cases) expect(scanDeclarations(c), JSON.stringify(c)).toMatchObject({ ok: false, reason: expect.stringMatching(/\$ref target/) });
+    });
+    it('a nested $id is a resource Familiar does not scope: the tool fails closed', () => {
+      const schema = { type: 'object', properties: { x: { type: 'string' }, nested: { $id: 'https://h.example/inner', type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, alias: { $ref: '#/properties/x' } } } } };
+      expect(scanDeclarations(schema)).toMatchObject({ ok: false, reason: expect.stringMatching(/\$id/) });
+      // The root's own $id is the document's: fine.
+      expect(scanDeclarations({ $id: 'https://h.example/tool', type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' } } })).toMatchObject({ ok: true });
+    });
+    it('a $ref to a boolean schema is a ref to a schema: the tool stays offered', () => {
+      expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, any: true, alias: { $ref: '#/properties/any' } } })).toMatchObject({ ok: true, declarations: [{ name: 'X' }] });
+    });
+    it('a $ref to a node that is no schema (a map of them) fails closed', () => {
+      expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, y: { $ref: '#/properties' } } }).ok).toBe(false);
+    });
     it('a $ref to another node leaves the declaration alone', () => {
       expect(scanDeclarations(decl({ y: { $ref: '#/$defs/d' }, root: { $defs: { d: { type: 'string' } } } }))).toMatchObject({ ok: true });
     });
