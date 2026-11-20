@@ -3,11 +3,11 @@
 // does. It must fail with the known gap's words; a port that also blanks the JSON-escaped form must pass;
 // a server that isn't started, or holds another key, must fail with other words, never pass.
 import { afterEach, describe, expect, it } from 'vitest';
-import { McpClient, parsePaste, systemClock, type ProcessPort } from '@familiar/core';
+import { McpClient, parsePaste, systemClock, type ProcessEvent, type ProcessPort } from '@familiar/core';
 import { memorySettingsStore } from '../../../packages/core/src/settings/store.ts';
 import { nodeProcessPort } from '../../../packages/core/tests/mcp/node-process.ts';
 import { FAKE_MAIN, REPO, testPaths } from '../../../packages/core/tests/mcp/fake.ts';
-import { ESCAPED_GAP, escapedCopyCheck } from '../shell-check/escaped.ts';
+import { ESCAPED_GAP, escapedCopyCheck, recording, type HeardLine, type WrittenLine } from '../shell-check/escaped.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
 afterEach(async () => {
@@ -18,22 +18,20 @@ const KEY = 'fkABCDEFGHIJKL"MNOPQRSTUVWX';
 const typed = { head: KEY.slice(0, 10), tail: KEY.slice(-10), length: KEY.length };
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** A port over core's Node one, with what core heard recorded, and optionally the escaped form blanked. */
-function world(blankEscaped: boolean, stored = KEY) {
+/** A port over core's Node one, with what core heard recorded by run and stream, and optionally the escaped
+    form blanked. `alter` changes a line before core hears it (and the record with it). */
+function world(blankEscaped: boolean, stored = KEY, alter: (e: Exclude<ProcessEvent, { t: 'exit' }>) => Exclude<ProcessEvent, { t: 'exit' }> = (e) => e) {
   const inner = nodeProcessPort({ secret: () => stored });
   cleanups.push(() => inner.closeAll());
-  const heard: string[] = [];
+  const heard: HeardLine[] = [];
+  const written: WrittenLine[] = [];
   const escaped = JSON.stringify(stored).slice(1, -1);
-  const port: ProcessPort = {
-    ...inner,
-    start: (setup, onEvent) =>
-      inner.start(setup, (e) => {
-        if (e.t !== 'exit' && blankEscaped) e = { ...e, line: e.line.split(escaped).join('[hidden]') };
-        if (e.t !== 'exit') heard.push(e.line);
-        onEvent(e);
-      })
-  };
-  return { port, heard, written: inner.written };
+  const port: ProcessPort = recording(inner, heard, written, (e) => {
+    if (e.t === 'exit') return e;
+    if (blankEscaped) e = { ...e, line: e.line.split(escaped).join('[hidden]') };
+    return alter(e);
+  });
+  return { port, heard, written };
 }
 
 async function added(port: ProcessPort) {
@@ -81,21 +79,30 @@ describe('security.mcp.secret-json-escaped, its positive control', () => {
     expect(await outcome(escapedCopyCheck(b.client, other.heard, other.written, b.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/another key/) });
   }, 30_000);
 
-  it("a stray line that looks like the reply, with another id, isn't the reply; a key one character short fails in words with no part of it", async () => {
+  it("a stray line that looks like the reply, with another id, isn't the reply; nor is the reply's own line on stderr; a key one character short fails in words with no part of it", async () => {
+    const reply = /"result":\{"content":\[\{"type":"text","text":"The secret is /;
     // The server's reply never reaches what the check reads; only a lookalike line with another id does.
+    // (Only the record is changed: core itself hears the reply, so the call answers.)
     const w = world(true);
-    const fake = { ...w.port, start: (setup: Parameters<ProcessPort['start']>[0], onEvent: Parameters<ProcessPort['start']>[1]) => w.port.start(setup, (e) => {
-      if (e.t !== 'exit' && /"result":\{"content":\[\{"type":"text","text":"The secret is /.test(e.line)) {
-        w.heard.pop();
-        w.heard.push(JSON.stringify({ jsonrpc: '2.0', id: 999, result: { content: [{ type: 'text', text: 'The secret is [hidden].' }] } }));
-      }
-      onEvent(e);
-    }) };
-    const a = await added(fake);
+    w.heard.push = (...xs: HeardLine[]) => Array.prototype.push.apply(w.heard, xs.map((h) => (h.stream === 'out' && reply.test(h.line) ? { ...h, line: JSON.stringify({ jsonrpc: '2.0', id: 999, result: { content: [{ type: 'text', text: 'The secret is [hidden].' }] } }) } : h)));
+    const a = await added(w.port);
     expect(await outcome(escapedCopyCheck(a.client, w.heard, w.written, a.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/reply line never reached/) });
+    // The record holds the reply, with its own id, only as a stderr line: not the witness. (Core itself hears
+    // it on stdout, so the call answers.)
+    const e = world(true);
+    e.heard.push = (...xs: HeardLine[]) => Array.prototype.push.apply(e.heard, xs.map((h) => (h.stream === 'out' && reply.test(h.line) ? { ...h, stream: 'err' as const } : h)));
+    const b0 = await added(e.port);
+    expect(await outcome(escapedCopyCheck(b0.client, e.heard, e.written, b0.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/reply line never reached/) });
     // The server holds the key less its last character: told by length, never by content.
     const short = world(false, KEY.slice(0, -1));
     const b = await added(short.port);
     expect(await outcome(escapedCopyCheck(b.client, short.heard, short.written, b.id, typed, sleep))).toMatchObject({ fail: expect.stringMatching(/another key/) });
+  }, 30_000);
+
+  it("secret_shape right, and only print_secret's text altered: the failure gives its length, never its text", async () => {
+    const w = world(true, KEY, (e) => (e.t === 'out' && /The secret is \[hidden\]/.test(e.line) ? { ...e, line: e.line.replace('The secret is [hidden].', `The secret is ${KEY.slice(0, 12)}-altered.`) } : e));
+    const a = await added(w.port);
+    const r = await outcome(escapedCopyCheck(a.client, w.heard, w.written, a.id, typed, sleep));
+    expect(r).toMatchObject({ fail: expect.stringMatching(/^print_secret's answer is neither the key nor \[hidden\] \(\d+ characters\)$/) });
   }, 30_000);
 });

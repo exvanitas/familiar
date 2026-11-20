@@ -331,7 +331,7 @@ export class ServerLink {
     // The run's end answers a call in flight "interrupted, it may have partly run" (3.11).
     if (run.target.where === 'local') {
       // A native start still pending is waited out first: the start itself then stops what it started.
-      if (run.process === undefined) await run.launched;
+      if (run.process === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('stop-skips-pending-start'))) await run.launched;
       if (run.process === undefined) return;
       // Waits for the exe's answer and the exit, with no deadline of its own (5.4): Stop answers only once
       // the process is gone. One native stop per run, whoever asks first. A stop the exe refuses answers
@@ -622,7 +622,7 @@ export class ServerLink {
     // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
     // past the step's deadline, whatever a server keeps sending.
     for (;;) {
-      if (!this.early(kind)) await Promise.race([this.drained(), deadline.over, ...((__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion')) ? [] : [this.stuckAt])]);
+      if (!this.early(kind)) await Promise.race([this.drained(), deadline.over, ...((__FAMILIAR_MUTATIONS__ && (mutant('forget-exhaustion') || mutant('no-stuck-wake'))) ? [] : [this.stuckAt])]);
       if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { end: { t: 'run-ended' } };
       if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended || run.closing) return { end: { t: 'run-ended' } };

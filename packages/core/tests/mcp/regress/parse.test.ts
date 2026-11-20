@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { ServerLink, type Target } from '../../../src/mcp/wire/link.ts';
 import { EventStream } from '../../../src/mcp/wire/parse.ts';
+import { mutations } from '../../../src/mutations.ts';
 import { fakeNet, initResult, json, listResult, realClock, sse, textResult } from '../wire-fakes.ts';
 
 const remote: Target = { where: 'remote', address: 'a1', url: 'https://h.example/mcp', headers: [] };
@@ -91,20 +92,46 @@ describe('a status other than 2xx', () => {
     expect(net.log.map((x) => x.body?.method)).toEqual(['initialize']);
   });
 
-  for (const type of ['application/jsonp', 'application/json-seq', 'text/event-streaming', 'text/event-stream-anything', `text/x-${'a'.repeat(7000)}`])
-    it(`a lookalike type is another type, and its words carry none of it: ${type.slice(0, 30)}`, async () => {
-      const net = fakeNet((b) => {
-        if (b.method === 'initialize') return { ...json(initResult(b.id)), headers: [['content-type', type]] };
-        if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
-        return json(listResult(b.id, ['look']));
-      });
-      const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
-      const r = await link.start(remote, 'L');
+  /** A start whose initialize answers with `type` and a body that type's lookalike would read as valid. */
+  const lookalike = async (type: string) => {
+    const reads = new Map<string, number>();
+    let initId = '';
+    const net = fakeNet((b) => {
+      if (b.method === 'initialize') {
+        const body = type.startsWith('text/event-stream') ? sse(initResult(b.id)) : json(initResult(b.id));
+        return { ...body, headers: [['content-type', type]] };
+      }
+      if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+      return json(listResult(b.id, ['look']));
+    });
+    const port = { ...net.port, fetch: (spec: Parameters<typeof net.port.fetch>[0], body: Uint8Array) => ((initId ||= spec.id), net.port.fetch(spec, body)), read: (id: string) => (reads.set(id, (reads.get(id) ?? 0) + 1), net.port.read(id)) };
+    const link = new ServerLink('s', { net: port }, realClock, { ended: () => {} });
+    const r = await link.start(remote, 'L');
+    return { r, reads: reads.get(initId) ?? 0 };
+  };
+  const LOOKALIKES = ['application/jsonp', 'application/json-seq', 'text/event-streaming', 'text/event-stream-anything'];
+  for (const type of [...LOOKALIKES, `text/x-${'a'.repeat(7000)}`])
+    it(`a lookalike type is another type, never read, and its words carry none of it: ${type.slice(0, 30)}`, async () => {
+      const { r, reads } = await lookalike(type);
       expect(r.ok).toBe(false);
+      // Refused at its head: not one read of a body that, read as its lookalike, would have been valid.
+      expect(reads).toBe(0);
       if (r.ok) return;
       expect(r.failure.words).not.toContain(type.split('/')[1]!.slice(0, 12));
       expect(r.failure.words.length).toBeLessThan(160);
     });
+  it('the lookalike test sees prefix matching: under media-prefix, every lookalike is read', async () => {
+    mutations.set(['media-prefix']);
+    try {
+      for (const type of LOOKALIKES) {
+        const { r, reads } = await lookalike(type);
+        expect(reads, type).toBeGreaterThan(0);
+        expect(r.ok, type).toBe(true);
+      }
+    } finally {
+      mutations.clear();
+    }
+  });
 
   it('a parameter after the exact type is still the type', async () => {
     const net = fakeNet((b) => {

@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
-import { wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
+import { MIRROR_VECTORS, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
 
 interface Control {
   readonly mutation: string;
@@ -38,6 +38,12 @@ const CONTROLS: Control[] = [
   { mutation: 'accept-any-response-id', check: 'H10', mode: { staleId: 0.9 } },
   { mutation: 'mirror-previous-call', check: 'H11', mode: modern },
   { mutation: 'mirror-wrong-value', check: 'H11', mode: modern },
+  {
+    mutation: 'measure-value-only',
+    check: 'H11',
+    mode: { ...modern, redirect: 0 },
+    schedule: (d) => d.when('ready', () => d.idle(), () => d.call('mirror', { region: MIRROR_VECTORS.at(-1) }))
+  },
   { mutation: 'modern-on-any-error', check: 'H12', mode: { era: 'legacy', initError: 0.6 } },
   { mutation: 'initialized-on-modern', check: 'H12', mode: modern },
   { mutation: 'answer-stray-ping-modern', check: 'H12', mode: modern },
@@ -70,10 +76,16 @@ const CONTROLS: Control[] = [
   { mutation: 'walk-beside-walk', check: 'H14', named: 'S26' },
   { mutation: 'media-prefix', check: 'H10', named: 'S21' },
   { mutation: 'relaunch-on-answer', check: 'H12', named: 'S22' },
-  { mutation: 'forget-exhaustion', check: 'H1', named: 'S24' },
+  { mutation: 'forget-exhaustion', check: 'H1', named: 'S24 cleanup refused for good' },
+  { mutation: 'no-stuck-wake', check: 'H1', named: 'S24 cleanup refused for good while a start is parked' },
   { mutation: 'ready-after-stop', check: 'H15', named: 'S19' },
   { mutation: 'stop-before-exit', check: 'H2', named: 'S11 Stop during initialize, local' },
   { mutation: 'stop-twice', check: 'H2', named: 'S11 Stop during initialize, local' },
+  { mutation: 'stop-skips-pending-start', check: 'H2', named: 'S11 Stop during a pending server_start, local' },
+  { mutation: 'stop-twice', check: 'H2', named: 'S11 Stop during a pending server_start, local' },
+  // One chunk with the cancel refused: the dropped ping shares its step with the flood that ends the
+  // exchange, and only the exact terminal position tells them apart.
+  { mutation: 'drop-pong-before-flood', check: 'H13', mode: { where: 'remote', era: 'legacy', pings: 40, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0 } },
   { mutation: 'drop-pong-before-flood', check: 'H13', mode: { where: 'local', era: 'legacy', pings: 40, session404: 'none', redirect: 0, earlyEnd: 0 } },
   { mutation: 'ready-during-recovery', check: 'H14', named: 'S12' },
   { mutation: 'publish-stale-walk', check: 'H3', named: 'S14 list_changed during the initial walk' },

@@ -78,6 +78,15 @@ export function scanDeclarations(schema: unknown): ScanResult {
   // node and its ancestors.
   const targets = refTargets(schema);
   if (typeof targets === 'string') return { ok: false, reason: targets };
+  // A named mutation: the old product loop, every declaration against every target.
+  if (__FAMILIAR_MUTATIONS__ && mutant('quadratic-ref-scan')) {
+    const list = [...targets];
+    for (const d of out) {
+      const pointer = pointerOf(d.path.flatMap((k) => ['properties', k]));
+      if (list.some((t) => pointer === t || pointer.startsWith(`${t}/`) || t === '')) return { ok: false, reason: `${where(d.path)}: x-mcp-header may not sit on a $ref target` };
+    }
+    return { ok: true, declarations: out };
+  }
   for (const d of out) {
     const node = d.path.flatMap((k) => ['properties', k]);
     for (let i = 0; i <= node.length; i++) {
@@ -217,7 +226,7 @@ export function paramHeaders(declarations: readonly HeaderDeclaration[], args: u
     }
     const name = `Mcp-Param-${d.name}`;
     const value = encodeValue(text);
-    if (new TextEncoder().encode(`${name}: ${value}`).length > MAX_HEADER_BYTES) {
+    if (new TextEncoder().encode((__FAMILIAR_MUTATIONS__ && mutant('measure-value-only')) ? value : `${name}: ${value}`).length > MAX_HEADER_BYTES) {
       if (!(__FAMILIAR_MUTATIONS__ && mutant('truncate-header'))) return { ok: false };
       out.push([name, value.slice(0, MAX_HEADER_BYTES - name.length - 2)]);
       continue;

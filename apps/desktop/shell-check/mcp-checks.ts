@@ -33,7 +33,7 @@ import { desktopMcpPorts } from '../src/mcp.ts';
 import { reason } from '../src/shell.ts';
 import { check, fail, ok, rand, shell, sleep, step, until } from './common.ts';
 import { dialog, START, type Ctx, type Paths } from './procs.ts';
-import { escapedCopyCheck } from './escaped.ts';
+import { escapedCopyCheck, recording, type HeardLine, type WrittenLine } from './escaped.ts';
 
 interface Typed { head: string; tail: string; length: number }
 
@@ -47,15 +47,19 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   const p = await step<Paths>('proc-paths', {}, 120000);
   const store = await openSettingsStore(indexedDB, 'familiar-check-mcp');
   // Every line core wrote to a server and every event core heard, to count and to search.
+  // `heard` and `written` are every line, for counting and leak searches; `heardBy` and `writtenBy` keep each
+  // line's run and stream apart, for a check that needs to know which run said it, and where.
   const written: string[] = [];
   const heard: string[] = [];
+  const heardBy: HeardLine[] = [];
+  const writtenBy: WrittenLine[] = [];
   const ports = desktopMcpPorts(shell);
-  const processes = {
-    ...ports.processes,
-    start: (setup: Parameters<typeof ports.processes.start>[0], onEvent: (e: ProcessEvent) => void) =>
-      ports.processes.start(setup, e => { if (e.t !== 'exit') heard.push(e.line); onEvent(e); }),
-    write: (r: string, bytes: Uint8Array) => { written.push(new TextDecoder().decode(bytes)); return ports.processes.write(r, bytes); }
-  };
+  const processes = recording(ports.processes, heardBy, writtenBy, (e: ProcessEvent) => {
+    if (e.t !== 'exit') heard.push(e.line);
+    return e;
+  });
+  const write = processes.write;
+  processes.write = (r: string, bytes: Uint8Array) => { written.push(new TextDecoder().decode(bytes)); return write(r, bytes); };
   const client = await McpClient.open({ store, ...ports, processes, clock: systemClock });
   const sent = (tool: string) => written.filter(l => l.includes('"tools/call"') && l.includes(`"name":"${tool}"`)).length;
   const cancels = () => written.filter(l => l.includes('notifications/cancelled')).length;
@@ -301,7 +305,7 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
       ok(d.shown && report.ok, 'the quoted-key server did not start');
       // Measured, then judged (escaped.ts): the known gap's exact words only when the escaped copy came
       // back; the server not Ready, another key stored or the reply never heard each have other words.
-      return await escapedCopyCheck(client, heard, written, added.id, k, sleep);
+      return await escapedCopyCheck(client, heardBy, writtenBy, added.id, k, sleep);
     } finally {
       await client.remove(added.id).catch(() => {});
     }

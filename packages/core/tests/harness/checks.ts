@@ -229,10 +229,16 @@ export const H2: Check = (r) => {
     for (const e of r.evidence) {
       if (e.what !== 'stop') continue;
       const answered = r.evidence.find((y) => y.what === 'stopped' && y.token === e.token && y.seq > e.seq);
+      // The process Stop is for: the last one the exe admitted to start before it, from the exe's own start
+      // record, so a Stop while that start is still pending (no write yet) is judged too.
+      const epoch = r.exe.processStarts.filter((t) => t.seq < e.seq).at(-1)?.epoch;
+      // Every Stop is answered, unless the run hit its step bound first.
+      if (!answered) {
+        if (epoch !== undefined && r.sched.step < 1500) problems.push(`H2: a local Stop made at step ${e.step} was never answered`);
+        continue;
+      }
       // A Stop refused (another one under way, or not running) stopped nothing.
-      if (!answered || answered.failure === 'refused') continue;
-      const epoch = r.exe.log.filter((x) => x.kind === 'write' && x.seq < e.seq).at(-1)?.epoch;
-      if (epoch === undefined) continue;
+      if (answered.failure === 'refused' || epoch === undefined) continue;
       const exit = r.exe.exits.find((t) => t.epoch === epoch);
       if (!exit || exit.step > answered.step) problems.push(`H2: a local Stop answered at step ${answered.step}, before its process exited${exit ? ` at ${exit.step}` : ''}`);
     }
@@ -420,7 +426,8 @@ export const H11: Check = (r) => {
     const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(region);
     // The client's own rule: plain visible ASCII goes as it is; anything else is the base64 sentinel.
     const plain = region !== '' && region === region.trim() && /^[\x20-\x7e\t]*$/.test(region) && !(region.startsWith('=?base64?') && region.endsWith('?='));
-    const tooLong = Buffer.byteLength(plain ? region : `=?base64?${Buffer.from(region, 'utf8').toString('base64')}?=`) > 8 * 1024;
+    // The whole header line, as the native 8 KiB bound counts it: its name and separator included.
+    const tooLong = Buffer.byteLength(`Mcp-Param-Region: ${plain ? region : `=?base64?${Buffer.from(region, 'utf8').toString('base64')}?=`}`) > 8 * 1024;
     // Only a modern remote run mirrors: elsewhere the value goes in the body alone.
     if ((lone || tooLong) && recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token && modernRun(x))) problems.push(`H11: ${e.token}'s value can't be mirrored, and a request went out`);
   }
@@ -496,10 +503,11 @@ export const H13: Check = (r) => {
       // Departure 1, judged at the ping's own delivery: the flood rule held then (two pongs outstanding, or
       // 32 handed off), or a flood ping came before it on this stream.
       if (/too many pings/.test(words(tokenOf(post.body))) && floodAt(r, [...post.delivered], post.delivered.get(p.id)!, handed)) continue;
-      // Departure 2, remotely: the exchange had already ended for the client (its call answered, stopped
-      // or timed out) and only drains, its cancel refused, so the exe keeps reading what the server sends.
-      const ended = r.evidence.find((e) => e.what === 'outcome' && e.token === tokenOf(post.body));
-      if (ended && ended.step * 1000 <= post.delivered.get(p.id)! && (post.refusals ?? 0) > 0) continue;
+      // Departure 2, remotely: the exchange had already ended for the client and only drains, its cancel
+      // refused, so the exe keeps reading what the server sends. Only a ping delivered strictly after the
+      // client's terminal position on this stream (its first net_cancel, at the same resolution as delivery)
+      // is excused: one that came before it, in the same chunk or step, is the client's to answer.
+      if (post.endedAt !== undefined && post.delivered.get(p.id)! > post.endedAt && (post.refusals ?? 0) > 0) continue;
       problems.push(`H13: ping ${p.id} on request ${post.n} got no pong and no departure`);
       continue;
     }

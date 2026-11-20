@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeValue, HEADER_WORDS, paramHeaders, scanDeclarations, wellFormed } from '../../src/mcp/wire/headers.ts';
 import { ServerLink, type Target } from '../../src/mcp/wire/link.ts';
+import { mutations } from '../../src/mutations.ts';
 import type { ProcessEvent, ProcessPort } from '../../src/mcp/process.ts';
 import { fakeNet, initResult, json, realClock, sse, textResult } from './wire-fakes.ts';
 
@@ -59,6 +60,40 @@ describe('3.5: the x-mcp-header scan', () => {
     });
     it('a $ref to another node leaves the declaration alone', () => {
       expect(scanDeclarations(decl({ y: { $ref: '#/$defs/d' }, root: { $defs: { d: { type: 'string' } } } }))).toMatchObject({ ok: true });
+    });
+    it('the $ref check does linear work: four times the declarations and refs, about four times the work', () => {
+      // Work is counted, not timed: every call of the lookups a scan can make, on any path.
+      const counted = ['startsWith', 'endsWith', 'includes', 'indexOf'] as const;
+      const work = (n: number): number => {
+        const properties: Record<string, unknown> = {};
+        for (let i = 0; i < n; i++) properties[`p${i}`] = { type: 'string', 'x-mcp-header': `H${i}` };
+        const $defs: Record<string, unknown> = {};
+        for (let i = 0; i < n; i++) $defs[`d${i}`] = { type: 'string' };
+        const schema = { type: 'object', properties: { ...properties, many: { anyOf: Array.from({ length: n }, (_, i) => ({ $ref: `#/$defs/d${i}` })) } }, $defs };
+        let calls = 0;
+        const saved = counted.map((m) => [m, String.prototype[m]] as const);
+        const sets = [Set.prototype.has, Map.prototype.get, Map.prototype.has] as const;
+        try {
+          for (const [m, f] of saved) (String.prototype as any)[m] = function (this: string, ...a: unknown[]) { calls++; return (f as any).apply(this, a); };
+          Set.prototype.has = function (this: Set<unknown>, v: unknown) { calls++; return sets[0].call(this, v); };
+          Map.prototype.get = function (this: Map<unknown, unknown>, k: unknown) { calls++; return sets[1].call(this, k); };
+          Map.prototype.has = function (this: Map<unknown, unknown>, k: unknown) { calls++; return sets[2].call(this, k); };
+          expect(scanDeclarations(schema).ok).toBe(true);
+        } finally {
+          for (const [m, f] of saved) (String.prototype as any)[m] = f;
+          [Set.prototype.has, Map.prototype.get, Map.prototype.has] = sets;
+        }
+        return calls;
+      };
+      const ratio = () => work(800) / work(200);
+      expect(ratio()).toBeLessThan(6);
+      // The control: the product loop, every declaration against every target, grows with the square.
+      mutations.set(['quadratic-ref-scan']);
+      try {
+        expect(ratio()).toBeGreaterThan(10);
+      } finally {
+        mutations.clear();
+      }
     });
     it('many declarations and many refs scan in linear time', () => {
       const properties: Record<string, unknown> = {};

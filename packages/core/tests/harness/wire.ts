@@ -33,8 +33,9 @@ const concat = (parts: readonly Uint8Array[]): Uint8Array => {
 };
 const MODERN = '2026-07-28';
 /** H11's fixed values for a mirrored string: plain, non-ASCII, empty, edge whitespace, sentinel-shaped, a
-    lone surrogate (refused), and one past 8 KiB once encoded (refused). */
-export const MIRROR_VECTORS = ['eu-1', 'café', '', ' edge ', '=?base64?eHk=?=', '\uD800x', 'é'.repeat(4000)];
+    lone surrogate (refused), one past 8 KiB once encoded (refused), and the two at the bound of the whole
+    line `Mcp-Param-Region: value`: 8,192 bytes (sent) and one more (refused, though the value alone fits). */
+export const MIRROR_VECTORS = ['eu-1', 'café', '', ' edge ', '=?base64?eHk=?=', '\uD800x', 'é'.repeat(4000), 'b'.repeat(8192 - 'Mcp-Param-Region: '.length), 'b'.repeat(8193 - 'Mcp-Param-Region: '.length)];
 
 /** The exe's admission (4.1): 32 open requests in all, server requests at most 24 in the pass build. */
 export const EXE_TOTAL = 32;
@@ -82,6 +83,9 @@ export interface Mode {
   readonly refuseCancel: number;
   /** The exe refuses every net_cancel of a call, keeping it alive (cleanup exhausted). */
   readonly refuseCancelAlways: boolean;
+  /** Which request's net_cancels refuseCancelAlways refuses: a call's by default, or the handshake's
+      `initialize` (S24, a start parked between its handshake's steps). */
+  readonly refuseCancelOf?: 'tools/call' | 'initialize';
   /** How often an answer comes with a media type other than the two exact ones: lookalike or oversized. */
   readonly oddMedia: number;
   /** A local modern-only server answers its list -32022, then exits. */
@@ -338,6 +342,9 @@ export interface NativeRec {
   openServer?: number;
   /** How many net_cancels the exe refused for it. */
   refusals?: number;
+  /** Remote: where the client's terminal step stood on this stream, at the resolution of ping delivery
+      (step × 1000 + the messages delivered by then): its first net_cancel, asked in that step. */
+  endedAt?: number;
   /** The media type the answer's head carried. */
   contentType?: string;
   readonly method: string;
@@ -376,6 +383,11 @@ export class FakeExe {
   readonly stopsAsked: { epoch: number; step: number }[] = [];
   /** Local: when each process run exited, by epoch. */
   readonly exits: { epoch: number; step: number }[] = [];
+  /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2). */
+  readonly processStarts: { epoch: number; seq: number; step: number; answered?: number }[] = [];
+  /** Holds the next process start's answer until `releaseStart()` (S11, Stop during a pending start). */
+  holdNextStart = false;
+  releaseStart?: () => void;
   /** Local: when each ping line reached the client. */
   readonly pingDelivered = new Map<string, number>();
   /** The highest count of server requests open at once, detached helpers included (H5's witness). */
@@ -563,9 +575,18 @@ export class FakeExe {
           const st = streams.get(id);
           if (!st) return resolve();
           const rec = st.rec;
+          // The client's terminal position, first asked: every message this stream delivered by then counts as
+          // before it, whatever the cancel's fate.
+          if (rec.endedAt === undefined) {
+            const plan = st.plan;
+            const bounds: number[] | undefined = (st as any).bounds;
+            const sent: number = (st as any).sent ?? 0;
+            const whole = plan && (plan.sse || (st as any).holdMsgs) && bounds ? bounds.filter((b) => b <= sent).length : 0;
+            rec.endedAt = this.sched.step * 1000 + whole;
+          }
           // The exe may refuse a net_cancel and keep the request alive: once per request, as a passing fault.
           // A refused request stays alive as it was, delivering what it would: refused isn't cancelled.
-          if ((this.server.mode.refuseCancelAlways && rec.body?.method === 'tools/call') || (!rec.refusedCancel && this.server.mode.refuseCancel && this.sched.random() < this.server.mode.refuseCancel)) {
+          if ((this.server.mode.refuseCancelAlways && rec.body?.method === (this.server.mode.refuseCancelOf ?? 'tools/call')) || (!rec.refusedCancel && this.server.mode.refuseCancel && this.sched.random() < this.server.mode.refuseCancel)) {
             rec.refusedCancel = true;
             rec.refusals = (rec.refusals ?? 0) + 1;
             return void this.sched.add({ label: `cancel-refused:${rec.n}`, fire: () => refuse(Object.assign(new Error('refused'), { kind: 'failed' })) });
@@ -703,8 +724,19 @@ export class FakeExe {
         new Promise((resolve) => {
           const run = `p${++runs}`;
           this.epoch++;
+          const admitted: { epoch: number; seq: number; step: number; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step };
+          this.processStarts.push(admitted);
           live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch });
-          this.sched.add({ label: `started:${run}`, fire: () => resolve({ run }) });
+          const answer = () => this.sched.add({ label: `started:${run}`, fire: () => {
+            admitted.answered = this.sched.step;
+            resolve({ run });
+          } });
+          if (!this.holdNextStart) return answer();
+          this.holdNextStart = false;
+          this.releaseStart = () => {
+            this.releaseStart = undefined;
+            answer();
+          };
         }),
       write: (run, bytes) =>
         new Promise<void>((resolve, reject) => {
@@ -968,6 +1000,18 @@ export class Driver {
   }
   releaseWrite(): void {
     this.store.release?.();
+  }
+
+  /** `act` in the same synchronous step as the owner's next release (a listener on its notice, as Settings
+      could be): the window between a held effect's end and its caller's continuation. */
+  whenOwnerFree(act: () => void): void {
+    let done = false;
+    const off = this.client.owner.onChange(() => {
+      if (done || this.client.owner.busy) return;
+      done = true;
+      off();
+      act();
+    });
   }
 
   /** A call with a fresh Yes: a unique token in its arguments, so every handoff names its decision. */

@@ -28,6 +28,28 @@ function stopInHandshake(step: 'initialize' | 'notifications/initialized'): Name
   };
 }
 
+/** S11 during a pending native start: Stop while the exe hasn't yet answered server_start. It waits that
+    start out, and answers only after the process it started has exited, with one native stop (H2). */
+const stopInStart: Named = {
+  name: 'S11 Stop during a pending server_start, local',
+  options: {
+    mode: { ...quiet, where: 'local' },
+    schedule: (d) => {
+      d.exe.holdNextStart = true;
+      d.when('starting', () => !!d.exe.releaseStart, () => {
+        d.stop();
+        d.sched.add({ label: 'act:release-start', fire: () => d.exe.releaseStart?.() });
+      });
+    }
+  },
+  expect: (r) => {
+    const stop = r.evidence.find((e) => e.what === 'stop');
+    const start = r.exe.processStarts[0];
+    if (!stop || !start) return 'no Stop made';
+    return start.answered !== undefined && start.answered > stop.step ? undefined : 'the Stop came after server_start answered';
+  }
+};
+
 function stopFence(where: 'local' | 'remote', during: 'walk' | 'ready'): Named {
   return {
     name: `S11 Stop ${during === 'walk' ? 'during a walk' : 'while Ready'}, ${where}`,
@@ -133,8 +155,9 @@ export const SCHEDULES: Named[] = [
     expect: (r) => (r.exe.log.filter((x) => x.body?.method === 'tools/list').length >= 3 ? undefined : 'no refresh carrying list_changed')
   },
   {
-    // S19: Test, with its catalog write held; then Stop, then Start; then the write lands. Test acts on its
-    // own run only (H15).
+    // S19: Test, with its catalog write held; then Stop; then the write lands, and Start B is admitted in the
+    // same step as the owner's release, before Test's own continuation runs. Test acts on its own run only,
+    // and B's run is left alone (H15).
     name: 'S19 Stop and Start during Test',
     options: {
       mode: { ...quiet, where: 'local' },
@@ -149,14 +172,20 @@ export const SCHEDULES: Named[] = [
             d.when('testing', () => !!d.store.release, () => {
               d.stop();
               d.when('stopped again', () => d.client.get('s1')?.phase !== 'stopping', () => {
-                d.start();
-                d.when('restarted', () => d.evidence.filter((e) => e.what === 'start').length >= 2, () => d.releaseWrite());
+                d.whenOwnerFree(() => d.start());
+                d.releaseWrite();
               });
             });
           });
         })
     },
-    expect: (r) => (r.evidence.some((e) => e.what === 'tested') ? undefined : 'Test never answered')
+    expect: (r) => {
+      const b = r.evidence.filter((e) => e.what === 'start')[1];
+      const started = b && r.evidence.find((e) => e.what === 'started' && e.seq > b.seq);
+      if (!r.evidence.some((e) => e.what === 'tested')) return 'Test never answered';
+      if (!b) return 'Start B was never made';
+      return started?.ok ? undefined : `Start B, made as the owner released, answered ${started ? started.failure : 'nothing'}: ${(started?.words ?? '').slice(0, 60)}`;
+    }
   },
   {
     // S20: the walk a list_changed restarts meets a 404 on its first page: nothing goes without the session
@@ -216,6 +245,22 @@ export const SCHEDULES: Named[] = [
         })
     },
     expect: (r) => (r.evidence.filter((e) => e.what === 'start').length >= 2 ? undefined : 'no Start after the cleanup failed')
+  },
+  {
+    // S24 in the handshake: every net_cancel of initialize refused, so the start waits between initialize
+    // and initialized for a drain that never comes. Exhaustion wakes it: Start answers the restart words
+    // well before its deadline, and nothing more is sent (H1).
+    name: 'S24 cleanup refused for good while a start is parked',
+    options: { mode: { ...quiet, refuseCancelAlways: true, refuseCancelOf: 'initialize' }, schedule: () => {} },
+    expect: (r) => {
+      const init = r.exe.log.find((x) => x.body?.method === 'initialize');
+      const started = r.evidence.find((e) => e.what === 'started');
+      if ((init?.refusals ?? 0) < 4) return 'the handshake\'s cleanup was never refused for good';
+      if (!started) return 'the parked Start never answered';
+      if (!/[Rr]estart/.test(started.words ?? '')) return `the parked Start answered "${(started.words ?? 'ready').slice(0, 60)}"`;
+      if (r.exe.log.some((x) => x.body?.method === 'notifications/initialized')) return 'initialized went out over the held slot';
+      return undefined;
+    }
   },
   {
     // S25: a modern tool whose only $ref is in its default and examples data stays offered, and is called (H11).
@@ -310,6 +355,7 @@ export const SCHEDULES: Named[] = [
     },
     expect: (r) => (r.evidence.filter((e) => e.what === 'call').length > 2 ? undefined : 'no call tried during the recovery')
   },
+  stopInStart,
   stopInHandshake('initialize'),
   stopInHandshake('notifications/initialized'),
   stopFence('local', 'walk'),
