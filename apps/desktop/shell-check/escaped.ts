@@ -3,7 +3,7 @@
    the server must be Ready, hold the key the driver typed (secret_shape says its length and quote, never
    the value), and print_secret's reply line must reach what the check reads. Only then does a copy of the
    key in what came back fail it, with exactly the known gap's words. Every other failure has other words. */
-import type { McpClient } from '@familiar/core';
+import type { CallOutcome, McpClient } from '@familiar/core';
 import { callWithYes } from '@familiar/core/testing';
 
 export interface TypedKey {
@@ -28,11 +28,12 @@ export async function escapedCopyCheck(client: McpClient, heard: readonly string
   // The server holds the key the driver typed: its length, and its quote.
   const shape = await callWithYes(client, serverId, 'secret_shape', {});
   const want = `length=${typed.length} quote=true`;
-  if (shape.kind !== 'result' || shape.text !== want) failWith(`the server holds another key than the one typed: ${shape.kind === 'result' && /^length=\d+ quote=(true|false)$/.test(shape.text) ? shape.text : shape.kind}, not ${want}`);
+  if (shape.kind !== 'result') return failWith(`secret_shape didn't answer: ${said(shape, typed)}`);
+  if (shape.text !== want) failWith(`the server holds another key than the one typed: ${/^length=\d+ quote=(true|false)$/.test(shape.text) ? shape.text : `${[...shape.text].length} characters`}, not ${want}`);
   const from = heard.length;
   const wrote = written.length;
   const r = await callWithYes(client, serverId, 'print_secret', {});
-  if (r.kind !== 'result' || !r.text.startsWith('The secret is ')) failWith(`print_secret didn't answer: ${r.kind}`);
+  if (r.kind !== 'result' || !r.text.startsWith('The secret is ')) failWith(`print_secret didn't answer: ${r.kind === 'result' ? `a result of ${[...r.text].length} characters` : said(r, typed)}`);
   await sleep(300);
   const after = heard.slice(from);
   // The reply line itself reached what this check reads: the response to this very request, by its id.
@@ -56,4 +57,12 @@ export async function escapedCopyCheck(client: McpClient, heard: readonly string
   const leaked = [JSON.stringify(r), ...after].filter((t) => t.includes(typed.head) || t.includes(typed.tail)).length;
   if (leaked) failWith(`${ESCAPED_GAP}: in ${leaked} texts, unblanked; the pre-release native pass blanks escaped forms`);
   return 'a key holding a quote came back blanked in its JSON-escaped form too';
+}
+
+/** An outcome that isn't a result, for the CI log: its kind and Familiar's words, unless they hold any part
+    of the typed key, which never goes to the log. */
+function said(o: CallOutcome, typed: TypedKey): string {
+  if (o.kind !== 'error') return o.kind;
+  const words = `${o.reason}: ${o.words}`;
+  return words.includes(typed.head) || words.includes(typed.tail) ? `${o.reason} (its words withheld: they hold part of the key)` : words;
 }

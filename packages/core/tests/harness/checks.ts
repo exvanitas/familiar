@@ -126,6 +126,14 @@ export const H1: Check = (r) => {
     const stop = r.evidence.find((e) => e.what === 'stopped' && e.failure !== 'refused' && addressOf(e.server) === x.server && e.step > x.start);
     if (stop && !/[Rr]estart/.test(stop.words ?? '')) problems.push(`H1: after cleanup failed for good, Stop said "${(stop.words ?? 'stopped').slice(0, 60)}"`);
   }
+  // A call made in the step its server's Start answered Ready, after that answer, is never refused busy:
+  // Ready means the start's own exchanges have drained.
+  for (const e of r.evidence) {
+    if (e.what !== 'started' || !e.ok) continue;
+    const calls = r.evidence.filter((c) => c.what === 'call' && c.step === e.step && c.seq > e.seq && (c.server ?? 's1') === (e.server ?? 's1')).map((c) => c.token);
+    const refused = r.evidence.find((o) => o.what === 'outcome' && calls.includes(o.token) && o.outcome?.kind === 'error' && o.outcome.reason === 'busy');
+    if (refused) problems.push(`H1: ${refused.token}, made as its Start answered Ready, was refused busy`);
+  }
   // A call refused busy never goes out afterwards.
   for (const e of r.evidence) {
     if (e.what !== 'outcome' || e.outcome?.kind !== 'error' || e.outcome.reason !== 'busy') continue;

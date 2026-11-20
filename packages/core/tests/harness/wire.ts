@@ -94,6 +94,9 @@ export interface Mode {
   readonly changeOnListAt?: number;
   /** Which requests' helpers may be held: any, or only calls (S8, S10). */
   readonly holdWhich: 'any' | 'calls';
+  /** Local: the exe acknowledges each write only after the server's answer to it has reached the client
+      (S27: a Start answers Ready while its last write is still unacknowledged). */
+  readonly lateAcks?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -657,12 +660,20 @@ export class FakeExe {
           }
           return;
         }
-        p.writes.splice(p.writes.indexOf(w), 1);
         p.taken++;
         w.rec.arrived = this.sched.step;
-        w.rec.end = this.sched.step;
-        w.rec.endAt = this.sched.now;
-        w.done();
+        const ack = () => {
+          if (p.exited || !p.writes.includes(w)) return;
+          p.writes.splice(p.writes.indexOf(w), 1);
+          w.rec.end = this.sched.step;
+          w.rec.endAt = this.sched.now;
+          w.done();
+        };
+        // Late acknowledgements: the write ends only once everything the server wrote back has been read.
+        if (this.server.mode.lateAcks) {
+          const late = (): void => void this.sched.add({ label: `ack:${w.rec.n}`, fire: () => (p.out.length || p.flushing ? late() : ack()) });
+          late();
+        } else ack();
         const body = w.rec.body ?? {};
         this.server.arrivals.push({ body, headers: {}, method: 'POST', step: this.sched.step });
         if (body.method === 'notifications/cancelled' || ('result' in body && body.method === undefined)) return;
@@ -923,9 +934,13 @@ export class Driver {
     this.evidence.push({ seq: this.tick(), step: this.sched.step, ...e });
   }
 
-  start(id = 's1'): void {
+  /** Start; with `then`, an action in the same step as its answer (a call made the moment it says Ready). */
+  start(id = 's1', then?: (ready: boolean) => void): void {
     this.note({ what: 'start', server: id });
-    void this.client.start(id).then((reply) => this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' }));
+    void this.client.start(id).then((reply) => {
+      this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' });
+      then?.(reply.kind === 'ready');
+    });
   }
 
   /** Stop, and when it answered: a local Stop answers only after the process has exited. */

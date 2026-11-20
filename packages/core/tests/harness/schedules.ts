@@ -100,7 +100,31 @@ function changeDuringWalk(pages: number, refresh: boolean): Named {
   };
 }
 
+/** S27: a call made the moment Start answers Ready, while the start's last exchange would still be
+    draining (locally, the exe acknowledging writes late; remotely, the list's net_cancel still pending):
+    it's admitted and answered, never refused busy (H1). */
+function callAtReady(where: 'local' | 'remote'): Named {
+  return {
+    name: `S27 a call the moment Start answers Ready, ${where}`,
+    options: {
+      mode: { ...quiet, where, ...(where === 'local' ? { lateAcks: true } : {}) },
+      schedule: (d) =>
+        d.when('stopped', () => d.evidence.some((e) => e.what === 'started'), () => {
+          d.stop();
+          d.when('stopped again', () => d.client.get('s1')?.phase === 'stopped', () => d.start('s1', (ready) => ready && d.call('echo')));
+        })
+    },
+    expect: (r) => {
+      const call = r.evidence.find((e) => e.what === 'call');
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === call?.token)?.outcome;
+      return !call ? 'no call made at Ready' : out?.kind === 'result' ? undefined : `the call made at Ready came back ${JSON.stringify(out)}`;
+    }
+  };
+}
+
 export const SCHEDULES: Named[] = [
+  callAtReady('local'),
+  callAtReady('remote'),
   {
     // S26: a refresh whose own page carries list_changed: the walk tries again, and that's the only extra
     // walk (H14's walk count).

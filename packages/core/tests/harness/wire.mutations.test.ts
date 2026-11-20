@@ -83,6 +83,8 @@ const CONTROLS: Control[] = [
   { mutation: 'no-write-bound', check: 'H1', named: 'S18' },
   { mutation: 'release-on-refused-cancel', check: 'H1', mode: { where: 'remote', era: 'legacy', refuseCancel: 0.8, session404: 'none', redirect: 0, holdHelpers: 0 } },
   { mutation: 'decoder-per-chunk', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 0, session404: 'none', redirect: 0, earlyEnd: 0 } },
+  { mutation: 'ready-before-drain', check: 'H1', named: 'S27 a call the moment Start answers Ready, local' },
+  { mutation: 'ready-before-drain', check: 'H1', named: 'S27 a call the moment Start answers Ready, remote' },
   { mutation: 'cr-forgets-pair', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 1, session404: 'none', redirect: 0, earlyEnd: 0 } }
 ];
 

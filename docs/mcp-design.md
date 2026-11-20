@@ -658,6 +658,7 @@ Server ids are random and never reused. A removed server leaves a tombstone, whi
 - **Nothing is ever resent.** A call while not Ready is refused "not running", and a call is never sent again on any path.
 - **Stop waits** for the exe's answer and the exit, with no deadline of its own: a local Stop answers only once the process has exited. A Stop while the native start is still pending waits that start out first; the start then stops what it started. Each run is stopped natively once, whoever asks first (Stop, or the run's own end). A stop the exe refuses answers once the run has ended, and its writes and the slot still wait for the exit. A start the exe never answers stays Starting, holding the owner, until a restart. That's unbounded by design.
 - **One exchange per server** (3.4). A call's timeout, or stopping the call, ends that call only.
+- **Ready means drained.** A start answers Ready only once its last exchange has drained (the list's write acknowledged, its request ended), within the start's deadline, so a call made the moment Start answers is admitted, never refused busy. A drain that outlasts the deadline fails the start in time's words.
 - **Test runs only while Stopped:** an admitted start, the tool list, then a stop. A failed Test leaves the server Stopped. Test acts on its own run only: a Stop (or a Stop and a Start) while its catalog write is saving means Test reports no success, and Test's own stop never touches a run started since. A catalog write that fails stops the run it was for, and the start answers failed in words; it never throws. "Mark reviewed" after it is a change.
 - **Mark reviewed is bound to the report it was pressed on.** Each Test report carries an id core issued. Mark reviewed names that report and the tools' names, nothing else: each named tool is marked reviewed at the fingerprint that report showed it with, never at whatever the saved list holds when the change lands, nor at what a later Test showed. A tool a run lists changed between Test and the press stays unreviewed, and asks to be reviewed again. A name the report didn't show is marked nothing; a report core didn't issue for that server, or one older than the newest 16, marks nothing and answers "Test again". No fingerprint is ever taken from a window. A tool the report showed that the saved list lacks, because Test's own catalog write was skipped while the owner was busy, is saved as seen at that fingerprint and reviewed, so the review isn't lost.
 
@@ -800,7 +801,7 @@ An upgrade of pi-durable must run these, and T13, again.
 
 **What runs:** the real client (`McpClient`, its links and the exchange machine) and the real journal on the real pi-durable 1.5.2. There are two harnesses, both in `packages/core/tests/harness/`:
 
-- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H15 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S26;
+- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H15 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S27;
 - **the journal harness** (`journal.ts`, checks in `journal-checks.ts`): the real journal over a fake IndexedDB that outlives each life, with a gated fake model. It runs H6 to H9 over seeded runs (40 by default, `FAMILIAR_JSEEDS`), and the named schedule S5.
 
 **The fake MCP server, scripted per seed.** Its legacy modes, local and remote, can:
@@ -827,6 +828,7 @@ Its **modern modes**, local and remote:
 
 - it hands over bytes, with chunk boundaries anywhere, through a multibyte character or between a CR and its LF;
 - `net_cancel` returns only when the request's task and every helper have terminated, and a helper can be held for any time; now and then it refuses a `net_cancel` once, keeping the request alive;
+- in one mode it acknowledges a local write only once the server's answer to it has been read, so a Start's last write can still be pending when its answer arrives;
 - the 32 open requests are counted until termination;
 - the writer takes 8 writes in flight, and blocks when the fake server stops reading;
 - a redirect mode follows 3xx answers as today's contract does: a 307 re-POSTs, a 303 becomes a GET;
@@ -845,7 +847,7 @@ The **pass build** adds P4's detach bound (1 s), the server cap, the refusal pas
 
 **The checks.** Each reads only the fake exe's log, the fake server's own record, the commit log and the evidence log:
 
-- **H1.** Per server, the native requests of two different exchanges are never open at once, cleanup included, and at most 3 are open on a remote server, 4 on a local one (3.4). Every call refused busy is answered within the step it was made, and no handoff for it ever follows. Overlap alone can't catch a queue, since a call queued until the slot drains never overlaps. Busy, and a start that times out, only while the exe shows the server's exchange in play; no local write stays pending past the interim bound (4.3). After cleanup the exe refused for good (four refused `net_cancel`s), nothing more goes to that server, and Start and Stop say a restart is needed.
+- **H1.** Per server, the native requests of two different exchanges are never open at once, cleanup included, and at most 3 are open on a remote server, 4 on a local one (3.4). Every call refused busy is answered within the step it was made, and no handoff for it ever follows. Overlap alone can't catch a queue, since a call queued until the slot drains never overlaps. Busy, and a start that times out, only while the exe shows the server's exchange in play, and never for a call made in the step its Start answered Ready; no local write stays pending past the interim bound (4.3). After cleanup the exe refused for good (four refused `net_cancel`s), nothing more goes to that server, and Start and Stop say a restart is needed.
 - **H2.** Every request body is one of the six kinds (3.2). No GET or `DELETE` is ever made, no error response is sent, and no `notifications/cancelled` goes to a remote server. No pong is sent for an id that wasn't a ping on its own exchange. No request is made after its exchange's terminal event, nothing at all (not even a pong) after its run's Stop, and none outlives its run. A local Stop answers only after its process exited, and each run is stopped natively once.
 - **H3.** Every `tools/call` body equals, byte for byte, the canonical body the harness builds itself from the arguments one Yes was for, answered before the handoff and not used by an earlier one. No call reaches the fake exe for a decision whose revoke, abort or fingerprint change the log shows before the handoff, and none goes out on a catalog a `list_changed` made stale before a walk after it came back.
 - **H4.** In the pass build, every `net_cancel` returns within its bound, even while a helper is held, and a held helper never keeps an exchange out of Idle past the bound. The pre-pass build records the same as a measured limitation.
@@ -903,6 +905,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |
 | `stop-twice`: Stop and the run's end each ask the exe to stop the process | H2 under S11, during initialize |
+| `ready-before-drain`: a start answers Ready while its list's exchange still drains | H1 under S27, local and remote; `tests/mcp/regress/start-drain.test.ts` |
 | `no-write-bound`: no interim page bound on a local write | H1 under S18 |
 | `release-on-refused-cancel`: free the slot on a refused `net_cancel` or stop | H1 |
 | `publish-stale-walk`: publish a walk's catalog though `list_changed` came during it | H3 under S14 |
@@ -983,6 +986,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 - **S24, cleanup refused for good:** every `net_cancel` of a call refused; the slot stays held, and Stop and Start say a restart is needed (H1).
 - **S25, a `$ref` only in schema data:** the tool is still offered (H11).
 - **S26, `list_changed` on a refresh's own page:** one retry, and no walk beside it (H14).
+- **S27, a call the moment Start answers Ready,** local with the exe acknowledging writes late, and remote with the list's `net_cancel` still pending: the call is admitted and answered (H1).
 
 ### 7.3 The exchange machine's exhaustive walk (W)
 
