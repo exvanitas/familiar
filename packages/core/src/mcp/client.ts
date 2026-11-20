@@ -115,7 +115,9 @@ export class McpClient {
   private readonly revokes = new Map<string, number>();
   /** What each recent Test report showed, by the report's id: its server, and each tool's fingerprint by
       name. Mark reviewed binds to one of them. The newest few are kept. */
-  private readonly reports = new Map<string, { readonly server: string; readonly shown: ReadonlyMap<string, string> }>();
+  private readonly reports = new Map<string, { readonly server: string; readonly shown: ReadonlyMap<string, string>; readonly listing: number }>();
+  /** Counts each server's listings (every run's, Test's included): a report is the newest while none came after it. */
+  private readonly listings = new Map<string, number>();
   private reportCount = 0;
   private readonly o: McpClientOptions;
 
@@ -256,7 +258,7 @@ export class McpClient {
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
     const reviewed = s.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
     const report = `test-${++this.reportCount}-${Math.random().toString(36).slice(2, 10)}`;
-    this.reports.set(report, { server: id, shown: new Map(tools.map(t => [t.name, t.fingerprint])) });
+    this.reports.set(report, { server: id, shown: new Map(tools.map(t => [t.name, t.fingerprint])), listing: this.listings.get(id) ?? 0 });
     for (const old of this.reports.keys()) if (this.reports.size > REPORTS_KEPT) this.reports.delete(old);
     return { ok: true, report, tools, changes: toolChanges(reviewed, tools), ...(flag ? { unpinned: flag } : {}), ...(notOffered.length ? { notOffered } : {}) };
   }
@@ -267,7 +269,9 @@ export class McpClient {
    * this lands, so a tool changed since stays unreviewed. A name the report didn't show is marked nothing,
    * and a report core didn't issue for this server (or one too old to be kept) marks nothing: "Test again".
    * A tool the report showed that the saved list lacks (Test's own catalog write was skipped while the
-   * owner was busy) is saved as seen at that fingerprint, reviewed, so the review isn't lost.
+   * owner was busy) is saved as seen at that fingerprint, reviewed, so the review isn't lost; but only on
+   * the newest listing's report: after a later listing, a tool missing from the saved list was removed, and
+   * an old report brings nothing back.
    */
   markReviewed(id: string, report: string, names: readonly string[]): Promise<void> {
     const shown = this.reports.get(report);
@@ -277,9 +281,10 @@ export class McpClient {
       const fingerprint = shown.shown.get(name);
       if (fingerprint !== undefined) at.set(name, fingerprint);
     }
+    const newest = shown.listing === (this.listings.get(id) ?? 0) || !!(__FAMILIAR_MUTATIONS__ && mutant('review-appends-old'));
     return this.update(id, r => {
       const tools = r.tools.map(t => (at.has(t.name) ? { ...t, reviewed: at.get(t.name)! } : t));
-      for (const [name, fingerprint] of at) if (!r.tools.some(t => t.name === name)) tools.push({ name, fingerprint, reviewed: fingerprint });
+      if (newest) for (const [name, fingerprint] of at) if (!r.tools.some(t => t.name === name)) tools.push({ name, fingerprint, reviewed: fingerprint });
       return { ...r, tools };
     });
   }
@@ -451,6 +456,7 @@ export class McpClient {
 
   /** A run's tool list, saved as the tools last seen while its run is current; what the person reviewed is kept. */
   private async seen(id: string, now: readonly ListedTool[], current: () => boolean): Promise<void> {
+    this.listings.set(id, (this.listings.get(id) ?? 0) + 1);
     const s = this.owner.server(id);
     if (!s) return;
     const before = new Map(s.tools.map(t => [t.name, t]));

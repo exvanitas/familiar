@@ -9,6 +9,7 @@ import type { ProcessEvent, ProcessPort } from '../../src/mcp/process.ts';
 import type { NetPort } from '../../src/mcp/wire/link.ts';
 import type { ServerSetup } from '../../src/mcp/setup.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
+import { mutations } from '../../src/mutations.ts';
 import { testPaths, REPO } from './fake.ts';
 import { fakeProcess, initResult, listResult, realClock } from './wire-fakes.ts';
 
@@ -463,6 +464,45 @@ describe('5.4: Mark reviewed marks what Test showed', () => {
     await client.markReviewed('l1', report.report, ['echo']);
     const again = await clientOf(store, speakingPort().port);
     expect(again.get('l1')!.tools).toEqual([{ name: 'echo', fingerprint: f1, reviewed: f1 }]);
+  });
+});
+
+describe('5.4: Mark reviewed on an old report brings back nothing removed (r32b #11)', () => {
+  it('Test 1 shows x; Test 2 lists only y and saves it; Mark reviewed on report 1: x stays absent (and back under review-appends-old)', async () => {
+   for (const mutation of [undefined, 'review-appends-old'] as const) {
+    mutations.set(mutation ? [mutation] : []);
+    try {
+    const store = memorySettingsStore();
+    let names = ['x'];
+    const port: ProcessPort = {
+      async start(_setup, onEvent) {
+        const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: names.map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) } })] : []));
+        (port as any).fp = fp;
+        await fp.port.start(_setup, onEvent);
+        return { run: `r${Math.random()}` };
+      },
+      write: async (_run, bytes) => (port as any).fp.port.write('p1', bytes),
+      stop: async () => (port as any).fp.port.stop('p1'),
+      forget: async () => {}
+    };
+    const client = await clientOf(store, port);
+    await client.add({ setup: local('l1'), problems: [] });
+    const one = await client.test('l1');
+    if (!one.ok) throw new Error('test 1');
+    names = ['y'];
+    const two = await client.test('l1');
+    if (!two.ok) throw new Error('test 2');
+    expect(client.owner.server('l1')!.tools.map((t) => t.name)).toEqual(['y']);
+    await client.markReviewed('l1', one.report, ['x']);
+    expect(client.owner.server('l1')!.tools.map((t) => t.name)).toEqual(mutation ? ['y', 'x'] : ['y']);
+    if (mutation) continue;
+    // On the newest report, a tool its own catalog write missed is still kept (the dropped-write case above).
+    await client.markReviewed('l1', two.report, ['y']);
+    expect(client.owner.server('l1')!.tools).toEqual([{ name: 'y', fingerprint: two.tools[0]!.fingerprint, reviewed: two.tools[0]!.fingerprint }]);
+    } finally {
+      mutations.clear();
+    }
+   }
   });
 });
 
