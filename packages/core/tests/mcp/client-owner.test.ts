@@ -379,7 +379,8 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
   it('a revoke the owner refuses holds for now and says it was not saved; a restart brings the saved choice back', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
-    await client.choose('s1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 'l' });
+    // A grant already saved (the client grants only a version listed now; the server isn't running here).
+    await client.owner.choose('s1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 'l' });
     const busy = client.owner.admit('other');
     if (!('release' in busy)) throw new Error('not admitted');
     const r = await client.revoke('s1', 'echo', 'ask');
@@ -539,7 +540,7 @@ describe('5.5: a revoke holds until the person chooses again', () => {
     expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('allow');
     // A server tool's: the overlay no longer refuses at the send either.
     await client.revoke('s1', 'echo', 'never');
-    await client.choose('s1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 'l' });
+    await client.choose('s1', 'echo', { policy: 'ask', fingerprint: 'f', setupFingerprint: 'l' });
     expect((client as any).overlay.has(choiceKey('s1', 'echo'))).toBe(false);
   });
 

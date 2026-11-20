@@ -163,6 +163,12 @@ export interface JournalOptions {
   /**
    * Saves a "may run on its own" grant for exactly these card facts, once the journal has checked the press
    * was on the card showing now and its facts still hold. Without it, no card offers the button.
+   *
+   * The contract (step 8 wires it to `McpClient.choose` with `policy: 'own'`, which keeps it): it resolves
+   * false, saving nothing, unless the server lists the tool now with exactly that fingerprint and setup; and
+   * a listing that lands while the grant saves, lacking the tool or listing it otherwise, stops the grant
+   * as it lands (asks again at once, cleared durably once the owner is free), so the journal's own check
+   * before it can't be outrun.
    */
   readonly grantOwn?: (facts: CardFacts) => Promise<boolean>;
   readonly presence: PresencePort;

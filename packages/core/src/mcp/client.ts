@@ -123,6 +123,9 @@ export class McpClient {
   private readonly listings = new Map<string, number>();
   private readonly runListing = new Map<string, number>();
   private reportCount = 0;
+  /** Grants being saved now, by key: spoiled when a listing during the save lacks the tool or lists it
+      otherwise. */
+  private readonly granting = new Map<string, { readonly fingerprint: string; spoiled: boolean }>();
   /** Grants a changed listing cleared in memory, still to be cleared durably. */
   private readonly clears = new Map<string, { readonly server: string; readonly tool: string; readonly fingerprint: string }>();
   private readonly o: McpClientOptions;
@@ -323,8 +326,37 @@ export class McpClient {
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
     const key = choiceKey(serverId, tool);
     const before = this.revokes.get(key) ?? 0;
-    const r = await this.owner.choose(serverId, tool, choice);
+    // "May run on its own" is granted only for the version the server lists now, with its setup; and any
+    // listing during the save that lacks the tool or lists it otherwise stops the grant as it lands (5.6).
+    const own = choice?.policy === 'own' && serverId !== BUILT_IN;
+    if (own) {
+      const live = this.tools().find(t => t.server.id === serverId && t.serverName === tool);
+      if (!live || live.fingerprint !== choice.fingerprint || live.setupFingerprint !== choice.setupFingerprint) throw new Error(`${tool} changed or stopped since you saw it, so "may run on its own" was not saved.`);
+      this.granting.set(key, { fingerprint: choice.fingerprint, spoiled: false });
+    }
+    let r: Awaited<ReturnType<Owner['choose']>>;
+    let spoiled = false;
+    try {
+      r = await this.owner.choose(serverId, tool, choice);
+    } finally {
+      if (own) {
+        spoiled = this.granting.get(key)?.spoiled === true;
+        this.granting.delete(key);
+      }
+    }
     if (!r.ok) throw new Error(r.words);
+    if (own) {
+      const live = this.tools().find(t => t.server.id === serverId && t.serverName === tool);
+      const changed = spoiled || !live || live.fingerprint !== choice.fingerprint || live.setupFingerprint !== choice.setupFingerprint;
+      if (changed && !(__FAMILIAR_MUTATIONS__ && mutant('own-grant-unchecked'))) {
+        // Saved, but already stale: stopped in memory at once, cleared durably as soon as the owner is free.
+        if (this.overlay.get(key) !== 'never') this.overlay.set(key, 'ask');
+        this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
+        this.clears.set(key, { server: serverId, tool, fingerprint: choice.fingerprint });
+        this.clearGrants();
+        return;
+      }
+    }
     if ((this.revokes.get(key) ?? 0) === before) this.overlay.delete(key);
   }
 
@@ -484,14 +516,22 @@ export class McpClient {
     // A "may run on its own" grant for a tool listed now with another fingerprint stops holding at once, in
     // memory, whatever the owner is doing; its durable clear follows (in the catalog write, or as soon as the
     // owner is free), so a tool that changes and changes back asks again (5.6).
-    const choices = this.owner.choices();
-    for (const t of now) {
-      const key = choiceKey(id, t.name);
-      const c = choices[key];
-      if (c?.policy !== 'own' || c.fingerprint === t.fingerprint || (__FAMILIAR_MUTATIONS__ && (mutant('own-kept-on-skip') || mutant('own-ignores-fingerprint')))) continue;
+    // A listing that lacks the tool stops it too: the grant holds only while the server lists the tool
+    // exactly as it did.
+    const listed = new Map(now.map(t => [t.name, t.fingerprint]));
+    for (const [key, c] of Object.entries(this.owner.choices())) {
+      const [server, tool] = JSON.parse(key) as [string, string];
+      if (server !== id || c.policy !== 'own') continue;
+      const fp = listed.get(tool);
+      if (fp === undefined && (__FAMILIAR_MUTATIONS__ && mutant('own-kept-on-absence'))) continue;
+      if (fp === c.fingerprint || (__FAMILIAR_MUTATIONS__ && (mutant('own-kept-on-skip') || mutant('own-ignores-fingerprint')))) continue;
       if (this.overlay.get(key) !== 'never') this.overlay.set(key, 'ask');
       this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
-      this.clears.set(key, { server: id, tool: t.name, fingerprint: c.fingerprint });
+      this.clears.set(key, { server: id, tool, fingerprint: c.fingerprint });
+    }
+    for (const [key, g] of this.granting) {
+      const [server, tool] = JSON.parse(key) as [string, string];
+      if (server === id && listed.get(tool) !== g.fingerprint) g.spoiled = true;
     }
     this.clearGrants();
     const s = this.owner.server(id);
