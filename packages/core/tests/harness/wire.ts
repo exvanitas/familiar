@@ -46,6 +46,9 @@ export const DETACH_MS = 1_000;
 export const EXE_DETACHED_SERVER_HELPERS = 8;
 /** The page's interim bound on a local write (4.3), as the contract gives it. */
 export const INTERIM_WRITE_MS = 10_000;
+/** The exe's own write bound in the pass build, and how long it drains a process's output at its exit. */
+export const EXE_WRITE_BOUND_MS = 10_000;
+export const EXE_EXIT_DRAIN_MS = 2_000;
 export const HELPER_HELD_MS = 120_000;
 
 /* ---------- the server's script, per seed ---------- */
@@ -633,7 +636,7 @@ export class FakeExe {
 
   processes(): ProcessPort {
     let runs = 0;
-    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; bounded?: boolean }>();
+    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number }>();
     const flush = (run: string) => {
       const p = live.get(run)!;
       if (p.flushing || !p.out.length) return;
@@ -658,9 +661,31 @@ export class FakeExe {
     };
     const exit = (run: string, code: number | null) => {
       const p = live.get(run);
-      if (!p || p.exited) return;
-      // As the exe does: the output already written drains before the exit is reported.
-      while (p.out.length) deliver(run, p.out.shift()!);
+      if (!p || p.exited || p.exiting) return;
+      // As the exe does: the output already written drains before the exit is reported, for at most 2 s;
+      // what's left then is dropped.
+      if (p.out.length) {
+        p.exiting = true;
+        let cut = false;
+        const cancel = this.sched.timer(() => {
+          cut = true;
+          p.out.length = 0;
+          finish(run, code);
+        }, EXE_EXIT_DRAIN_MS);
+        const drain = (): void => void this.sched.add({ label: `drain:${run}`, fire: () => {
+          if (cut) return;
+          if (p.out.length) deliver(run, p.out.shift()!);
+          if (p.out.length) return drain();
+          cancel();
+          finish(run, code);
+        } });
+        return drain();
+      }
+      finish(run, code);
+    };
+    const finish = (run: string, code: number | null) => {
+      const p = live.get(run)!;
+      if (p.exited) return;
       p.exited = true;
       this.exits.push({ epoch: p.epoch, step: this.sched.step });
       for (const w of p.writes.splice(0)) {
@@ -673,14 +698,11 @@ export class FakeExe {
     const take = (run: string, w: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }) => {
       const p = live.get(run)!;
       this.sched.add({ label: `write-done:${w.rec.n}`, fire: () => {
-        if (p.exited || !p.writes.includes(w)) return;
+        // A process the exe is ending reads nothing more.
+        if (p.exited || p.exiting || !p.writes.includes(w)) return;
         if (this.server.mode.stopReading && p.taken >= 4) {
-          // It stopped reading: the write never ends. In the pass build the exe's own write bound ends the
-          // run 10 s later (the process killed); in the pre-pass build only the page's bound does.
-          if (this.build === 'pass' && !p.bounded) {
-            p.bounded = true;
-            this.sched.timer(() => exit(run, null), 10_000);
-          }
+          // It stopped reading: the write never ends. In the pass build the exe's own write bound, armed at
+          // the write's start, ends the run (the process killed); in the pre-pass build only the page's does.
           return;
         }
         p.taken++;
@@ -760,6 +782,11 @@ export class FakeExe {
           const w = { rec, done: resolve, fail: reject };
           p.writes.push(w);
           take(run, w);
+          // The pass build's native write bound (4.1), from the write's own start: a write still pending 10 s
+          // later kills the process. Armed where a server can stop reading.
+          if (this.build === 'pass' && this.server.mode.stopReading) this.sched.timer(() => {
+            if (!p.exited && p.writes.includes(w)) exit(run, null);
+          }, EXE_WRITE_BOUND_MS);
         }),
       stop: async (run) => {
         const asked = live.get(run);

@@ -27,3 +27,17 @@ describe('the named schedules', () => {
     expect(H4(pass)).toEqual([]);
   }, 60_000);
 });
+
+describe("the exe's own write bound", () => {
+  it('S18 in the pass build with the page watchdog off (no-write-bound): the exe alone stops the server within the bound, and H1 holds', async () => {
+    const s18 = SCHEDULES.find((s) => s.name.startsWith('S18'))!;
+    const problems: string[] = [];
+    for (let seed = 1; seed <= 8; seed++) {
+      const r = await wireRun(seed, { ...s18.options, build: 'pass', mutation: 'no-write-bound' });
+      for (const [name, check] of Object.entries(PASS_CHECKS)) if (name !== 'H4' && name !== 'H5') for (const p of check(r)) problems.push(`seed ${seed} ${name}: ${p}`);
+      const missing = s18.expect?.(r);
+      if (missing) problems.push(`seed ${seed}: ${missing}`);
+    }
+    expect(problems).toEqual([]);
+  }, 120_000);
+});
