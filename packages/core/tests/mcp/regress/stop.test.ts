@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ServerLink, type Target } from '../../../src/mcp/wire/link.ts';
 import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import { initResult, listResult, realClock } from '../wire-fakes.ts';
+import { mutations } from '../../../src/mutations.ts';
 
 const local: Target = { where: 'local', setup: { id: 's1', label: 'S', program: 'node', args: [], cwd: '.', env: [], secrets: [] } };
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -129,5 +130,55 @@ describe('Stop during the handshake', () => {
     expect((await started).ok).toBe(false);
     await sleep(40);
     expect(stops).toEqual(['p1']);
+  });
+});
+
+describe('a Stop the exe refuses (shadow r32 F28, r32b #7)', () => {
+  it('on a Ready local run: Stop answers, in words that say it may still be running, and the slot waits for the exit (stop-refused-waits hangs)', async () => {
+   for (const mutation of [undefined, 'stop-refused-waits'] as const) {
+    mutations.set(mutation ? [mutation] : []);
+    try {
+    const { McpClient } = await import('../../../src/mcp/client.ts');
+    const { memorySettingsStore } = await import('../../../src/settings/store.ts');
+    const { testPaths, REPO } = await import('../fake.ts');
+    let emit!: (e: ProcessEvent) => void;
+    const port: ProcessPort = {
+      async start(_s, on) {
+        emit = on;
+        return { run: 'p1' };
+      },
+      async write(_r, b) {
+        const m = JSON.parse(new TextDecoder().decode(b));
+        queueMicrotask(() => {
+          if (m.method === 'initialize') emit({ t: 'out', line: JSON.stringify(initResult(m.id)) });
+          if (m.method === 'tools/list') emit({ t: 'out', line: JSON.stringify(listResult(m.id, ['look'])) });
+        });
+      },
+      async stop() {
+        throw Object.assign(new Error('refused'), { kind: 'failed' });
+      },
+      async forget() {}
+    };
+    const client = await McpClient.open({ store: memorySettingsStore(), processes: port, net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: realClock, paths: testPaths });
+    await client.add({ setup: { kind: 'local', id: 'l1', label: 'L', program: process.execPath, args: ['x.js'], cwd: REPO, env: [], secrets: [] }, problems: [] });
+    expect((await client.start('l1')).kind).toBe('ready');
+    const answered = await Promise.race([client.stop('l1'), sleep(mutation ? 300 : 2_000).then(() => 'hung' as const)]);
+    if (mutation) {
+      // The control: Stop waits for a run's end that nothing brings.
+      expect(answered).toBe('hung');
+      emit({ t: 'exit', code: 0 });
+      continue;
+    }
+    expect(answered).toMatchObject({ kind: 'failed', failure: { words: expect.stringMatching(/refused, so it may still be running/) } });
+    expect(client.get('l1')!.phase).toBe('failed');
+    // Nothing is admitted to the process while it may live: a Start is refused until it has exited.
+    expect((await client.start('l1')).kind).not.toBe('ready');
+    emit({ t: 'exit', code: 0 });
+    await sleep(10);
+    expect((await client.start('l1')).kind).toBe('ready');
+    } finally {
+      mutations.clear();
+    }
+   }
   });
 });

@@ -16,7 +16,7 @@ import type { ProcessPort } from './process.ts';
 import { remoteHeaders } from './remote.ts';
 import { processSetupOf, remoteTargetOf, setupFingerprint } from './setup.ts';
 import type { Failure, ListedTool, Reply } from './types.ts';
-import { LINK_LIMITS, ServerLink, type LinkClock, type LinkLimits, type NetPort, type Target } from './wire/link.ts';
+import { LINK_LIMITS, ServerLink, STOP_REFUSED, type LinkClock, type LinkLimits, type NetPort, type Target } from './wire/link.ts';
 import { mutant } from '../mutations.ts';
 
 export type Phase = 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed';
@@ -228,8 +228,12 @@ export class ServerRuntime {
     if (this.phaseNow !== 'ready' && this.phaseNow !== 'starting') return { kind: 'refused', words: `It is ${this.phaseNow}.` };
     this.startToken++;
     this.set('stopping');
-    await this.link.stop();
+    const how = await this.link.stop();
     this.runId = undefined;
+    if (how === 'refused') {
+      this.set('failed', STOP_REFUSED);
+      return { kind: 'failed', failure: STOP_REFUSED };
+    }
     this.set('stopped');
     return { kind: 'stopped' };
   }

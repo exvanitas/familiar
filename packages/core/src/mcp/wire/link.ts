@@ -73,6 +73,8 @@ export interface LinkLimits {
 
 export const LINK_LIMITS: LinkLimits = { startMs: 60_000, listMs: 30_000, pongMs: 5_000, headersMs: 120_000, idleMs: 15 * 60_000, writeMs: 10_000 };
 export const MAX_PAGES = 16;
+/** A Stop the exe refused (5.4): the run is over for Familiar, but the process may still be running. */
+export const STOP_REFUSED: Failure = { kind: 'failed', words: 'Familiar asked Windows to stop the server and was refused, so it may still be running. Familiar starts it again only once it has exited; restarting Familiar ends it for sure.' };
 export const MAX_SESSION_ID = 1024;
 const DROPPED_LINE = /^a stdout line over \d+ MiB was dropped$/;
 
@@ -134,6 +136,8 @@ interface Run {
   /** Familiar asked the exe to stop the process (a watchdog, a deadline, Stop): its exit is Familiar's doing,
       never a server that ended its own process, so no relaunch follows it. */
   killed?: boolean;
+  /** The exe refused Stop's native stop: the process may live on until it exits by itself. */
+  stopRefused?: boolean;
   /** Stop has begun: set synchronously before Stop awaits anything, so no exchange is admitted after it. */
   closing?: boolean;
   nextId: number;
@@ -255,6 +259,10 @@ export class ServerLink {
     // Held for good: a restart is the only way back, and the words say so (not "try again in a moment").
     if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { ok: false, failure: this.stuck };
     if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
+    // A local process whose stop the exe refused may still be running: nothing starts beside it until it
+    // has exited.
+    const prev = this.run;
+    if (prev && prev.target.where === 'local' && prev.process !== undefined && !prev.exited && prev.stopRefused) return { ok: false, failure: STOP_REFUSED };
     let finish!: () => void;
     const over = new Promise<void>((r) => (finish = r));
     let sawExit!: () => void;
@@ -338,10 +346,14 @@ export class ServerLink {
     }
   }
 
-  /** Ends the run: a local server is stopped (its exit ends the run); a remote run ends at once. */
-  async stop(): Promise<void> {
+  /**
+   * Ends the run: a local server is stopped (its exit ends the run); a remote run ends at once. `refused`:
+   * the exe refused to stop the process, so the run is ended without its exit, and the process may still
+   * be running; its writes, the slot and the next start still wait for the exit.
+   */
+  async stop(): Promise<'stopped' | 'refused'> {
     const run = this.run;
-    if (!run || run.ended) return;
+    if (!run || run.ended) return 'stopped';
     // The fence, before any await: a local Stop waits for the exe and the exit, and nothing may be
     // admitted to the stopping server meanwhile (a walk's next page, a call, an idle ping's pong).
     if (!(__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'))) {
@@ -356,7 +368,7 @@ export class ServerLink {
     if (run.target.where === 'local') {
       // A native start still pending is waited out first: the start itself then stops what it started.
       if (run.process === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('stop-skips-pending-start'))) await run.launched;
-      if (run.process === undefined) return;
+      if (run.process === undefined) return 'stopped';
       // Waits for the exe's answer and the exit, with no deadline of its own (5.4): Stop answers only once
       // the process is gone. One native stop per run, whoever asks first. A stop the exe refuses answers
       // once the run has ended; its writes, and the slot, still wait for the exit (H1).
@@ -365,16 +377,24 @@ export class ServerLink {
           () => true,
           () => false
         );
+        // Refused: nothing will end the run but an exit that may never come. The run ends now, in those
+        // words, and Stop answers; the writes and the slot wait for the exit as before.
+        if (!asked && !run.exited && !(__FAMILIAR_MUTATIONS__ && mutant('stop-refused-waits'))) {
+          run.stopRefused = true;
+          this.endRun(run, STOP_REFUSED, false);
+          return 'refused';
+        }
         await (asked && !(__FAMILIAR_MUTATIONS__ && mutant('stop-before-exit')) ? run.exit : run.over);
       }
       await run.over;
-      return;
+      return 'stopped';
     }
     if ((__FAMILIAR_MUTATIONS__ && mutant('delete-at-stop'))) {
       const t = run.target as Extract<Target, { where: 'remote' }>;
       void this.ports.net!.fetch({ id: randomId(), address: t.address, url: t.url, method: 'DELETE' as 'POST', headers: this.headers(run, undefined) }, new Uint8Array(0)).catch(() => {});
     }
     this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
+    return 'stopped';
   }
 
   /** The tool list again (Test, or after list_changed). A failed walk ends the run. */
