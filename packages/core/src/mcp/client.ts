@@ -122,12 +122,17 @@ export class McpClient {
   /** Counts each server's listings (every run's, Test's included): a report is the newest while none came after it. */
   private readonly listings = new Map<string, number>();
   private reportCount = 0;
+  /** Grants a changed listing cleared in memory, still to be cleared durably. */
+  private readonly clears = new Map<string, { readonly server: string; readonly tool: string; readonly fingerprint: string }>();
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {
     this.o = options;
     this.owner = owner;
-    owner.onChange(() => this.sync());
+    owner.onChange(() => {
+      this.sync();
+      this.clearGrants();
+    });
     this.sync();
   }
 
@@ -153,6 +158,21 @@ export class McpClient {
       this.runtimes.set(id, rt);
     }
     for (const id of [...this.runtimes.keys()]) if (!ids.has(id)) this.runtimes.delete(id);
+  }
+
+  /** The durable half of a grant's clearing: tried whenever the owner is free, until it lands. */
+  private clearGrants(): void {
+    if (this.owner.busy || !this.clears.size) return;
+    for (const [key, c] of this.clears) {
+      const now = this.owner.choices()[key];
+      if (now?.policy !== 'own' || now.fingerprint !== c.fingerprint) {
+        this.clears.delete(key);
+        continue;
+      }
+      this.clears.delete(key);
+      void this.owner.choose(c.server, c.tool, undefined).then((r) => (r.ok ? undefined : this.clears.set(key, c)));
+      return;
+    }
   }
 
   /** Repair, in a fresh exe only (5.3): the one mark finished or rolled back, tombstones retried, orphan
@@ -453,6 +473,19 @@ export class McpClient {
   /** A run's tool list, saved as the tools last seen while its run is current; what the person reviewed is kept. */
   private async seen(id: string, now: readonly ListedTool[], current: () => boolean): Promise<void> {
     this.listings.set(id, (this.listings.get(id) ?? 0) + 1);
+    // A "may run on its own" grant for a tool listed now with another fingerprint stops holding at once, in
+    // memory, whatever the owner is doing; its durable clear follows (in the catalog write, or as soon as the
+    // owner is free), so a tool that changes and changes back asks again (5.6).
+    const choices = this.owner.choices();
+    for (const t of now) {
+      const key = choiceKey(id, t.name);
+      const c = choices[key];
+      if (c?.policy !== 'own' || c.fingerprint === t.fingerprint || (__FAMILIAR_MUTATIONS__ && (mutant('own-kept-on-skip') || mutant('own-ignores-fingerprint')))) continue;
+      if (this.overlay.get(key) !== 'never') this.overlay.set(key, 'ask');
+      this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
+      this.clears.set(key, { server: id, tool: t.name, fingerprint: c.fingerprint });
+    }
+    this.clearGrants();
     const s = this.owner.server(id);
     if (!s) return;
     const before = new Map(s.tools.map(t => [t.name, t]));

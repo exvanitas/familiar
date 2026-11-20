@@ -12,8 +12,7 @@ const card = (presentation: string, extra: Partial<ConsentCard> = {}): ConsentCa
 
 describe('T10: card answers from another window (5.7)', () => {
   it('carry a presentation id and a button only; each presentation answers once; anything else answers nothing', async () => {
-    const own: ConsentCard[] = [];
-    const desk = createCardDesk({ onOwn: (c) => own.push(c) });
+    const desk = createCardDesk();
     const plain = desk.port.ask(card('p1'));
     expect(desk.showing().map((s) => [s.card.presentation, s.buttons])).toEqual([['p1', ['yes', 'skip']]]);
     // Not an answer: not an object, no presentation, too long, not a string button, an unknown presentation.
@@ -31,13 +30,12 @@ describe('T10: card answers from another window (5.7)', () => {
     const odd = desk.port.ask(card('p3', { own: 'May run on its own.' }));
     expect(desk.answer({ presentation: 'p3', button: 'always' })).toEqual({ kind: 'answered', yes: false, own: false });
     expect(await odd).toBe(false);
-    // "May run on its own", where offered: a Yes, and the grant goes to the owner through the desk's own
-    // callback, for the card's stored facts.
+    // "May run on its own", where offered: the card answers `own`, a Yes that asks for the grant; the journal
+    // checks the presentation and its facts before it saves anything (tests/mcp/journal.test.ts).
     const withOwn = desk.port.ask(card('p4', { own: 'May run on its own.' }));
     expect(buttonsOf(card('p4', { own: 'May run on its own.' }))).toEqual(['yes', 'own', 'skip']);
     expect(desk.answer({ presentation: 'p4', button: 'own' })).toEqual({ kind: 'answered', yes: true, own: true });
-    expect(await withOwn).toBe(true);
-    expect(own.map((c) => c.presentation)).toEqual(['p4']);
+    expect(await withOwn).toBe('own');
     // A card withdrawn (its call stopped) is gone: a late answer is nothing.
     const stop = new AbortController();
     const withdrawn = desk.port.ask(card('p5'), stop.signal);

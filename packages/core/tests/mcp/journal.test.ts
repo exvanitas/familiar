@@ -4,6 +4,7 @@
 // interrupted, with Run again, and the server never gets it a second time.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFakeModel, type FakeReply } from '../../src/testing/index.ts';
+import type { JournalOptions } from '../../src/index.ts';
 import { choiceKey, decideByRules, McpClient, openJournal, parsePaste, systemClock, toolPolicies, type GatePolicy, type ModelRequest, type ServerTool, type ToolChoice } from '../../src/index.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 import { nodeWorld, type NodeWorld } from '../journal/node-env.ts';
@@ -22,7 +23,7 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice>; review?: boolean } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice>; review?: boolean; grantOwn?: JournalOptions['grantOwn'] } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
   const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
@@ -44,7 +45,7 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
 }
 
 /** A journal over the given wrappers: the tools a turn loop holds until it's opened again. */
-async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string } = {}) {
+async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; grantOwn?: JournalOptions['grantOwn'] } = {}) {
   const model = createFakeModel(script);
   const journal = await openJournal({
     store: await world.open(extra.storeName ?? 'mcp-kill'),
@@ -56,6 +57,7 @@ async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: Model
     clock: systemClock,
     wake: { wakeAt: () => {} },
     consent: extra.consent ?? { ask: (card) => Promise.resolve(extra.ask?.(card) ?? true) },
+    ...(extra.grantOwn ? { grantOwn: extra.grantOwn } : {}),
     ...(extra.policy ? { policy: extra.policy } : {}),
     presence: { report: () => {} },
     persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
@@ -138,7 +140,7 @@ describe('a server tool in the turn loop', () => {
     let held: ServerTool[] = [];
     let client!: McpClient;
     const policy = () => client.policy(held);
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true, grantOwn: async () => true });
     held = one.tools;
     client = one.client;
     const echo = held.find(t => t.serverName === 'echo')!;

@@ -103,8 +103,9 @@ export interface ConsentCard {
 }
 
 export interface ConsentPort {
-  /** Shows the card and resolves with the person's answer. After a restart the same card is asked again. */
-  ask(card: ConsentCard, signal?: AbortSignal): Promise<boolean>;
+  /** Shows the card and resolves with the person's answer: Yes, No, or "May run on its own" (`own`, a Yes
+      that also asks for the standing grant). After a restart the same card is asked again. */
+  ask(card: ConsentCard, signal?: AbortSignal): Promise<boolean | 'own'>;
 }
 
 export type { Question } from './view.ts';
@@ -130,7 +131,7 @@ export interface Remark {
 
 /** The words on a server tool card's "May run on its own" button. */
 export function ownWords(tool: string, server: string): string {
-  return `May run on its own: Familiar will call ${tool} on ${server} whenever she decides to, without asking you, even when something a server said led her there. Only this version of the tool, and you can take it back in Settings.`;
+  return `May run on its own: Familiar will call ${tool} on ${server} whenever she decides to, without asking you, even when something a server said led her there. It holds only while the server lists the tool exactly as it does now: if that listing changes, Familiar asks again. You can take it back in Settings.`;
 }
 
 /** What the decider sees that the loop doesn't know itself. */
@@ -159,6 +160,11 @@ export interface JournalOptions {
   /** Shows a parked wake's notification when it fires. */
   readonly notifier: NotifierPort;
   readonly consent: ConsentPort;
+  /**
+   * Saves a "may run on its own" grant for exactly these card facts, once the journal has checked the press
+   * was on the card showing now and its facts still hold. Without it, no card offers the button.
+   */
+  readonly grantOwn?: (facts: CardFacts) => Promise<boolean>;
   readonly presence: PresencePort;
   readonly persona: { readonly id: string; readonly name: string; readonly instructions: string };
   readonly decider: DecisionPort;
@@ -540,19 +546,21 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         askedAt: stored?.askedAt ?? clock.now(),
         turn,
         presentation: Math.random().toString(36).slice(2, 14),
-        ...(facts ? { facts, own: ownWords(call.name, (tool as { server?: { label?: string } } | undefined)?.server?.label ?? 'its server') } : {})
+        ...(facts ? { facts, ...(options.grantOwn ? { own: ownWords(call.name, (tool as { server?: { label?: string } } | undefined)?.server?.label ?? 'its server') } : {}) } : {})
       };
       await harness.commit(async (tx: any) => {
         (await tx.doc(ConsentDoc)).cards[id] = card;
       }, ctx);
       // The wait observes the call's abort signal, so a close never hangs on an unanswered card. The card
       // stays in the journal, unanswered, and is asked again on the next open.
-      const ok = await new Promise<boolean | 'closed'>((resolve) => {
+      const ok = await new Promise<boolean | 'own' | 'closed'>((resolve) => {
         if (signal?.aborted) return resolve('closed');
         signal?.addEventListener('abort', () => resolve('closed'), { once: true });
         options.consent.ask(card, signal).then(resolve, () => resolve(false));
       });
       if (ok === 'closed') throw new Error('The journal closed while the card was open.');
+      // (The named mutation saves the grant before anything is checked: a press on a card already stale.)
+      if (ok === 'own' && card.facts && options.grantOwn && (__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) void options.grantOwn(card.facts).catch(() => false);
       // The answer counts only for the presentation still current.
       const current = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
       if (current?.presentation !== card.presentation) return 'The card was answered after it was replaced, so nothing was sent.';
@@ -568,6 +576,12 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const doc = await tx.doc(ConsentDoc);
         if (doc.cards[id]?.presentation === card.presentation) doc.cards[id].answer = ok ? 'allow' : 'deny';
       }, ctx);
+      // "May run on its own", pressed on the card showing now, whose facts still hold: the grant, for exactly
+      // those facts. A grant that isn't saved is reported; the Yes to this call stands either way.
+      if (ok === 'own' && card.facts && options.grantOwn && !(__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) {
+        const saved = await options.grantOwn(card.facts).catch(() => false);
+        if (!saved) report('own', 'The "may run on its own" choice was not saved. This call was still sent.');
+      }
       return ok ? { allowedBy: 'asked', ...(card.facts ? { facts: card.facts } : {}) } : 'The person said no.';
     }
     return `${call.name} kept changing while you were asked, so nothing was sent.`;

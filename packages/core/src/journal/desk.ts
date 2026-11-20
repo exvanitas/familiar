@@ -28,21 +28,21 @@ export interface CardDesk {
 
 const MAX_ID = 64;
 
-/** `onOwn` hears a "May run on its own" press, with the card it was pressed on: Settings saves the grant for
-    the card's stored facts (its tool, fingerprint and setup), never for anything a window sent. */
-export function createCardDesk(options: { readonly onOwn?: (card: ConsentCard) => void } = {}): CardDesk {
-  const pending = new Map<string, { readonly card: ConsentCard; readonly settle: (yes: boolean) => void }>();
+/** A "May run on its own" press answers the card `own`: the journal checks it was pressed on the card showing
+    now, with its facts still holding, and only then saves the grant for those facts (journal's `grantOwn`). */
+export function createCardDesk(): CardDesk {
+  const pending = new Map<string, { readonly card: ConsentCard; readonly settle: (yes: boolean | 'own') => void }>();
   // For a named mutation only: the step each presentation was for.
   const stepOf = new Map<string, string>();
   return {
     port: {
       ask(card, signal) {
-        return new Promise<boolean>((resolve) => {
+        return new Promise<boolean | 'own'>((resolve) => {
           const p = card.presentation;
           // A card with no presentation id can't be answered from outside: it's never shown here.
           if (!p) return resolve(false);
           if (__FAMILIAR_MUTATIONS__) stepOf.set(p, card.id);
-          const settle = (yes: boolean) => {
+          const settle = (yes: boolean | 'own') => {
             if (pending.get(p)?.settle !== settle) return;
             pending.delete(p);
             resolve(yes);
@@ -65,8 +65,7 @@ export function createCardDesk(options: { readonly onOwn?: (card: ConsentCard) =
       const offered = (buttonsOf(entry.card) as readonly string[]).includes(button);
       const yes = offered && (button === 'yes' || button === 'own');
       const own = offered && button === 'own';
-      entry.settle(yes);
-      if (own) options.onOwn?.(entry.card);
+      entry.settle(own ? 'own' : yes);
       return { kind: 'answered', yes, own };
     }
   };
