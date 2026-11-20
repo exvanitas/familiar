@@ -63,7 +63,7 @@ describe('Start and the last exchange\'s drain', () => {
       },
       async forget() {}
     };
-    const link = new ServerLink('s', { processes: port }, realClock, { ended: () => {} }, { startMs: 200, listMs: 200, pongMs: 100, headersMs: 1000, idleMs: 1000, writeMs: 60_000 });
+    const link = new ServerLink('s', { processes: port }, realClock, { ended: () => {} }, { startMs: 200, listMs: 200, pongMs: 100, headersMs: 1000, idleMs: 1000, writeMs: 60_000, stopMs: 10_000, graceMs: 2_000 });
     const r = await link.start(local, 'L');
     expect(r).toMatchObject({ ok: false, failure: { kind: 'timed-out' } });
   });

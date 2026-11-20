@@ -5,10 +5,23 @@ import { describe, expect, it } from 'vitest';
 import { ServerLink, type Target } from '../../../src/mcp/wire/link.ts';
 import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import { realClock } from '../wire-fakes.ts';
-import { LINK_LIMITS } from '../../../src/mcp/wire/link.ts';
+import { LINK_LIMITS, type LinkLimits } from '../../../src/mcp/wire/link.ts';
 import { mutations } from '../../../src/mutations.ts';
 
 const local: Target = { where: 'local', setup: { id: 's1', label: 'S', program: 'node', args: [], cwd: '.', env: [], secrets: [] } };
+
+/** A port that counts its native starts: the relaunch, now inside the start (3.9), is a second one. */
+function counted(port: ProcessPort): { readonly port: ProcessPort; readonly starts: () => number } {
+  let n = 0;
+  return { port: { ...port, start: (s, on) => (n++, port.start(s, on)) }, starts: () => n };
+}
+/** Starts once and reports whether a relaunch followed (a second native start). */
+async function relaunched(port: ProcessPort, limits?: LinkLimits): Promise<{ readonly ok: boolean; readonly relaunched: boolean }> {
+  const c = counted(port);
+  const link = new ServerLink('m', { processes: c.port }, realClock, { ended: () => {} }, limits);
+  const r = await link.start(local, 'L');
+  return { ok: r.ok, relaunched: c.starts() > 1 };
+}
 
 /** A modern-only server: refuses the opening, then answers the modern list with `list` (or nothing), and
     exits `exitMs` later; `closeAfterInit` closes the pipe right after the opening. */
@@ -36,17 +49,13 @@ function modernOnly(list: 'refuse' | 'nothing', exitMs: number) {
 
 describe('a definitive refusal of the modern list', () => {
   it('a list answered -32022, then an exit: no relaunch, the answer decides', async () => {
-    const link = new ServerLink('m', { processes: modernOnly('refuse', 20) }, realClock, { ended: () => {} });
-    const r = await link.start(local, 'L');
-    expect(r.ok).toBe(false);
-    expect(r).not.toHaveProperty('relaunch');
+    expect(await relaunched(modernOnly('refuse', 20))).toEqual({ ok: false, relaunched: false });
   });
 
   it('the control: relaunching on an answer too (the named mutation) asks for one', async () => {
     mutations.set(['relaunch-on-answer']);
     try {
-      const link = new ServerLink('m', { processes: modernOnly('refuse', 20) }, realClock, { ended: () => {} });
-      expect(await link.start(local, 'L')).toMatchObject({ ok: false, relaunch: 'modern' });
+      expect(await relaunched(modernOnly('refuse', 20))).toMatchObject({ relaunched: true });
     } finally {
       mutations.clear();
     }
@@ -76,10 +85,7 @@ describe('a modern stdio refusal whose exit lags', () => {
     };
     mutations.set(['relaunch-races-exit']);
     try {
-      const link = new ServerLink('m', { processes: port }, realClock, { ended: () => {} });
-      const r = await link.start(local, 'L');
-      expect(r.ok).toBe(false);
-      expect(r).not.toHaveProperty('relaunch');
+      expect(await relaunched(port)).toEqual({ ok: false, relaunched: false });
       expect(mutations.hits('relaunch-races-exit')).toBeGreaterThan(0);
     } finally {
       mutations.clear();
@@ -107,8 +113,7 @@ describe('a modern stdio refusal whose exit lags', () => {
       async stop() {},
       async forget() {}
     };
-    const link = new ServerLink('m', { processes: port }, realClock, { ended: () => {} });
-    expect(await link.start(local, 'L')).toMatchObject({ ok: false, relaunch: 'modern' });
+    expect(await relaunched(port)).toMatchObject({ relaunched: true });
   });
 });
 
@@ -135,14 +140,12 @@ describe('a server that stops reading after refusing', () => {
       },
       async forget() {}
     };
-    const run = async () => new ServerLink('m', { processes: port }, realClock, { ended: () => {} }, { ...LINK_LIMITS, writeMs: 30 }).start(local, 'L');
-    const r = await run();
-    expect(r.ok).toBe(false);
-    expect(r).not.toHaveProperty('relaunch');
+    const run = () => relaunched(port, { ...LINK_LIMITS, writeMs: 30 });
+    expect(await run()).toEqual({ ok: false, relaunched: false });
     // The control: the end's cause forgotten, the exit Familiar caused reads as the server's own.
     mutations.set(['relaunch-after-kill']);
     try {
-      expect(await run()).toMatchObject({ ok: false, relaunch: 'modern' });
+      expect(await run()).toMatchObject({ relaunched: true });
     } finally {
       mutations.clear();
     }
@@ -176,9 +179,6 @@ describe('a modern list answered, but not with a list Familiar can use, then an 
     ['a catalog past its bound', () => ({ resultType: 'complete', tools: tools(200) })]
   ] as const)
     it(`${name}: the answer is the server's word, so no relaunch`, async () => {
-      const link = new ServerLink('m', { processes: answered(result) }, realClock, { ended: () => {} });
-      const r = await link.start(local, 'L');
-      expect(r.ok).toBe(false);
-      expect(r).not.toHaveProperty('relaunch');
+      expect(await relaunched(answered(result))).toEqual({ ok: false, relaunched: false });
     });
 });

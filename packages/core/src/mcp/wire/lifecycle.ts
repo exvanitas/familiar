@@ -31,7 +31,8 @@ export type Cause =
   | 'era-changed'
   | 'catalog-failed'
   | 'held'
-  | 'readmit-refused';
+  | 'readmit-refused'
+  | 'turned-off';
 export type Want = { readonly kind: 'initialize' } | { readonly kind: 'initialized' } | { readonly kind: 'list'; readonly page: number };
 
 export interface Native {
@@ -152,7 +153,7 @@ export type LcEvent =
   | { readonly t: 'exhausted'; readonly failure: Failure }
   | { readonly t: 'deadline'; readonly id: number }
   | { readonly t: 'saved'; readonly gen: number; readonly outcome: 'saved' | 'skipped' | 'failed' }
-  | { readonly t: 'readmit'; readonly run: string; readonly ok: boolean; readonly words?: string };
+  | { readonly t: 'readmit'; readonly run: string; readonly ok: boolean; readonly words?: string; readonly off?: boolean };
 
 export type Reply = { readonly kind: 'ready' } | { readonly kind: 'stopped' } | { readonly kind: 'failed'; readonly failure: Failure } | { readonly kind: 'refused'; readonly words: string } | { readonly kind: 'tested'; readonly run: string };
 export type LcEffect =
@@ -196,7 +197,7 @@ const RECORD_WORDS: Record<Exclude<StartFacts['record'], 'ok'>, Reply> = {
   unlaunchable: { kind: 'failed', failure: { kind: 'failed', words: "Familiar can't read this server's saved setup, so it won't start it." } }
 };
 
-const m = (name: string): boolean => !!(__FAMILIAR_MUTATIONS__ && mutant(name));
+// Every switch is guarded at its own site by the build constant, so the app build drops it with its name.
 
 export function initialState(id: string): LcState {
   return { id, nextRun: 0, nextDeadline: 0, nextGen: 0, orphans: [], waiters: [], owner: 'free', slot: 'idle', dirty: false };
@@ -213,10 +214,27 @@ export function phaseOf(s: LcState): 'stopped' | 'starting' | 'ready' | 'stoppin
   return 'starting';
 }
 
-/** Whether a call may be handed off now: Ready, the slot Idle, and the catalog fresh (G26). */
-export function callable(s: LcState): boolean {
+/** Whether the run's catalog is the one calls may be checked against: Ready, and walked under every notice
+    read (G26). A call on it may still meet a busy slot. */
+export function offering(s: LcState): boolean {
   const r = s.run;
-  return !s.held && !!r && r.step === 'ready' && s.slot === 'idle' && !r.refreshOwed && r.published !== undefined && r.changes === r.published;
+  if (!r || s.held) return false;
+  if (r.purpose === 'recovery' && r.step !== 'closing' && (__FAMILIAR_MUTATIONS__ && mutant('ready-during-recovery'))) return true;
+  if (r.step === 'closing' && r.cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'))) return true;
+  return r.step === 'ready' && !r.refreshOwed && r.published !== undefined && r.changes === r.published;
+}
+
+/** Whether a call may be handed off now: offering, and the slot Idle. */
+export function callable(s: LcState): boolean {
+  return offering(s) && s.slot === 'idle';
+}
+
+/** Whether nothing may be admitted to the run now (Stop's fence, or no run): an idle ping goes unanswered. */
+export function fenced(s: LcState): boolean {
+  const r = s.run;
+  if (!r || s.held) return true;
+  if (r.step === 'closing') return !(r.cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence')));
+  return false;
 }
 
 /** The words a failed or stopped server shows. */
@@ -260,15 +278,17 @@ class Tx {
   /** The step's administrative exchange, issued now if the slot is Idle, and the slot marked busy at once. */
   issue(): void {
     const r = this.s.run;
-    if (!r || !r.want || this.s.slot !== 'idle' || this.s.held) return;
-    if (r.step === 'closing' && !m('lc-admit-after-fence')) return;
+    if (!r || !r.want || this.s.held) return;
+    const early = (__FAMILIAR_MUTATIONS__ && mutant('admit-while-draining')) || (r.want.kind === 'list' && r.want.page > 1 && (__FAMILIAR_MUTATIONS__ && mutant('page-before-drain')));
+    if (this.s.slot !== 'idle' && !early) return;
+    if (r.step === 'closing' && !(__FAMILIAR_MUTATIONS__ && mutant('lc-admit-after-fence')) && !(__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'))) return;
     this.emit({ t: 'admin', run: r.id, want: r.want, era: r.era });
     this.setRun({ inFlight: r.want, want: undefined });
     this.s.slot = 'busy';
   }
   saveCatalog(): void {
     const r = this.s.run!;
-    if (this.s.saving && !m('lc-save-overlap')) {
+    if (this.s.saving && !(__FAMILIAR_MUTATIONS__ && mutant('lc-save-overlap'))) {
       this.s.dirty = true;
       return;
     }
@@ -283,7 +303,7 @@ export function next(state: LcState, e: LcEvent): { readonly state: LcState; rea
   return { state: tx.s, effects: tx.fx };
 }
 
-const isCurrent = (tx: Tx, run: string) => tx.run?.id === run || (m('lc-old-run-events') && !!tx.run);
+const isCurrent = (tx: Tx, run: string) => tx.run?.id === run || ((__FAMILIAR_MUTATIONS__ && mutant('lc-old-run-events')) && !!tx.run);
 
 function step(tx: Tx, e: LcEvent): void {
   switch (e.t) {
@@ -298,7 +318,8 @@ function step(tx: Tx, e: LcEvent): void {
       const r = tx.run;
       if (!r || r.id !== e.run || r.native?.stop !== 'pending') return;
       tx.setRun({ native: { ...r.native, stop: e.ok ? 'ok' : 'refused' } });
-      if (!e.ok) finish(tx, m('lc-stopped-on-refusal') ? 'done' : 'refused');
+      if (e.ok && (__FAMILIAR_MUTATIONS__ && mutant('stop-before-exit'))) for (const w of tx.s.waiters.filter((x) => x.run === r.id && x.kind === 'stop')) tx.answer(w.token, { kind: 'stopped' });
+      if (!e.ok && !(__FAMILIAR_MUTATIONS__ && mutant('stop-refused-waits'))) finish(tx, (__FAMILIAR_MUTATIONS__ && mutant('lc-stopped-on-refusal')) ? 'done' : 'refused');
       return;
     }
     case 'exit':
@@ -338,16 +359,16 @@ function step(tx: Tx, e: LcEvent): void {
 
 function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   const s = tx.s;
-  if (s.held) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'failed', failure: s.held } });
+  if (s.held && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'failed', failure: s.held } });
   if (s.run) {
     const words = s.run.step === 'ready' ? 'It is already running.' : `It is ${phaseOf(s)}.`;
     return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'refused', words } });
   }
-  if (e.facts.record !== 'ok') return tx.emit({ t: 'answer', token: e.token, reply: RECORD_WORDS[e.facts.record] });
+  if (e.facts.record !== 'ok') return refuseStart(tx, e.token, RECORD_WORDS[e.facts.record]);
   // A process whose stop was refused may still be running: nothing starts beside it (I2).
-  if (s.orphans.length && !m('lc-start-beside-orphan')) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'failed', failure: STOP_REFUSED } });
+  if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-start-beside-orphan'))) return refuseStart(tx, e.token, { kind: 'failed', failure: STOP_REFUSED });
   if (!e.facts.ownerFree) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'refused', words: e.facts.ownerWords ?? '' } });
-  if (s.slot === 'busy') return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'failed', failure: { kind: 'busy', words: BUSY_SLOT } } });
+  if (s.slot === 'busy') return refuseStart(tx, e.token, { kind: 'failed', failure: { kind: 'busy', words: BUSY_SLOT } });
   const id = `${s.id}#${++s.nextRun}`;
   const local = e.facts.where === 'local';
   s.after = undefined;
@@ -380,13 +401,20 @@ function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   } else tx.issue();
 }
 
+/** A start answered at once. A failure (a setup that can't be launched, a slot still draining, a process
+    that may still run) is the server's state, so it shows beside Failed; a refusal changes nothing. */
+function refuseStart(tx: Tx, token: string, reply: Reply): void {
+  if (reply.kind === 'failed') tx.s.after = { failed: true, failure: reply.failure };
+  tx.emit({ t: 'answer', token, reply });
+}
+
 function stop(tx: Tx, token: string): void {
   const s = tx.s;
   if (s.held) return tx.emit({ t: 'answer', token, reply: { kind: 'failed', failure: s.held } });
   const r = s.run;
   if (!r) {
     // After a refused stop the process may still run: every later Stop says so, until its exit (r33 #4).
-    if (s.orphans.length && !m('lc-second-stop-stopped')) return tx.emit({ t: 'answer', token, reply: { kind: 'failed', failure: STOP_REFUSED } });
+    if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-second-stop-stopped'))) return tx.emit({ t: 'answer', token, reply: { kind: 'failed', failure: STOP_REFUSED } });
     return tx.emit({ t: 'answer', token, reply: { kind: 'stopped' } });
   }
   if (r.step === 'relaunch') {
@@ -394,16 +422,20 @@ function stop(tx: Tx, token: string): void {
     // ended run.
     for (const w of s.waiters.filter((x) => x.run === r.id)) tx.answer(w.token, { kind: 'stopped' });
     tx.disarm();
-    if (m('lc-readmit-after-stop')) s.zombie = r.id;
+    if ((__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-after-stop'))) s.zombie = r.id;
     s.run = undefined;
     s.after = { failed: false };
     return tx.emit({ t: 'answer', token, reply: { kind: 'stopped' } });
   }
+  if (r.step === 'launching' && (__FAMILIAR_MUTATIONS__ && mutant('stop-skips-pending-start'))) {
+    tx.emit({ t: 'answer', token, reply: { kind: 'stopped' } });
+    return end(tx, 'person-stop', { kind: 'exited', words: STOPPED_WORDS });
+  }
   s.waiters = [...s.waiters, { kind: 'stop', token, run: r.id }];
   if (r.step === 'closing') {
     // Every Stop has a deadline: one made after an earlier Stop's deadline was answered arms it again.
-    if (!r.deadline && !m('lc-no-stop-deadline')) tx.arm('stop');
-    if (m('lc-two-native-stops') && r.native?.process && r.native.stop === 'pending') tx.emit({ t: 'native-stop', run: r.id, process: r.native.process });
+    if (!r.deadline && !(__FAMILIAR_MUTATIONS__ && mutant('lc-no-stop-deadline'))) tx.arm('stop');
+    if ((__FAMILIAR_MUTATIONS__ && mutant('lc-two-native-stops')) && r.native?.process && r.native.stop === 'pending') tx.emit({ t: 'native-stop', run: r.id, process: r.native.process });
     return;
   }
   end(tx, 'person-stop', { kind: 'exited', words: STOPPED_WORDS });
@@ -413,7 +445,7 @@ function stop(tx: Tx, token: string): void {
 
 function started(tx: Tx, e: Extract<LcEvent, { t: 'started' }>): void {
   const r = tx.run!;
-  const keep = r.step === 'closing' && m('lc-owner-held-on-stop');
+  const keep = r.step === 'closing' && (__FAMILIAR_MUTATIONS__ && mutant('lc-owner-held-on-stop'));
   if (!keep) {
     tx.s.owner = 'free';
     tx.emit({ t: 'owner-release' });
@@ -463,8 +495,8 @@ function exit(tx: Tx, process: string, failure: Failure): void {
 
 function relaunchable(r: Run): boolean {
   if (r.where !== 'local' || !r.modernOpening || r.relaunched || r.purpose !== 'start') return false;
-  if (r.killed && !m('lc-relaunch-after-kill')) return false;
-  if (r.walk?.answered && !m('lc-relaunch-on-answer')) return false;
+  if (r.killed && !(__FAMILIAR_MUTATIONS__ && (mutant('lc-relaunch-after-kill') || mutant('relaunch-after-kill')))) return false;
+  if (r.walk?.answered && !(__FAMILIAR_MUTATIONS__ && (mutant('lc-relaunch-on-answer') || mutant('relaunch-on-answer')))) return false;
   return true;
 }
 
@@ -486,14 +518,15 @@ function slot(tx: Tx, idle: boolean): void {
 /** Ready only at an Idle slot, and only on a catalog walked under every notice read: otherwise walk again. */
 function settle(tx: Tx): void {
   const r = tx.run!;
-  if (r.changes !== r.published && !m('lc-ready-stale')) {
+  if (r.changes !== r.published && !(__FAMILIAR_MUTATIONS__ && (mutant('lc-ready-stale') || mutant('publish-stale-walk')))) {
     const attempt = (r.walk?.attempt ?? 0) + 1;
     if (attempt >= MAX_ATTEMPTS) return end(tx, 'list-answered', KEPT_CHANGING);
     tx.setRun({ step: 'walking', walk: { attempt, page: 1, startedAt: r.changes, answered: false }, want: { kind: 'list', page: 1 } });
     return tx.issue();
   }
   const purpose = r.purpose;
-  tx.setRun({ step: 'ready', walk: undefined, refreshOwed: m('lc-ready-stale') ? r.changes !== r.published : false, purpose: 'start' });
+  const beside = r.refreshOwed && (__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk'));
+  tx.setRun({ step: 'ready', walk: undefined, refreshOwed: beside, purpose: 'start' });
   if (purpose === 'recovery') tx.setRun({ recovered: true });
   if (purpose === 'start' && r.firstSave === 'none') {
     // The start's deadline keeps running, for its answer only, until the first catalog write settles.
@@ -503,6 +536,7 @@ function settle(tx: Tx): void {
   }
   tx.disarm();
   tx.saveCatalog();
+  if (beside && tx.s.slot === 'idle') refresh(tx);
 }
 
 function refresh(tx: Tx): void {
@@ -521,7 +555,7 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
   tx.setRun({ inFlight: undefined });
   // A run Familiar is ending takes no more of its list: an unanswered page after a kill is Familiar's own
   // doing, never a server that ended its process (r32 #2).
-  if ((r.step === 'closing' && !(m('lc-relaunch-after-kill') && o.k === 'unanswered')) || r.step === 'relaunch' || r.step === 'grace') return;
+  if ((r.step === 'closing' && !((__FAMILIAR_MUTATIONS__ && (mutant('lc-relaunch-after-kill') || mutant('relaunch-after-kill'))) && o.k === 'unanswered')) || r.step === 'relaunch' || r.step === 'grace') return;
   if (o.k === 'session-ended') return sessionEnded(tx);
   if (kind === 'initialize') {
     if (o.k === 'legacy') {
@@ -530,7 +564,11 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
     }
     if (o.k === 'modern-refusal') {
       // Decided once, at the run's opening; a re-handshake never changes the era (G29).
-      if (r.purpose === 'recovery' && !m('lc-era-on-recovery')) return end(tx, 'session-ended', SESSION_ENDED);
+      if (r.purpose === 'recovery' && !(__FAMILIAR_MUTATIONS__ && (mutant('lc-era-on-recovery') || mutant('era-change-on-recovery')))) return end(tx, 'session-ended', SESSION_ENDED);
+      if ((__FAMILIAR_MUTATIONS__ && mutant('initialized-on-modern'))) {
+        tx.setRun({ era: 'modern', modernOpening: r.purpose === 'start', step: 'initialized', want: { kind: 'initialized' } });
+        return tx.issue();
+      }
       tx.setRun({ era: 'modern', modernOpening: r.purpose === 'start', step: 'walking', walk: { attempt: 0, page: 1, startedAt: r.changes, answered: false }, want: { kind: 'list', page: 1 } });
       return tx.issue();
     }
@@ -549,7 +587,7 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
   const walk = r.walk!;
   if (o.k === 'page') {
     // A page that completes rearms the 404 bound once the recovery is over (3.8).
-    if (r.recovered) tx.setRun({ dropped: 0, recovered: false });
+    if (r.recovered || (r.purpose === 'recovery' && (__FAMILIAR_MUTATIONS__ && mutant('rearm-in-recovery')))) tx.setRun({ dropped: 0, recovered: false });
     if (o.more) {
       if (walk.page >= MAX_PAGES) return end(tx, 'list-answered', TOO_MANY_PAGES);
       tx.setRun({ walk: { ...walk, page: walk.page + 1, answered: true }, want: { kind: 'list', page: walk.page + 1 } });
@@ -557,22 +595,23 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
     }
     if (o.catalog !== 'ok') return end(tx, 'list-answered', o.catalog ?? KEPT_CHANGING);
     const now = tx.run!;
-    if (now.changes !== walk.startedAt && !m('lc-ready-stale')) {
+    if (now.changes !== walk.startedAt && !(__FAMILIAR_MUTATIONS__ && (mutant('lc-ready-stale') || mutant('publish-stale-walk')))) {
       if (walk.attempt + 1 >= MAX_ATTEMPTS) return end(tx, 'list-answered', KEPT_CHANGING);
       tx.setRun({ walk: { attempt: walk.attempt + 1, page: 1, startedAt: now.changes, answered: false }, want: { kind: 'list', page: 1 } });
       return tx.issue();
     }
     const gen = ++tx.s.nextGen;
-    tx.setRun({ published: walk.startedAt, gen, step: 'settling', walk: { ...walk, answered: true } });
+    // (The named mutation publishes a walk a notice outran, as if it were fresh.)
+    tx.setRun({ published: (__FAMILIAR_MUTATIONS__ && (mutant('lc-ready-stale') || mutant('publish-stale-walk'))) ? now.changes : walk.startedAt, gen, step: 'settling', walk: { ...walk, answered: true } });
     tx.emit({ t: 'publish', run: r.id, gen });
-    if (m('lc-ready-before-idle')) return settle(tx);
+    if ((__FAMILIAR_MUTATIONS__ && (mutant('lc-ready-before-idle') || mutant('ready-before-drain')))) return settle(tx);
     if (tx.s.slot === 'idle') return settle(tx);
     return;
   }
   if (o.k === 'invalid' || o.k === 'refused') {
     // Any answer to the list, a refusal or a line the parser rejected, is the server's word: no relaunch.
     tx.setRun({ walk: { ...walk, answered: true } });
-    if (m('lc-relaunch-on-answer') && relaunchable(tx.run!)) return unanswered(tx, o.failure);
+    if ((__FAMILIAR_MUTATIONS__ && (mutant('lc-relaunch-on-answer') || mutant('relaunch-on-answer'))) && relaunchable(tx.run!)) return unanswered(tx, o.failure);
     return end(tx, 'list-answered', o.failure);
   }
   if (o.k === 'unanswered') return unanswered(tx, o.failure);
@@ -589,6 +628,7 @@ function unanswered(tx: Tx, failure: Failure): void {
       return;
     }
     // The pipe can close before the exe reports the exit: wait for it, up to 2 s, before deciding.
+    if ((__FAMILIAR_MUTATIONS__ && mutant('relaunch-races-exit'))) return end(tx, 'list-unanswered', failure);
     tx.setRun({ step: 'grace', graceFailure: failure });
     tx.arm('grace');
     return;
@@ -600,7 +640,8 @@ function sessionEnded(tx: Tx): void {
   const r = tx.run!;
   if (r.where !== 'remote') return end(tx, 'list-unanswered', SESSION_ENDED);
   const fromReady = r.step === 'ready' || (r.purpose === 'refresh' && r.step !== 'settling');
-  if (!fromReady || r.dropped > 0) return end(tx, 'session-ended', SESSION_ENDED);
+  if (r.purpose === 'refresh' && r.step !== 'ready' && (__FAMILIAR_MUTATIONS__ && mutant('end-on-refresh-404'))) return end(tx, 'session-ended', SESSION_ENDED);
+  if ((!fromReady || r.dropped > 0) && !(__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) return end(tx, 'session-ended', SESSION_ENDED);
   // One fresh handshake, then the tool list; calls are refused meanwhile.
   tx.setRun({ purpose: 'recovery', step: 'opening', want: { kind: 'initialize' }, walk: undefined, dropped: 1, recovered: false, refreshOwed: false });
   tx.emit({ t: 'new-session', run: r.id });
@@ -623,9 +664,10 @@ function notice(tx: Tx, run: string): void {
   const r = tx.run;
   if (!r || r.id !== run || r.era !== 'legacy' || r.step === 'closing' || r.step === 'relaunch' || r.step === 'grace' || r.step === 'launching') return;
   tx.setRun({ changes: r.changes + 1 });
+  if (r.step !== 'ready' && r.purpose !== 'start' && (__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk'))) tx.setRun({ refreshOwed: true });
   if (r.step !== 'ready') return; // a walk under way absorbs it, at its end or its settle
   if (tx.s.slot === 'idle') return refresh(tx);
-  if (!m('lc-refresh-dropped')) tx.setRun({ refreshOwed: true });
+  if (!(__FAMILIAR_MUTATIONS__ && (mutant('lc-refresh-dropped') || mutant('refresh-through-list')))) tx.setRun({ refreshOwed: true });
 }
 
 /* ---------- deadlines, saves, the relaunch ---------- */
@@ -694,7 +736,7 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
 
 function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   const s = tx.s;
-  if (m('lc-readmit-after-stop') && s.zombie === e.run && !s.run && e.ok) {
+  if ((__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-after-stop')) && s.zombie === e.run && !s.run && e.ok) {
     // The mutation: the relaunch Stop cancelled launches anyway.
     const id = `${s.id}#${++s.nextRun}`;
     s.run = { ...emptyRun(id, 'local', 'start'), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false } };
@@ -705,6 +747,8 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   }
   const r = s.run;
   if (!r || r.id !== e.run || r.step !== 'relaunch') return;
+  // Turned off meanwhile (an automatic start's relaunch): Stopped, as it was asked.
+  if (!e.ok && e.off) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: e.words ?? 'It is turned off.' });
   if (!e.ok) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: e.words ?? 'Press Start again.' });
   const id = `${s.id}#${++s.nextRun}`;
   s.run = { ...emptyRun(id, 'local', r.mode), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false }, ...(r.deadline ? { deadline: r.deadline } : {}) };
@@ -723,6 +767,8 @@ function exhausted(tx: Tx, failure: Failure): void {
   const s = tx.s;
   if (s.held) return;
   s.held = failure;
+  // (The named mutation leaves a start parked between its handshake's steps to its own deadline.)
+  if ((__FAMILIAR_MUTATIONS__ && mutant('no-stuck-wake'))) return;
   // Every waiter, a start parked between its handshake's steps included, is answered in this transition.
   for (const w of [...s.waiters]) tx.answer(w.token, { kind: 'failed', failure });
   if (s.run && s.run.step !== 'closing') end(tx, 'held', failure);
@@ -739,12 +785,13 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
     tx.emit({ t: 'disarm', id: r.saveBy });
     tx.setRun({ saveBy: undefined });
   }
-  tx.emit({ t: 'end-live', run: r.id });
-  tx.setRun({ cause, failure, step: 'closing', ...(m('lc-admit-after-fence') ? {} : { want: undefined }) });
+  const unfenced = cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'));
+  if (!unfenced) tx.emit({ t: 'end-live', run: r.id });
+  tx.setRun({ cause, failure, step: 'closing', ...((__FAMILIAR_MUTATIONS__ && mutant('lc-admit-after-fence')) || unfenced ? {} : { want: undefined }) });
   if (r.where === 'remote') return finish(tx, 'done');
   const n = r.native!;
   if (n.start === 'pending') {
-    if (!m('lc-no-stop-deadline')) tx.arm('stop');
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-no-stop-deadline'))) tx.arm('stop');
     return;
   }
   if (n.process && !n.exited) {
@@ -752,7 +799,7 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
       tx.setRun({ native: { ...n, stop: 'pending' }, killed: true });
       tx.emit({ t: 'native-stop', run: r.id, process: n.process });
     }
-    if (!m('lc-no-stop-deadline')) tx.arm('stop');
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-no-stop-deadline'))) tx.arm('stop');
     return;
   }
   finish(tx, 'done');
@@ -774,12 +821,12 @@ function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Caus
   if (alive) s.orphans = [...s.orphans, { run: r.id, process: r.native!.process! }];
   else if (r.native?.process) tx.emit({ t: 'release-writes', process: r.native.process });
   const stillWords = how === 'refused' ? STOP_REFUSED : STOP_UNCONFIRMED;
-  const own = cause === 'person-stop' || cause === 'test-done';
+  const own = cause === 'person-stop' || cause === 'test-done' || cause === 'turned-off';
   const words: Failure = mayRun ? (own ? stillWords : { kind: failure.kind, words: `${failure.words} ${stillWords.words}` }) : failure;
   for (const w of s.waiters.filter((x) => x.run === r.id)) {
-    if (w.kind === 'stop') tx.answer(w.token, mayRun || (alive && !m('lc-stopped-on-refusal')) ? { kind: 'failed', failure: words } : { kind: 'stopped' });
-    else if (w.kind === 'test') tx.answer(w.token, cause === 'test-done' && (!mayRun || m('lc-test-ok-on-refusal')) ? { kind: 'tested', run: r.id } : { kind: 'failed', failure: words });
-    else tx.answer(w.token, (cause === 'person-stop' || m('lc-crash-words-lost')) && !mayRun ? { kind: 'stopped' } : { kind: 'failed', failure: words });
+    if (w.kind === 'stop') tx.answer(w.token, mayRun || (alive && !(__FAMILIAR_MUTATIONS__ && mutant('lc-stopped-on-refusal'))) ? { kind: 'failed', failure: words } : { kind: 'stopped' });
+    else if (w.kind === 'test') tx.answer(w.token, (cause === 'test-done' || (cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop')))) && (!mayRun || (__FAMILIAR_MUTATIONS__ && mutant('lc-test-ok-on-refusal'))) ? { kind: 'tested', run: r.id } : { kind: 'failed', failure: words });
+    else tx.answer(w.token, (cause === 'person-stop' || cause === 'turned-off' || (__FAMILIAR_MUTATIONS__ && mutant('lc-crash-words-lost'))) && !mayRun ? { kind: 'stopped' } : { kind: 'failed', failure: words });
   }
   // A Test leaves the server Stopped unless the process may still run; a person's Stop too.
   const failed = mayRun || (!own && r.mode !== 'test');

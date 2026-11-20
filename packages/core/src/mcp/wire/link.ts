@@ -1,12 +1,17 @@
-// One server's link: Familiar's own MCP client for it (docs/mcp-design.md 3.1 to 3.11). It holds the
-// server's exchange slot, which outlives a run, so a Start of the same server waits for nothing: it's
-// refused busy until the old run's exchange has drained. For each run (one Start to its end) it holds the
-// run id, the era, the negotiated version, the remote session id, and the catalog with its stale bit.
-// There's no queue, no second exchange and no timer that isn't an exchange's own.
+// One server's link: Familiar's own MCP client for it (docs/mcp-design.md 3.1 to 3.11, 5.4). Two halves:
 //
-// The effects of the pure exchange machine (exchange.ts) are done here: a remote request is one POST
-// through the exe's net_fetch, read with net_read, ended with net_cancel; a local one is one server_write
-// of a line. What comes back is checked (parse.ts) and fed to the machine as inputs, in order.
+// - The wire: the server's exchange slot, which outlives a run (so a Start of the same server waits for
+//   nothing: it's refused while the old run's exchange drains), framing, the exchanges' native requests,
+//   and the untrusted answers' checks. The exchange machine (exchange.ts) is pure; its effects are done here:
+//   a remote request is one POST through the exe's net_fetch, read with net_read, ended with net_cancel; a
+//   local one is one server_write of a line.
+// - The driver of the run lifecycle (lifecycle.ts): Start, Stop, Test, the walk, the refresh, a session's
+//   recovery, the relaunch, every end. Its state lives only in that pure machine. The driver turns every
+//   native answer, deadline, slot change, server notice and person action into an event, feeds it, drains
+//   every event the effects raise in the same task, and carries the effects out. It decides nothing.
+//
+// `handoff()` stays one synchronous step: it reads `callable()` from the machine, whose queue is empty
+// between tasks, and hands off in the same step.
 
 import { boundTools, checkTools, CatalogError, MAX_TOOLS } from '../catalog.ts';
 import type { ProcessEvent, ProcessPort, ProcessSetup } from '../process.ts';
@@ -16,10 +21,12 @@ import { exitFailure, protocolFailure, remoteFailure, startFailure } from '../wo
 import { emptySlot, step, type Effect, type End, type ExchangeKind, type Input, type Slot } from './exchange.ts';
 import { frame, frameCall, LEGACY_VERSIONS, legacyVersion, MODERN_VERSION, type AdminMessage, type Era, type RpcId } from './framing.ts';
 import { HEADER_WORDS, paramHeaders, scanDeclarations, type HeaderDeclaration } from './headers.ts';
+import { BUSY_SLOT, callable, failureOf, fenced, offering, initialState, next, phaseOf, STOPPED_WORDS, type AdminOutcome, type LcEffect, type LcEvent, type LcState, type Mode, type Reply, type StartFacts, type Want } from './lifecycle.ts';
 import { mutant } from '../../mutations.ts';
 import { callResult, cutText, EventStream, initializeResult, Invalid, listResult, MAX_HANDSHAKE_BYTES, MAX_MESSAGE_BYTES, parseMessage, resultText, type Inbound } from './parse.ts';
 
-/** The exe's fetch, as core uses it: one request per id, its head, its body pulled, and its end. */
+export { MAX_PAGES, STOP_REFUSED, STOP_UNCONFIRMED } from './lifecycle.ts';
+
 export interface NetSpec {
   readonly id: string;
   readonly address: string;
@@ -69,26 +76,30 @@ export interface LinkLimits {
    * has stopped reading. It goes when the exe's own write bound lands.
    */
   readonly writeMs: number;
+  /** Stop's own bound: past it, a process not yet seen to exit may still be running (5.4). */
+  readonly stopMs: number;
+  /** How long a modern-only stdio server's exit is awaited before a relaunch is decided (3.9). */
+  readonly graceMs: number;
 }
 
-export const LINK_LIMITS: LinkLimits = { startMs: 60_000, listMs: 30_000, pongMs: 5_000, headersMs: 120_000, idleMs: 15 * 60_000, writeMs: 10_000 };
-export const MAX_PAGES = 16;
-/** A Stop the exe refused (5.4): the run is over for Familiar, but the process may still be running. */
-export const STOP_REFUSED: Failure = { kind: 'failed', words: 'Familiar asked Windows to stop the server and was refused, so it may still be running. Familiar starts it again only once it has exited; restarting Familiar ends it for sure.' };
+export const LINK_LIMITS: LinkLimits = { startMs: 60_000, listMs: 30_000, pongMs: 5_000, headersMs: 120_000, idleMs: 15 * 60_000, writeMs: 10_000, stopMs: 10_000, graceMs: 2_000 };
 export const MAX_SESSION_ID = 1024;
 const DROPPED_LINE = /^a stdout line over \d+ MiB was dropped$/;
 
 export interface LinkEvents {
-  /** The run ended: a crash, an exit, a failed walk, a second session drop. Called once per run. */
-  ended(run: string, failure: Failure): void;
-  /** The catalog changed after a walk. */
-  listed?(run: string, tools: readonly ListedTool[]): void;
-}
-
-/** A start's, a walk's or a re-handshake's deadline: every step of it races it, the slot's waits included. */
-interface Deadline {
-  expired: boolean;
-  readonly over: Promise<void>;
+  /** A run ended in a failure (a crash, an exit, a failed walk, a second session drop). */
+  ended?(run: string, failure: Failure): void;
+  /** A run's catalog was published: save it. Its outcome settles the start that waits for it. */
+  listed?(run: string, tools: readonly ListedTool[]): Promise<'saved' | 'skipped' | 'failed' | void> | 'saved' | 'skipped' | 'failed' | void;
+  /** The owner's admission for a native start: held while the exe answers it (5.1). */
+  admit?(): { readonly release: () => void } | { readonly words: string };
+  /** The relaunch's second admission, with the committed record read again (3.9). */
+  readmit?(run: string): { readonly ok: true; readonly release?: () => void } | { readonly ok: false; readonly words: string; readonly off?: boolean };
+  /** The phase or its words changed. */
+  changed?(): void;
+  /** The test build's conformance record: every event fed, the state the driver then holds, and the
+      exchange machine's slot (busy or not), with whether the queue had drained. */
+  transition?(event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }): void;
 }
 
 /** What one exchange gave back. */
@@ -99,7 +110,8 @@ interface Outcome {
   readonly offered?: string;
 }
 
-interface Run {
+/** The wire's record of one run: what its exchanges need. Nothing in it decides anything. */
+interface Wire {
   readonly id: string;
   readonly target: Target;
   readonly launch: string;
@@ -108,56 +120,31 @@ interface Run {
   sessionId?: string;
   /** The process run id the exe gave, for a local server. */
   process?: string;
+  exited?: boolean;
+  exitedEarly?: { readonly code: number | null };
   tools: readonly ListedTool[];
   /** Modern remote: each offered tool's header declarations. */
   declarations: Map<string, readonly HeaderDeclaration[]>;
   /** Tools listed but not offered, with why (Test shows them). */
   notOffered: readonly { readonly name: string; readonly reason: string }[];
-  stale: boolean;
-  /** Counts list_changed notifications: a walk publishes its catalog only if none came while it ran. */
-  changes: number;
-  /** A refresh walk is already scheduled for list_changed: a burst is one more walk. */
-  relisting?: boolean;
-  /** The walk under way, if any: one walk owns the run's list at a time, its own retry absorbing list_changed. */
-  walker?: object;
-  /** Counts the server's ended sessions: a walk begun under an earlier one sends nothing more. */
-  session: number;
-  ready: boolean;
-  ended: boolean;
-  /** A local run's process has exited (the exe said so). */
-  exited?: boolean;
-  /** Resolves when the exe says a local run's process has exited. */
-  readonly exit: Promise<void>;
-  sawExit: () => void;
-  /** Resolves when a local run's native start has answered, whether or not a process came of it. */
-  readonly launched: Promise<void>;
-  /** The one native stop of a local run's process: asked once, whoever asks first (Stop, or the run's end). */
-  stopCall?: Promise<void>;
-  /** Familiar asked the exe to stop the process (a watchdog, a deadline, Stop): its exit is Familiar's doing,
-      never a server that ended its own process, so no relaunch follows it. */
-  killed?: boolean;
-  /** The exe refused Stop's native stop: the process may live on until it exits by itself. */
-  stopRefused?: boolean;
-  /** Stop has begun: set synchronously before Stop awaits anything, so no exchange is admitted after it. */
-  closing?: boolean;
   nextId: number;
-  /** Re-handshakes since the last exchange that completed without a 404. */
-  dropped: number;
   readonly last: LastOutput;
-  /** Why the run ended, once it has. */
-  failure?: Failure;
+  /** The walk's pages so far, and its cursor. */
+  pages: Record<string, unknown>[];
+  cursor?: string;
+  /** The catalog the last page built, published by the machine's effect. */
+  built?: { readonly tools: readonly ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: readonly { name: string; reason: string }[] };
+  /** A session's recovery is under way (for a named mutation's resend). */
+  recovering?: boolean;
   /** The last call's body and arguments (for named mutations only). */
   lastCall?: { readonly body: string; readonly args: string };
-  /** Resolves when the run has ended. */
-  readonly over: Promise<void>;
-  finish: () => void;
 }
 
 /** Per exchange: its waiter, and what the natives hold for it. */
 interface Pending {
   readonly n: number;
   readonly kind: ExchangeKind;
-  readonly run: Run;
+  readonly run: Wire;
   readonly requestId?: number;
   readonly body: string;
   readonly done: (o: Outcome) => void;
@@ -178,17 +165,31 @@ const enc = new TextEncoder();
 
 export class ServerLink {
   private slot: Slot = emptySlot;
-  private run: Run | undefined;
   private readonly pending = new Map<number, Pending>();
   /** Native request id per handle, remote. */
   private readonly natives = new Map<string, string>();
   private readonly idle: (() => void)[] = [];
-  /** Cleanup the exe refused for good: the slot is held until Familiar restarts, and these are the words. */
+
+  /* The lifecycle: its state lives only in the machine (lifecycle.ts); the driver feeds it events and does
+     its effects, and decides nothing. */
+  private lc: LcState;
+  private readonly queue: LcEvent[] = [];
+  private draining = false;
+  /** Depth of the exchange machine's effects under way: lifecycle events wait until they're done. */
+  private effecting = 0;
+  /** The wire's own record of each run (what the exchanges need), by run id. */
+  private readonly wires = new Map<string, Wire>();
+  private readonly timers = new Map<number, () => void>();
+  private readonly answers = new Map<string, (r: Reply) => void>();
+  private tokens = 0;
+  /** The owner's admission while the machine holds it (a native start), released by its effect. */
+  private ownerHold?: () => void;
+  /** What the next run the machine starts is: its target and launch. */
+  private next?: { readonly target: Target; readonly launch: string };
+  /** Test-only listeners for a catalog published (list()). */
+  private readonly published: ((run: string) => void)[] = [];
+  /** The exe's cleanup refusal for good, as words (the machine holds the same). */
   private stuck?: Failure;
-  /** Exchanges waiting for the slot, each woken if the slot is held for good: registered only while one
-      waits, and taken away when its wait ends, so a long-lived link keeps nothing per exchange. */
-  private readonly stuckWaiters = new Set<() => void>();
-  private runs = 0;
 
   readonly serverId: string;
   private readonly ports: { readonly net?: NetPort; readonly processes?: ProcessPort };
@@ -202,247 +203,429 @@ export class ServerLink {
     this.clock = clock;
     this.events = events;
     this.limits = limits;
+    this.lc = initialState(serverId);
   }
 
-  /* ---------- the slot, for the lifecycle and the tests ---------- */
+  /* ---------- what the rest of core reads ---------- */
 
+  /** The machine's state, as it stands between events (the queue is always empty between tasks). */
+  get state(): LcState {
+    return this.lc;
+  }
+  get phase(): ReturnType<typeof phaseOf> {
+    return phaseOf(this.lc);
+  }
+  get failure(): Failure | undefined {
+    return failureOf(this.lc);
+  }
   /** Set once cleanup the exe refused for good has left the slot held until a restart: the words. */
   get held(): Failure | undefined {
-    return this.stuck;
+    return this.lc.held;
   }
-
   /** Whether an exchange holds the slot, Live or Draining. */
   get busy(): boolean {
     return this.slot.ex !== undefined;
   }
-  get current(): { readonly run: string; readonly era: Era; readonly ready: boolean; readonly stale: boolean; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[]; readonly sessionId?: string; readonly version?: string; readonly launch: string } | undefined {
-    const r = this.run;
-    return r && !r.ended ? { run: r.id, era: r.era, ready: r.ready, stale: r.stale, tools: r.tools, notOffered: r.notOffered, launch: r.launch, ...(r.sessionId ? { sessionId: r.sessionId } : {}), ...(r.version ? { version: r.version } : {}) } : undefined;
-  }
-  /** How many exchanges are waiting for the slot now (for the tests: none, once it's idle). */
+  /** Person actions not yet answered. */
   get waiting(): number {
-    return this.stuckWaiters.size;
+    return this.lc.waiters.length;
   }
-
-  /** Waits for the slot to be Idle, the deadline, or the slot held for good, whichever comes first. */
-  private slotWait(deadline: Deadline, wakeOnStuck = true): Promise<void> {
-    return new Promise<void>((resolve) => {
-      let done = false;
-      const end = () => {
-        if (done) return;
-        done = true;
-        if (!(__FAMILIAR_MUTATIONS__ && mutant('stuck-waiter-kept'))) this.stuckWaiters.delete(end);
-        resolve();
-      };
-      if (wakeOnStuck) this.stuckWaiters.add(end);
-      if (!this.busy) return end();
-      this.idle.push(end);
-      void deadline.over.then(end);
-    });
+  get current(): { readonly run: string; readonly era: Era; readonly ready: boolean; readonly stale: boolean; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[]; readonly sessionId?: string; readonly version?: string; readonly launch: string } | undefined {
+    const r = this.lc.run;
+    const w = r && this.wires.get(r.id);
+    if (!r || !w || r.step === 'closing') return undefined;
+    const stale = r.refreshOwed || r.published === undefined || r.changes !== r.published || r.step !== 'ready';
+    return { run: r.id, era: r.era, ready: r.step === 'ready', stale, tools: w.tools, notOffered: w.notOffered, launch: w.launch, ...(w.sessionId ? { sessionId: w.sessionId } : {}), ...(w.version ? { version: w.version } : {}) };
   }
-
   /** Resolves when the slot is next Idle. */
   drained(): Promise<void> {
     if (!this.busy) return Promise.resolve();
     return new Promise((r) => this.idle.push(r));
   }
 
-  /* ---------- start, stop, list ---------- */
+  /* ---------- the driver ---------- */
 
-  /**
-   * Starts a run: the legacy handshake (initialize, then initialized, each its own exchange), then the
-   * tool list. Refused busy while the slot holds an exchange (a Stop's drain included). The whole start
-   * runs under one deadline; past it the local process is stopped, or the remote run ends.
-   */
-  async start(target: Target, launch: string, options: { readonly era?: Era; readonly launched?: () => void } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure; readonly relaunch?: 'modern' }> {
-    if (this.busy && (__FAMILIAR_MUTATIONS__ && mutant('slot-per-run'))) this.slot = emptySlot;
-    // Held for good: a restart is the only way back, and the words say so (not "try again in a moment").
-    if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { ok: false, failure: this.stuck };
-    if (this.busy || (this.run && !this.run.ended)) return { ok: false, failure: { kind: 'busy', words: 'The server is still finishing its last request. Try again in a moment.' } };
-    // A local process whose stop the exe refused may still be running: nothing starts beside it until it
-    // has exited.
-    const prev = this.run;
-    if (prev && prev.target.where === 'local' && prev.process !== undefined && !prev.exited && prev.stopRefused) return { ok: false, failure: STOP_REFUSED };
-    let finish!: () => void;
-    const over = new Promise<void>((r) => (finish = r));
-    let sawExit!: () => void;
-    const exit = new Promise<void>((r) => (sawExit = r));
-    let launchedNow!: () => void;
-    const launched = new Promise<void>((r) => (launchedNow = r));
-    const run: Run = { id: `${this.serverId}#${++this.runs}`, target, launch, era: options.era ?? 'legacy', tools: [], declarations: new Map(), notOffered: [], stale: true, changes: 0, session: 0, ready: false, ended: false, nextId: 1, dropped: 0, last: new LastOutput(), over, finish, exit, sawExit, launched };
-    this.run = run;
-    if (target.where === 'local') {
-      const processes = this.ports.processes!;
-      try {
-        const started = await processes.start(target.setup, (e) => this.processEvent(run, e));
-        run.process = started.run;
-      } catch (e) {
-        run.ended = true;
-        run.finish();
-        launchedNow();
-        options.launched?.();
-        return { ok: false, failure: startFailure(e, target.setup.program, target.setup.secrets) };
-      }
-      launchedNow();
-      // Stopped while the exe was still starting it: the process it then started is stopped here, and its
-      // exit awaited, before the start answers, so the next Start meets no orphan.
-      if (run.closing || (run.ended && !run.exited)) {
-        await this.stopProcess(run).catch(() => {});
-        await run.exit;
-        this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
-        options.launched?.();
-        return { ok: false, failure: { kind: 'exited', words: 'The server was stopped.' } };
-      }
-      // The exe answered: the owner's native start is over (5.1).
-      options.launched?.();
-      if (run.ended) return { ok: false, failure: this.exitWords(run) };
-    }
-    if (target.where === 'remote') options.launched?.();
-    const { deadline, cancel } = this.deadline(run, this.limits.startMs);
-    try {
-      // A modern relaunch skips the opening: the era was decided by the refusal on the first start.
-      const failure = run.era === 'modern' ? undefined : await this.handshake(run, deadline);
-      if (failure) {
-        this.endRun(run, failure, false);
-        return { ok: false, failure };
-      }
-      const refusedOnStdio = run.era === 'modern' && options.era === undefined && target.where === 'local';
-      const listed = await this.walk(run, deadline);
-      if (!('tools' in listed)) {
-        // A modern-only stdio server that ended its process after refusing (rmcp does, B2): one relaunch
-        // with the era fixed to modern, readmitted by the caller. Only when the list got no answer (a
-        // refused write, a closed pipe): an answer, a refusal included, is the server's word and decides.
-        // The pipe can close before the exe reports the exit: a write refused then is the pipe closing, so
-        // the exit is awaited, within 2 s and the start's deadline, before deciding. Only an actual exit
-        // counts: a run Familiar ended itself (the write bound's) is not a server that ended its process.
-        const answered = 'answered' in listed && listed.answered && !(__FAMILIAR_MUTATIONS__ && mutant('relaunch-on-answer'));
-        if (refusedOnStdio && !answered && !run.exited && !deadline.expired && !(__FAMILIAR_MUTATIONS__ && mutant('relaunch-races-exit'))) {
-          let stop: (() => void) | undefined;
-          await Promise.race([run.exit, deadline.over, new Promise<void>((r) => (stop = this.clock.setTimer(r, 2_000, { background: false })))]);
-          stop?.();
-        }
-        const relaunch = refusedOnStdio && !answered && !!run.exited && (!run.killed || !!(__FAMILIAR_MUTATIONS__ && mutant('relaunch-after-kill'))) && !deadline.expired;
-        this.endRun(run, listed.failure, false);
-        return { ok: false, failure: listed.failure, ...(relaunch ? { relaunch: 'modern' as const } : {}) };
-      }
-      // Ready only once the list's own exchange has drained (its write acknowledged, its request ended),
-      // within the start's deadline: a call made the moment Start answers is admitted, never refused busy.
-      if (this.busy && !(__FAMILIAR_MUTATIONS__ && mutant('ready-before-drain'))) await this.slotWait(deadline);
-      // And only a run still alive: an exit that came with (or right after) the last reply ended it.
-      const gone: Failure | undefined = deadline.expired && this.busy ? { kind: 'timed-out', words: "The server didn't finish starting in time." } : run.ended || run.closing || this.stuck ? this.startWords(run, { t: 'run-ended' }) : undefined;
-      if (gone) {
-        this.endRun(run, gone, false);
-        return { ok: false, failure: gone };
-      }
-      run.ready = true;
-      return { ok: true, run: run.id, tools: run.tools };
-    } catch (e) {
-      // Nothing a server sends may throw out of a start: whatever did ends the run, in words.
-      const failure = unexpected(e);
-      this.endRun(run, failure, false);
-      return { ok: false, failure };
-    } finally {
-      cancel?.();
-    }
+  /** Feeds one event, and drains every event its effects raise, in this same task. */
+  private feed(e: LcEvent): void {
+    this.queue.push(e);
+    // Never in the middle of the exchange machine's own effects: those finish first, so the machine always
+    // sees the slot as the exchange machine left it.
+    if (this.draining || this.effecting > 0) return;
+    this.drain();
   }
 
-  /**
-   * Ends the run: a local server is stopped (its exit ends the run); a remote run ends at once. `refused`:
-   * the exe refused to stop the process, so the run is ended without its exit, and the process may still
-   * be running; its writes, the slot and the next start still wait for the exit.
-   */
-  async stop(): Promise<'stopped' | 'refused'> {
-    const run = this.run;
-    if (!run || run.ended) return 'stopped';
-    // The fence, before any await: a local Stop waits for the exe and the exit, and nothing may be
-    // admitted to the stopping server meanwhile (a walk's next page, a call, an idle ping's pong).
-    if (!(__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'))) {
-      run.closing = true;
-      run.ready = false;
-      // The live exchange ends in this same step ("interrupted"): no pong or reply of it is taken after
-      // Stop. Its native writes still end only at the exit.
-      const ex = this.slot.ex;
-      if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
+  private drain(): void {
+    this.draining = true;
+    const before = `${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}`;
+    try {
+      while (this.queue.length) {
+        const ev = this.queue.shift()!;
+        const out = next(this.lc, ev);
+        this.lc = out.state;
+        for (const fx of out.effects) this.apply(fx);
+        // A driver that decides outside next() (the conformance check's control).
+        if (__FAMILIAR_MUTATIONS__ && ev.t === 'slot' && !ev.idle && mutant('driver-decides')) this.lc = { ...this.lc, slot: 'idle' };
+        this.events.transition?.(ev, this.lc, { busy: this.busy, quiet: this.queue.length === 0 && this.effecting === 0 });
+      }
+    } finally {
+      this.draining = false;
     }
-    // The run's end answers a call in flight "interrupted, it may have partly run" (3.11).
-    if (run.target.where === 'local') {
-      // A native start still pending is waited out first: the start itself then stops what it started.
-      if (run.process === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('stop-skips-pending-start'))) await run.launched;
-      if (run.process === undefined) return 'stopped';
-      // Waits for the exe's answer and the exit, with no deadline of its own (5.4): Stop answers only once
-      // the process is gone. One native stop per run, whoever asks first. A stop the exe refuses answers
-      // once the run has ended; its writes, and the slot, still wait for the exit (H1).
-      if (!run.exited) {
-        const asked = await this.stopProcess(run).then(
-          () => true,
-          () => false
+    if (`${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}` !== before) this.events.changed?.();
+  }
+
+  private wireFor(run: string, era: Era): Wire {
+    let w = this.wires.get(run);
+    if (!w) {
+      const from = this.next!;
+      w = { id: run, target: from.target, launch: from.launch, era, tools: [], declarations: new Map(), notOffered: [], nextId: 1, last: new LastOutput(), pages: [] };
+      this.wires.set(run, w);
+      // Keep only what's still needed: the current run and any whose process may still be running.
+      for (const id of [...this.wires.keys()]) if (id !== run && id !== this.lc.run?.id && !this.lc.orphans.some((o) => o.run === id)) this.wires.delete(id);
+    }
+    w.era = era;
+    return w;
+  }
+
+  private apply(fx: LcEffect): void {
+    switch (fx.t) {
+      case 'native-start': {
+        const w = this.wireFor(fx.run, fx.era);
+        const setup = (w.target as Extract<Target, { where: 'local' }>).setup;
+        this.ports.processes!.start(setup, (e) => this.processEvent(w, e)).then(
+          (started) => {
+            w.process = started.run;
+            this.feed({ t: 'started', run: fx.run, ok: true, process: started.run });
+            // An exit that came before the exe's answer named the process.
+            if (w.exitedEarly) this.feed({ t: 'exit', process: started.run, failure: exitFailure(w.exitedEarly.code, w.last.text()) });
+          },
+          (e: unknown) => this.feed({ t: 'started', run: fx.run, ok: false, failure: startFailure(e, setup.program, setup.secrets) })
         );
-        // Refused: nothing will end the run but an exit that may never come. The run ends now, in those
-        // words, and Stop answers; the writes and the slot wait for the exit as before.
-        if (!asked && !run.exited && !(__FAMILIAR_MUTATIONS__ && mutant('stop-refused-waits'))) {
-          run.stopRefused = true;
-          this.endRun(run, STOP_REFUSED, false);
-          return 'refused';
-        }
-        await (asked && !(__FAMILIAR_MUTATIONS__ && mutant('stop-before-exit')) ? run.exit : run.over);
+        return;
       }
-      await run.over;
-      return 'stopped';
+      case 'native-stop': {
+        const stop = () =>
+          this.ports.processes!.stop(fx.process).then(
+            () => this.feed({ t: 'stop-answered', run: fx.run, ok: true }),
+            () => {
+              const w = this.wires.get(fx.run);
+              if (w && (__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel'))) this.releaseWrites(w);
+              this.feed({ t: 'stop-answered', run: fx.run, ok: false });
+            }
+          );
+        void stop();
+        if (__FAMILIAR_MUTATIONS__ && mutant('stop-twice')) void this.ports.processes!.stop(fx.process).catch(() => {});
+        return;
+      }
+      case 'admin':
+        return this.admin(fx.run, fx.want, fx.era);
+      case 'end-live': {
+        const ex = this.slot.ex;
+        if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run.id === fx.run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
+        return;
+      }
+      case 'arm': {
+        const ms = { start: this.limits.startMs, list: this.limits.listMs, recovery: this.limits.startMs, grace: this.limits.graceMs, stop: this.limits.stopMs }[fx.which];
+        const cancel = this.clock.setTimer(() => {
+          this.timers.delete(fx.id);
+          this.feed({ t: 'deadline', id: fx.id });
+        }, ms, { background: false });
+        if (cancel) this.timers.set(fx.id, cancel);
+        return;
+      }
+      case 'disarm':
+        this.timers.get(fx.id)?.();
+        this.timers.delete(fx.id);
+        return;
+      case 'owner-hold':
+        if (!this.ownerHold) {
+          const a = this.events.admit?.();
+          if (a && 'release' in a) this.ownerHold = a.release;
+        }
+        return;
+      case 'owner-release': {
+        const r = this.ownerHold;
+        this.ownerHold = undefined;
+        r?.();
+        return;
+      }
+      case 'publish': {
+        const w = this.wires.get(fx.run);
+        if (!w || !w.built) return;
+        w.tools = w.built.tools;
+        w.declarations = w.built.declarations;
+        w.notOffered = w.built.notOffered;
+        w.built = undefined;
+        if (w.recovering) {
+          w.recovering = false;
+          const resend = __FAMILIAR_MUTATIONS__ && mutant('resend-404-call') ? w.lastCall?.body : undefined;
+          if (resend) void this.drained().then(() => this.exchangeNow(w, 'call', w.nextId++, resend, 'tools/call'));
+        }
+        for (const l of this.published.splice(0)) l(fx.run);
+        return;
+      }
+      case 'save': {
+        const w = this.wires.get(fx.run);
+        const tools = w?.tools ?? [];
+        Promise.resolve(this.events.listed ? this.events.listed(fx.run, tools) : 'saved').then(
+          (o) => this.feed({ t: 'saved', gen: fx.gen, outcome: o === 'skipped' || o === 'failed' ? o : 'saved' }),
+          () => this.feed({ t: 'saved', gen: fx.gen, outcome: 'failed' })
+        );
+        return;
+      }
+      case 'answer': {
+        const a = this.answers.get(fx.token);
+        this.answers.delete(fx.token);
+        a?.(fx.reply);
+        return;
+      }
+      case 'release-writes': {
+        const w = [...this.wires.values()].find((x) => x.process === fx.process);
+        if (w) this.releaseWrites(w);
+        return;
+      }
+      case 'ended':
+        this.events.ended?.(fx.run, fx.failure ?? { kind: 'exited', words: 'The server stopped.' });
+        return;
+      case 'readmit-check': {
+        // The relaunch's second admission, with the committed record read again (3.9).
+        const facts = this.events.readmit ? this.events.readmit(fx.run) : ({ ok: true } as const);
+        if (facts.ok && 'release' in facts && facts.release) this.ownerHold = facts.release;
+        const from = this.wires.get(fx.run);
+        if (from) this.next = { target: from.target, launch: from.launch };
+        this.feed({ t: 'readmit', run: fx.run, ok: facts.ok, ...(facts.ok ? {} : { words: facts.words, ...(facts.off ? { off: true } : {}) }) });
+        return;
+      }
+      case 'new-session': {
+        const w = this.wires.get(fx.run);
+        if (!w) return;
+        if (!(__FAMILIAR_MUTATIONS__ && mutant('keep-old-session-id'))) delete w.sessionId;
+        delete w.version;
+        w.recovering = true;
+        return;
+      }
     }
-    if ((__FAMILIAR_MUTATIONS__ && mutant('delete-at-stop'))) {
-      const t = run.target as Extract<Target, { where: 'remote' }>;
-      void this.ports.net!.fetch({ id: randomId(), address: t.address, url: t.url, method: 'DELETE' as 'POST', headers: this.headers(run, undefined) }, new Uint8Array(0)).catch(() => {});
-    }
-    this.endRun(run, { kind: 'exited', words: 'The server was stopped.' }, false);
-    return 'stopped';
   }
 
-  /** The tool list again (Test, or after list_changed). A failed walk ends the run. */
-  async list(): Promise<readonly ListedTool[] | Failure> {
-    const run = this.run;
-    if (this.stuck) return this.stuck;
-    if (!run || run.ended || !run.ready) return { kind: 'failed', words: 'The server is not running.' };
-    // One walk at a time: one under way (between its pages the slot is idle) answers busy too.
-    if (this.busy || (run.walker && !(__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk')))) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
-    return this.relist(run);
+  /** A person action, fed as an event, answered by its own effect. */
+  private ask(make: (token: string) => LcEvent): Promise<Reply> {
+    const token = `a${++this.tokens}`;
+    return new Promise<Reply>((resolve) => {
+      this.answers.set(token, resolve);
+      this.feed(make(token));
+    });
   }
+
+  /* ---------- start, stop, Test ---------- */
 
   /**
-   * A walk of the run's list, published if it completes, under the list's deadline. Each of its pages waits
-   * for the slot like any administrative exchange, so a refresh after list_changed isn't lost to an idle
-   * ping that took the slot first. A failed walk ends the run.
+   * A Start (or Test, by `mode`) as the machine answers it. `facts` are read by the caller in the same
+   * step; the owner's admission is asked here, once, and handed to the machine as a fact.
    */
-  private async relist(run: Run): Promise<readonly ListedTool[] | Failure> {
-    const { deadline, cancel } = this.deadline(run, this.limits.listMs);
-    try {
-      const r = await this.walk(run, deadline).catch((e: unknown) => ({ failure: unexpected(e) }));
-      if ('tools' in r) {
-        this.events.listed?.(run.id, r.tools);
-        return r.tools;
-      }
-      // A 404 on a page: the session's recovery is under way (3.8), and decides the run's end.
-      if ('session' in r && r.session && !(__FAMILIAR_MUTATIONS__ && mutant('end-on-refresh-404'))) return r.failure;
-      this.endRun(run, r.failure, true);
-      return r.failure;
-    } finally {
-      cancel?.();
+  startReply(target: Target, launch: string, mode: Mode = 'start', facts: Partial<StartFacts> = {}): Promise<Reply> {
+    if (this.busy && (__FAMILIAR_MUTATIONS__ && mutant('slot-per-run'))) {
+      this.slot = emptySlot;
+      this.feed({ t: 'slot', idle: true });
     }
+    const record = facts.record ?? 'ok';
+    let ownerFree = facts.ownerFree ?? true;
+    let ownerWords = facts.ownerWords;
+    let admitted: (() => void) | undefined;
+    if (record === 'ok' && ownerFree && !this.lc.run && !this.ownerHold && this.events.admit) {
+      const a = this.events.admit();
+      if ('release' in a) admitted = a.release;
+      else {
+        ownerFree = false;
+        ownerWords = a.words;
+      }
+    }
+    this.next = { target, launch };
+    if (admitted) this.ownerHold = admitted;
+    const reply = this.ask((token) => ({ t: 'start', token, mode, facts: { record, ownerFree, ...(ownerWords !== undefined ? { ownerWords } : {}), where: target.where } }));
+    // The machine holds the owner only for a local native start: any other admission is released at once.
+    if (admitted && this.lc.owner !== 'start' && this.ownerHold === admitted) {
+      this.ownerHold = undefined;
+      admitted();
+    }
+    return reply;
   }
 
-  /** A deadline for a start, a walk or a re-handshake: when it passes, the step under way ends. */
-  private deadline(run: Run, ms: number): { readonly deadline: Deadline; readonly cancel: () => void } {
-    let fire!: () => void;
-    const deadline: Deadline = { expired: false, over: new Promise<void>((r) => (fire = r)) };
-    const cancel = this.clock.setTimer(() => {
-      deadline.expired = true;
-      fire();
-      const ex = this.slot.ex;
-      if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run && ex.kind !== 'pong') this.input({ t: 'terminal', n: ex.n, end: { t: 'timeout' } });
-    }, ms, { background: false });
-    return { deadline, cancel: () => cancel?.() };
+  /** The old shape, for the wire's own tests: Ready with the run and its tools, or a failure in words. */
+  async start(target: Target, launch: string, _options: { readonly era?: Era } = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[] } | { readonly ok: false; readonly failure: Failure }> {
+    const r = await this.startReply(target, launch);
+    if (r.kind === 'ready') {
+      const run = this.lc.run;
+      return { ok: true, run: run?.id ?? '', tools: (run && this.wires.get(run.id)?.tools) ?? [] };
+    }
+    if (r.kind === 'failed') return { ok: false, failure: r.failure };
+    if (r.kind === 'refused') return { ok: false, failure: { kind: 'busy', words: r.words } };
+    return { ok: false, failure: { kind: 'exited', words: STOPPED_WORDS } };
+  }
+
+  /** Test: a start whose run, once listed, stops itself; ok only once that run has ended. */
+  async test(target: Target, launch: string, facts: Partial<StartFacts> = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] } | { readonly ok: false; readonly failure: Failure; readonly refused?: true }> {
+    const r = await this.startReply(target, launch, 'test', facts);
+    if (r.kind === 'tested') {
+      const w = this.wires.get(r.run);
+      return { ok: true, run: r.run, tools: w?.tools ?? [], notOffered: w?.notOffered ?? [] };
+    }
+    if (r.kind === 'failed') return { ok: false, failure: r.failure };
+    if (r.kind === 'refused') return { ok: false, failure: { kind: 'failed', words: r.words }, refused: true };
+    return { ok: false, failure: { kind: 'failed', words: 'The server was stopped before it was ready.' } };
+  }
+
+  /** Stop, as the machine answers it. */
+  stopReply(): Promise<Reply> {
+    const r = this.lc.run;
+    if (r && r.where === 'remote' && r.step !== 'closing' && (__FAMILIAR_MUTATIONS__ && mutant('delete-at-stop'))) {
+      const w = this.wires.get(r.id);
+      const t = w?.target as Extract<Target, { where: 'remote' }> | undefined;
+      if (w && t) void this.ports.net!.fetch({ id: randomId(), address: t.address, url: t.url, method: 'DELETE' as 'POST', headers: this.headers(w, undefined) }, new Uint8Array(0)).catch(() => {});
+    }
+    return this.ask((token) => ({ t: 'stop', token }));
+  }
+
+  /** The old shape: stopped, or refused (the exe refused, or the process may still be running). */
+  async stop(): Promise<'stopped' | 'refused'> {
+    const r = await this.stopReply();
+    return r.kind === 'stopped' ? 'stopped' : 'refused';
+  }
+
+  /** For tests: the tool list again, as a notice of changed tools would bring it. */
+  async list(): Promise<readonly ListedTool[] | Failure> {
+    if (this.lc.held) return this.lc.held;
+    const r = this.lc.run;
+    if (!r || phaseOf(this.lc) !== 'ready') return { kind: 'failed', words: 'The server is not running.' };
+    if (!callable(this.lc) || r.era !== 'legacy') return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
+    const id = r.id;
+    const done = new Promise<void>((res) => this.published.push(() => res()));
+    this.feed({ t: 'notice', run: id });
+    const ended = new Promise<void>((res) => {
+      const check = () => (this.lc.run?.id !== id ? res() : void this.clock.setTimer(check, 5, { background: true }));
+      check();
+    });
+    await Promise.race([done, ended]);
+    await this.drained();
+    const w = this.wires.get(id);
+    return this.lc.run?.id === id && w ? w.tools : (this.lc.held ?? failureOf(this.lc) ?? { kind: 'failed', words: 'The server is not running.' });
+  }
+
+  /* ---------- administrative exchanges, classified for the machine ---------- */
+
+  private admin(run: string, want: Want, era: Era): void {
+    const w = this.wireFor(run, era);
+    let p: Promise<Outcome> | undefined;
+    const onEnd = (o: Outcome) => {
+      let outcome: AdminOutcome;
+      try {
+        outcome = this.classify(w, want, o);
+      } catch (e) {
+        outcome = { k: 'invalid', failure: unexpected(e) };
+      }
+      this.feed({ t: 'admin-done', run, outcome });
+    };
+    if (want.kind === 'initialize') {
+      const id = w.nextId++;
+      p = this.exchangeNow(w, 'initialize', id, frame({ kind: 'initialize', id }, 'legacy', w.target.where), 'initialize', undefined, onEnd);
+    } else if (want.kind === 'initialized') {
+      p = this.exchangeNow(w, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', w.target.where), 'notifications/initialized', undefined, onEnd);
+    } else {
+      if (want.page === 1) {
+        w.pages = [];
+        w.cursor = undefined;
+      }
+      const id = w.nextId++;
+      const msg: AdminMessage = { kind: 'list', id, ...(w.cursor !== undefined ? { cursor: w.cursor } : {}) };
+      p = this.exchangeNow(w, 'list', id, frame(msg, w.era, w.target.where), 'tools/list', undefined, onEnd);
+    }
+    // The machine issues only at an Idle slot: a refusal here would mean the mirror drifted.
+    if (!p) this.feed({ t: 'admin-done', run, outcome: { k: 'unanswered', failure: { kind: 'busy', words: BUSY_SLOT } } });
+  }
+
+  private classify(w: Wire, want: Want, o: Outcome): AdminOutcome {
+    const end = o.end;
+    if (end.t === 'session-ended') return { k: 'session-ended' };
+    // A notification completes on its write (local) or its 202 (remote): there's no response to read.
+    if (want.kind === 'initialized' && end.t === 'done') return { k: 'ok' };
+    const answered = end.t === 'invalid' || end.t === 'line-too-long' || end.t === 'flood';
+    if (end.t !== 'done' || !o.response) return answered ? { k: 'invalid', failure: this.startWords(w, end) } : { k: 'unanswered', failure: this.startWords(w, end) };
+    const r = o.response;
+    if (want.kind === 'initialize') {
+      if (r.error) {
+        if (modernRefusal(r.error) || (__FAMILIAR_MUTATIONS__ && mutant('modern-on-any-error'))) {
+          if (o.offered !== undefined && (__FAMILIAR_MUTATIONS__ && mutant('session-id-on-modern'))) w.sessionId = o.offered;
+          else delete w.sessionId;
+          return { k: 'modern-refusal' };
+        }
+        return { k: 'refused', failure: refusedWords(r.error) };
+      }
+      try {
+        w.version = initializeResult(r.result ?? {}).protocolVersion;
+        return { k: 'legacy' };
+      } catch (e) {
+        return { k: 'invalid', failure: { kind: 'protocol', words: `The server's answer to the handshake was wrong: ${(e as Error).message}.`, ...(w.last.text() ? { lastOutput: w.last.text()! } : {}) } };
+      }
+    }
+    if (want.kind === 'initialized') return { k: 'ok' };
+    // A page of the list: any answer is the server's word.
+    if (r.error) {
+      if (w.era === 'modern' && r.error.code === -32022) return { k: 'refused', failure: refusedWords(r.error) };
+      return { k: 'refused', failure: { kind: 'protocol', words: `The server refused to list its tools: ${r.error.message}` } };
+    }
+    let page;
+    try {
+      page = listResult(r.result ?? {}, w.era);
+    } catch (e) {
+      return { k: 'invalid', failure: { kind: 'protocol', words: `The server's tool list was wrong: ${(e as Error).message}.` } };
+    }
+    // Bounded before anything is kept: every listed tool counts, offered or not.
+    if (w.pages.length + page.tools.length > MAX_TOOLS) return { k: 'invalid', failure: { kind: 'protocol', words: `The server lists more than ${MAX_TOOLS} tools. Familiar takes at most ${MAX_TOOLS}.` } };
+    for (const t of page.tools) w.pages.push(t);
+    w.cursor = page.nextCursor;
+    if (w.cursor !== undefined) return { k: 'page', more: true };
+    return { k: 'page', more: false, catalog: this.build(w) };
+  }
+
+  /** The listed tools, bounded and scanned, kept for the publish effect; or why the list fails. */
+  private build(w: Wire): 'ok' | Failure {
+    const raw = w.pages;
+    // Every listed tool is bounded before any is scanned (names, shape, bytes, the whole list): one that
+    // isn't offered still can't share a name with one that is, nor outgrow the bounds unchecked.
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('bound-offered-only'))) {
+      try {
+        boundTools(raw as never);
+      } catch (e) {
+        if (e instanceof CatalogError) return e.failure;
+        return unexpected(e);
+      }
+    }
+    // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
+    // rules isn't offered, and Test says why (3.5). The tool's fingerprint covers its declarations and the
+    // era, since they change what goes on the wire: the same tool listed by a legacy run is another tool.
+    const offered: Record<string, unknown>[] = [];
+    const notOffered: { name: string; reason: string }[] = [];
+    const declarations = new Map<string, readonly HeaderDeclaration[]>();
+    for (const t of raw) {
+      if (w.era === 'modern' && w.target.where === 'remote') {
+        const scan = scanDeclarations(t.inputSchema);
+        if (!scan.ok) {
+          notOffered.push({ name: cutText(String(t.name), 128), reason: cutText(scan.reason, 200) });
+          continue;
+        }
+        if (typeof t.name === 'string') declarations.set(t.name, scan.declarations);
+      }
+      offered.push(t);
+    }
+    try {
+      w.built = { tools: checkTools(offered as never, w.era === 'modern' && w.target.where === 'remote' ? { declarations } : {}), declarations, notOffered };
+      return 'ok';
+    } catch (e) {
+      if (e instanceof CatalogError) return e.failure;
+      return unexpected(e);
+    }
   }
 
   /* ---------- calls: the synchronous handoff ---------- */
+
 
   /**
    * Hands a call off, synchronously: the caller (client.ts) has checked the decision in the same step,
@@ -450,8 +633,8 @@ export class ServerLink {
    * nothing sent; otherwise the call's outcome, once it ends. `ms` is the call's time limit.
    */
   handoff(name: string, canonicalArguments: string, signal: AbortSignal, ms: number): Promise<CallOutcome> | undefined {
-    const run = this.run;
-    if (!run || run.ended || run.closing || !run.ready || run.stale || this.busy) return undefined;
+    const run = this.lc.run && this.wires.get(this.lc.run.id);
+    if (!run || !callable(this.lc) || this.busy) return undefined;
     // Modern remote: the headers come from the same decision as the body, in this same step (3.6).
     let extra: (readonly [string, string])[] | undefined;
     if (run.era === 'modern' && run.target.where === 'remote') {
@@ -485,18 +668,19 @@ export class ServerLink {
 
   /** Whether the run offers this tool with this fingerprint, catalog fresh. */
   offers(run: string, tool: string, fingerprint: string): boolean {
-    const r = this.run;
-    return !!r && r.id === run && !r.ended && !r.closing && r.ready && !r.stale && r.tools.some((t) => t.name === tool && t.fingerprint === fingerprint);
+    const r = this.lc.run && this.wires.get(this.lc.run.id);
+    return !!r && r.id === run && offering(this.lc) && r.tools.some((t) => t.name === tool && t.fingerprint === fingerprint);
   }
 
-  private callOutcome(run: Run, o: Outcome): CallOutcome {
+
+  private callOutcome(run: Wire, o: Outcome): CallOutcome {
     const end = o.end;
     if (end.t === 'done' && o.response) {
       const r = o.response;
       if (r.error) {
         if (run.era === 'modern' && r.error.code === -32022) {
           // The server changed its mind about the era: the run ends, with its versions in words.
-          this.endRun(run, refusedWords(r.error), true);
+          this.feed({ t: 'call-ended', run: run.id, end: 'era-refusal', failure: refusedWords(r.error) });
           return { kind: 'interrupted' };
         }
         if (run.era === 'modern' && r.error.code === -32020) return { kind: 'result', text: "The server said the call's headers didn't match its body. Familiar didn't send it again.", isError: true };
@@ -537,159 +721,8 @@ export class ServerLink {
     }
   }
 
-  /* ---------- the handshake and the walk ---------- */
-
-  private async handshake(run: Run, deadline: Deadline, opening = true): Promise<Failure | undefined> {
-    const id = run.nextId++;
-    const init = await this.exchange(run, 'initialize', id, frame({ kind: 'initialize', id }, 'legacy', run.target.where), deadline, 'initialize');
-    if (deadline.expired) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
-    if (init.end.t !== 'done' || !init.response) return this.startWords(run, init.end);
-    const r = init.response;
-    if (r.error) {
-      // The opening's classifier (3.3): a -32022 naming 2026-07-28 and no legacy version Familiar speaks
-      // makes this run modern. There's no new exchange: no discover, no initialized, straight to the list.
-      // Only on a run's opening: a re-handshake never changes an established run's era. There, the refusal
-      // ends the run, and Start opens a new one.
-      if (opening && (modernRefusal(r.error) || (__FAMILIAR_MUTATIONS__ && mutant('modern-on-any-error')))) {
-        run.era = 'modern';
-        if (init.offered !== undefined && (__FAMILIAR_MUTATIONS__ && mutant('session-id-on-modern'))) run.sessionId = init.offered;
-        else delete run.sessionId;
-        // The mutant keeps sending initialized on a modern run.
-        if ((__FAMILIAR_MUTATIONS__ && mutant('initialized-on-modern'))) await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where), deadline, 'notifications/initialized');
-        return undefined;
-      }
-      return refusedWords(r.error);
-    }
-    let info;
-    try {
-      info = initializeResult(r.result ?? {});
-    } catch (e) {
-      return { kind: 'protocol', words: `The server's answer to the handshake was wrong: ${(e as Error).message}.`, ...(run.last.text() ? { lastOutput: run.last.text()! } : {}) };
-    }
-    run.version = info.protocolVersion;
-    const sent = await this.exchange(run, 'initialized', undefined, frame({ kind: 'initialized' }, 'legacy', run.target.where), deadline, 'notifications/initialized');
-    if (deadline.expired) return { kind: 'timed-out', words: "The server didn't finish starting in time." };
-    if (sent.end.t !== 'done') return this.startWords(run, sent.end);
-    return undefined;
-  }
-
-  /**
-   * The tool list, published only if no list_changed came while it was walked: otherwise it's walked
-   * again, from the first page, within the same deadline, and a server whose tools keep changing fails the
-   * walk rather than leave a catalog Familiar knows is stale.
-   */
-  private async walk(run: Run, deadline: Deadline): Promise<{ readonly tools: readonly ListedTool[] } | { readonly failure: Failure; readonly session?: true; readonly answered?: true }> {
-    // This walk owns the run's list until it ends: a list_changed meanwhile only counts, and its retry
-    // absorbs it. A session the server ends meanwhile ends the walk before it sends anything more.
-    const me = {};
-    run.walker = me;
-    const session = run.session;
-    try {
-      for (let attempt = 0; ; attempt++) {
-        const at = run.changes;
-        run.stale = true;
-        const r = await this.walkOnce(run, deadline, session);
-        if (!('tools' in r)) return r;
-        if (run.changes !== at && !(__FAMILIAR_MUTATIONS__ && mutant('publish-stale-walk'))) {
-          if (attempt >= 2) return { failure: { kind: 'protocol', words: "The server's tools kept changing while Familiar listed them." } };
-          continue;
-        }
-        run.tools = r.tools;
-        run.declarations = r.declarations;
-        run.notOffered = r.notOffered;
-        run.stale = false;
-        return { tools: run.tools };
-      }
-    } finally {
-      if (run.walker === me) run.walker = undefined;
-    }
-  }
-
-  /** Pages of tools/list, each its own exchange through the barrier, at most 16, and 128 tools in all. */
-  private async walkOnce(run: Run, deadline: Deadline, session: number): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true; readonly answered?: true }> {
-    const raw: Record<string, unknown>[] = [];
-    let cursor: string | undefined;
-    // Once any page has an answer, the list's outcome is the server's word: a failure after it never asks
-    // for a relaunch (3.9).
-    let answered = false;
-    const said = (failure: Failure) => (answered ? { failure, answered: true as const } : { failure });
-    for (let page = 1; ; page++) {
-      if (page > MAX_PAGES) return said({ kind: 'protocol', words: `The server's tool list ran past ${MAX_PAGES} pages.` });
-      const id = run.nextId++;
-      const msg: AdminMessage = { kind: 'list', id, ...(cursor !== undefined ? { cursor } : {}) };
-      const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where), deadline, 'tools/list', session);
-      if (deadline.expired) return said({ kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." });
-      if (o.end.t !== 'done' || !o.response) return { ...said(this.startWords(run, o.end)), ...(o.end.t === 'session-ended' ? { session: true as const } : {}) };
-      answered = true;
-      if (o.response.error) {
-        // An answer, not a closed pipe: the server's own word, which decides (no relaunch follows it).
-        if (run.era === 'modern' && o.response.error.code === -32022) return { failure: refusedWords(o.response.error), answered: true };
-        return { failure: { kind: 'protocol', words: `The server refused to list its tools: ${o.response.error.message}` }, answered: true };
-      }
-      let p;
-      try {
-        p = listResult(o.response.result ?? {}, run.era);
-      } catch (e) {
-        return said({ kind: 'protocol', words: `The server's tool list was wrong: ${(e as Error).message}.` });
-      }
-      // Bounded before anything is kept: every listed tool counts, offered or not.
-      if (raw.length + p.tools.length > MAX_TOOLS) return said({ kind: 'protocol', words: `The server lists more than ${MAX_TOOLS} tools. Familiar takes at most ${MAX_TOOLS}.` });
-      for (const t of p.tools) raw.push(t);
-      cursor = p.nextCursor;
-      if (cursor === undefined) break;
-    }
-    // Every listed tool is bounded before any is scanned (names, shape, bytes, the whole list): one that
-    // isn't offered still can't share a name with one that is, nor outgrow the bounds unchecked.
-    if (!(__FAMILIAR_MUTATIONS__ && mutant('bound-offered-only'))) {
-      try {
-        boundTools(raw as never);
-      } catch (e) {
-        if (e instanceof CatalogError) return said(e.failure);
-        throw e;
-      }
-    }
-    // A modern remote run mirrors declared arguments into headers: a tool whose declarations break the
-    // rules isn't offered, and Test says why (3.5). The tool's fingerprint covers its declarations and the
-    // era, since they change what goes on the wire: the same tool listed by a legacy run is another tool.
-    const offered: Record<string, unknown>[] = [];
-    const notOffered: { name: string; reason: string }[] = [];
-    const declarations = new Map<string, readonly HeaderDeclaration[]>();
-    for (const t of raw) {
-      if (run.era === 'modern' && run.target.where === 'remote') {
-        const scan = scanDeclarations(t.inputSchema);
-        if (!scan.ok) {
-          notOffered.push({ name: cutText(String(t.name), 128), reason: cutText(scan.reason, 200) });
-          continue;
-        }
-        if (typeof t.name === 'string') declarations.set(t.name, scan.declarations);
-      }
-      offered.push(t);
-    }
-    try {
-      return { tools: checkTools(offered as never, run.era === 'modern' && run.target.where === 'remote' ? { declarations } : {}), declarations, notOffered };
-    } catch (e) {
-      if (e instanceof CatalogError) return said(e.failure);
-      throw e;
-    }
-  }
 
   /* ---------- exchanges ---------- */
-
-  /** One administrative exchange: waits for the slot to be Idle first (the walk's own pages, the handshake). */
-  private async exchange(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, deadline: Deadline, method: string, session?: number): Promise<Outcome> {
-    // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
-    // past the step's deadline, whatever a server keeps sending.
-    for (;;) {
-      if (!this.early(kind)) await this.slotWait(deadline, !((__FAMILIAR_MUTATIONS__ && (mutant('forget-exhaustion') || mutant('no-stuck-wake')))));
-      if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { end: { t: 'run-ended' } };
-      if (deadline.expired) return { end: { t: 'timeout' } };
-      if (run.ended || run.closing) return { end: { t: 'run-ended' } };
-      // A walk begun under a session the server has since ended: nothing more of it goes out.
-      if (session !== undefined && run.session !== session && !(__FAMILIAR_MUTATIONS__ && mutant('walk-across-recovery'))) return { end: { t: 'session-ended' } };
-      const started = this.exchangeNow(run, kind, requestId, body, method);
-      if (started) return started;
-    }
-  }
 
   /** Only under a named mutation: admitting before the slot has drained. */
   private early(kind: ExchangeKind): boolean {
@@ -698,22 +731,34 @@ export class ServerLink {
   }
 
   /** Admits and hands off in one synchronous step, or undefined if the slot isn't Idle. */
-  private exchangeNow(run: Run, kind: ExchangeKind, requestId: number | undefined, body: string, method?: string, extra?: readonly (readonly [string, string])[]): Promise<Outcome> | undefined {
+  private exchangeNow(run: Wire, kind: ExchangeKind, requestId: number | undefined, body: string, method?: string, extra?: readonly (readonly [string, string])[], onEnd?: (o: Outcome) => void): Promise<Outcome> | undefined {
     if (this.busy && !this.early(kind)) return undefined;
-    if (run.ended || run.closing) return Promise.resolve({ end: { t: 'run-ended' } });
-    let resolve!: (o: Outcome) => void;
-    const promise = new Promise<Outcome>((r) => (resolve = r));
+    let settle!: (o: Outcome) => void;
+    const promise = new Promise<Outcome>((r) => (settle = r));
+    // An administrative exchange's outcome reaches the lifecycle in the exchange's own end step, before its
+    // drain: the machine sees "done", then Idle, in that order.
+    const resolve = (o: Outcome) => {
+      settle(o);
+      onEnd?.(o);
+    };
     const n = this.slot.next;
     this.pending.set(n, { n, kind, run, ...(requestId !== undefined ? { requestId } : {}), body, done: resolve, ...(method ? { method } : {}), ...(extra ? { extra } : {}) });
     this.input({ t: 'admit', kind, where: run.target.where, era: run.era, ...(requestId !== undefined ? { requestId } : {}) });
+    this.feed({ t: 'slot', idle: false });
     return promise;
   }
 
-  /** Feeds the machine one input and does its effects, synchronously. */
+  /** Feeds the exchange machine one input and does its effects, synchronously. */
   private input(input: Input): void {
     const s = step(this.slot, input);
     this.slot = s.slot;
-    for (const e of s.effects) this.effect(e);
+    this.effecting++;
+    try {
+      for (const e of s.effects) this.effect(e);
+    } finally {
+      this.effecting--;
+    }
+    if (this.effecting === 0 && !this.draining && this.queue.length) this.drain();
   }
 
   private effect(e: Effect): void {
@@ -728,10 +773,10 @@ export class ServerLink {
         const p = this.pending.get(e.n);
         if (!p) return;
         p.done({ end: e.end, ...(p.response ? { response: p.response } : {}), ...(p.offeredSession !== undefined ? { offered: p.offeredSession } : {}) });
-        // The first page or call after a re-handshake that completes without a 404 rearms the bound (3.8).
-        // Rearmed only by a page or call after the recovery, not by the re-handshake's own walk.
-        if (e.end.t === 'done' && (p.kind === 'list' || p.kind === 'call') && (p.run.ready || (__FAMILIAR_MUTATIONS__ && mutant('rearm-in-recovery')))) p.run.dropped = 0;
-        if (e.end.t === 'session-ended') this.sessionDropped(p.run);
+        // A call that completes rearms a recovered session's 404 bound; a call that met a 404 is the
+        // lifecycle's (3.8). An administrative exchange's outcome reaches it through its own classifier.
+        if (p.kind === 'call' && e.end.t === 'done') this.feed({ t: 'call-ended', run: p.run.id, end: 'done' });
+        if (p.kind === 'call' && e.end.t === 'session-ended') this.feed({ t: 'call-ended', run: p.run.id, end: 'session-ended' });
         return;
       }
       case 'idle': {
@@ -739,6 +784,7 @@ export class ServerLink {
         for (const [h] of [...this.natives]) if (h.startsWith(`${e.n}:`)) this.natives.delete(h);
         const waiters = this.idle.splice(0);
         for (const w of waiters) w();
+        this.feed({ t: 'slot', idle: true });
         return;
       }
       case 'departure':
@@ -761,18 +807,19 @@ export class ServerLink {
     return this.post(run, e.handle, text, e.message === 'request' ? p : undefined);
   }
 
+
   /* ---------- local ---------- */
 
-  private write(run: Run, handle: string, text: string, request: Pending | undefined): void {
-    if (run.ended || run.process === undefined) {
-      // No run to write to: the write ends at once.
+  private write(run: Wire, handle: string, text: string, request: Pending | undefined): void {
+    if (run.process === undefined || run.exited) {
+      // No process to write to: the write ends at once.
       queueMicrotask(() => this.input({ t: 'released', handle }));
       return;
     }
     // The page's watchdog on this write: past the bound, the server has stopped reading.
     const watchdog = (__FAMILIAR_MUTATIONS__ && mutant('no-write-bound'))
       ? undefined
-      : this.clock.setTimer(() => this.endRun(run, { kind: 'protocol', words: 'The server stopped reading what Familiar sent, so it was stopped.' }, true), this.limits.writeMs, { background: false });
+      : this.clock.setTimer(() => this.feed({ t: 'write-bound', run: run.id }), this.limits.writeMs, { background: false });
     this.ports.processes!.write(run.process, enc.encode(`${text}\n`)).then(
       () => {
         watchdog?.();
@@ -786,15 +833,18 @@ export class ServerLink {
     );
   }
 
-  private processEvent(run: Run, e: ProcessEvent): void {
+  private processEvent(run: Wire, e: ProcessEvent): void {
     if (e.t === 'exit') {
       run.exited = true;
-      run.sawExit();
-      if (run.ended) return this.releaseWrites(run);
-      this.endRun(run, exitFailure(e.code, run.last.text()), true);
+      if (run.process === undefined) {
+        run.exitedEarly = { code: e.code };
+        return;
+      }
+      this.feed({ t: 'exit', process: run.process, failure: exitFailure(e.code, run.last.text()) });
       return;
     }
-    if (run.ended) return;
+    // Lines of a run that isn't the current one (an orphan) are nobody's now.
+    if (this.lc.run?.id !== run.id) return;
     if (e.t === 'err') {
       if (DROPPED_LINE.test(e.line)) {
         const ex = this.slot.ex;
@@ -821,7 +871,7 @@ export class ServerLink {
 
   /* ---------- remote ---------- */
 
-  private headers(run: Run, method: string | undefined): [string, string][] {
+  private headers(run: Wire, method: string | undefined): [string, string][] {
     const t = run.target as Extract<Target, { where: 'remote' }>;
     // Reserved names never come from a setup (5.7): refused when it's saved, and dropped here too.
     const h: [string, string][] = t.headers.filter(([k]) => !reservedHeader(k)).map(([k, v]) => [k, v]);
@@ -844,7 +894,7 @@ export class ServerLink {
     return h;
   }
 
-  private post(run: Run, handle: string, text: string, request: Pending | undefined): void {
+  private post(run: Wire, handle: string, text: string, request: Pending | undefined): void {
     const t = run.target as Extract<Target, { where: 'remote' }>;
     const id = randomId();
     this.natives.set(handle, id);
@@ -885,19 +935,17 @@ export class ServerLink {
       () => {
         if ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel'))) return this.input({ t: 'released', handle });
         if (attempt < 3) return void this.clock.setTimer(() => this.cancel(handle, attempt + 1), 1000 * 2 ** attempt, { background: false });
-        // For good: the slot stays held until a restart. Every later Start, and an exchange waiting for the
-        // slot (a start parked between its handshake's steps), answers with these words.
+        // For good: the slot stays held until a restart. The machine answers every waiter, a start parked
+        // between its handshake's steps included, with these words.
         const failure: Failure = { kind: 'protocol', words: "Familiar couldn't end a request to the server. Restart Familiar to use it again." };
         this.stuck = failure;
-        const run = this.run;
-        if (run && !run.ended) this.endRun(run, failure, true);
-        for (const w of [...this.stuckWaiters]) w();
+        this.feed({ t: 'exhausted', failure });
       }
     );
   }
 
   /** A request's head and body. */
-  private async response(run: Run, p: Pending, id: string, head: NetHead): Promise<void> {
+  private async response(run: Wire, p: Pending, id: string, head: NetHead): Promise<void> {
     const live = () => this.slot.ex?.n === p.n && this.slot.ex.phase === 'live';
     if (!live()) return;
     if ((head.redirected || (head.status >= 300 && head.status < 400)) && !(__FAMILIAR_MUTATIONS__ && mutant('ignore-redirected'))) return this.input({ t: 'terminal', n: p.n, end: { t: 'redirected', status: head.status } });
@@ -952,7 +1000,7 @@ export class ServerLink {
   }
 
   /** One message on a remote request's stream. True once the exchange has its response. */
-  private remoteMessage(run: Run, p: Pending, text: string, status?: number): boolean {
+  private remoteMessage(run: Wire, p: Pending, text: string, status?: number): boolean {
     let m: Inbound;
     try {
       m = parseMessage(text, p.kind === 'initialize' || status !== undefined ? MAX_HANDSHAKE_BYTES : MAX_MESSAGE_BYTES);
@@ -973,7 +1021,7 @@ export class ServerLink {
   /* ---------- inbound, both transports ---------- */
 
   /** True when the message completed the live exchange. */
-  private inbound(run: Run, m: Inbound, remote: boolean, on?: Pending): boolean {
+  private inbound(run: Wire, m: Inbound, remote: boolean, on?: Pending): boolean {
     const ex = this.slot.ex;
     const live = ex && ex.phase === 'live' ? this.pending.get(ex.n) : undefined;
     const mine = live && live.run === run && (!remote || live === on) ? live : undefined;
@@ -995,124 +1043,34 @@ export class ServerLink {
         const n = mine.n;
         queueMicrotask(() => this.input({ t: 'ping', n, id: m.id }));
       } else if (mine) this.input({ t: 'ping', n: mine.n, id: m.id });
-      else if (!remote && !this.busy && !run.closing) this.idlePing(run, m.id);
+      else if (!remote && !this.busy && this.lc.run?.id === run.id && !fenced(this.lc)) this.idlePing(run, m.id);
       else if (ex && ex.phase === 'draining' && !remote) this.input({ t: 'ping', n: ex.n, id: m.id });
       return false;
     }
-    if (m.method === 'notifications/tools/list_changed' && run.era === 'legacy') {
-      run.stale = true;
-      run.changes++;
-      // Idle: walk now; otherwise after the exchange that carried it. A burst is one more walk, and a walk
-      // under way when it comes walks again on its own.
-      const beside = !!(__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk'));
-      if (run.ready && !run.relisting && (!run.walker || beside)) {
-        run.relisting = true;
-        void this.drained().then(() => {
-          run.relisting = false;
-          if (run.ended || run.closing || !run.ready || !run.stale || (run.walker && !beside)) return undefined;
-          // Through the slot's own wait, never the public list(), which answers busy to an idle ping's pong.
-          return (__FAMILIAR_MUTATIONS__ && mutant('refresh-through-list')) ? this.list() : this.relist(run);
-        });
-      }
-    }
+    // The lifecycle decides what a notice of changed tools brings: a walk now, after the exchange that
+    // carried it, or folded into a walk under way.
+    if (m.method === 'notifications/tools/list_changed' && run.era === 'legacy') this.feed({ t: 'notice', run: run.id });
     return false;
   }
 
   /** A local ping with no live exchange: answered as an exchange of its own, one write. */
-  private idlePing(run: Run, id: RpcId): void {
+  private idlePing(run: Wire, id: RpcId): void {
     const n = this.slot.next;
     this.pending.set(n, { n, kind: 'pong', run, body: frame({ kind: 'pong', id }, run.era, 'local'), done: () => {} });
     this.input({ t: 'admit', kind: 'pong', where: 'local', era: run.era });
+    this.feed({ t: 'slot', idle: false });
   }
 
-  /* ---------- a remote session that ended (3.8) ---------- */
+  /* ---------- the wire's end of a process ---------- */
 
-  /**
-   * A 404 on a request that carried the session id: the server ended the session. The call that met it
-   * isn't resent. The next exchange is one fresh handshake (initialize with no session id, the new id on
-   * `initialized` onward), then the tool list; calls are refused busy meanwhile. A second drop before a
-   * page or a call has completed since, or a failed re-handshake, ends the run.
-   */
-  private sessionDropped(run: Run): void {
-    if (run.ended || run.closing) return;
-    if ((run.dropped > 0 || !run.ready) && !(__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) {
-      this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
-      return;
-    }
-    run.dropped = 1;
-    run.session++;
-    if (!(__FAMILIAR_MUTATIONS__ && mutant('ready-during-recovery'))) {
-      run.ready = false;
-      run.stale = true;
-    }
-    const resend = (__FAMILIAR_MUTATIONS__ && mutant('resend-404-call')) && run.lastCall ? run.lastCall.body : undefined;
-    if (!(__FAMILIAR_MUTATIONS__ && mutant('keep-old-session-id'))) delete run.sessionId;
-    delete run.version;
-    void (async () => {
-      const { deadline, cancel } = this.deadline(run, this.limits.startMs);
-      try {
-        const failure = run.ended ? undefined : await this.handshake(run, deadline, !!(__FAMILIAR_MUTATIONS__ && mutant('era-change-on-recovery')));
-        if (run.ended) return;
-        if (failure) return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
-        const listed = await this.walk(run, deadline);
-        if (run.ended) return;
-        if (!('tools' in listed)) {
-          // The mutant's own re-handshake for the walk's 404 is already under way.
-          if (/ended its session/.test(listed.failure.words) && (__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) return;
-          return this.endRun(run, { kind: 'http', words: 'The server ended its session.' }, true);
-        }
-        run.ready = true;
-        this.events.listed?.(run.id, run.tools);
-        if (resend) {
-          await this.drained();
-          void this.exchangeNow(run, 'call', run.nextId++, resend, 'tools/call');
-        }
-      } finally {
-        cancel?.();
-      }
-    })().catch((e: unknown) => this.endRun(run, unexpected(e), true));
-  }
-
-  /* ---------- the run's end ---------- */
-
-  private endRun(run: Run, failure: Failure, report: boolean): void {
-    if (run.ended) return;
-    run.ended = true;
-    run.ready = false;
-    run.failure = failure;
-    run.finish();
-    const ex = this.slot.ex;
-    if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run === run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
-    if (run.target.where === 'local') {
-      // A local run that ends with its process still running stops it, whatever ended it; its writes end
-      // when the exe says the process has exited, not before, so a blocked write keeps the slot (H1).
-      // Remote requests end through net_cancel.
-      // A refused stop releases nothing: the writes end only when the exe says the process has exited.
-      if (run.process !== undefined && !run.exited) void this.stopProcess(run).catch(() => ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel')) ? this.releaseWrites(run) : undefined));
-      else this.releaseWrites(run);
-    }
-    if (report) this.events.ended(run.id, failure);
-  }
-
-  /** The run's one native stop: asked the first time, the same answer after. */
-  private stopProcess(run: Run): Promise<void> {
-    run.killed = true;
-    if ((__FAMILIAR_MUTATIONS__ && mutant('stop-twice'))) return this.ports.processes!.stop(run.process!);
-    return (run.stopCall ??= this.ports.processes!.stop(run.process!));
-  }
-
-  /** A local run's process is gone: its exchange's writes have ended. */
-  private releaseWrites(run: Run): void {
+  /** A local process is gone: the writes of its exchange have ended. */
+  private releaseWrites(run: Wire): void {
     const ex = this.slot.ex;
     if (ex && this.pending.get(ex.n)?.run === run) for (const h of [...ex.open]) this.input({ t: 'released', handle: h });
   }
 
-  private exitWords(run: Run): Failure {
-    return exitFailure(undefined, run.last.text());
-  }
-
-  private startWords(run: Run, end: End): Failure {
-    if (end.t === 'run-ended') return run.failure ?? (run.target.where === 'local' ? protocolFailure(run.last.text()) : { kind: 'exited', words: 'The connection to the server closed.' });
+  private startWords(run: Wire, end: End): Failure {
+    if (end.t === 'run-ended') return run.target.where === 'local' ? protocolFailure(run.last.text()) : { kind: 'exited', words: 'The connection to the server closed.' };
     if (end.t === 'timeout') return { kind: 'timed-out', words: "The server didn't finish starting in time." };
     if (end.t === 'native') return remoteFailure({ kind: end.kind });
     if (end.t === 'http') return remoteFailure({ code: end.status });

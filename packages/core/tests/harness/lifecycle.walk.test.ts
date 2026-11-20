@@ -118,6 +118,8 @@ function check(prev: LcState, e: LcEvent, s: LcState, effects: readonly LcEffect
   const run = s.run;
   // I1: Ready entered only fresh and Idle; callable only then.
   if (run?.step === 'ready' && prev.run?.step !== 'ready' && (s.slot !== 'idle' || !fresh(s))) bad.push('I1: Ready entered stale or busy');
+  // And the catalog it stands on was walked under every notice read: the walk's own count, not the record.
+  if (run?.step === 'ready' && prev.run?.step !== 'ready' && prev.run?.walk && prev.run.walk.startedAt !== run.changes) bad.push('I1: Ready on a walk a notice outran');
   if (callable(s) && (s.slot !== 'idle' || !fresh(s))) bad.push('I1: callable on a stale catalog or a busy slot');
   // I2: one process per setup; one native stop per run.
   const alive = s.orphans.length + (run?.native && (run.native.start === 'pending' || (run.native.process && !run.native.exited)) ? 1 : 0);

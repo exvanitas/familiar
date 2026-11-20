@@ -37,6 +37,7 @@ import { secretRefs, setupFingerprint, setupProblems, type ServerSetup } from '.
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
 import { unpinned, type Unpinned } from './unpinned.ts';
 import type { LinkLimits, NetPort } from './wire/link.ts';
+import type { LcEvent, LcState } from './wire/lifecycle.ts';
 
 /** Saved addresses: the exe's `address_add` (which asks the person), `address_remove` (which deletes
     the address's key) and `address_list` (for the start-time sweep of addresses no record owns). */
@@ -73,6 +74,8 @@ export interface McpClientOptions {
   readonly paths?: PathRules;
   /** Hears that a server's state, tools or failure changed. */
   readonly onChange?: (id: string) => void;
+  /** The test build's conformance record: each server's lifecycle events and the states they gave. */
+  readonly transition?: (id: string, event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }) => void;
 }
 
 export interface ServerStatus {
@@ -144,7 +147,8 @@ export class McpClient {
         this.owner,
         { processes: this.o.processes, net: this.o.net, clock: this.o.clock, ...(this.o.limits ? { limits: this.o.limits } : {}) },
         () => this.o.onChange?.(id),
-        (tools, current) => this.seen(id, tools, current)
+        (tools, current) => this.seen(id, tools, current),
+        this.o.transition ? (event, state, slot) => this.o.transition!(id, event, state, slot) : undefined
       );
       this.runtimes.set(id, rt);
     }
@@ -239,22 +243,14 @@ export class McpClient {
     const s = this.owner.server(id);
     if (!rt || !s) return { ok: false, failure: { kind: 'failed', words: 'No server is saved with that id.' } };
     if (rt.phase !== 'stopped' && rt.phase !== 'failed') return { ok: false, failure: { kind: 'busy', words: 'Stop the server to test it. Test never disturbs a running server.' } };
-    const starting = rt.start();
-    // Test's own start, by its token: read in the same step as the call, before any await.
-    const token = rt.token;
-    const r = await starting;
-    // Test's own run: the one it stops at the end, and the only one it reports.
-    const run = r.kind === 'ready' ? rt.runNow : undefined;
-    if (r.kind !== 'ready' || (run === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop')))) {
-      rt.settle(token);
-      const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: 'The server was stopped before it was ready.' };
-      return { ok: false, failure };
-    }
+    // Test's own run, from its start to its own stop, is the machine's (5.4): its answer comes only once that
+    // run has ended, and it never touches another run.
+    const r = await rt.test();
+    if (!r.ok) return { ok: false, failure: r.failure };
     const saved = new Map(s.tools.map(t => [t.name, t]));
-    const named = rt.tools.map(t => ({ t, n: modelName(s.key, t.name) }));
+    const named = r.tools.map(t => ({ t, n: modelName(s.key, t.name) }));
     const tools = named.filter(x => 'name' in x.n).map(({ t }) => ({ ...t, fresh: fresh(saved.get(t.name), t.fingerprint) }));
-    const notOffered = [...rt.notOffered, ...named.flatMap(({ t, n }) => ('reason' in n ? [{ name: t.name, reason: n.reason }] : []))];
-    if (run !== undefined) await rt.stopRun(run);
+    const notOffered = [...r.notOffered, ...named.flatMap(({ t, n }) => ('reason' in n ? [{ name: t.name, reason: n.reason }] : []))];
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
     const reviewed = s.tools.flatMap(t => (t.reviewed ? [{ name: t.name, fingerprint: t.reviewed }] : []));
     const report = `test-${++this.reportCount}-${Math.random().toString(36).slice(2, 10)}`;

@@ -1,8 +1,7 @@
-// A long-lived link keeps nothing per exchange it made (3.4): an exchange waiting for the slot registers a
-// waiter for the slot held for good only while it waits, and takes it away when its wait ends.
+// A long-lived link keeps nothing per exchange it made (3.4): after 1,000 refreshes no person action is left
+// waiting, and nothing else waits on a promise.
 import { describe, expect, it } from 'vitest';
 import { ServerLink, type Target } from '../../../src/mcp/wire/link.ts';
-import { mutations } from '../../../src/mutations.ts';
 import { fakeNet, initResult, json, listResult, realClock } from '../wire-fakes.ts';
 
 const remote: Target = { where: 'remote', address: 'a1', url: 'https://h.example/mcp', headers: [] };
@@ -29,12 +28,7 @@ describe("the slot's waiters", () => {
     expect(await refreshes(1000)).toBe(0);
   }, 60_000);
 
-  it('the control: a waiter kept after its wait ends piles up, one per exchange', async () => {
-    mutations.set(['stuck-waiter-kept']);
-    try {
-      expect(await refreshes(50)).toBeGreaterThanOrEqual(50);
-    } finally {
-      mutations.clear();
-    }
-  });
+  // The old waiters (a promise per exchange racing the slot held for good) are gone: an exchange waiting for
+  // the slot is now a step in the lifecycle machine's state, answered by its transitions, so there is no
+  // waiter to leave behind and no control to put one back (W checks every waiter is answered once).
 });

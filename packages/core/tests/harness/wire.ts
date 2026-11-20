@@ -10,6 +10,7 @@ import type { NetHead, NetPort, NetSpec } from '../../src/mcp/wire/link.ts';
 import type { ProcessEvent, ProcessPort, ProcessSetup } from '../../src/mcp/process.ts';
 import { memorySettingsStore } from '../../src/settings/store.ts';
 import type { CallOutcome } from '../../src/mcp/types.ts';
+import type { LcEvent, LcState } from '../../src/mcp/wire/lifecycle.ts';
 import { Scheduler } from './sched.ts';
 
 const enc = new TextEncoder();
@@ -107,6 +108,11 @@ export interface Mode {
   /** Local, with lateAcks: an idle ping delivered the moment a call's write is acknowledged, in the very
       window between its exchange's drain and anything waiting on that drain (S30). */
   readonly pingAtDrain?: boolean;
+  /** Local, with lateAcks: a list_changed written right after the first tools/list answer, before its write
+      is acknowledged (a notice during Start's final drain). */
+  readonly noticeAtDrain?: boolean;
+  /** Local: the exe refuses every server_stop, and the process doesn't exit. */
+  readonly refuseStop?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -392,7 +398,7 @@ export class FakeExe {
   /** Local: when each process run exited, by epoch. */
   readonly exits: { epoch: number; step: number }[] = [];
   /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2). */
-  readonly processStarts: { epoch: number; seq: number; step: number; answered?: number }[] = [];
+  readonly processStarts: { epoch: number; seq: number; step: number; server: string; answered?: number }[] = [];
   /** Holds the next process start's answer until `releaseStart()` (S11, Stop during a pending start). */
   holdNextStart = false;
   releaseStart?: () => void;
@@ -639,7 +645,7 @@ export class FakeExe {
 
   processes(): ProcessPort {
     let runs = 0;
-    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number }>();
+    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; noticed?: boolean }>();
     const flush = (run: string) => {
       const p = live.get(run)!;
       if (p.flushing || !p.out.length) return;
@@ -725,7 +731,23 @@ export class FakeExe {
         };
         // Late acknowledgements: the write ends only once everything the server wrote back has been read.
         if (this.server.mode.lateAcks) {
-          const late = (): void => void this.sched.add({ label: `ack:${w.rec.n}`, fire: () => (p.out.length || p.flushing ? late() : ack()) });
+          const notice = this.server.mode.noticeAtDrain && w.rec.body?.method === 'tools/list' && !p.noticed;
+          const late = (): void =>
+            void this.sched.add({
+              label: `ack:${w.rec.n}`,
+              fire: () => {
+                if (p.out.length || p.flushing) return late();
+                // A notice of changed tools, written after the list's answer and before its write is acknowledged.
+                if (notice && !p.noticed) {
+                  p.noticed = true;
+                  this.server.variant = this.server.variant === 'a' ? 'b' : 'a';
+                  p.out.push(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
+                  flush(run);
+                  return late();
+                }
+                ack();
+              }
+            });
           late();
         } else ack();
         const body = w.rec.body ?? {};
@@ -753,11 +775,11 @@ export class FakeExe {
       } });
     };
     return {
-      start: (_setup: ProcessSetup, onEvent) =>
+      start: (setup: ProcessSetup, onEvent) =>
         new Promise((resolve) => {
           const run = `p${++runs}`;
           this.epoch++;
-          const admitted: { epoch: number; seq: number; step: number; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step };
+          const admitted: { epoch: number; seq: number; step: number; server: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id };
           this.processStarts.push(admitted);
           live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch });
           const answer = () => this.sched.add({ label: `started:${run}`, fire: () => {
@@ -800,6 +822,7 @@ export class FakeExe {
       stop: async (run) => {
         const asked = live.get(run);
         if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step });
+        if (this.server.mode.refuseStop) throw Object.assign(new Error('refused'), { kind: 'failed' });
         this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) });
       },
       forget: async () => {}
@@ -850,7 +873,17 @@ export interface Evidence {
   readonly admitted?: boolean;
 }
 
+/** One lifecycle transition as the driver made it: the event, the state it then held, and the exchange slot. */
+export interface LcRecord {
+  readonly event: LcEvent;
+  readonly state: LcState;
+  readonly busy: boolean;
+  readonly quiet: boolean;
+}
+
 export interface WireRun {
+  /** Each server's lifecycle record, in order (the conformance check replays it through next()). */
+  readonly lifecycle: ReadonlyMap<string, readonly LcRecord[]>;
   readonly sched: Scheduler;
   readonly exe: FakeExe;
   readonly server: ScriptedServer;
@@ -886,7 +919,9 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   });
   let addresses = 0;
   const store = holdable(memorySettingsStore());
+  const lifecycle = new Map<string, LcRecord[]>();
   const client = await McpClient.open({
+    transition: (id, event, state, slot) => lifecycle.set(id, [...(lifecycle.get(id) ?? []), { event, state, ...slot }]),
     store,
     processes: exe.processes(),
     net: exe.net(),
@@ -908,7 +943,7 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   await sched.run(options.steps ?? 1500);
   if (options.mutation && firstHit === undefined && mutations.hits(options.mutation) > 0) firstHit = sched.step;
   mutations.clear();
-  return { sched, exe, server, evidence, firstHit };
+  return { sched, exe, server, evidence, firstHit, lifecycle };
 }
 
 export class Driver {
@@ -1004,15 +1039,19 @@ export class Driver {
     this.note({ what: 'model', ok });
   }
 
-  private note(e: Omit<Evidence, 'seq' | 'step'>): void {
-    this.evidence.push({ seq: this.tick(), step: this.sched.step, ...e });
+  private note(e: Omit<Evidence, 'seq' | 'step'>): Evidence {
+    const rec = { seq: this.tick(), step: this.sched.step, ...e };
+    this.evidence.push(rec);
+    return rec;
   }
 
   /** Start; with `then`, an action in the same step as its answer (a call made the moment it says Ready). */
   start(id = 's1', then?: (ready: boolean) => void): void {
     const before = this.client.get(id)?.phase;
+    // Noted before the call (its sequence precedes anything the start sends), its admission read after.
+    const e = this.note({ what: 'start', server: id });
     const starting = this.client.start(id);
-    this.note({ what: 'start', server: id, admitted: before !== 'starting' && this.client.get(id)?.phase === 'starting' });
+    (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void starting.then((reply) => {
       this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' });
       then?.(reply.kind === 'ready');
@@ -1032,8 +1071,9 @@ export class Driver {
   /** Test, as Settings runs it: its report, with the tools it showed. */
   test(id = 's1'): void {
     const before = this.client.get(id)?.phase;
+    const e = this.note({ what: 'test', server: id });
     const testing = this.client.test(id);
-    this.note({ what: 'test', server: id, admitted: before !== 'starting' && this.client.get(id)?.phase === 'starting' });
+    (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void testing.then(
       (report) => this.note({ what: 'tested', server: id, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] } }),
       (e: unknown) => this.note({ what: 'tested', server: id, failure: 'threw', words: String(e).slice(0, 80) })

@@ -3,6 +3,7 @@
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import type { Evidence, NativeRec, WireRun } from './wire.ts';
+import { initialState, next } from '../../src/mcp/wire/lifecycle.ts';
 
 export type Check = (r: WireRun) => string[];
 
@@ -64,7 +65,7 @@ function admittedStarts(r: WireRun, server: string): Evidence[] {
   return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && addressOf(e.server) === server && (e.admitted || evidenceControls.countRefusedStarts));
 }
 /** The harness's own controls, for its tests only: count refused Starts as runs, as the old evidence did. */
-export const evidenceControls = { countRefusedStarts: false, globalTests: false };
+export const evidenceControls = { countRefusedStarts: false, globalTests: false, globalStarts: false };
 
 function runOf(r: WireRun, x: NativeRec): number {
   if (x.kind === 'write') return x.epoch;
@@ -151,7 +152,10 @@ function inPlay(r: WireRun, server: string, s: number): boolean {
     if (x.start > s) return false;
     if ((x.end ?? Infinity) >= s) return true;
     if (x.body?.id === undefined || !x.body.method) return false;
-    const answered = r.exe.responded.get(`${x.epoch}:${x.body.id}`);
+    // A response for this id read before the request was written is a stale one (a server replaying an
+    // earlier run's id), not this request's answer.
+    const seen = r.exe.responded.get(`${x.epoch}:${x.body.id}`);
+    const answered = seen !== undefined && seen >= x.start ? seen : undefined;
     const cancelled = r.exe.log.some((y) => y.kind === 'write' && y.epoch === x.epoch && y.body?.method === 'notifications/cancelled' && y.body.params?.requestId === x.body!.id && (y.end ?? Infinity) <= s);
     const exited = r.exe.exits.some((t) => t.epoch === x.epoch && t.step <= s);
     return (answered === undefined || answered >= s) && !cancelled && !exited;
@@ -228,16 +232,17 @@ export const H2: Check = (r) => {
     for (const e of r.evidence) {
       if (e.what !== 'stop') continue;
       const answered = r.evidence.find((y) => y.what === 'stopped' && y.token === e.token && y.seq > e.seq);
-      // The process Stop is for: the last one the exe admitted to start before it, from the exe's own start
-      // record, so a Stop while that start is still pending (no write yet) is judged too.
-      const epoch = r.exe.processStarts.filter((t) => t.seq < e.seq).at(-1)?.epoch;
+      // The process Stop is for: the last one the exe admitted to start for that server before it, from the
+      // exe's own start record, so a Stop while that start is still pending (no write yet) is judged too.
+      const epoch = r.exe.processStarts.filter((t) => t.seq < e.seq && (evidenceControls.globalStarts || t.server === (e.server ?? 's1'))).at(-1)?.epoch;
       // Every Stop is answered, unless the run hit its step bound first.
       if (!answered) {
         if (epoch !== undefined && r.sched.step < 1500) problems.push(`H2: a local Stop made at step ${e.step} was never answered`);
         continue;
       }
-      // A Stop refused (another one under way, or not running) stopped nothing.
-      if (answered.failure === 'refused' || epoch === undefined) continue;
+      // A Stop refused (another one under way, or not running) stopped nothing; one answered "may still be
+      // running" (the exe refused, or Stop's deadline came first) claims no exit.
+      if (answered.failure === 'refused' || epoch === undefined || /may still be running/.test(answered.words ?? '')) continue;
       const exit = r.exe.exits.find((t) => t.epoch === epoch);
       if (!exit || exit.step > answered.step) problems.push(`H2: a local Stop answered at step ${answered.step}, before its process exited${exit ? ` at ${exit.step}` : ''}`);
     }
@@ -701,7 +706,30 @@ export function handoffHistory(r: WireRun, upTo: number): string {
   return JSON.stringify(r.exe.log.filter((x) => x.start <= upTo).map((x) => [x.kind, x.server, x.method, x.url ?? null, [...(x.headerPairs ?? Object.entries(x.headers))].map(([k, v]) => [k.toLowerCase(), v]).sort(), x.start, x.raw ?? null]));
 }
 
-export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14, H15 };
+/**
+ * HC, conformance: the real driver decided nothing outside the machine. Each server's record of events and
+ * the states the driver then held is replayed through next() from the start, and every state must be the
+ * one the machine gives; and whenever the driver's queue had drained, its slot mirror must match the
+ * exchange machine's.
+ */
+export const HC: Check = (r) => {
+  const problems: string[] = [];
+  for (const [server, records] of r.lifecycle) {
+    let s = initialState(server);
+    for (let i = 0; i < records.length && problems.length < 3; i++) {
+      const rec = records[i]!;
+      s = next(s, rec.event).state;
+      if (canonical(s) !== canonical(rec.state)) {
+        problems.push(`HC: ${server}'s state after event ${i} (${rec.event.t}) isn't the machine's`);
+        s = rec.state;
+      }
+      if (rec.quiet && (rec.state.slot === 'busy') !== rec.busy) problems.push(`HC: ${server}'s slot mirror says ${rec.state.slot} after event ${i} (${rec.event.t}), the exchange machine ${rec.busy ? 'busy' : 'idle'}`);
+    }
+  }
+  return problems.slice(0, 3);
+};
+
+export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14, H15, HC };
 export const PASS_CHECKS: Record<string, Check> = { ...WIRE_CHECKS, H4, H5 };
 
 /** Each check's witness (7.2): a step where its condition was in play and could have failed. */

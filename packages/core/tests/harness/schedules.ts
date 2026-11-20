@@ -144,7 +144,120 @@ function callAtReady(where: 'local' | 'remote'): Named {
   };
 }
 
+const mayRun = /may still be running/;
+
+/** The lifecycle machine's own cases (S31 to S35), each a sequence the old lifecycle code got wrong. */
+const LIFECYCLE: Named[] = [
+  {
+    // S31: Stop while server_start is pending, then the exe refuses the stop and the process never exits:
+    // Stop answers that it may still be running, and the owner is free (a Start is fenced, not "busy").
+    name: 'S31 a refused Stop during a pending server_start',
+    options: {
+      mode: { ...quiet, where: 'local', refuseStop: true },
+      schedule: (d) => {
+        d.exe.holdNextStart = true;
+        d.when('starting', () => !!d.exe.releaseStart, () => {
+          d.stop();
+          d.sched.add({ label: 'act:release-start', fire: () => d.exe.releaseStart?.() });
+          d.when('stop answered', () => d.evidence.some((e) => e.what === 'stopped'), () => d.start());
+        });
+      }
+    },
+    expect: (r) => {
+      const stopped = r.evidence.find((e) => e.what === 'stopped');
+      const again = r.evidence.filter((e) => e.what === 'started').at(-1);
+      if (!stopped || !mayRun.test(stopped.words ?? '')) return `the Stop answered ${stopped ? stopped.words ?? 'stopped' : 'nothing'}`;
+      if (!again || !mayRun.test(again.words ?? '')) return `the next Start answered ${again ? (again.words ?? 'ready').slice(0, 60) : 'nothing'}`;
+      return undefined;
+    }
+  },
+  {
+    // S32: two Stops of a Ready local run whose stop the exe refuses: both say it may still be running.
+    name: 'S32 Stop twice, the stop refused',
+    options: {
+      mode: { ...quiet, where: 'local', refuseStop: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.stop();
+          d.when('stop answered', () => d.evidence.some((e) => e.what === 'stopped'), () => d.stop());
+        })
+    },
+    expect: (r) => {
+      const answers = r.evidence.filter((e) => e.what === 'stopped');
+      if (answers.length < 2) return `${answers.length} Stops answered`;
+      return answers.every((e) => mayRun.test(e.words ?? '')) ? undefined : `a Stop answered ${answers.find((e) => !mayRun.test(e.words ?? ''))?.words ?? 'stopped'}`;
+    }
+  },
+  {
+    // S33: Test after a Stop the exe refused: the process may still run, so Test reports no success.
+    name: 'S33 Test after a refused Stop',
+    options: {
+      mode: { ...quiet, where: 'local', refuseStop: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.stop();
+          d.when('stop answered', () => d.evidence.some((e) => e.what === 'stopped'), () => d.test());
+        })
+    },
+    expect: (r) => {
+      const tested = r.evidence.find((e) => e.what === 'tested');
+      return !tested ? 'Test never answered' : tested.report?.ok ? 'Test reported success beside a process that may still run' : undefined;
+    }
+  },
+  {
+    // S34: a notice of changed tools during Start's final drain: Start walks again before Ready, and a call
+    // made the moment it answers goes out.
+    name: 'S34 a notice during the final drain',
+    options: {
+      mode: { ...quiet, where: 'local', lateAcks: true, noticeAtDrain: true },
+      schedule: (d) =>
+        d.when('first answer', () => d.evidence.some((e) => e.what === 'started'), () => {
+          d.stop();
+          d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => d.start('s1', (ready) => ready && d.call('echo')));
+        })
+    },
+    expect: (r) => {
+      const call = r.evidence.find((e) => e.what === 'call');
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === call?.token)?.outcome;
+      const lists = r.exe.log.filter((x) => x.body?.method === 'tools/list').length;
+      if (lists < 3) return `${lists} lists: no walk again after the notice`;
+      return !call ? 'no call made at Ready' : out?.kind === 'result' ? undefined : `the call made at Ready came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
+    // S35: two local servers, the first stopped after the second launched: H2 judges the Stop against the
+    // first server's own process.
+    name: 'S35 two local servers, the first stopped',
+    options: {
+      servers: 2,
+      mode: { ...quiet, where: 'local' },
+      schedule: (d) => {
+        // Whichever server came up first, the other is started once the owner is free (its own start at
+        // launch may have met the first's); then the first is stopped, the second still running.
+        let first: string | undefined;
+        d.when('one ready', () => d.idle('s1') || d.idle('s2'), () => {
+          first = d.idle('s1') ? 's1' : 's2';
+          const other = first === 's1' ? 's2' : 's1';
+          const startOther = (n: number): void =>
+            d.when(`${other} start ${n}`, () => !d.client.owner.busy && !['starting', 'ready'].includes(d.client.get(other)?.phase ?? ''), () => {
+              d.start(other);
+              if (n < 3) startOther(n + 1);
+            });
+          startOther(1);
+          d.when('both ready', () => d.idle('s1') && d.idle('s2'), () => d.stop(first));
+        });
+      }
+    },
+    expect: (r) => {
+      const stopped = r.evidence.find((e) => e.what === 'stopped');
+      const other = stopped?.server === 's1' ? 's2' : 's1';
+      return stopped && r.exe.processStarts.some((t) => t.server === other) ? undefined : 'no Stop of one server beside the other started';
+    }
+  }
+];
+
 export const SCHEDULES: Named[] = [
+  ...LIFECYCLE,
   {
     // S28: S26 with a Start made while Ready, which the client refuses: it begins no run, so the run's
     // walks are still judged together (H14), and its era too (H12).

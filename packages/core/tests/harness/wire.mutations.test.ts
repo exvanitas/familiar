@@ -84,6 +84,7 @@ const CONTROLS: Control[] = [
   { mutation: 'stop-before-exit', check: 'H2', named: 'S11 Stop during initialize, local' },
   { mutation: 'stop-twice', check: 'H2', named: 'S11 Stop during initialize, local' },
   { mutation: 'stop-skips-pending-start', check: 'H2', named: 'S11 Stop during a pending server_start, local' },
+  { mutation: 'stop-before-exit', check: 'H2', named: 'S35' },
   { mutation: 'stop-twice', check: 'H2', named: 'S11 Stop during a pending server_start, local' },
   // One chunk with the cancel refused: the dropped ping shares its step with the flood that ends the
   // exchange, and only the exact terminal position tells them apart.
@@ -99,6 +100,8 @@ const CONTROLS: Control[] = [
   { mutation: 'decoder-per-chunk', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 0, session404: 'none', redirect: 0, earlyEnd: 0 } },
   { mutation: 'ready-before-drain', check: 'H1', named: 'S27 a call the moment Start answers Ready, local' },
   { mutation: 'ready-before-drain', check: 'H1', named: 'S27 a call the moment Start answers Ready, remote' },
+  // The driver decides something outside next(): HC sees its state leave the machine's.
+  { mutation: 'driver-decides', check: 'HC', mode: { ...remote, era: 'legacy', pings: 2, session404: 'none', redirect: 0 } },
   { mutation: 'cr-forgets-pair', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 1, session404: 'none', redirect: 0, earlyEnd: 0 } }
 ];
 
@@ -137,6 +140,18 @@ describe("the evidence's own controls", () => {
       for (let seed = 1; seed <= 20; seed++) expect(PASS_CHECKS.H14!(await wireRun(seed, { ...s28, mutation: 'walk-beside-walk' })), `seed ${seed}`).toEqual([]);
     } finally {
       evidenceControls.countRefusedStarts = false;
+    }
+  }, 60_000);
+
+  it('Stop paired with the last process started on any server (the old evidence): a clean run fails H2 under S35', async () => {
+    const s35 = SCHEDULES.find((s) => s.name.startsWith('S35'))!.options;
+    evidenceControls.globalStarts = true;
+    try {
+      let flagged = 0;
+      for (let seed = 1; seed <= 8; seed++) if (PASS_CHECKS.H2!(await wireRun(seed, s35)).length) flagged++;
+      expect(flagged).toBeGreaterThan(0);
+    } finally {
+      evidenceControls.globalStarts = false;
     }
   }, 60_000);
 

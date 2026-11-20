@@ -316,10 +316,9 @@ describe('3.9: a modern-only stdio server', () => {
       return [];
     });
     const link = new ServerLink('m', { processes: p.port }, realClock, quiet);
-    const first = await link.start(local, 'L');
-    expect(first).toMatchObject({ ok: false, relaunch: 'modern' });
-    await link.drained();
-    expect(await link.start(local, 'L', { era: 'modern' })).toMatchObject({ ok: true, tools: [{ name: 'look' }] });
+    // One Start: the refusal, the exit, then the relaunch with the era fixed, inside the same start.
+    expect(await link.start(local, 'L')).toMatchObject({ ok: true, tools: [{ name: 'look' }] });
+    expect(p.starts()).toBe(2);
     expect(p.writes[1]!.map((m) => m.method)).toEqual(['tools/list']);
   });
 });
@@ -377,7 +376,7 @@ describe("66d803a's wait: idle pings without pause never hold a step past its de
     const s = pinging({ listAnswers: true, floodAtInitialized: true });
     let stopped = 0;
     const port: ProcessPort = { ...s.port, stop: async (run) => { stopped++; return s.port.stop(run); } };
-    const link = new ServerLink('m', { processes: port }, realClock, quiet, { startMs: 150, listMs: 5000, pongMs: 5000, headersMs: 5000, idleMs: 5000, writeMs: 60_000 });
+    const link = new ServerLink('m', { processes: port }, realClock, quiet, { startMs: 150, listMs: 5000, pongMs: 5000, headersMs: 5000, idleMs: 5000, writeMs: 60_000, stopMs: 10_000, graceMs: 2_000 });
     const t0 = Date.now();
     const r = await link.start(local, 'L');
     const ms = Date.now() - t0;
@@ -391,7 +390,7 @@ describe("66d803a's wait: idle pings without pause never hold a step past its de
 
   it('a list walk is admitted only from Idle: under a flood that holds the slot, Test or a refresh is refused busy at once, and the run stays', async () => {
     const s = pinging({ listAnswers: true });
-    const link = new ServerLink('m', { processes: s.port }, realClock, quiet, { startMs: 5000, listMs: 150, pongMs: 5000, headersMs: 5000, idleMs: 5000, writeMs: 60_000 });
+    const link = new ServerLink('m', { processes: s.port }, realClock, quiet, { startMs: 5000, listMs: 150, pongMs: 5000, headersMs: 5000, idleMs: 5000, writeMs: 60_000, stopMs: 10_000, graceMs: 2_000 });
     expect(await link.start(local, 'L')).toMatchObject({ ok: true });
     s.flood();
     await sleep(10);

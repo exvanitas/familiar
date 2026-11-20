@@ -54,7 +54,7 @@ describe("Test and its catalog write", () => {
   });
 });
 
-describe("Test's settle acts on its own start only", () => {
+describe("Test acts on its own run only", () => {
   const scenario = async () => {
     const store = memorySettingsStore();
     let starts = 0;
@@ -86,6 +86,9 @@ describe("Test's settle acts on its own start only", () => {
     });
     release();
     const report = await testing;
+    // Test answers once its own run has ended (at the Stop, now); the held write lands after, and B is
+    // started in the owner's release step.
+    for (let i = 0; i < 200 && !b; i++) await new Promise((r) => setTimeout(r, 5));
     await b;
     off();
     expect(report.ok).toBe(false);
@@ -96,14 +99,8 @@ describe("Test's settle acts on its own start only", () => {
     expect(s.phase).toBe('failed');
     expect(s.failure?.kind).toBe('declined');
   });
-  it('the control: a settle with no token (stale-settle) clears that failure', async () => {
-    mutations.set(['stale-settle']);
-    try {
-      expect((await scenario()).phase).toBe('stopped');
-    } finally {
-      mutations.clear();
-    }
-  });
+  // There is no settle any more: Test's answer is bound to its own run in the lifecycle machine, so no
+  // control can put a stale settle back (W's lc-old-run-events covers an old run acting on a new one).
 });
 
 describe("a crash during Test's catalog write", () => {
