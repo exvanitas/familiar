@@ -11,7 +11,7 @@
    - security.mcp.crash-mid-call: a call that crashes the server is answered interrupted and was sent
      once; the approved setup restarts with no dialog.
    - security.mcp.changed-tool: the running server changes echo (set_variant) and says its tools changed.
-     Through the gate, echo goes back to ask and the other tools keep their "always"; the wrapper made
+     Through the gate, echo goes back to ask and the other tools keep their "may run on its own"; the wrapper made
      before the change can't send; the new one can.
    - security.mcp.secret-blanked: print_secret, from the key typed into Settings, comes back [hidden]
      in the reply, the model's text and every line core saw, and nothing core keeps holds it.
@@ -37,7 +37,7 @@ import { escapedCopyCheck, recording, type HeardLine, type WrittenLine } from '.
 
 interface Typed { head: string; tail: string; length: number }
 
-const noWrites: ToolStep = { id: 'mcp-check', sources: [], readFrom: () => {}, write: async () => fail('a server tool made a built-in write') };
+const noWrites: ToolStep = { id: 'mcp-check', write: async () => fail('a server tool made a built-in write') };
 // Each call goes through `send` with a decision, as the journal's gate would mint after a Yes.
 const run = (t: ServerTool | undefined, args: object) => (t ? runWithYes(t, args, noWrites) : Promise.reject(new Error('no such tool')));
 const TOOLS = 11;
@@ -182,9 +182,9 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
   await check('security.mcp.changed-tool', async () => {
     need();
     const before = client.tools();
-    const always = Object.fromEntries(before.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
+    const always = Object.fromEntries(before.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'own' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
     const gate = (tools: ServerTool[], t: ServerTool) => gateFor(t.name, t, { perTool: toolPolicies(tools, always) });
-    ok(before.every(t => gate(before, t) === 'allow'), '"always" did not hold before the change');
+    ok(before.every(t => gate(before, t) === 'own'), '"may run on its own" did not hold before the change');
     const oldEcho = before.find(t => t.serverName === 'echo')!;
     // A Yes given before the change, sent after it.
     const oldYes = yesFor(client, id, 'echo', { text: 'old' })!;
@@ -197,14 +197,14 @@ export async function mcpChecks(ctx: Ctx): Promise<void> {
     ok(newEcho.setupFingerprint === oldEcho.setupFingerprint, 'the setup changed too, so this would prove nothing about tools');
     ok(gate(after, newEcho) === 'ask', 'the changed echo did not go back to ask: ' + gate(after, newEcho));
     const others = after.filter(t => t.serverName !== 'echo');
-    ok(others.every(t => gate(after, t) === 'allow'), 'another tool lost its "always"');
+    ok(others.every(t => gate(after, t) === 'own'), 'another tool lost its "may run on its own"');
     // The Yes given before the change can't send; a new one can.
     const echoes = sent('echo');
     const old = await client.send(oldYes, new AbortController().signal);
     ok(old.kind === 'error' && /tool changed since it was allowed/.test(old.words) && sent('echo') === echoes, `the old Yes: ${JSON.stringify(old)}; echo sent ${sent('echo') - echoes} more times`);
     const fresh = await run(newEcho, { text: 'quiet' });
     ok(fresh.endsWith('\nQUIET'), 'the new wrapper: ' + fresh.slice(-40));
-    return `echo changed on the running server: through the gate it asks again while the other ${others.length} tools keep "always"; a Yes given before the change was refused before sending; a new one answered`;
+    return `echo changed on the running server: through the gate it asks again while the other ${others.length} tools keep "may run on its own"; a Yes given before the change was refused before sending; a new one answered`;
   });
 
   await check('security.mcp.secret-blanked', async () => {

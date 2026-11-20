@@ -1,8 +1,8 @@
 // Consent bound to the exact call (docs/mcp-design.md 5.5). A `ToolDecision` is opaque: it has a type
 // brand, its constructor isn't exported, and every minted one lives in a module-private WeakSet, so a cast
 // object or a copy is never genuine. Only the gate mints one (journal.ts, inside the tool's execute), from
-// durable facts: a standing "always" for exactly this identity and both fingerprints while the request
-// carries no outside content, or the person's Yes on a card whose stored facts match this call now. A
+// durable facts: the person's Yes on a card whose stored facts match this call now, or their "may run on
+// its own" for exactly this tool, its fingerprint and its setup. There is no "always" for a server's tool. A
 // decision is used once: `send` (client.ts) marks it used in the same synchronous step as its handoff.
 
 import { canonicalJson, sha256 } from './hash.ts';
@@ -29,10 +29,8 @@ export interface ToolDecision extends CardFacts {
   readonly [brand]: true;
   /** The step (tool task) it's bound to. */
   readonly step: string;
-  /** How it was minted: a standing "always", or the person's Yes to this call. */
-  readonly by: 'always' | 'asked';
-  /** Whether the request that made the call carried outside content (never with "always"). */
-  readonly outside: boolean;
+  /** How it was minted: the person's Yes to this call, or their "may run on its own" for this tool. */
+  readonly by: 'asked' | 'own';
 }
 
 const minted = new WeakSet<object>();
@@ -61,13 +59,9 @@ export function sameFacts(a: CardFacts, b: CardFacts): boolean {
   return a.server === b.server && a.tool === b.tool && a.run === b.run && a.launch === b.launch && a.fingerprint === b.fingerprint && a.canonical === b.canonical && a.hash === b.hash;
 }
 
-/**
- * Mints a decision. For the gate only: a module-graph test fails on any other importer outside tests.
- * "Always" is never minted for a request with outside content.
- */
-export function mintDecision(facts: CardFacts, step: string, by: 'always' | 'asked', outside: boolean): ToolDecision | undefined {
-  if (by === 'always' && outside) return undefined;
-  const d = Object.freeze({ ...facts, step, by, outside }) as ToolDecision;
+/** Mints a decision. For the gate only: a module-graph test fails on any other importer outside tests. */
+export function mintDecision(facts: CardFacts, step: string, by: 'asked' | 'own'): ToolDecision {
+  const d = Object.freeze({ ...facts, step, by }) as ToolDecision;
   minted.add(d);
   return d;
 }

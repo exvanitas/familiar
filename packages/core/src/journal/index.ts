@@ -1,5 +1,5 @@
 // The journal facade: the turn loop on pi-durable. Everything pi-durable is behind these exports.
-export { AnswersDoc, InterruptionsDoc, journalSettings, openJournal, SendNowDoc, SummarizedDoc, systemClock } from './journal.ts';
+export { AnswersDoc, InterruptionsDoc, journalSettings, openJournal, ownWords, SendNowDoc, systemClock } from './journal.ts';
 export { TurnsDoc } from './turns.ts';
 export type { AmbientState, CapsSetup, ConsentCard, ConsentPort, Journal, JournalClock, JournalOptions, Question, Remark, RemarkPrompt, SendNowOffer, SendResult, Turn, TurnEnd, Notification, NotifierPort, WakePort } from './journal.ts';
 export { journalUsageStore, LedgerDoc } from './ledger.ts';
@@ -16,7 +16,7 @@ export { defineJournalDoc, replayOf } from './tools.ts';
 export type { AllowedBy, FamiliarTool, JournalDocToken, ToolKind, ToolStep, WriteTx } from './tools.ts';
 export { admit, boundWords, emptyBudget, TOOL_CALLS_PER_REPLY, TOOL_CALLS_PER_TURN } from './bounds.ts';
 export type { Bound, Budget } from './bounds.ts';
-export { BUILT_IN_READS, gateFor, RUN_WITHOUT_ASKING } from './gate.ts';
-export type { GatePolicy, ToolPolicy } from './gate.ts';
+export { BUILT_IN_READS, gateFor, RUN_WITHOUT_ASKING, unaskedBuiltIn } from './gate.ts';
+export type { GatePolicy, GateVerdict, ToolPolicy } from './gate.ts';
 export { buttonsOf, createCardDesk } from './desk.ts';
 export type { CardButton, CardDesk, DeskResult } from './desk.ts';

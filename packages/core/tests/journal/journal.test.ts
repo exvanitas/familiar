@@ -98,10 +98,15 @@ describe('the consent gate', () => {
     expect(gateFor('mystery', undefined)).toBe('ask');
     // Deny wins, over the list too.
     expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write' }), { perTool: { note_add: 'deny' } })).toBe('deny');
-    // The person's always-allow holds, but a tool's own `asks` still asks: it can only be stricter.
-    expect(gateFor('srv', tool({ name: 'srv', kind: 'server' }), { perTool: { srv: 'allow' } })).toBe('allow');
+    // No "always" for a server's tool: an allow from anywhere asks. Only the person's "may run on its own"
+    // runs it unasked, and a tool's own `asks` still asks: it can only be stricter.
+    expect(gateFor('srv', tool({ name: 'srv', kind: 'server' }), { perTool: { srv: 'allow' } })).toBe('ask');
+    expect(gateFor('srv', tool({ name: 'srv', kind: 'server' }), { perTool: { srv: 'own' } })).toBe('own');
     expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write', asks: true }))).toBe('ask');
-    expect(gateFor('srv', tool({ name: 'srv', kind: 'server', asks: true }), { perTool: { srv: 'allow' } })).toBe('ask');
+    expect(gateFor('srv', tool({ name: 'srv', kind: 'server', asks: true }), { perTool: { srv: 'own' } })).toBe('ask');
+    // A built-in off the list asks whatever a policy says; "own" means nothing for a built-in.
+    expect(gateFor('send_message', tool({ name: 'send_message', kind: 'effect' }), { perTool: { send_message: 'allow' } })).toBe('ask');
+    expect(gateFor('note_add', tool({ name: 'note_add', kind: 'write' }), { perTool: { note_add: 'own' } })).toBe('allow');
   });
 
   it('in the loop: a built-in read and note_add run without asking; another read, a server tool and a read-only server tool ask; a denied tool never runs or asks', async () => {

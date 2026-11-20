@@ -17,19 +17,19 @@
 // pins, each with its test (tests/journal/pins.test.ts):
 //   - background compaction off (`backgroundTokens: 0`), no model overrides, no conversation `configure`,
 //     and any compaction task a journal made before the pin aborted at open, before `resume()`;
-//   - `afterFailedRun` left at "keep", the queue modes at "one-at-a-time", no `afterRun` or `onYield` hook,
+//   - `afterFailedRun` left at "keep", the queue modes at "one-at-a-time", no `afterRun`, `onYield` or compaction hook,
 //     no reset, handoff, `terminate`, `compact`, conversation or submission abort, or raw submission;
 //   - exactly one extension, Familiar's own;
 //   - every write but her line display-only: the bound notice, the reminder line, `familiar.ack`.
 
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
-import { AssistantEntry, CompactionTask, GenerationTask, Harness, InboxDoc, LiveDoc, ToolTask, createRegistry, defineExtension, defineTask, hook } from '@earendil-works/pi-durable';
+import { AssistantEntry, GenerationTask, Harness, InboxDoc, LiveDoc, ToolTask, createRegistry, defineExtension, defineTask, hook } from '@earendil-works/pi-durable';
 import { needsReply } from '../decide/ack.ts';
 import type { Decision, DecisionContext, DecisionPort, PastReaction, PersonaEvent } from '../decide/port.ts';
 import type { CallInfo, CapsConfig, CapsOptions, Clock, Ledger } from '../model/caps.ts';
 import { cappedPort, createCaps, emptyLedger, extendTurn } from '../model/caps.ts';
-import type { ChatMessage, ModelPort, ModelRequest } from '../model/port.ts';
+import type { ChatMessage, ModelPort } from '../model/port.ts';
 import type { RetryOptions } from '../model/retry.ts';
 import { withRetries } from '../model/retry.ts';
 import { journalUsageStore, LedgerDoc } from './ledger.ts';
@@ -37,7 +37,6 @@ import type { OwnerLock } from './owner.ts';
 import type { PresencePort } from './presence.ts';
 import { presenceReporter, stateOf } from './presence.ts';
 import { decodeModelError, portProvider } from './provider.ts';
-import { messageSources, serverOf, SOURCES_FIELD, UNRECORDED } from './provenance.ts';
 import type { JournalStore } from './store.ts';
 import { admit, boundWords, type Budget } from './bounds.ts';
 import { finishTurn, openTurn, recordSubmission, turnKeyOf, turnOfInputs, TurnsDoc } from './turns.ts';
@@ -96,8 +95,11 @@ export interface ConsentCard {
   readonly presentation?: string;
   /** For a server's tool: what the card shows and a Yes binds to, stored when the card is made. */
   readonly facts?: CardFacts;
-  /** Whether the card may offer "Always": never while the conversation carries outside content. */
-  readonly always?: boolean;
+  /**
+   * For a server's tool: the words of its "May run on its own" button, which says plainly what that lets
+   * her do. Pressing it is a Yes to this call and the person's grant for this exact tool version and setup.
+   */
+  readonly own?: string;
 }
 
 export interface ConsentPort {
@@ -114,19 +116,21 @@ export interface SendNowOffer {
   readonly failure: string | null;
 }
 
-/** What her line is made from: the prompt the decider built, and the sources of everything in it. */
+/** What her line is made from: the prompt the decider built. */
 export interface RemarkPrompt {
   readonly system: string;
   readonly messages: readonly ChatMessage[];
-  /** Where the prompt's content came from (a server, say). Empty for her own words and yours. */
-  readonly sources?: readonly string[];
 }
 
 export interface Remark {
   readonly text: string;
   /** Her model sees it: written into a quiet chat. Otherwise it's shown only. */
   readonly visible: boolean;
-  readonly sources: readonly string[];
+}
+
+/** The words on a server tool card's "May run on its own" button. */
+export function ownWords(tool: string, server: string): string {
+  return `May run on its own: Familiar will call ${tool} on ${server} whenever she decides to, without asking you, even when something a server said led her there. Only this version of the tool, and you can take it back in Settings.`;
 }
 
 /** What the decider sees that the loop doesn't know itself. */
@@ -208,16 +212,7 @@ export const InterruptionsDoc = defineJournalDoc<Interruptions>('familiar.interr
 export const AnswersDoc = defineJournalDoc<Answers>('familiar.answers', () => ({ byTask: {}, order: [] }));
 /** Each Send now by its request id: the submission it was shown for, and the continue it started. */
 export const SendNowDoc = defineJournalDoc<{ byRequest: Record<string, { submission: string; sent?: string }>; order: string[] }>('familiar.send-now', () => ({ byRequest: {}, order: [] }));
-/**
- * The summarized set (5.6): the sources of everything any compaction of this conversation summarized,
- * written by the beforeCompact hook before the summary is asked for, and only ever growing. A summary
- * carries forward the summary before it, so its sources are this set. `recorded` is set by the first
- * hook; a summary while it is unset (one made before the hook existed) counts as outside.
- */
-export const SummarizedDoc = defineJournalDoc<{ sources: string[]; recorded?: true }>('familiar.summarized', () => ({ sources: [] }));
 const RemarkEntry = 'familiar.remark';
-/** A message no rule knows, standing in when a compaction is handed no messages at all: outside. */
-const UNRECORDED_MESSAGE = { role: 'unknown' };
 /** Records kept per document before the oldest go. */
 const KEEP_RECORDS = 256;
 const keepNewest = (order: string[], byKey: Record<string, unknown>, key: string) => {
@@ -382,49 +377,13 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
   // The caps count a turn as the tool-call bound does (bounds.ts): from your message, across every
   // "go on", by its id in the turn registry (turns.ts).
   const turnOf = async (): Promise<string> => turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
-  /** The summarized set as the hook last wrote it; undefined while no compaction has recorded one. */
-  const summarized = async (): Promise<string[] | undefined> => {
-    const doc: any = await harness.snapshot(SummarizedDoc, ctx);
-    return doc?.recorded ? [...doc.sources] : undefined;
-  };
-  /**
-   * A request's sources (5.6): the union over the messages it sends, from pi-durable's own context for it,
-   * plus the server of every tool it offers that the person hasn't reviewed as it is now, whose
-   * description is the server's word. The reply carries them for good.
-   */
-  const requestSources = async (messages: readonly unknown[], request: ModelRequest): Promise<string[]> => {
-    const out = new Set(messageSources(messages, await summarized()));
-    for (const spec of request.tools ?? []) {
-      const t = tools.get(spec.name);
-      const server = serverOf(spec.name);
-      if (t?.kind === 'server' && t.fresh && server) out.add(server);
-    }
-    return [...out].sort();
-  };
   const port = async (): Promise<ModelPort> => {
     const turn = await turnOf();
     const capped = cappedPort(options.model, caps!, () => ({ ...options.caps.call, turn, conversation: String(rootId) }));
     const retried = withRetries(capped, { ...options.retries, sleep });
     return retried;
   };
-  /**
-   * The sources of the request that made a call (5.6), read inline from the reply that holds it: the tool
-   * task's own input names that reply's entry. A nested call, a reply with no such call, or one with no
-   * sources recorded: outside.
-   */
-  const callSources = async (taskId: unknown, callId: string | undefined): Promise<string[]> => {
-    if (!callId) return [UNRECORDED];
-    const found: string[] | undefined = await harness.commit(async (tx: any) => {
-      const input = (await tx.task(taskId))?.input;
-      if (!input || input.kind === 'nested' || input.assistant === undefined) return undefined;
-      const m = (await tx.entry(input.assistant))?.model?.[0];
-      if (m?.role !== 'assistant' || !(m.content ?? []).some((b: any) => b.type === 'toolCall' && b.id === callId)) return undefined;
-      const s = m[SOURCES_FIELD];
-      return Array.isArray(s) && s.every((x: unknown) => typeof x === 'string') ? [...s] : undefined;
-    }, ctx);
-    return found ?? [UNRECORDED];
-  };
-  const { provider } = portProvider(port, { id: PROVIDER, modelId: options.modelId, sources: requestSources });
+  const { provider } = portProvider(port, { id: PROVIDER, modelId: options.modelId });
   const models = createModels();
   models.setProvider(provider);
 
@@ -530,8 +489,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
 
   /**
    * The consent gate (gate.ts): the bounds, a parked interruption, then the policy, and consent when it
-   * asks. A reason not to run, or how the call was allowed: by a standing "always", or by the person's yes
-   * to this call. `beforeTool` runs it on every call, and each tool's own execute runs it again, for a call
+   * asks. A reason not to run, or how the call was allowed: unasked (a listed built-in, or a server tool the
+   * person let run on its own), or by the person's yes to this call. `beforeTool` runs it on every call, and each tool's own execute runs it again, for a call
    * recovered after a crash, which never passes `beforeTool`; the execute hands the tool how it was allowed.
    */
   const gateCall = async (call: { name: string; arguments: unknown; id?: string }, api: any, context: any): Promise<{ refused: string } | Allowed> => {
@@ -550,26 +509,23 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     // rest of the turn after a skip, a call the model makes to it again doesn't run.
     const parked = await parkedFor(call.name, id);
     if (parked) return parked;
-    let policy = gateFor(call.name, tool, options.policy?.());
+    const policy = gateFor(call.name, tool, options.policy?.());
     if (policy === 'deny') return `${call.name} is turned off.`;
     // A server's tool is bound to the exact call: its facts are read from the server's run now.
     const bound = tool?.consent !== undefined;
     const factsNow = (): CardFacts | undefined => tool?.consent?.facts(call.arguments);
     let facts = bound ? factsNow() : undefined;
     if (bound && !facts) return `${call.name} can't be sent now: its server isn't running, it no longer offers this tool as it was, or the arguments aren't plain JSON.`;
-    // "Always" never acts on outside content (5.6): if the request that made this call was outside (the
-    // sources its reply carries, unreviewed tool descriptions included), it asks, and the card offers no
-    // Always.
-    const sources = await callSources(api.taskId, call.id);
-    const outside = bound ? sources.length > 0 : false;
-    if (policy === 'allow' && bound && outside) policy = 'ask';
-    if (policy === 'allow') return { allowedBy: 'always', sources, ...(facts ? { facts, outside } : {}) };
+    // Unasked: a built-in on the fixed list, or a server tool the person let run on its own (checked again
+    // against the saved grant at the handoff). Every other call asks.
+    if (policy === 'allow' && !bound) return { allowedBy: 'unasked' };
+    if (policy === 'own' && bound) return { allowedBy: 'unasked', ...(facts ? { facts } : {}) };
     const stored: (ConsentCard & { answer?: 'allow' | 'deny' }) | undefined = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
     if (stored?.answer === 'deny') return 'The person said no.';
     if (stored?.answer === 'allow') {
       // A Yes covers only what its card showed: the stored facts must match this call now.
-      if (!bound) return { allowedBy: 'asked', sources };
-      if (stored.facts && facts && sameFacts(stored.facts, facts)) return { allowedBy: 'asked', sources, facts: stored.facts, outside };
+      if (!bound) return { allowedBy: 'asked' };
+      if (stored.facts && facts && sameFacts(stored.facts, facts)) return { allowedBy: 'asked', facts: stored.facts };
     }
     const turn = turnKeyOf(await harness.snapshot(LiveDoc, rootId, ctx), await harness.snapshot(TurnsDoc, ctx));
     const signal: AbortSignal | undefined = context?.abortSignal;
@@ -584,7 +540,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         askedAt: stored?.askedAt ?? clock.now(),
         turn,
         presentation: Math.random().toString(36).slice(2, 14),
-        ...(facts ? { facts, always: !outside } : {})
+        ...(facts ? { facts, own: ownWords(call.name, (tool as { server?: { label?: string } } | undefined)?.server?.label ?? 'its server') } : {})
       };
       await harness.commit(async (tx: any) => {
         (await tx.doc(ConsentDoc)).cards[id] = card;
@@ -612,7 +568,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const doc = await tx.doc(ConsentDoc);
         if (doc.cards[id]?.presentation === card.presentation) doc.cards[id].answer = ok ? 'allow' : 'deny';
       }, ctx);
-      return ok ? { allowedBy: 'asked', sources, ...(card.facts ? { facts: card.facts, outside } : {}) } : 'The person said no.';
+      return ok ? { allowedBy: 'asked', ...(card.facts ? { facts: card.facts } : {}) } : 'The person said no.';
     }
     return `${call.name} kept changing while you were asked, so nothing was sent.`;
   };
@@ -644,35 +600,12 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
             ? { step: id, task: String(live?.run?.taskId ?? ''), kind: 'rerun', tool: call.name, arguments: call.arguments, turn, text: `${call.name} was cut off when the app closed, and may have partially run.` }
             : { step: id, task: String(live?.run?.taskId ?? ''), kind: 'redo', tool: call.name, arguments: call.arguments, turn, text: `I was ${tool.doing(call.arguments)} when the app closed. Do it now?` };
       }, ctx);
-      let out = result;
-      if (interrupted && tool?.kind === 'effect') out = { ...out, output: [{ type: 'text', text: STOPPED_WORDS }] };
-      // A built-in's result the harness wrote itself (no such tool, bad arguments, refused, cut off) holds
-      // Familiar's and the harness's own words: no sources (5.6). One the tool wrote carries its own; a read
-      // whose run threw counts as outside, since its words may hold what it read.
-      if (!server && !Array.isArray(out.details?.sources)) out = { ...out, details: { ...(out.details ?? {}), sources: tool?.kind === 'read' ? [UNRECORDED] : [] } };
-      return out === result ? undefined : out;
-    }
-  } as any);
-
-  /**
-   * The summarized set (5.6). Decides nothing: it records, before the summary is asked for, the sources of
-   * exactly the entries the summary replaces (the head marker, an earlier summary, first among them), by
-   * the same rule a request uses. Run again after a crash, it adds the same set again.
-   */
-  const summaryHook = hook(CompactionTask, {
-    beforeCompact: async (compaction: any) => {
-      const before = await summarized();
-      const covered = messageSources(compaction.messages ?? [UNRECORDED_MESSAGE], before);
-      await harness.commit(async (tx: any) => {
-        const doc = await tx.doc(SummarizedDoc);
-        if (!(__FAMILIAR_MUTATIONS__ && mutant('summary-sources-dropped'))) doc.sources = [...new Set([...doc.sources, ...covered])].sort();
-        doc.recorded = true;
-      }, ctx);
+      if (interrupted && tool?.kind === 'effect') return { ...result, output: [{ type: 'text', text: STOPPED_WORDS }] };
       return undefined;
     }
   } as any);
 
-  const familiar = defineExtension({ name: 'familiar', tools: options.tools.map((t) => toDurableTool(t, gateCall)), hooks: [consentHook, parkHook, summaryHook], tasks: [WakeAt] } as any);
+  const familiar = defineExtension({ name: 'familiar', tools: options.tools.map((t) => toDurableTool(t, gateCall)), hooks: [consentHook, parkHook], tasks: [WakeAt] } as any);
   const registry = createRegistry();
   registry.install(familiar);
 
@@ -1164,9 +1097,6 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
     async remark(prompt) {
       if (dead) return undefined;
       const key = `moment:${Math.random().toString(36).slice(2, 12)}`;
-      // Her line's sources are the union of what her prompt was made from (2.1); the note that puts it in
-      // the conversation carries them (5.6).
-      const sources = [...new Set(prompt.sources ?? [])].sort();
       // One request, no tools, through the caps under its own key: never resumable, so its reservation
       // settles when the call returns, or becomes a spent record at its deadline if the app dies. One try
       // only (2.1): an error, retryable or not, means she stays quiet.
@@ -1193,15 +1123,15 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         const live = await tx.doc(LiveDoc, rootId);
         const inbox = await tx.doc(InboxDoc, rootId);
         const quiet = !live?.run && (!live?.runFailure || (__FAMILIAR_MUTATIONS__ && mutant('remark-no-failure-check'))) && ((inbox?.items ?? []).length === 0 || (__FAMILIAR_MUTATIONS__ && mutant('remark-no-inbox-check')));
-        const data = { text, sources };
+        const data = { text };
         const note = `[${options.persona.name} said this on her own, not in reply to a message: "${text}"]`;
         await root.submit(tx, {
           type: 'write',
-          entry: quiet ? { kind: RemarkEntry, data, model: [{ role: 'user', content: [{ type: 'text', text: note }], timestamp: clock.now(), [SOURCES_FIELD]: __FAMILIAR_MUTATIONS__ && mutant('reply-sources-empty') ? [] : sources }] } : { kind: RemarkEntry, data }
+          entry: quiet ? { kind: RemarkEntry, data, model: [{ role: 'user', content: [{ type: 'text', text: note }], timestamp: clock.now() }] } : { kind: RemarkEntry, data }
         });
         return quiet;
       }, ctx);
-      return { text, visible, sources };
+      return { text, visible };
     },
     setup() {
       const installed: any[] = [...registry.snapshot().installed()];

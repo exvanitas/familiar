@@ -12,13 +12,16 @@
 //   other servers are still admitted then.
 // - Fail closed: an unreadable choice loads as "ask"; an unreadable server is neither started nor
 //   overwritten; the whole record unreadable means nothing loads and nothing is written.
+// - No "always" for a server's tool, and no Allow for a built-in off the fixed notes-and-reminders list:
+//   either is refused when it's saved, and one found in the record loads as "ask" (5.6).
 
 import type { JsonValue } from '../model/port.ts';
 import type { SettingsStore } from '../settings/store.ts';
-import type { ToolPolicy } from '../journal/gate.ts';
+import { unaskedBuiltIn } from '../journal/gate.ts';
+import { mutant } from '../mutations.ts';
 import { literalClass } from './native-rules.ts';
 import type { ServerLimits, SavedTool } from './saved.ts';
-import { choiceKey, type ToolChoice } from './server-tools.ts';
+import { choiceKey, type ChoicePolicy, type ToolChoice } from './server-tools.ts';
 import { secretRefs, type ServerSetup } from './setup.ts';
 
 export const OWNER_KEY = 'mcp.owner';
@@ -27,6 +30,36 @@ export const BUSY_WORDS = 'Saving another change. Try again in a moment.';
 export const WAITING_WORDS = 'Familiar is waiting on Windows. Restarting Familiar finishes or undoes this change.';
 export const UNFINISHED_WORDS = 'A change was saved but its cleanup didn\'t finish. Press Retry first.';
 export const WAITING_AFTER_MS = 10_000;
+/** The server id built-in tools' choices are kept under: no saved server can have it (ids are non-empty). */
+export const BUILT_IN = '';
+export const NO_ALWAYS_WORDS = 'There\'s no "always" for a server\'s tool: every call asks for your Yes. To let this one tool run without asking, choose "May run on its own".';
+export const ONLY_LISTED_WORDS = 'Only Familiar\'s own notes and reminders run without asking. This tool asks every time.';
+
+/** Why a choice can't be saved, if it can't (5.6). */
+export function choiceProblem(serverId: string, tool: string, choice: ToolChoice | undefined): string | undefined {
+  if (!choice) return undefined;
+  if (serverId === BUILT_IN) {
+    if (choice.policy === 'own') return ONLY_LISTED_WORDS;
+    if (choice.policy === 'allow' && !unaskedBuiltIn(tool)) return ONLY_LISTED_WORDS;
+    return undefined;
+  }
+  if (choice.policy === 'allow' && !(__FAMILIAR_MUTATIONS__ && mutant('server-always'))) return NO_ALWAYS_WORDS;
+  if (choice.policy === 'own' && (!choice.fingerprint || !choice.setupFingerprint)) return 'That grant names no version of the tool, so it was not saved.';
+  return undefined;
+}
+
+/** A saved choice as the gate may read it: one that can't be saved now (an old "always" for a server tool,
+    an Allow for a built-in off the list) loads as "ask", never as what it said. */
+function loadable(key: string, c: ToolChoice): ToolChoice {
+  let k: unknown;
+  try {
+    k = JSON.parse(key);
+  } catch {
+    return { ...c, policy: 'ask' };
+  }
+  if (!Array.isArray(k) || k.length !== 2 || typeof k[0] !== 'string' || typeof k[1] !== 'string') return { ...c, policy: 'ask' };
+  return choiceProblem(k[0], k[1], c) ? { ...c, policy: 'ask' } : c;
+}
 
 export interface OwnedServer {
   readonly setup: ServerSetup;
@@ -177,8 +210,8 @@ function readServer(v: unknown): OwnedServer | undefined {
 }
 
 function readChoice(v: unknown): ToolChoice | undefined {
-  if (!isObj(v) || (v.policy !== 'allow' && v.policy !== 'ask' && v.policy !== 'deny') || typeof v.fingerprint !== 'string' || typeof v.setupFingerprint !== 'string') return undefined;
-  return { policy: v.policy as ToolPolicy, fingerprint: v.fingerprint, setupFingerprint: v.setupFingerprint };
+  if (!isObj(v) || (v.policy !== 'allow' && v.policy !== 'ask' && v.policy !== 'deny' && v.policy !== 'own') || typeof v.fingerprint !== 'string' || typeof v.setupFingerprint !== 'string') return undefined;
+  return { policy: v.policy as ChoicePolicy, fingerprint: v.fingerprint, setupFingerprint: v.setupFingerprint };
 }
 
 /* ---------- the owner ---------- */
@@ -236,7 +269,10 @@ export class Owner {
    */
   choices(): Readonly<Record<string, ToolChoice>> {
     const out: Record<string, ToolChoice> = {};
-    for (const [k, v] of Object.entries(this.doc.choices)) out[k] = readChoice(v) ?? { policy: 'ask', fingerprint: '', setupFingerprint: '' };
+    for (const [k, v] of Object.entries(this.doc.choices)) {
+      const c = readChoice(v);
+      out[k] = c ? loadable(k, c) : { policy: 'ask', fingerprint: '', setupFingerprint: '' };
+    }
     return out;
   }
   get mark(): Mark | undefined {
@@ -312,6 +348,13 @@ export class Owner {
       await this.commit((d) => {
         const cur = readServer(d.servers[id]);
         if (cur) d.servers[id] = { ...cur, tools } as unknown as JsonValue;
+        // A "may run on its own" grant for a tool listed now with another fingerprint is cleared in the same
+        // commit: the changed tool asks, and a grant is never revived by the tool changing back.
+        for (const t of tools) {
+          const key = choiceKey(id, t.name);
+          const c = readChoice(d.choices[key]);
+          if (c?.policy === 'own' && c.fingerprint !== t.fingerprint && !(__FAMILIAR_MUTATIONS__ && mutant('own-ignores-fingerprint'))) delete d.choices[key];
+        }
       });
     } finally {
       t.release();
@@ -580,6 +623,8 @@ export class Owner {
   }
 
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<Outcome> {
+    const problem = choiceProblem(serverId, tool, choice);
+    if (problem) return no(problem);
     const t = this.admit('choice');
     if (!('release' in t)) return t;
     try {

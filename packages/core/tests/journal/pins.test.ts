@@ -53,16 +53,15 @@ describe('2.5: the settings pins', () => {
     expect(s).not.toHaveProperty('extensions');
   });
 
-  it("the journal's engine runs with exactly those settings, one extension (Familiar's own), no afterRun or onYield hook, and one compaction hook that decides nothing", async () => {
+  it("the journal's engine runs with exactly those settings, one extension (Familiar's own), and no afterRun, onYield or compaction hook", async () => {
     const store = await openJournalStore('pins-setup', { indexedDB: new IDBFactory() as any });
     const { journal } = await open(store);
     const setup = journal.setup();
     expect(setup.settings).toEqual(journalSettings(50));
     expect(setup.extensions).toEqual(['familiar']);
     const hooks = setup.hooks.flatMap((h) => h.hooks);
-    expect(hooks.sort()).toEqual(['afterTool', 'afterTools', 'beforeCompact', 'beforeTool']);
-    // The one compaction hook is the summarized set's (5.6), on pi-durable's compaction task only.
-    expect(setup.hooks.filter((h) => h.hooks.includes('beforeCompact')).map((h) => h.task)).toEqual(['pi.compaction']);
+    expect(hooks.sort()).toEqual(['afterTool', 'afterTools', 'beforeTool']);
+    expect(setup.hooks.map((h) => h.task)).not.toContain('pi.compaction');
     expect(hooks).not.toContain('afterRun');
     expect(hooks).not.toContain('onYield');
     await journal.close();
@@ -190,8 +189,8 @@ describe('2.5: the module graph', () => {
     expect(sitesOf(files, /\.configure\(/)).toEqual([]);
     expect(sitesOf(files, /whenBusy|whenIdle|steeringMode|followUpMode|afterFailedRun|modelOverrides/)).toEqual([]);
     expect(sitesOf(files, /\bafterRun\b|\bonYield\b/)).toEqual([]);
-    // One beforeCompact, the summarized set's, and it never declines or supplies a summary.
-    expect(sitesOf(files, /\bbeforeCompact\b/)).toEqual(['journal/journal.ts: beforeCompact: async (compaction: any) => {']);
+    // No compaction hook at all: nothing declines, supplies or watches a summary.
+    expect(sitesOf(files, /\bbeforeCompact\b|\bafterCompact\b|CompactionTask/)).toEqual([]);
     expect(sitesOf(files, /[{,]\s*(decline|summary)\s*:/)).toEqual([]);
     expect(sitesOf(files, /api\.conversation\(/)).toEqual([]);
     // An abort on a conversation or a submission handle: `.abort(ctx)` or `.abort(context)`.

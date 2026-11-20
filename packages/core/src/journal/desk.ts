@@ -7,15 +7,15 @@
 import { mutant } from '../mutations.ts';
 import type { ConsentCard, ConsentPort } from './journal.ts';
 
-export type CardButton = 'yes' | 'always' | 'skip';
+export type CardButton = 'yes' | 'own' | 'skip';
 
-/** The buttons a card offers: Always only where the card allows it (a server tool, nothing outside). */
+/** The buttons a card offers: "May run on its own" only on a server tool's card, which carries its words. */
 export function buttonsOf(card: ConsentCard): readonly CardButton[] {
-  return card.always ? ['yes', 'always', 'skip'] : ['yes', 'skip'];
+  return card.own ? ['yes', 'own', 'skip'] : ['yes', 'skip'];
 }
 
 /** What answering did: `answered` (and with what), or `ignored`, with nothing changed. */
-export type DeskResult = { readonly kind: 'answered'; readonly yes: boolean; readonly always: boolean } | { readonly kind: 'ignored' };
+export type DeskResult = { readonly kind: 'answered'; readonly yes: boolean; readonly own: boolean } | { readonly kind: 'ignored' };
 
 export interface CardDesk {
   /** The journal's consent port. */
@@ -28,7 +28,9 @@ export interface CardDesk {
 
 const MAX_ID = 64;
 
-export function createCardDesk(options: { readonly onAlways?: (card: ConsentCard) => void } = {}): CardDesk {
+/** `onOwn` hears a "May run on its own" press, with the card it was pressed on: Settings saves the grant for
+    the card's stored facts (its tool, fingerprint and setup), never for anything a window sent. */
+export function createCardDesk(options: { readonly onOwn?: (card: ConsentCard) => void } = {}): CardDesk {
   const pending = new Map<string, { readonly card: ConsentCard; readonly settle: (yes: boolean) => void }>();
   // For a named mutation only: the step each presentation was for.
   const stepOf = new Map<string, string>();
@@ -61,11 +63,11 @@ export function createCardDesk(options: { readonly onAlways?: (card: ConsentCard
       if (!entry && (__FAMILIAR_MUTATIONS__ && mutant('answers-by-step'))) entry = [...pending.values()].find((e) => e.card.id === stepOf.get(presentation));
       if (!entry) return { kind: 'ignored' };
       const offered = (buttonsOf(entry.card) as readonly string[]).includes(button);
-      const yes = offered && (button === 'yes' || button === 'always');
-      const always = offered && button === 'always';
+      const yes = offered && (button === 'yes' || button === 'own');
+      const own = offered && button === 'own';
       entry.settle(yes);
-      if (always) options.onAlways?.(entry.card);
-      return { kind: 'answered', yes, always };
+      if (own) options.onOwn?.(entry.card);
+      return { kind: 'answered', yes, own };
     }
   };
 }

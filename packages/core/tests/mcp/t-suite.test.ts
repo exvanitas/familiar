@@ -39,7 +39,7 @@ async function localServer(args: string[] = [], extra: Partial<McpClientOptions>
 }
 
 const calls = (port: NodeProcessPort) => port.written.filter((l) => l.includes('"tools/call"')).length;
-const yes = (client: McpClient, id: string, tool = 'echo', args: unknown = { text: 'hi' }, by: 'asked' | 'always' = 'asked') => mintDecision(client.facts(id, tool, args)!, `step-${Math.random()}`, by, false)!;
+const yes = (client: McpClient, id: string, tool = 'echo', args: unknown = { text: 'hi' }, by: 'asked' | 'own' = 'asked') => mintDecision(client.facts(id, tool, args)!, `step-${Math.random()}`, by);
 const signal = () => new AbortController().signal;
 
 describe('T1: the export list', () => {
@@ -151,11 +151,11 @@ describe('T1: the export list', () => {
 });
 
 describe('T2: decisions at the handoff', () => {
-  it('a cast object, a second use, an aborted signal, "never" after minting, "always" revoked between mint and send: zero handoffs; a fresh one hands off once', async () => {
+  it('a cast object, a second use, an aborted signal, "never" after minting, "may run on its own" revoked between mint and send: zero handoffs; a fresh one hands off once', async () => {
     const { client, port, id } = await localServer();
     const facts = client.facts(id, 'echo', { text: 'hi' })!;
     // A cast object: the decision's shape, never minted.
-    const cast = Object.freeze({ ...facts, step: 's', by: 'asked', outside: false }) as unknown as ToolDecision;
+    const cast = Object.freeze({ ...facts, step: 's', by: 'asked' }) as unknown as ToolDecision;
     expect((await client.send(cast, signal())).kind).toBe('error');
     // An aborted signal.
     const stopped = new AbortController();
@@ -166,14 +166,14 @@ describe('T2: decisions at the handoff', () => {
     client.revoke(id, 'echo', 'never');
     expect(await client.send(d1, signal())).toMatchObject({ kind: 'error' });
     expect(calls(port)).toBe(0);
-    // "always" revoked between mint and send, on another tool: first shown to work, with a saved Allow.
+    // "May run on its own" revoked between mint and send, on another tool: first shown to work, with the grant saved.
     const note = client.tools().find((t) => t.serverName === 'add_note')!;
     // The revoke above saves itself in the background: wait for the owner.
     for (let i = 0; i < 100 && client.owner.busy; i++) await new Promise((r) => setTimeout(r, 10));
-    await client.choose(id, 'add_note', { policy: 'allow', fingerprint: note.fingerprint, setupFingerprint: note.setupFingerprint });
-    expect((await client.send(yes(client, id, 'add_note', { text: 'w' }, 'always'), signal())).kind).toBe('result');
+    await client.choose(id, 'add_note', { policy: 'own', fingerprint: note.fingerprint, setupFingerprint: note.setupFingerprint });
+    expect((await client.send(yes(client, id, 'add_note', { text: 'w' }, 'own'), signal())).kind).toBe('result');
     expect(calls(port)).toBe(1);
-    const d2 = yes(client, id, 'add_note', { text: 'x' }, 'always');
+    const d2 = yes(client, id, 'add_note', { text: 'x' }, 'own');
     client.revoke(id, 'add_note', 'ask');
     expect(await client.send(d2, signal())).toMatchObject({ kind: 'error' });
     expect(calls(port)).toBe(1);

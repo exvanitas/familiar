@@ -9,18 +9,17 @@
 import type { JournalClock } from '../journal/journal.ts';
 import type { SettingsStore } from '../settings/store.ts';
 import { canonicalArguments, markUsed, usable, type CardFacts, type ToolDecision } from './decision.ts';
-import { addressIdentity, modelName, Owner, type Outcome } from './owner.ts';
+import { addressIdentity, BUILT_IN, modelName, Owner, type Outcome } from './owner.ts';
+export { BUILT_IN };
 import { mutant } from '../mutations.ts';
 import type { PathRules } from './native-rules.ts';
 import type { Draft } from './paste.ts';
 import type { ProcessPort } from './process.ts';
 import { ServerRuntime, type Phase } from './runtime.ts';
 import { fresh, type SavedTool, type ServerLimits } from './saved.ts';
-import { choiceKey, serverTool, toolChanges, toolPolicies, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
-import type { GatePolicy, ToolPolicy } from '../journal/gate.ts';
+import { choiceKey, ownHolds, serverTool, toolChanges, toolPolicies, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
+import type { GatePolicy, GateVerdict } from '../journal/gate.ts';
 
-/** The server id built-in tools' choices are kept under: no saved server can have it (ids are non-empty). */
-export const BUILT_IN = '';
 
 /** A revoke whose durable write didn't land. */
 export const REVOKE_NOT_SAVED = 'Revoked for now, but not saved: it comes back when Familiar restarts. Try again.';
@@ -312,7 +311,7 @@ export class McpClient {
    */
   policy(wrappers: readonly ServerTool[]): GatePolicy {
     const choices = this.owner.choices();
-    const perTool: Record<string, ToolPolicy> = { ...toolPolicies(wrappers, choices) };
+    const perTool: Record<string, GateVerdict> = { ...toolPolicies(wrappers, choices) };
     for (const [key, c] of Object.entries(choices)) {
       const tool = builtInTool(key);
       if (tool !== undefined) perTool[tool] = c.policy;
@@ -327,7 +326,7 @@ export class McpClient {
 
   /** The overlay on top: "never" denies; "ask" asks, explicitly, since a built-in's absent entry is its
       default, which for some is allow. */
-  private tighten(perTool: Record<string, ToolPolicy>, name: string, key: string): void {
+  private tighten(perTool: Record<string, GateVerdict>, name: string, key: string): void {
     const o = this.overlay.get(key);
     if (o === 'never') perTool[name] = 'deny';
     else if (o === 'ask' && perTool[name] !== 'deny') perTool[name] = 'ask';
@@ -405,8 +404,9 @@ export class McpClient {
    * The only way a call reaches a server (3.6). In one synchronous step, with no await: it refuses unless
    * the decision is genuine, unused and its signal not aborted; its server's run is Ready, the run and
    * launch it was minted for; the catalog is fresh and offers the tool with its fingerprint; the person's
-   * choice, with the revoke overlay, still allows it ("always" still "always" for these fingerprints and no
-   * outside content; a Yes not turned to "never"); and the exchange slot is Idle. Then it marks the decision
+   * choice, with the revoke overlay, still allows it (a decision minted on "may run on its own" needs that
+   * grant still saved for these fingerprints and not revoked; a Yes not turned to "never"); and the
+   * exchange slot is Idle. Then it marks the decision
    * used, builds the body from the decision alone, and hands it off.
    */
   send(decision: ToolDecision, signal: AbortSignal, raw?: unknown): Promise<CallOutcome> {
@@ -423,8 +423,8 @@ export class McpClient {
     const choice = this.owner.choices()[key];
     const overlay = this.overlay.get(key);
     if (choice?.policy === 'deny' || overlay === 'never') return refuse('changed', `You chose never to run ${decision.tool} on this server, so Familiar didn't send the call.`);
-    if (decision.by === 'always' && (decision.outside || overlay === 'ask' || !(choice?.policy === 'allow' && choice.fingerprint === decision.fingerprint && choice.setupFingerprint === decision.launch))) {
-      return refuse('changed', `Your "always" for ${decision.tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`);
+    if (decision.by === 'own' && (overlay === 'ask' || !ownHolds(choice, decision.fingerprint, decision.launch))) {
+      return refuse('changed', `Your "may run on its own" for ${decision.tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`);
     }
     const ms = Math.min(CALL_MS_MAX, Math.max(CALL_MS_MIN, record.limits.callMs ?? CALL_MS));
     // Named mutations: queue behind a live exchange, a gap between the checks and the handoff, or a body

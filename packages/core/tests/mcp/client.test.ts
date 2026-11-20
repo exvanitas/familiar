@@ -177,9 +177,9 @@ describe('the MCP client, local, against the fake server', () => {
     await w.client.markReviewed(id, first.report, first.tools.map(t => t.name));
     await w.client.start(id);
     const a = w.client.tools();
-    // The person said "always" to every tool, for this exact tool and setup, keyed by server and tool.
-    const always = Object.fromEntries(a.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
-    expect(Object.values(toolPolicies(a, always)).every(p => p === 'allow')).toBe(true);
+    // The person let every tool run on its own, for this exact tool and setup, keyed by server and tool.
+    const always = Object.fromEntries(a.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'own' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
+    expect(Object.values(toolPolicies(a, always)).every(p => p === 'own')).toBe(true);
     expect(Object.keys(toolPolicies(a, always))).toHaveLength(a.length);
     await w.client.stop(id);
 
@@ -192,7 +192,7 @@ describe('the MCP client, local, against the fake server', () => {
     const b = w.client.tools();
     expect(b.every(t => t.setupFingerprint !== a[0]!.setupFingerprint)).toBe(true);
     expect(b.filter(t => t.fresh).map(t => t.serverName)).toEqual(['echo']);
-    // A new setup: "always" no longer holds for any tool. "Never" still holds.
+    // A new setup: "may run on its own" no longer holds for any tool. "Never" still holds.
     expect(toolPolicies(b, always)).toEqual({});
     const echo = b.find(t => t.serverName === 'echo')!;
     expect(toolPolicies(b, { [choiceKey(id, 'echo')]: { policy: 'deny', fingerprint: 'old', setupFingerprint: 'old' } })).toEqual({ [echo.name]: 'deny' });
@@ -207,7 +207,7 @@ describe('the MCP client, local, against the fake server', () => {
     const id = await addFake(w);
     await w.client.start(id);
     const before = w.client.tools();
-    const always = Object.fromEntries(before.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'allow' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
+    const always = Object.fromEntries(before.map(t => [choiceKey(t.server.id, t.serverName), { policy: 'own' as const, fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }]));
     const oldEcho = before.find(t => t.serverName === 'echo')!;
     const oldYes = yesFor(w.client, id, 'echo', { text: 'old' })!;
     // The server changes echo while it runs, and says its tools changed.
@@ -224,14 +224,14 @@ describe('the MCP client, local, against the fake server', () => {
     expect(await runWithYes(newEcho, { text: 'new' })).toMatch(/\nNEW$/);
   });
 
-  it('"always" never passes from one server to another with the same setup (r19 #4)', async () => {
+  it('"may run on its own" never passes from one server to another with the same setup (r19 #4)', async () => {
     const w = await world();
     const a = await addFake(w);
     await w.client.start(a);
     const tool = w.client.tools().find(t => t.serverName === 'echo')!;
-    const always = { [choiceKey(tool.server.id, 'echo')]: { policy: 'allow' as const, fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint } };
+    const always = { [choiceKey(tool.server.id, 'echo')]: { policy: 'own' as const, fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint } };
     // The control: the choice does allow A's own tool.
-    expect(toolPolicies([tool], always)).toEqual({ [tool.name]: 'allow' });
+    expect(toolPolicies([tool], always)).toEqual({ [tool.name]: 'own' });
     await w.client.stop(a);
     const b = await addFake(w);
     await w.client.start(b);
@@ -259,32 +259,31 @@ describe('the MCP client, local, against the fake server', () => {
     expect(sentCalls(w.port, 'echo')).toBe(1);
   });
 
-  it('a decision minted on "always" is checked again at the send: the choice changed, revoked, or outside content, and nothing is written', async () => {
+  it('a decision minted on "may run on its own" is checked again at the send: the grant changed or revoked, and nothing is written; "always" is refused at save', async () => {
     const w = await world();
     const id = await addFake(w);
     await w.client.start(id);
     const echo = w.client.tools().find(t => t.serverName === 'echo')!;
-    const always: ToolChoice = { policy: 'allow' as const, fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint };
+    const always: ToolChoice = { policy: 'own' as const, fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint };
+    await expect(w.client.choose(id, 'echo', { ...always, policy: 'allow' })).rejects.toThrow(/no "always" for a server's tool/);
     const facts = w.client.facts(id, 'echo', { text: 'kept' })!;
     const signal = new AbortController().signal;
     await w.client.choose(id, 'echo', always);
     // Kept: it goes.
-    expect(await w.client.send(mintDecision(facts, 's1', 'always', false)!, signal)).toMatchObject({ kind: 'result', text: 'kept' });
-    // Never minted for outside content.
-    expect(mintDecision(facts, 's2', 'always', true)).toBeUndefined();
+    expect(await w.client.send(mintDecision(facts, 's1', 'own'), signal)).toMatchObject({ kind: 'result', text: 'kept' });
     // The choice taken back after the mint: refused at the send.
-    const d = mintDecision(facts, 's3', 'always', false)!;
+    const d = mintDecision(facts, 's3', 'own');
     await w.client.choose(id, 'echo', undefined);
-    expect(await w.client.send(d, signal)).toMatchObject({ kind: 'error', words: expect.stringMatching(/Your "always" for echo on this server no longer stands/) });
+    expect(await w.client.send(d, signal)).toMatchObject({ kind: 'error', words: expect.stringMatching(/Your "may run on its own" for echo on this server no longer stands/) });
     // Withdrawn by the overlay: the same.
     await w.client.choose(id, 'echo', always);
     w.client.revoke(id, 'echo', 'ask');
-    expect(await w.client.send(mintDecision(facts, 's4', 'always', false)!, signal)).toMatchObject({ kind: 'error' });
+    expect(await w.client.send(mintDecision(facts, 's4', 'own'), signal)).toMatchObject({ kind: 'error' });
     expect(sentCalls(w.port, 'echo')).toBe(1);
     // A Yes to this call needs only the tool unchanged and no "never".
-    expect(await w.client.send(mintDecision(facts, 's5', 'asked', false)!, signal)).toMatchObject({ kind: 'result' });
+    expect(await w.client.send(mintDecision(facts, 's5', 'asked'), signal)).toMatchObject({ kind: 'result' });
     // A decision is used once; a copy or a cast object is never genuine.
-    const once = mintDecision(facts, 's6', 'asked', false)!;
+    const once = mintDecision(facts, 's6', 'asked');
     expect(await w.client.send(once, signal)).toMatchObject({ kind: 'result' });
     expect(await w.client.send(once, signal)).toMatchObject({ kind: 'error', words: expect.stringMatching(/used already/) });
     expect(await w.client.send({ ...once } as typeof once, signal)).toMatchObject({ kind: 'error' });

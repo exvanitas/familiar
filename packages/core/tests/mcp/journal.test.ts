@@ -11,7 +11,7 @@ import { FAKE_MAIN, REPO, testPaths } from './fake.ts';
 import { nodeProcessPort, type NodeProcessPort } from './node-process.ts';
 import { nodeNetPort } from './node-net.ts';
 import { callWithYes } from '../../src/testing/consent.ts';
-import { createCardDesk, type ConsentCard, type ConsentPort } from '../../src/index.ts';
+import { buttonsOf, createCardDesk, type ConsentCard, type ConsentPort } from '../../src/index.ts';
 import { mutations } from '../../src/mutations.ts';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
@@ -128,76 +128,104 @@ describe('a server tool in the turn loop', () => {
     await two.journal.close();
   });
 
-  it('"always" runs a call only while the conversation holds no outside content; after a server result, and a changed tool, it asks, with the facts read now (G12, r19 #15)', async () => {
+  /** A chat whose model calls the fake server's echo on every turn, with the gate's policy read from the
+      wrappers the turn loop holds and the client's saved choices. */
+  async function echoChat(storeName: string, answer: boolean) {
     const world = nodeWorld();
     const store = memorySettingsStore();
     const cards: ConsentCard[] = [];
-    const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
-    const script = (r: ModelRequest): FakeReply => {
-      const last = r.messages.at(-1);
-      if (last?.role === 'tool') return { text: 'Done.' };
-      return { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'fakeserver__echo', arguments: { text: 'hi' } }] };
-    };
-    // The gate's policy comes from the wrappers the turn loop holds, each by its own identity.
-    let held: ServerTool[] = [];
-    let client!: McpClient;
-    const policy = () => ({ perTool: toolPolicies(held, client.choices()) });
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-consent', review: true });
-    held = one.tools;
-    client = one.client;
-    const echo = client.tools().find(t => t.serverName === 'echo')!;
-    await client.choose(echo.server.id, 'echo', { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint });
-
-    // "Always", and nothing outside in the conversation yet: it runs without asking.
-    const t1 = await one.journal.send('Echo something.', 'turn-1');
-    if (!t1.replied) throw new Error('not replied');
-    await one.journal.turn(t1.turn.id).wait();
-    expect(cards).toEqual([]);
-    expect(echoCalls(one.port)).toBe(1);
-
-    // The server changes echo while it runs.
-    await callWithYes(client, one.serverId, 'set_variant', { variant: 'b' });
-    for (let i = 0; i < 200 && client.tools().find(t => t.serverName === 'echo')!.fingerprint === echo.fingerprint; i++) await sleep(10);
-    const changed = client.tools().find(t => t.serverName === 'echo')!;
-
-    // The conversation now holds the server's result: "always" doesn't apply, the card offers no Always,
-    // and it shows the tool as the server offers it now.
-    const t2 = await one.journal.send('Echo something again.', 'turn-2');
-    if (!t2.replied) throw new Error('not replied');
-    await one.journal.turn(t2.turn.id).wait();
-    expect(cards).toHaveLength(1);
-    expect(cards[0]!.always).toBe(false);
-    expect(cards[0]!.facts).toMatchObject({ server: one.serverId, tool: 'echo', fingerprint: changed.fingerprint });
-    expect(cards[0]!.presentation).toMatch(/^[0-9a-z]+$/);
-    expect(echoCalls(one.port)).toBe(2);
-    await one.journal.close();
-  });
-
-  it('a clean chat, but the request offers tools the person never reviewed: their descriptions are outside, so "always" asks and the card offers no Always (5.6)', async () => {
-    const world = nodeWorld();
-    const store = memorySettingsStore();
-    const cards: ConsentCard[] = [];
-    const echoCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
     const script = (r: ModelRequest): FakeReply => (r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { text: 'On it.', toolCalls: [{ id: `call-${r.messages.length}`, name: 'fakeserver__echo', arguments: { text: 'hi' } }] });
     let held: ServerTool[] = [];
     let client!: McpClient;
-    const policy = () => ({ perTool: toolPolicies(held, client.choices()) });
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); }, storeName: 'mcp-unreviewed' });
+    const policy = () => client.policy(held);
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true });
     held = one.tools;
     client = one.client;
-    expect(held.filter(t => t.fresh).length).toBeGreaterThan(1);
     const echo = held.find(t => t.serverName === 'echo')!;
-    await client.choose(echo.server.id, 'echo', { policy: 'allow', fingerprint: echo.fingerprint, setupFingerprint: echo.setupFingerprint });
-    const t1 = await one.journal.send('Echo something.', 'turn-1');
-    if (!t1.replied) throw new Error('not replied');
-    await one.journal.turn(t1.turn.id).wait();
-    expect(cards).toHaveLength(1);
-    expect(cards[0]!).toMatchObject({ always: false, facts: { tool: 'echo' } });
-    expect(echoCalls(one.port)).toBe(1);
-    await one.journal.close();
+    const calls = () => one.port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"echo"')).length;
+    let n = 0;
+    const turn = async () => {
+      const t = await one.journal.send(`Echo something ${++n}.`, `turn-${n}`);
+      if (!t.replied) throw new Error('not replied');
+      await one.journal.turn(t.turn.id).wait();
+    };
+    return { one, client, echo, cards, calls, turn };
+  }
+
+  it('G12: no server tool runs without your Yes to that call; an "always" is refused when saved, and a policy saying allow still asks', async () => {
+    for (const mutation of [undefined, 'server-always'] as const) {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const c = await echoChat(`mcp-g12-${mutation ?? 'twin'}`, false);
+        const saved = await c.client.choose(c.echo.server.id, 'echo', { policy: 'allow', fingerprint: c.echo.fingerprint, setupFingerprint: c.echo.setupFingerprint }).then(() => 'saved', (e: Error) => e.message);
+        await c.turn();
+        if (mutation === undefined) {
+          expect(saved).toMatch(/no "always" for a server's tool/);
+          // The card is shown, the person says no, and nothing reaches the server.
+          expect(c.cards.map((x) => x.tool)).toEqual(['fakeserver__echo']);
+          expect(c.calls()).toBe(0);
+        } else {
+          // The control: the old "always" back, and the call goes out with no Yes to it.
+          expect(c.cards).toEqual([]);
+          expect(c.calls()).toBe(1);
+        }
+        await c.one.journal.close();
+      } finally {
+        mutations.clear();
+      }
+    }
   });
 
-  it("r20 #1: a turn's saved wrapper from z is never allowed by a's \"always\", whatever names the servers have now", async () => {
+  it('"may run on its own": that one tool runs unasked for exactly its version and setup; a changed fingerprint clears it, and a revoke takes it back', async () => {
+    for (const mutation of [undefined, 'own-ignores-fingerprint'] as const) {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const c = await echoChat(`mcp-own-${mutation ?? 'twin'}`, true);
+        // The first call asks; its card offers "May run on its own", in words that say what it lets her do.
+        await c.turn();
+        expect(c.cards).toHaveLength(1);
+        expect(c.cards[0]!.own).toMatch(/whenever she decides to, without asking you, even when something a server said led her there/);
+        expect(buttonsOf(c.cards[0]!)).toEqual(['yes', 'own', 'skip']);
+        // The grant, for the card's own facts.
+        await c.client.choose(c.echo.server.id, 'echo', { policy: 'own', fingerprint: c.cards[0]!.facts!.fingerprint, setupFingerprint: c.cards[0]!.facts!.launch });
+        await c.turn();
+        expect(c.cards).toHaveLength(1);
+        expect(c.calls()).toBe(2);
+        // The server changes echo: the grant is cleared with the catalog write, and the changed tool asks.
+        await callWithYes(c.client, c.one.serverId, 'set_variant', { variant: 'b' });
+        for (let i = 0; i < 300 && c.client.tools().find(t => t.serverName === 'echo')!.fingerprint === c.echo.fingerprint; i++) await sleep(10);
+        for (let i = 0; i < 300 && !mutation && c.client.choices()[choiceKey(c.echo.server.id, 'echo')]; i++) await sleep(10);
+        await c.turn();
+        if (mutation === undefined) {
+          expect(c.client.choices()[choiceKey(c.echo.server.id, 'echo')]).toBeUndefined();
+          expect(c.cards).toHaveLength(2);
+          expect(c.cards[1]!.facts!.fingerprint).not.toBe(c.echo.fingerprint);
+        } else {
+          // The control: the grant kept for a tool that changed, and it ran unasked.
+          expect(c.cards).toHaveLength(1);
+        }
+        expect(c.calls()).toBe(3);
+        await c.one.journal.close();
+      } finally {
+        mutations.clear();
+      }
+    }
+  });
+
+  it('"may run on its own" revoked: the next call asks at once', async () => {
+    const c = await echoChat('mcp-own-revoke', true);
+    await c.client.choose(c.echo.server.id, 'echo', { policy: 'own', fingerprint: c.echo.fingerprint, setupFingerprint: c.echo.setupFingerprint });
+    await c.turn();
+    expect(c.cards).toEqual([]);
+    expect(c.calls()).toBe(1);
+    expect((await c.client.revoke(c.echo.server.id, 'echo', 'ask')).ok).toBe(true);
+    await c.turn();
+    expect(c.cards).toHaveLength(1);
+    expect(c.calls()).toBe(2);
+    await c.one.journal.close();
+  });
+
+  it("r20 #1: a turn's saved wrapper from z is never run on a's \"may run on its own\", whatever names the servers have now", async () => {
     const world = nodeWorld();
     const port = nodeProcessPort();
     cleanups.push(() => port.closeAll());
@@ -214,8 +242,8 @@ describe('a server tool in the turn loop', () => {
     expect(held.find(t => t.serverName === 'echo')!.name).toBe('same__echo');
     expect((await client.start('a')).kind).toBe('ready');
     const aEcho = client.tools().find(t => t.server.id === 'a' && t.serverName === 'echo')!;
-    // "Always" only for a's echo.
-    const choices: Record<string, ToolChoice> = { [choiceKey('a', 'echo')]: { policy: 'allow', fingerprint: aEcho.fingerprint, setupFingerprint: aEcho.setupFingerprint } };
+    // "May run on its own" only for a's echo.
+    const choices: Record<string, ToolChoice> = { [choiceKey('a', 'echo')]: { policy: 'own', fingerprint: aEcho.fingerprint, setupFingerprint: aEcho.setupFingerprint } };
     // Frozen keys: z keeps its name, and a has its own.
     expect(client.tools().map(t => t.name).sort()).toEqual(expect.arrayContaining(['same__echo', 'same2__echo']));
     let asks = 0;

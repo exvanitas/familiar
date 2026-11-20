@@ -376,14 +376,14 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
   it('a revoke the owner refuses holds for now and says it was not saved; a restart brings the saved choice back', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
-    await client.choose('s1', 'echo', { policy: 'allow', fingerprint: 'f', setupFingerprint: 'l' });
+    await client.choose('s1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 'l' });
     const busy = client.owner.admit('other');
     if (!('release' in busy)) throw new Error('not admitted');
     const r = await client.revoke('s1', 'echo', 'ask');
     busy.release();
     expect(r).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
     expect((client as any).overlay.get(choiceKey('s1', 'echo'))).toBe('ask');
-    expect((await clientOf(store, speakingPort().port)).choices()[choiceKey('s1', 'echo')]?.policy).toBe('allow');
+    expect((await clientOf(store, speakingPort().port)).choices()[choiceKey('s1', 'echo')]?.policy).toBe('own');
     // A failing store says the same.
     const failing: SettingsStore = { ...store, putIf: async () => false };
     const other = await clientOf(failing, speakingPort().port);
@@ -477,7 +477,7 @@ describe('5.5: a revoke holds until the person chooses again', () => {
     expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('allow');
     // A server tool's: the overlay no longer refuses at the send either.
     await client.revoke('s1', 'echo', 'never');
-    await client.choose('s1', 'echo', { policy: 'allow', fingerprint: 'f', setupFingerprint: 'l' });
+    await client.choose('s1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 'l' });
     expect((client as any).overlay.has(choiceKey('s1', 'echo'))).toBe(false);
   });
 

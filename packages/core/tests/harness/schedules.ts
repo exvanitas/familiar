@@ -207,7 +207,7 @@ export const SCHEDULES: Named[] = [
     expect: (r) => (r.exe.exits.length ? undefined : 'the server never exited')
   },
   {
-    // S23: a modern server that relists its tools with their properties in another order: a saved "always"
+    // S23: a modern server that relists its tools with their properties in another order: a saved "may run on its own"
     // made on the first listing still holds after a Stop and Start (H3: nothing lost to key order).
     name: 'S23 a relist in another property order',
     options: {
@@ -216,18 +216,18 @@ export const SCHEDULES: Named[] = [
         d.when('ready', () => d.idle(), () => {
           const tool = d.client.tools().find((t) => t.serverName === 'mirror2');
           if (!tool) return;
-          void d.client.choose('s1', 'mirror2', { policy: 'allow', fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint }).then(() => {
+          void d.client.choose('s1', 'mirror2', { policy: 'own', fingerprint: tool.fingerprint, setupFingerprint: tool.setupFingerprint }).then(() => {
             d.stop();
             d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
               d.start();
-              d.when('ready again', () => d.idle() && d.evidence.some((e) => e.what === 'started' && e.ok && e.seq > [...d.evidence].reverse().find((x) => x.what === 'start')!.seq), () => d.always('mirror2', { count: 7, flag: true }));
+              d.when('ready again', () => d.idle() && d.evidence.some((e) => e.what === 'started' && e.ok && e.seq > [...d.evidence].reverse().find((x) => x.what === 'start')!.seq), () => d.own('mirror2', { count: 7, flag: true }));
             });
           });
         })
     },
     expect: (r) => {
       const out = r.evidence.find((e) => e.what === 'outcome' && e.tool === 'mirror2')?.outcome;
-      return out?.kind === 'result' ? undefined : `the "always" call after a reordered relist came back ${JSON.stringify(out)}`;
+      return out?.kind === 'result' ? undefined : `the call on its own after a reordered relist came back ${JSON.stringify(out)}`;
     }
   },
   {

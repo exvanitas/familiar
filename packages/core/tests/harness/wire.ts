@@ -927,7 +927,7 @@ export class Driver {
 
   /** The Yes on a card shown earlier, and the call it allows. */
   yes(card: { token: string; facts: NonNullable<ReturnType<McpClient['facts']>>; args: Record<string, unknown> }, id = 's1'): void {
-    const decision = mintDecision(card.facts, card.token, 'asked', false)!;
+    const decision = mintDecision(card.facts, card.token, 'asked');
     this.note({ what: 'yes', token: card.token, tool: card.facts.tool, body: card.facts.canonical, args: card.args, server: id });
     const stop = new AbortController();
     this.calls.set(card.token, stop);
@@ -944,13 +944,13 @@ export class Driver {
     }
   }
 
-  /** A call under a saved "always", as the journal's gate would mint it with nothing outside in context. */
-  always(tool: string, extra: Record<string, unknown> = {}, id = 's1'): void {
+  /** A call under a saved "may run on its own", as the journal's gate would mint it. */
+  own(tool: string, extra: Record<string, unknown> = {}, id = 's1'): void {
     const token = `t${++this.n}`;
     const args = { text: token, ...extra };
     const facts = this.client.facts(id, tool, args);
     if (!facts) return void this.note({ what: 'not-offered', tool, server: id });
-    const decision = mintDecision(facts, token, 'always', false)!;
+    const decision = mintDecision(facts, token, 'own');
     this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id });
     this.note({ what: 'call', token, tool, server: id });
     void this.client.send(decision, new AbortController().signal).then((outcome) => this.note({ what: 'outcome', token, tool, outcome, server: id }));
@@ -1024,7 +1024,7 @@ export class Driver {
       if (this.idle(id) && this.client.tools().some((t) => t.server.id === id)) this.note({ what: 'not-offered', tool, server: id });
       return;
     }
-    const decision = mintDecision(facts, token, 'asked', false)!;
+    const decision = mintDecision(facts, token, 'asked');
     this.note({ what: 'card', token, tool, body: facts.canonical, server: id });
     this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id });
     const stop = new AbortController();

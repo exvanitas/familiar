@@ -12,7 +12,7 @@ import type { CallOutcome } from '../mcp/types.ts';
 /** A decision for this call as the server offers it now, or undefined if it can't be bound. */
 export function yesFor(client: McpClient, serverId: string, tool: string, args: unknown, step = 'test'): ToolDecision | undefined {
   const facts: CardFacts | undefined = client.facts(serverId, tool, args);
-  return facts ? mintDecision(facts, step, 'asked', false) : undefined;
+  return facts ? mintDecision(facts, step, 'asked') : undefined;
 }
 
 /** One call through `send`, with a fresh Yes. */
@@ -24,6 +24,6 @@ export function callWithYes(client: McpClient, serverId: string, tool: string, a
 /** A wrapper's run, as the journal's execute would make it after a Yes. */
 export function runWithYes(t: ServerTool, args: unknown, step: Partial<ToolStep> = {}): Promise<string> {
   const facts = t.consent.facts(args);
-  const decision = facts ? mintDecision(facts, 'test', 'asked', false) : undefined;
+  const decision = facts ? mintDecision(facts, 'test', 'asked') : undefined;
   return t.run(args, { id: 'test', write: async () => { throw new Error('no writes'); }, ...step, ...(decision ? { decision } : {}) } as ToolStep);
 }

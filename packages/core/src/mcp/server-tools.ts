@@ -4,7 +4,8 @@
 // content: the server's word, never the person's.
 
 import type { FamiliarTool, ToolStep } from '../journal/tools.ts';
-import type { ToolPolicy } from '../journal/gate.ts';
+import type { GateVerdict, ToolPolicy } from '../journal/gate.ts';
+import { mutant } from '../mutations.ts';
 import { effectiveDescription } from './catalog.ts';
 import type { CardFacts, ToolDecision } from './decision.ts';
 import type { CallOutcome, ListedTool } from './types.ts';
@@ -46,7 +47,7 @@ export interface ServerTool extends FamiliarTool {
   readonly serverName: string;
   /** The tool as offered: the call is sent only if the server still offers exactly this. */
   readonly fingerprint: string;
-  /** The fingerprint of the setup its run started from. "Always for this" binds to both. */
+  /** The fingerprint of the setup its run started from. "May run on its own" binds to both. */
   readonly setupFingerprint: string;
   /** New or changed since the person last reviewed it. */
   readonly fresh: boolean;
@@ -117,12 +118,19 @@ export function outcomeText(server: string, tool: string, o: CallOutcome): strin
   }
 }
 
-/** The person's "always" or "never" for one tool, with what it was given for. */
+/**
+ * The person's choice for one tool, with what it was given for:
+ * - a server's tool: `own` ("may run on its own", for exactly this fingerprint and setup), `ask` or
+ *   `deny`; there's no "always" for a server's tool, so `allow` is refused when it's saved;
+ * - a built-in: `ask` or `deny`, or `allow` only for one on the fixed notes-and-reminders list, where it is
+ *   that tool's default.
+ */
 export interface ToolChoice {
-  readonly policy: ToolPolicy;
+  readonly policy: ChoicePolicy;
   readonly setupFingerprint: string;
   readonly fingerprint: string;
 }
+export type ChoicePolicy = ToolPolicy | 'own';
 
 /** The key a choice is kept under: the server's immutable id and the tool's own name. Never the model's
     name for it, which depends on labels and on the other servers. */
@@ -130,14 +138,20 @@ export function choiceKey(serverId: string, toolName: string): string {
   return JSON.stringify([serverId, toolName]);
 }
 
+/** Whether a "may run on its own" grant holds for this tool now: exactly its fingerprint and setup. */
+export function ownHolds(c: ToolChoice | undefined, fingerprint: string, setupFingerprint: string): boolean {
+  if (c?.policy !== 'own' && !(c?.policy === 'allow' && (__FAMILIAR_MUTATIONS__ && mutant('server-always')))) return false;
+  return (c.fingerprint === fingerprint && c.setupFingerprint === setupFingerprint) || !!(__FAMILIAR_MUTATIONS__ && mutant('own-ignores-fingerprint'));
+}
+
 /** One wrapper's policy, from its own identity only: the server's id and the tool's own name, with both
-    fingerprints. "Always" holds only for the exact tool and setup it was given for; "never" holds whatever
-    changed, since stricter is safe. Undefined: the gate's default, which asks. */
-export function wrapperPolicy(t: ServerTool, choices: Readonly<Record<string, ToolChoice>>): ToolPolicy | undefined {
+    fingerprints. "May run on its own" holds only for the exact tool and setup it was given for; "never"
+    holds whatever changed, since stricter is safe. Undefined: the gate's default, which asks. */
+export function wrapperPolicy(t: ServerTool, choices: Readonly<Record<string, ToolChoice>>): GateVerdict | undefined {
   const c = choices[choiceKey(t.server.id, t.serverName)];
   if (!c) return undefined;
   if (c.policy === 'deny') return 'deny';
-  if (c.policy === 'allow' && c.fingerprint === t.fingerprint && c.setupFingerprint === t.setupFingerprint) return 'allow';
+  if (ownHolds(c, t.fingerprint, t.setupFingerprint)) return 'own';
   return undefined;
 }
 
@@ -147,8 +161,8 @@ export function wrapperPolicy(t: ServerTool, choices: Readonly<Record<string, To
  * across servers. Give it the very wrappers the turn loop was given, so a name always means the wrapper
  * that carries it.
  */
-export function toolPolicies(tools: readonly ServerTool[], choices: Readonly<Record<string, ToolChoice>>): Record<string, ToolPolicy> {
-  const out: Record<string, ToolPolicy> = {};
+export function toolPolicies(tools: readonly ServerTool[], choices: Readonly<Record<string, ToolChoice>>): Record<string, GateVerdict> {
+  const out: Record<string, GateVerdict> = {};
   for (const t of tools) {
     const p = wrapperPolicy(t, choices);
     if (p) out[t.name] = p;

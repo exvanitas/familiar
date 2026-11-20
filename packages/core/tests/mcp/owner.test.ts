@@ -74,7 +74,7 @@ describe('5.1: one durable effect at a time', () => {
     expect(await owner.add(local('l1'))).toEqual({ ok: true });
     hold = true;
     const seen = owner.seen('l1', [{ name: 'echo', fingerprint: 'f1' }]);
-    const choice = owner.choose('l1', 'echo', { policy: 'allow', fingerprint: 'f1', setupFingerprint: 'x' });
+    const choice = owner.choose('l1', 'echo', { policy: 'own', fingerprint: 'f1', setupFingerprint: 'x' });
     await new Promise((r) => setTimeout(r, 5));
     hold = false;
     gates.splice(0).forEach((g) => g());
@@ -85,7 +85,7 @@ describe('5.1: one durable effect at a time', () => {
     // The other way round: the choice holds the owner, and the catalog write is skipped (re-derived at the
     // next listing), never a second write on the same revision.
     hold = true;
-    const second = owner.choose('l1', 'echo', { policy: 'allow', fingerprint: 'f1', setupFingerprint: 'x' });
+    const second = owner.choose('l1', 'echo', { policy: 'own', fingerprint: 'f1', setupFingerprint: 'x' });
     await new Promise((r) => setTimeout(r, 1));
     await owner.seen('l1', [{ name: 'echo', fingerprint: 'f2' }]);
     hold = false;
@@ -161,7 +161,7 @@ describe('5.1: one durable effect at a time', () => {
     const t = ports();
     const owner = await Owner.open(t.p);
     await owner.add(local('l1', ['TOKEN']));
-    await owner.choose('l1', 'echo', { policy: 'allow', fingerprint: 'f', setupFingerprint: 's' });
+    await owner.choose('l1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 's' });
     await owner.choose('l10', 'echo', { policy: 'deny', fingerprint: 'f', setupFingerprint: 's' });
     expect(await owner.remove('l1', async () => void t.log.push('stopped'))).toEqual({ ok: true });
     expect(t.log).toEqual(['stopped', 'forget l1', 'secret_delete server:l1:TOKEN']);
@@ -332,9 +332,34 @@ describe('5.1: the owner keeps built-in choices too', () => {
     const t = ports();
     const client = await McpClient.open({ store: t.p.store, processes: { start: async () => ({ run: 'x' }), write: async () => {}, stop: async () => {}, forget: async () => {} }, net: { fetch: async () => { throw new Error('no'); }, read: async () => new Uint8Array(0), cancel: async () => {} }, addresses: t.p.addresses, secrets: t.p.secrets, clock: { now: () => 0, setTimer: () => undefined } });
     await client.choose(BUILT_IN, 'note_add', { policy: 'deny', fingerprint: '', setupFingerprint: '' });
-    await client.choose(BUILT_IN, 'look', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
-    expect(client.policy([])).toEqual({ perTool: { note_add: 'deny', look: 'allow' } });
-    void client.revoke(BUILT_IN, 'look', 'ask');
-    expect(client.policy([]).perTool).toEqual({ note_add: 'deny', look: 'ask' });
+    await client.choose(BUILT_IN, 'note_search', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    expect(client.policy([])).toEqual({ perTool: { note_add: 'deny', note_search: 'allow' } });
+    void client.revoke(BUILT_IN, 'note_search', 'ask');
+    expect(client.policy([]).perTool).toEqual({ note_add: 'deny', note_search: 'ask' });
+  });
+
+  it('r32b #5: an Allow for a built-in off the notes-and-reminders list is refused at save; one in the record loads as ask, and the gate asks', async () => {
+    const { McpClient, BUILT_IN } = await import('../../src/mcp/client.ts');
+    const { gateFor } = await import('../../src/journal/gate.ts');
+    const t = ports();
+    const open = () => McpClient.open({ store: t.p.store, processes: { start: async () => ({ run: 'x' }), write: async () => {}, stop: async () => {}, forget: async () => {} }, net: { fetch: async () => { throw new Error('no'); }, read: async () => new Uint8Array(0), cancel: async () => {} }, addresses: t.p.addresses, secrets: t.p.secrets, clock: { now: () => 0, setTimer: () => undefined } });
+    const client = await open();
+    const send = { name: 'send_message', kind: 'effect' } as never;
+    await expect(client.choose(BUILT_IN, 'send_message', { policy: 'allow', fingerprint: '', setupFingerprint: '' })).rejects.toThrow(/Only Familiar's own notes and reminders run without asking/);
+    await expect(client.choose(BUILT_IN, 'note_add', { policy: 'own', fingerprint: '', setupFingerprint: '' })).rejects.toThrow();
+    // Written by something older, straight into the record: it loads as ask, and the gate asks.
+    await client.choose(BUILT_IN, 'note_search', { policy: 'allow', fingerprint: '', setupFingerprint: '' });
+    const stored = (await t.p.store.get(OWNER_KEY))!;
+    const value = JSON.parse(JSON.stringify(stored.value));
+    value.choices[JSON.stringify([BUILT_IN, 'send_message'])] = { policy: 'allow', fingerprint: '', setupFingerprint: '' };
+    value.choices[JSON.stringify(['l1', 'echo'])] = { policy: 'allow', fingerprint: 'f', setupFingerprint: 's' };
+    await t.p.store.put(OWNER_KEY, { v: stored.v, value });
+    const reopened = await open();
+    expect(reopened.choices()[JSON.stringify([BUILT_IN, 'send_message'])]?.policy).toBe('ask');
+    // An old "always" for a server's tool loads as ask too.
+    expect(reopened.choices()[JSON.stringify(['l1', 'echo'])]?.policy).toBe('ask');
+    expect(gateFor('send_message', send, reopened.policy([]))).toBe('ask');
+    // Even a policy that says allow, from anywhere, asks for it.
+    expect(gateFor('send_message', send, { perTool: { send_message: 'allow' } })).toBe('ask');
   });
 });

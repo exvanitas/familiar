@@ -4,8 +4,9 @@
 // that never starts a run. All against the real pi-durable 1.5.2 on a fake IndexedDB.
 
 import { describe, expect, it } from 'vitest';
-import { alternate, decodeFailure, encodeModelError, runView, SummarizedDoc, TurnsDoc, type ChatMessage, type Journal, type ModelRequest } from '../../src/index.ts';
+import { alternate, decodeFailure, encodeModelError, runView, TurnsDoc, type ChatMessage, type Journal, type ModelRequest } from '../../src/index.ts';
 import type { FakeReply } from '../../src/testing/index.ts';
+import { mutations } from '../../src/mutations.ts';
 import { nodeWorld, type NodeWorld } from './node-env.ts';
 import { openFor, type Env, type OpenOptions } from './scenarios.ts';
 
@@ -369,7 +370,7 @@ describe('2.2: several interrupted steps in one round make one question (S7)', (
 /* ---------- her line ---------- */
 
 describe('2.1: her line', () => {
-  const prompt = { system: 'Say one short line.', messages: [{ role: 'user' as const, content: 'Your reminder is due.' }], sources: ['server:weather', 'server:weather'] };
+  const prompt = { system: 'Say one short line.', messages: [{ role: 'user' as const, content: 'Your reminder is due.' }] };
 
   it('is one model request: an error, even one that says it was never processed, is not tried again, and she stays quiet', async () => {
     let n = 0;
@@ -380,10 +381,10 @@ describe('2.1: her line', () => {
     await journal.close();
   });
 
-  it('into a quiet chat: model-visible, as a note that merges with your next message; its sources are written', async () => {
+  it('into a quiet chat: model-visible, as a note that merges with your next message', async () => {
     const { journal, model } = await journalOf({ script: (r) => (r.tools.length === 0 && r.system === 'Say one short line.' ? { text: 'The kettle!' } : { text: `answer to ${lastUser(r)}` }) });
     const said = await journal.remark(prompt);
-    expect(said).toEqual({ text: 'The kettle!', visible: true, sources: ['server:weather'] });
+    expect(said).toEqual({ text: 'The kettle!', visible: true });
     expect(model.requests[0]).toMatchObject({ tools: [], system: 'Say one short line.' });
     expect((await journal.transcript()).at(-1)).toMatchObject({ kind: 'familiar.remark', text: 'The kettle!' });
     // Nothing ran: no run, no question.
@@ -443,10 +444,10 @@ describe('2.1: her line', () => {
 
 void idle;
 
-/* ---------- 5.6: the outside record, and "always" ---------- */
+/* ---------- 5.6: no server tool runs without your Yes ---------- */
 
-describe('5.6 and G12: "always" never acts on outside content, her remark included (T9)', () => {
-  async function run(sources: string[]) {
+describe('5.6 and G12: no server tool runs without your Yes to that call, whatever a policy says (T9)', () => {
+  async function run(answer: boolean) {
     const { IDBFactory } = await import('fake-indexeddb');
     const { openJournal, openJournalStore, decideByRules } = await import('../../src/index.ts');
     const { createFakeModel } = await import('../../src/testing/index.ts');
@@ -459,6 +460,7 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
       description: 'A server tool.',
       inputSchema: { type: 'object', properties: {} },
       kind: 'server' as const,
+      server: { id: 'srv', label: 'Weather' },
       doing: () => 'looking on the server',
       consent: { facts: () => ({ server: 'srv', tool: 'look', run: 'r1', launch: 'L', fingerprint: 'F', canonical: '{}', hash: sha256('{}') }) },
       run: async (_a: unknown, step: any) => {
@@ -466,7 +468,7 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
         return 'looked';
       }
     };
-    const model = createFakeModel((r: ModelRequest) => (r.system === 'One line.' ? { text: 'I saw the forecast.' } : r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { toolCalls: [{ id: 'c1', name: 'srv__look', arguments: {} }] }));
+    const model = createFakeModel((r: ModelRequest) => (r.system === 'One line.' ? { text: 'I saw the forecast.' } : r.messages.at(-1)?.role === 'tool' ? { text: 'Done.' } : { toolCalls: [{ id: `c${r.messages.length}`, name: 'srv__look', arguments: {} }] }));
     const journal = await openJournal({
       store: await openJournalStore(`t9-${Math.random()}`, { indexedDB: new IDBFactory() as any }),
       owner: memoryOwner(),
@@ -474,106 +476,50 @@ describe('5.6 and G12: "always" never acts on outside content, her remark includ
       modelId: 'fake-1',
       caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
       tools: [tool as any],
+      // An "always", from anywhere: a clean chat, nothing a server said in it yet.
       policy: () => ({ perTool: { srv__look: 'allow' } }),
       wake: { wakeAt: () => {} },
       notifier: { notify: () => {} },
-      consent: { ask: async (card) => { cards.push(card); return true; } },
+      consent: { ask: async (card) => { cards.push(card); return answer; } },
       presence: { report: () => {} },
       persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
       decider: { decide: async (event, context) => decideByRules(event, context) },
       ambient: () => ({ persona: { sketch: 'kind', interests: [] }, chattiness: 'medium', doNotDisturb: false, fullscreen: false, sentAway: false, chatInFront: true, teaserDue: false }),
       resendDelayMs: 50
     });
-    expect(await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say something.' }], sources })).toMatchObject({ visible: true });
-    const t = await journal.send('Look it up.', 'a');
-    if (t.replied) await t.turn.wait();
+    expect(await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say something.' }] })).toMatchObject({ visible: true });
+    for (const id of ['a', 'b']) {
+      const t = await journal.send('Look it up.', id);
+      if (t.replied) await t.turn.wait();
+    }
     await journal.close();
     return { cards, ran };
   }
 
-  it('a remark made from a server result carries its source: the next request is outside, "always" asks, and the card offers no Always', async () => {
-    const r = await run(['server:weather']);
-    expect(r.cards).toHaveLength(1);
-    expect(r.cards[0]).toMatchObject({ always: false, facts: { server: 'srv', tool: 'look' } });
-    expect(r.ran).toHaveLength(1);
-    expect(r.ran[0]).toMatchObject({ by: 'asked', outside: true });
+  it('each call shows its card, with "May run on its own" in plain words; a No sends nothing', async () => {
+    const yes = await run(true);
+    expect(yes.cards).toHaveLength(2);
+    expect(yes.cards[0]).toMatchObject({ facts: { server: 'srv', tool: 'look' }, own: expect.stringMatching(/May run on its own: Familiar will call srv__look on Weather whenever she decides to/) });
+    expect(yes.ran).toHaveLength(2);
+    expect(yes.ran.every((d: any) => d.by === 'asked')).toBe(true);
+    const no = await run(false);
+    expect(no.cards).toHaveLength(2);
+    expect(no.ran).toEqual([]);
   });
 
-  it('the control: the same remark without sources leaves the conversation inside, and "always" runs it without asking', async () => {
-    const r = await run([]);
-    expect(r.cards).toEqual([]);
-    expect(r.ran[0]).toMatchObject({ by: 'always', outside: false });
+  it('the control: the old "always" (server-always) runs it with no Yes to the call', async () => {
+    mutations.set(['server-always']);
+    try {
+      const r = await run(false);
+      expect(r.cards).toEqual([]);
+      expect(r.ran).toHaveLength(2);
+    } finally {
+      mutations.clear();
+    }
   });
 });
 
 /* ---------- 2.7: the recovered-run gate ---------- */
-
-describe('5.6: outside content survives a compaction', () => {
-  it('a server result in the range a compaction keeps, then 300 requests with no sources: "always" still asks', async () => {
-    const { IDBFactory } = await import('fake-indexeddb');
-    const { openJournal, openJournalStore, decideByRules } = await import('../../src/index.ts');
-    const { createFakeModel } = await import('../../src/testing/index.ts');
-    const { memoryOwner } = await import('./node-env.ts');
-    const { sha256 } = await import('../../src/mcp/hash.ts');
-    const { isSummary } = await import('./pi-durable-world.ts');
-    const cards: any[] = [];
-    let summaries = 0;
-    const tool = {
-      name: 'srv__look',
-      description: 'A server tool.',
-      inputSchema: { type: 'object', properties: {} },
-      kind: 'server' as const,
-      doing: () => 'looking on the server',
-      consent: { facts: () => ({ server: 'srv', tool: 'look', run: 'r1', launch: 'L', fingerprint: 'F', canonical: '{}', hash: sha256('{}') }) },
-      run: async () => 'looked'
-    };
-    // Every reply reports a context near the window, so a long history is summarized inside the turn.
-    const big = { inputTokens: 9000, outputTokens: 5 };
-    const model = createFakeModel((r: ModelRequest) => {
-      if (isSummary(r)) return (summaries++, { text: 'SUMMARY' });
-      if (r.system === 'One line.') return { text: 'Hi.' };
-      // Her lines merge into the user message before yours (2.1), so it ends with yours.
-      if (lastUser(r).endsWith('Look it up.') && r.messages.at(-1)?.role !== 'tool') return { toolCalls: [{ id: `c${r.messages.length}`, name: 'srv__look', arguments: {} }], usage: big };
-      return { text: 'Done.', usage: big };
-    });
-    const journal = await openJournal({
-      store: await openJournalStore(`f42-${Math.random()}`, { indexedDB: new IDBFactory() as any }),
-      owner: memoryOwner(),
-      model,
-      modelId: 'fake-1',
-      caps: { config: { maxReplyTokens: 200 }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
-      tools: [tool as any],
-      policy: () => ({ perTool: { srv__look: 'allow' } }),
-      wake: { wakeAt: () => {} },
-      notifier: { notify: () => {} },
-      consent: { ask: async (card) => { cards.push(card); return true; } },
-      presence: { report: () => {} },
-      persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
-      decider: { decide: async (event, context) => decideByRules(event, context) },
-      ambient: () => ({ persona: { sketch: 'kind', interests: [] }, chattiness: 'medium', doNotDisturb: false, fullscreen: false, sentAway: false, chatInFront: true, teaserDue: false }),
-      resendDelayMs: 50
-    });
-    const say = async (text: string, id: string) => {
-      const t = await journal.send(text, id);
-      if (t.replied) await t.turn.wait();
-    };
-    for (let k = 0; k < 2; k++) await say(`Earlier notes ${k}: ${'lorem ipsum dolor sit amet '.repeat(1800)}`, `e${k}`);
-    // A clean chat: "always" runs the call, and its result is the server's word from here on.
-    await say('Look it up.', 'look-1');
-    expect(cards).toEqual([]);
-    await say(`Later notes: ${'lorem ipsum dolor sit amet '.repeat(1800)}`, 'later');
-    expect(summaries).toBeGreaterThan(0);
-    // 300 requests with no sources of their own (her lines), more than the outside records keep.
-    for (let i = 0; i < 300; i++) await journal.remark({ system: 'One line.', messages: [{ role: 'user', content: 'Say something.' }], sources: [] });
-    await say('Look it up.', 'look-2');
-    expect(cards).toHaveLength(1);
-    expect(cards[0]).toMatchObject({ always: false });
-    // The summary's sources were recorded by the hook, before it was asked for.
-    const summarized: any = await journal.read(SummarizedDoc);
-    expect(summarized.recorded).toBe(true);
-    await journal.close();
-  }, 120_000);
-});
 
 describe('2.7: a run recovered after a restart never gets server tools', () => {
   it('its server call is refused in words and never starts; the next message\'s run can call it', async () => {
