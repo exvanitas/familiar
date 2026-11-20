@@ -16,8 +16,6 @@ export type ScanResult = { readonly ok: true; readonly declarations: readonly He
 
 const TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const TYPES = new Set(['string', 'integer', 'boolean']);
-/** Keywords a declaration's path may not pass through; one found under them makes the tool invalid. */
-const UNREACHABLE = ['items', 'prefixItems', 'contains', 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames', 'patternProperties', 'dependentSchemas', 'oneOf', 'anyOf', 'allOf', 'not', 'if', 'then', 'else', '$defs', 'definitions'];
 const NAMED = new Set(['patternProperties', 'dependentSchemas', '$defs', 'definitions']);
 export const MAX_HEADER_BYTES = 8 * 1024;
 export const MAX_HEADERS = 64;
@@ -57,10 +55,11 @@ export function scanDeclarations(schema: unknown): ScanResult {
         if (f) return f;
       }
     }
-    for (const k of UNREACHABLE) {
-      const sub = s[k];
-      if (sub === undefined) continue;
-      const branches = Array.isArray(sub) ? sub : sub !== null && typeof sub === 'object' && NAMED.has(k) ? Object.values(sub as Record<string, unknown>) : [sub];
+    // Every other position, whatever its keyword (named or not, draft-07's included), is walked too, and a
+    // declaration found there is outside a chain of properties: the tool is invalid. Only data is skipped.
+    for (const [k, sub] of Object.entries(s)) {
+      if (k === 'properties' || DATA.has(k) || sub === null || typeof sub !== 'object') continue;
+      const branches = Array.isArray(sub) ? sub : MAPS.has(k) || NAMED.has(k) ? Object.values(sub as Record<string, unknown>) : [sub];
       for (const b of branches) {
         const f = visit(b, [...path, `<${k}>`], false);
         if (f) return f;
@@ -99,6 +98,9 @@ export function scanDeclarations(schema: unknown): ScanResult {
 
 /** Keywords whose value is a map of schemas by name: its keys are names, never keywords. */
 const MAPS = new Set(['properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions', 'dependencies']);
+/** Keywords whose value is a schema, or a list of them: with the maps, where a schema is known to sit. An
+    `$anchor` anywhere else (inside an annotation, say) can't be placed, and the tool fails closed. */
+const SCHEMA_KEYWORDS = new Set(['items', 'additionalItems', 'prefixItems', 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames', 'contains', 'not', 'if', 'then', 'else', 'allOf', 'anyOf', 'oneOf']);
 /** Keywords whose value is data, never a schema: a `$ref` inside them is data. */
 const DATA = new Set(['default', 'examples', 'const', 'enum']);
 
@@ -118,16 +120,16 @@ function refTargets(schema: unknown): Set<string> | string {
   const refs: string[] = [];
   const anchors = new Map<string, string>();
   const nodes = new Set<string>();
-  // [value, its keys from the root]
-  const stack: [unknown, string[]][] = [[schema, []]];
+  // [value, its keys from the root, whether it sits where a schema is known to sit]
+  const stack: [unknown, string[], boolean][] = [[schema, [], true]];
   while (stack.length) {
-    const [n, keys] = stack.pop()!;
+    const [n, keys, known] = stack.pop()!;
     if (typeof n === 'boolean') {
       nodes.add(pointerOf(keys));
       continue;
     }
     if (Array.isArray(n)) {
-      n.forEach((c, i) => stack.push([c, [...keys, String(i)]]));
+      n.forEach((c, i) => stack.push([c, [...keys, String(i)], known]));
       continue;
     }
     if (n === null || typeof n !== 'object') continue;
@@ -136,16 +138,23 @@ function refTargets(schema: unknown): Set<string> | string {
     if (typeof s.$ref === 'string') refs.push(s.$ref);
     else if (s.$ref !== undefined) return 'a $ref that is not a string';
     if (keys.length > 0 && (typeof s.$id === 'string' || typeof s.id === 'string')) return 'a nested $id, a resource of its own, which Familiar does not scope';
-    if (typeof s.$anchor === 'string') anchors.set(s.$anchor, pointerOf(keys));
-    if (s.$dynamicRef !== undefined || s.$dynamicAnchor !== undefined || s.$recursiveRef !== undefined) return 'a dynamic $ref, which Familiar does not resolve';
+    if (s.$anchor !== undefined) {
+      // Registered only where a schema is known to sit, and only once: anything else could stand in for the
+      // real target (an annotation's copy, a second claimant), so the tool fails closed.
+      const anywhere = !!(__FAMILIAR_MUTATIONS__ && mutant('anchor-anywhere'));
+      if (typeof s.$anchor !== 'string' || (!known && !anywhere)) return 'an $anchor where Familiar can\'t tell a schema sits';
+      if (anchors.has(s.$anchor) && !anywhere) return `two schemas claim the $anchor "${cutRef(s.$anchor)}"`;
+      anchors.set(s.$anchor, pointerOf(keys));
+    }
+    if (s.$dynamicRef !== undefined || s.$dynamicAnchor !== undefined || s.$recursiveRef !== undefined || s.$recursiveAnchor !== undefined) return 'a dynamic $ref, which Familiar does not resolve';
     for (const [k, v] of Object.entries(s)) {
       if (DATA.has(k)) continue;
       if (k === '$ref' || k === '$id' || k === '$anchor' || k === '$schema' || k === '$comment') continue;
       if (MAPS.has(k) && v !== null && typeof v === 'object' && !Array.isArray(v)) {
-        for (const [name, c] of Object.entries(v as Record<string, unknown>)) stack.push([c, [...keys, k, name]]);
+        for (const [name, c] of Object.entries(v as Record<string, unknown>)) stack.push([c, [...keys, k, name], known]);
         continue;
       }
-      stack.push([v, [...keys, k]]);
+      stack.push([v, [...keys, k], known && SCHEMA_KEYWORDS.has(k)]);
     }
   }
   const out = new Set<string>();

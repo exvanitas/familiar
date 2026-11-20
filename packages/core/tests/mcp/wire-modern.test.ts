@@ -79,6 +79,32 @@ describe('3.5: the x-mcp-header scan', () => {
     it('a $ref to a boolean schema is a ref to a schema: the tool stays offered', () => {
       expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, any: true, alias: { $ref: '#/properties/any' } } })).toMatchObject({ ok: true, declarations: [{ name: 'X' }] });
     });
+    it('an $anchor Familiar cannot place fails closed: one inside an annotation, or two of one name', () => {
+      const x = { type: 'string', 'x-mcp-header': 'X', $anchor: 'a' };
+      // An annotation (a keyword Familiar has no name for) carrying the same anchor, before properties.
+      expect(scanDeclarations({ 'x-annotation': { $anchor: 'a' }, type: 'object', properties: { x, y: { $ref: '#a' } } })).toMatchObject({ ok: false });
+      expect(scanDeclarations({ type: 'object', properties: { x, y: { $ref: '#a' } }, 'x-annotation': { $anchor: 'a' } })).toMatchObject({ ok: false });
+      // Two schemas claiming one anchor.
+      expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, y: { type: 'string', $anchor: 'b' }, z: { type: 'string', $anchor: 'b' } } })).toMatchObject({ ok: false, reason: expect.stringMatching(/anchor/) });
+      // A $dynamicAnchor anywhere, too.
+      expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' } }, 'x-annotation': { $dynamicAnchor: 'd' } })).toMatchObject({ ok: false });
+      // The control: anchors registered anywhere, the last one winning (anchor-anywhere), let the annotation's
+      // displace the real one, and the declaration on the referenced node passes.
+      mutations.set(['anchor-anywhere']);
+      try {
+        expect(scanDeclarations({ 'x-annotation': { $anchor: 'a' }, type: 'object', properties: { x, y: { $ref: '#a' } } })).toMatchObject({ ok: true });
+      } finally {
+        mutations.clear();
+      }
+    });
+    it('a declaration outside a chain of properties is refused, wherever it sits: additionalItems, dependencies, an annotation', () => {
+      const cases = [
+        { type: 'object', properties: { list: { type: 'array', items: [{ type: 'string' }], additionalItems: { type: 'string', 'x-mcp-header': 'X' } } } },
+        { type: 'object', properties: { a: { type: 'string' } }, dependencies: { a: { properties: { b: { type: 'string', 'x-mcp-header': 'B' } } } } },
+        { type: 'object', properties: { a: { type: 'string' } }, 'x-annotation': { properties: { b: { type: 'string', 'x-mcp-header': 'B' } } } }
+      ];
+      for (const c of cases) expect(scanDeclarations(c), JSON.stringify(c)).toMatchObject({ ok: false, reason: expect.stringMatching(/only on a property reached through "properties"/) });
+    });
     it('a $ref to a node that is no schema (a map of them) fails closed', () => {
       expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, y: { $ref: '#/properties' } } }).ok).toBe(false);
     });
