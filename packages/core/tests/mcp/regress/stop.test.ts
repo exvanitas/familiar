@@ -133,7 +133,7 @@ describe('Stop during the handshake', () => {
   });
 });
 
-describe('a Stop the exe refuses (shadow r32 F28, r32b #7)', () => {
+describe('a Stop the exe refuses', () => {
   it('on a Ready local run: Stop answers, in words that say it may still be running, and the slot waits for the exit (stop-refused-waits hangs)', async () => {
    for (const mutation of [undefined, 'stop-refused-waits'] as const) {
     mutations.set(mutation ? [mutation] : []);

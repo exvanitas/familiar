@@ -338,7 +338,7 @@ describe('5.1: the owner keeps built-in choices too', () => {
     expect(client.policy([]).perTool).toEqual({ note_add: 'deny', note_search: 'ask' });
   });
 
-  it('r32b #5: an Allow for a built-in off the notes-and-reminders list is refused at save; one in the record loads as ask, and the gate asks', async () => {
+  it('an Allow for a built-in off the notes-and-reminders list is refused at save; one in the record loads as ask, and the gate asks', async () => {
     const { McpClient, BUILT_IN } = await import('../../src/mcp/client.ts');
     const { gateFor } = await import('../../src/journal/gate.ts');
     const t = ports();

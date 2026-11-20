@@ -485,7 +485,7 @@ describe('5.4: Mark reviewed marks what Test showed', () => {
   });
 });
 
-describe('5.4: Mark reviewed on an old report brings back nothing removed (r32b #11)', () => {
+describe('5.4: Mark reviewed on an old report brings back nothing removed', () => {
   it('Test 1 shows x; Test 2 lists only y and saves it; Mark reviewed on report 1: x stays absent (and back under review-appends-old)', async () => {
    for (const mutation of [undefined, 'review-appends-old'] as const) {
     mutations.set(mutation ? [mutation] : []);

@@ -106,7 +106,7 @@ describe("Test's settle acts on its own start only", () => {
   });
 });
 
-describe("a crash during Test's catalog write (shadow r32 F05)", () => {
+describe("a crash during Test's catalog write", () => {
   it("Test reports the crash in its own words, not that the server was stopped", async () => {
     const store = memorySettingsStore();
     let emit!: (e: ProcessEvent) => void;
