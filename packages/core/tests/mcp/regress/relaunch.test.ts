@@ -129,12 +129,56 @@ describe('a server that stops reading after refusing', () => {
         // The modern list's write never ends: the server stopped reading; it never exits.
         await new Promise<void>(() => {});
       },
+      // As the exe does after killing the job: the stop emits the process's exit a little later.
+      async stop() {
+        setTimeout(() => emit({ t: 'exit', code: null }), 25);
+      },
+      async forget() {}
+    };
+    const run = async () => new ServerLink('m', { processes: port }, realClock, { ended: () => {} }, { ...LINK_LIMITS, writeMs: 30 }).start(local, 'L');
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r).not.toHaveProperty('relaunch');
+    // The control: the end's cause forgotten, the exit Familiar caused reads as the server's own.
+    mutations.set(['relaunch-after-kill']);
+    try {
+      expect(await run()).toMatchObject({ ok: false, relaunch: 'modern' });
+    } finally {
+      mutations.clear();
+    }
+  }, 10_000);
+});
+
+describe('a modern list answered, but not with a list Familiar can use, then an exit', () => {
+  /** The opening refused, then the list answered with `result`, and an exit 20 ms later. */
+  const answered = (result: (id: unknown) => unknown): ProcessPort => {
+    let emit!: (e: ProcessEvent) => void;
+    return {
+      async start(_s, on) {
+        emit = on;
+        return { run: 'p1' };
+      },
+      async write(_r, b) {
+        const m = JSON.parse(new TextDecoder().decode(b));
+        if (m.method === 'initialize') queueMicrotask(() => emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32022, message: 'x', data: { supported: ['2026-07-28'] } } }) }));
+        if (m.method === 'tools/list') {
+          queueMicrotask(() => emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', id: m.id, result: result(m.id) }) }));
+          setTimeout(() => emit({ t: 'exit', code: 0 }), 20);
+        }
+      },
       async stop() {},
       async forget() {}
     };
-    const link = new ServerLink('m', { processes: port }, realClock, { ended: () => {} }, { ...LINK_LIMITS, writeMs: 30 });
-    const r = await link.start(local, 'L');
-    expect(r.ok).toBe(false);
-    expect(r).not.toHaveProperty('relaunch');
-  }, 10_000);
+  };
+  const tools = (n: number) => Array.from({ length: n }, (_, i) => ({ name: `t${i}`, inputSchema: { type: 'object', properties: {} } }));
+  for (const [name, result] of [
+    ['a malformed list', () => ({ resultType: 'complete', tools: 'invalid' })],
+    ['a catalog past its bound', () => ({ resultType: 'complete', tools: tools(200) })]
+  ] as const)
+    it(`${name}: the answer is the server's word, so no relaunch`, async () => {
+      const link = new ServerLink('m', { processes: answered(result) }, realClock, { ended: () => {} });
+      const r = await link.start(local, 'L');
+      expect(r.ok).toBe(false);
+      expect(r).not.toHaveProperty('relaunch');
+    });
 });

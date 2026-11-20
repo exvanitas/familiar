@@ -131,6 +131,9 @@ interface Run {
   readonly launched: Promise<void>;
   /** The one native stop of a local run's process: asked once, whoever asks first (Stop, or the run's end). */
   stopCall?: Promise<void>;
+  /** Familiar asked the exe to stop the process (a watchdog, a deadline, Stop): its exit is Familiar's doing,
+      never a server that ended its own process, so no relaunch follows it. */
+  killed?: boolean;
   /** Stop has begun: set synchronously before Stop awaits anything, so no exchange is admitted after it. */
   closing?: boolean;
   nextId: number;
@@ -288,7 +291,7 @@ export class ServerLink {
           await Promise.race([run.exit, deadline.over, new Promise<void>((r) => (stop = this.clock.setTimer(r, 2_000, { background: false })))]);
           stop?.();
         }
-        const relaunch = refusedOnStdio && !answered && !!run.exited && !deadline.expired;
+        const relaunch = refusedOnStdio && !answered && !!run.exited && (!run.killed || !!(__FAMILIAR_MUTATIONS__ && mutant('relaunch-after-kill'))) && !deadline.expired;
         this.endRun(run, listed.failure, false);
         return { ok: false, failure: listed.failure, ...(relaunch ? { relaunch: 'modern' as const } : {}) };
       }
@@ -555,13 +558,18 @@ export class ServerLink {
   private async walkOnce(run: Run, deadline: Deadline, session: number): Promise<{ readonly tools: ListedTool[]; readonly declarations: Map<string, readonly HeaderDeclaration[]>; readonly notOffered: { name: string; reason: string }[] } | { readonly failure: Failure; readonly session?: true; readonly answered?: true }> {
     const raw: Record<string, unknown>[] = [];
     let cursor: string | undefined;
+    // Once any page has an answer, the list's outcome is the server's word: a failure after it never asks
+    // for a relaunch (3.9).
+    let answered = false;
+    const said = (failure: Failure) => (answered ? { failure, answered: true as const } : { failure });
     for (let page = 1; ; page++) {
-      if (page > MAX_PAGES) return { failure: { kind: 'protocol', words: `The server's tool list ran past ${MAX_PAGES} pages.` } };
+      if (page > MAX_PAGES) return said({ kind: 'protocol', words: `The server's tool list ran past ${MAX_PAGES} pages.` });
       const id = run.nextId++;
       const msg: AdminMessage = { kind: 'list', id, ...(cursor !== undefined ? { cursor } : {}) };
       const o = await this.exchange(run, 'list', id, frame(msg, run.era, run.target.where), deadline, 'tools/list', session);
-      if (deadline.expired) return { failure: { kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." } };
-      if (o.end.t !== 'done' || !o.response) return { failure: this.startWords(run, o.end), ...(o.end.t === 'session-ended' ? { session: true } : {}) };
+      if (deadline.expired) return said({ kind: 'timed-out', words: run.ready ? "The server's tool list didn't arrive in time." : "The server didn't finish starting in time." });
+      if (o.end.t !== 'done' || !o.response) return { ...said(this.startWords(run, o.end)), ...(o.end.t === 'session-ended' ? { session: true as const } : {}) };
+      answered = true;
       if (o.response.error) {
         // An answer, not a closed pipe: the server's own word, which decides (no relaunch follows it).
         if (run.era === 'modern' && o.response.error.code === -32022) return { failure: refusedWords(o.response.error), answered: true };
@@ -571,10 +579,10 @@ export class ServerLink {
       try {
         p = listResult(o.response.result ?? {}, run.era);
       } catch (e) {
-        return { failure: { kind: 'protocol', words: `The server's tool list was wrong: ${(e as Error).message}.` } };
+        return said({ kind: 'protocol', words: `The server's tool list was wrong: ${(e as Error).message}.` });
       }
       // Bounded before anything is kept: every listed tool counts, offered or not.
-      if (raw.length + p.tools.length > MAX_TOOLS) return { failure: { kind: 'protocol', words: `The server lists more than ${MAX_TOOLS} tools. Familiar takes at most ${MAX_TOOLS}.` } };
+      if (raw.length + p.tools.length > MAX_TOOLS) return said({ kind: 'protocol', words: `The server lists more than ${MAX_TOOLS} tools. Familiar takes at most ${MAX_TOOLS}.` });
       for (const t of p.tools) raw.push(t);
       cursor = p.nextCursor;
       if (cursor === undefined) break;
@@ -585,7 +593,7 @@ export class ServerLink {
       try {
         boundTools(raw as never);
       } catch (e) {
-        if (e instanceof CatalogError) return { failure: e.failure };
+        if (e instanceof CatalogError) return said(e.failure);
         throw e;
       }
     }
@@ -609,7 +617,7 @@ export class ServerLink {
     try {
       return { tools: checkTools(offered as never, run.era === 'modern' && run.target.where === 'remote' ? { declarations } : {}), declarations, notOffered };
     } catch (e) {
-      if (e instanceof CatalogError) return { failure: e.failure };
+      if (e instanceof CatalogError) return said(e.failure);
       throw e;
     }
   }
@@ -1035,6 +1043,7 @@ export class ServerLink {
 
   /** The run's one native stop: asked the first time, the same answer after. */
   private stopProcess(run: Run): Promise<void> {
+    run.killed = true;
     if ((__FAMILIAR_MUTATIONS__ && mutant('stop-twice'))) return this.ports.processes!.stop(run.process!);
     return (run.stopCall ??= this.ports.processes!.stop(run.process!));
   }
