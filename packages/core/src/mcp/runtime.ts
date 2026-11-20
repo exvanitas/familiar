@@ -204,7 +204,12 @@ export class ServerRuntime {
     }
     // Stopped, or stopped and started again, while the write was saving: this start's run is over, and
     // it says so; it never answers for another run.
-    if ((this.startToken !== mine || this.runId !== run) && !(__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop'))) return { kind: 'stopped' };
+    if ((this.startToken !== mine || this.runId !== run) && !(__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop'))) {
+      // No Stop, no later start: the run ended by itself while its write saved (a crash), and the start
+      // answers with that failure's own words.
+      if (this.startToken === mine && this.phaseNow === 'failed' && this.failureNow) return { kind: 'failed', failure: this.failureNow };
+      return { kind: 'stopped' };
+    }
     return { kind: 'ready' };
   }
 

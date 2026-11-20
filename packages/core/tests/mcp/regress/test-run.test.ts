@@ -2,7 +2,7 @@
 // write means Test reports no success, and Test never stops a run started since.
 import { describe, expect, it } from 'vitest';
 import { McpClient } from '../../../src/mcp/client.ts';
-import type { ProcessPort } from '../../../src/mcp/process.ts';
+import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import type { ServerSetup } from '../../../src/mcp/setup.ts';
 import { memorySettingsStore, type SettingsStore } from '../../../src/settings/store.ts';
 import { mutations } from '../../../src/mutations.ts';
@@ -103,5 +103,47 @@ describe("Test's settle acts on its own start only", () => {
     } finally {
       mutations.clear();
     }
+  });
+});
+
+describe("a crash during Test's catalog write (shadow r32 F05)", () => {
+  it("Test reports the crash in its own words, not that the server was stopped", async () => {
+    const store = memorySettingsStore();
+    let emit!: (e: ProcessEvent) => void;
+    const p: ProcessPort = {
+      async start(_s, on) {
+        emit = on;
+        return { run: 'p1' };
+      },
+      async write(_r, b) {
+        const m = JSON.parse(new TextDecoder().decode(b));
+        queueMicrotask(() => {
+          if (m.method === 'initialize') emit({ t: 'out', line: JSON.stringify(initResult(m.id)) });
+          if (m.method === 'tools/list') emit({ t: 'out', line: JSON.stringify(listResult(m.id, ['echo'])) });
+        });
+      },
+      async stop() {
+        queueMicrotask(() => emit({ t: 'exit', code: 0 }));
+      },
+      async forget() {}
+    };
+    const first = await open(store, p);
+    await first.add({ setup: local('l1'), problems: [] });
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let hold = true;
+    const slow: SettingsStore = { ...store, putIf: async (k, r, g) => (hold ? ((hold = false), await held) : undefined, store.putIf(k, r, g)) };
+    const client = await open(slow, p);
+    const testing = client.test('l1');
+    for (let i = 0; i < 200 && client.get('l1')!.phase !== 'ready'; i++) await new Promise((r) => setTimeout(r, 5));
+    // The server crashes while Test's catalog write is saving.
+    emit({ t: 'err', line: 'boom: out of memory' });
+    emit({ t: 'exit', code: 3 });
+    release();
+    const report = await testing;
+    expect(report.ok).toBe(false);
+    if (report.ok) return;
+    expect(report.failure.words).not.toMatch(/stopped before it was ready/);
+    expect(report.failure.lastOutput ?? report.failure.words).toMatch(/boom|exited|code 3/);
   });
 });
