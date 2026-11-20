@@ -794,7 +794,7 @@ An upgrade of pi-durable must run these, and T13, again.
 
 **What runs:** the real client (`McpClient`, its links and the exchange machine) and the real journal on the real pi-durable 1.5.2. There are two harnesses, both in `packages/core/tests/harness/`:
 
-- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H15 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S27;
+- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H15 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S29;
 - **the journal harness** (`journal.ts`, checks in `journal-checks.ts`): the real journal over a fake IndexedDB that outlives each life, with a gated fake model. It runs H6 to H9 over seeded runs (40 by default, `FAMILIAR_JSEEDS`), and the named schedule S5.
 
 **The fake MCP server, scripted per seed.** Its legacy modes, local and remote, can:
@@ -859,7 +859,7 @@ The **pass build** adds P4's detach bound (1 s), the server cap, the refusal pas
   - judged per run: after a 404 on a Ready run, the next request is an `initialize` with no session id, then `initialized` with the new one, and no call is admitted until the re-handshake's list has completed, each tried call refused as the run not being Ready, not only by the busy slot. An empty history there is a missed re-handshake;
   - a 404 before a page or call has completed after the recovery's own walk, or a failed re-handshake, ends the run with no further request;
   - nothing without the session id goes out between a 404 and its recovery's `initialize`, and a run walks its list no more often than its Start, its `list_changed`s, its recoveries and its Tests account for;
-  - a run is one admitted Start (or Test) to its end, on one server: a Start refused busy begins none, and Ready means the Start answered ready;
+  - a run is one admitted Start (or Test) to its end, on one server: admission is read from the server going to Starting in the step it was asked, never from the reply, so a Start refused (busy, already running, the owner busy) begins none; Ready means the Start answered ready; and a run's walks are allowed by its own Start, `list_changed`s and recoveries only, never by a Test elsewhere;
   - under the redirect mode, a redirected call fails, and nothing follows it.
 - **H15.** Test acts on its own run: a Test that met a Stop never reports success, and no Test reports success with no tools where the server listed some.
 
@@ -871,7 +871,7 @@ The **pass build** adds P4's detach bound (1 s), the server cap, the refusal pas
 
 - the named check fails in the mutant;
 - the same check passes in the twin;
-- the two runs' histories are identical up to the first step where the switch changed behaviour: the scheduler's choices and every native handoff whole, its kind, server, method, URL, sorted headers and bytes (wire), or every commit's submissions, entries with their contents, and documents with their values (journal; the run's random ids come from its seed, and wall-clock times and measured durations read alike). A control that changes one header shows the comparison sees it.
+- the two runs' histories are identical up to the first step where the switch changed behaviour: the scheduler's choices and every native handoff whole, its kind, server, method, URL, every header as a pair (so a duplicate shows) and its bytes (a local write's line end included) (wire), or every commit's submissions, entries with their contents, and documents with their values (journal; the run's random ids come from its seed, and wall-clock times and measured durations read alike). A control that changes one header shows the comparison sees it.
 
 Since the twin's identical prefix passes, the mutant's failure lies at or after that step. So a failure is caused by the switch, not only ordered after it. A mutation with no such seed is a broken control, and fails the build.
 
@@ -899,7 +899,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `quadratic-ref-scan`: every declaration compared with every `$ref` target | `tests/mcp/wire-modern.test.ts` (a work count, four times the input) |
 | `ready-after-stop`: a start answers ready though Stop came during its catalog write | H15 under S19 |
 | `media-prefix`: a media type read by its prefix (`application/jsonp` as JSON) | H10 under S21; `tests/mcp/regress/parse.test.ts` (a lookalike with a body valid for what it looks like, and no read of it) |
-| `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26 |
+| `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26, S28 and S29 |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |
 | `stop-twice`: Stop and the run's end each ask the exe to stop the process | H2 under S11, during initialize |
 | `ready-before-drain`: a start answers Ready while its list's exchange still drains | H1 under S27, local and remote; `tests/mcp/regress/start-drain.test.ts` |
@@ -983,6 +983,8 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 - **S24, cleanup refused for good:** every `net_cancel` of a call refused; the slot stays held, and Stop and Start say a restart is needed (H1). And every `net_cancel` of the opening `initialize` refused, with the start parked between its handshake's steps: exhaustion wakes it, and it answers the restart words before its deadline, with nothing more sent.
 - **S25, a `$ref` only in schema data:** the tool is still offered (H11).
 - **S26, `list_changed` on a refresh's own page:** one retry, and no walk beside it (H14).
+- **S28, a refused Start splits no run:** S26 with a Start made while Ready, which the client refuses; the run's walks are judged together (H14).
+- **S29, a walk beside a walk, with a Test elsewhere:** S26 on one server while another is Tested; the Test allows that run no extra walk (H14).
 - **S27, a call the moment Start answers Ready,** local with the exe acknowledging writes late, and remote with the list's `net_cancel` still pending: the call is admitted and answered (H1).
 
 ### 7.3 The exchange machine's exhaustive walk (W)

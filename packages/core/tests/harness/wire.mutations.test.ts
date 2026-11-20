@@ -3,7 +3,7 @@
 // first step where the switch changed behaviour. Since the twin's identical prefix passes, the mutant's
 // failure lies at or after that step. A mutation with no such seed is a broken control and fails the build.
 import { describe, expect, it } from 'vitest';
-import { handoffHistory, PASS_CHECKS } from './checks.ts';
+import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
 import { MIRROR_VECTORS, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
 
@@ -74,6 +74,8 @@ const CONTROLS: Control[] = [
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop during a walk, local' },
   { mutation: 'no-stop-fence', check: 'H2', named: 'S11 Stop while Ready, local' },
   { mutation: 'walk-beside-walk', check: 'H14', named: 'S26' },
+  { mutation: 'walk-beside-walk', check: 'H14', named: 'S28' },
+  { mutation: 'walk-beside-walk', check: 'H14', named: 'S29' },
   { mutation: 'media-prefix', check: 'H10', named: 'S21' },
   { mutation: 'relaunch-on-answer', check: 'H12', named: 'S22' },
   { mutation: 'forget-exhaustion', check: 'H1', named: 'S24 cleanup refused for good' },
@@ -127,11 +129,45 @@ describe('every named wire mutation fails its check, beside its unmutated twin',
   }
 });
 
+describe("the evidence's own controls", () => {
+  it('a refused Start counted as a run (the old evidence) splits the run, and walk-beside-walk escapes H14 under S28', async () => {
+    const s28 = SCHEDULES.find((s) => s.name.startsWith('S28'))!.options;
+    evidenceControls.countRefusedStarts = true;
+    try {
+      for (let seed = 1; seed <= 20; seed++) expect(PASS_CHECKS.H14!(await wireRun(seed, { ...s28, mutation: 'walk-beside-walk' })), `seed ${seed}`).toEqual([]);
+    } finally {
+      evidenceControls.countRefusedStarts = false;
+    }
+  }, 60_000);
+
+  it('a Test on another server allowing every run a walk (the old evidence): walk-beside-walk escapes H14 under S29', async () => {
+    const s29 = SCHEDULES.find((s) => s.name.startsWith('S29'))!.options;
+    evidenceControls.globalTests = true;
+    try {
+      for (let seed = 1; seed <= 20; seed++) expect(PASS_CHECKS.H14!(await wireRun(seed, { ...s29, mutation: 'walk-beside-walk' })), `seed ${seed}`).toEqual([]);
+    } finally {
+      evidenceControls.globalTests = false;
+    }
+  }, 60_000);
+});
+
 describe('the twin comparison itself', () => {
   it('counts two histories that differ only in one header as different', async () => {
     const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });
-    const b = { ...a, exe: { ...a.exe, log: a.exe.log.map((x, i) => (i === 1 ? { ...x, headers: { ...x.headers, 'mcp-session-id': 'other' } } : x)) } } as typeof a;
+    const b = { ...a, exe: { ...a.exe, log: a.exe.log.map((x, i) => (i === 1 ? { ...x, headerPairs: [...x.headerPairs!.filter(([k]) => k.toLowerCase() !== 'mcp-session-id'), ['Mcp-Session-Id', 'other'] as const] } : x)) } } as typeof a;
     expect(handoffHistory(a, a.sched.step)).not.toBe(handoffHistory(b, a.sched.step));
     expect(handoffHistory(a, a.sched.step)).toBe(handoffHistory({ ...a }, a.sched.step));
+  });
+
+  it('counts a duplicated header, and a local write missing its newline, as different', async () => {
+    const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });
+    const i = a.exe.log.findIndex((x) => x.kind === 'post');
+    const dup = { ...a, exe: { ...a.exe, log: a.exe.log.map((x, k) => (k === i ? { ...x, headerPairs: [...x.headerPairs!, x.headerPairs![0]!] } : x)) } } as typeof a;
+    expect(handoffHistory(a, a.sched.step)).not.toBe(handoffHistory(dup, a.sched.step));
+    const l = await wireRun(3, { mode: { where: 'local', era: 'legacy' } });
+    const w = l.exe.log.findIndex((x) => x.kind === 'write');
+    expect(l.exe.log[w]!.raw!.endsWith('\n')).toBe(true);
+    const cut = { ...l, exe: { ...l.exe, log: l.exe.log.map((x, k) => (k === w ? { ...x, raw: x.raw!.slice(0, -1) } : x)) } } as typeof l;
+    expect(handoffHistory(l, l.sched.step)).not.toBe(handoffHistory(cut, l.sched.step));
   });
 });

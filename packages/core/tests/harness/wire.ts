@@ -351,6 +351,8 @@ export interface NativeRec {
   readonly body: Msg | undefined;
   /** The body's bytes as text, as the exe received them. */
   readonly raw?: string;
+  /** Remote: every header as sent, a pair each, in order, so a duplicate shows (the twin rule). */
+  readonly headerPairs?: readonly (readonly [string, string])[];
   /** Remote: the address it went to. */
   readonly url?: string;
   readonly headers: Record<string, string>;
@@ -442,7 +444,7 @@ export class FakeExe {
         const headers: Record<string, string> = {};
         for (const [k, v] of spec.headers) headers[k.toLowerCase()] = v;
         if (parsed?.method === 'initialize') this.epoch++;
-        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, url: spec.url, method: spec.method, body: parsed, raw: text, headers, start: this.sched.step, delivered: new Map(), epoch: this.epoch };
+        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, url: spec.url, method: spec.method, body: parsed, raw: text, headers, headerPairs: spec.headers.map(([k, v]) => [k, v] as const), start: this.sched.step, delivered: new Map(), epoch: this.epoch };
         if (!this.admits('post')) {
           rec.refused = 'busy';
           rec.end = rec.terminated = this.sched.step;
@@ -741,10 +743,11 @@ export class FakeExe {
       write: (run, bytes) =>
         new Promise<void>((resolve, reject) => {
           const p = live.get(run);
-          const text = new TextDecoder().decode(bytes).trim();
+          // The bytes whole, line end included: a write missing its newline must show.
+          const text = new TextDecoder().decode(bytes);
           let body: Msg | undefined;
           try {
-            body = JSON.parse(text);
+            body = JSON.parse(text.trim());
           } catch {
             body = undefined;
           }
@@ -806,6 +809,9 @@ export interface Evidence {
   readonly tool?: string;
   readonly body?: string;
   readonly outcome?: CallOutcome;
+  /** A Start or Test: whether the client admitted it (its server went to Starting in the same step), read
+      from the server's state, never from the reply. */
+  readonly admitted?: boolean;
 }
 
 export interface WireRun {
@@ -968,8 +974,10 @@ export class Driver {
 
   /** Start; with `then`, an action in the same step as its answer (a call made the moment it says Ready). */
   start(id = 's1', then?: (ready: boolean) => void): void {
-    this.note({ what: 'start', server: id });
-    void this.client.start(id).then((reply) => {
+    const before = this.client.get(id)?.phase;
+    const starting = this.client.start(id);
+    this.note({ what: 'start', server: id, admitted: before !== 'starting' && this.client.get(id)?.phase === 'starting' });
+    void starting.then((reply) => {
       this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' });
       then?.(reply.kind === 'ready');
     });
@@ -987,8 +995,10 @@ export class Driver {
 
   /** Test, as Settings runs it: its report, with the tools it showed. */
   test(id = 's1'): void {
-    this.note({ what: 'test', server: id });
-    void this.client.test(id).then(
+    const before = this.client.get(id)?.phase;
+    const testing = this.client.test(id);
+    this.note({ what: 'test', server: id, admitted: before !== 'starting' && this.client.get(id)?.phase === 'starting' });
+    void testing.then(
       (report) => this.note({ what: 'tested', server: id, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] } }),
       (e: unknown) => this.note({ what: 'tested', server: id, failure: 'threw', words: String(e).slice(0, 80) })
     );

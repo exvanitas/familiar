@@ -58,14 +58,13 @@ function localPongKey(r: WireRun, rec: NativeRec): string {
 
 /** Which run of its server a native request belongs to: local, the process (an epoch); remote, the count
     of Starts made before it (a run lasts from one Start to its end, re-handshakes included). */
-/** The Starts and Tests the client admitted on a server, in order: a Start refused busy doesn't begin a run. */
+/** The Starts and Tests the client admitted on a server, in order, as the driver saw the server go to
+    Starting in the step it asked: a Start or Test refused (busy, already running, the owner busy) begins no run. */
 function admittedStarts(r: WireRun, server: string): Evidence[] {
-  const admitted = (e: Evidence) => {
-    const reply = r.evidence.find((y) => y.what === 'started' && y.server === e.server && y.seq > e.seq);
-    return !(reply?.failure === 'busy');
-  };
-  return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && addressOf(e.server) === server && admitted(e));
+  return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && addressOf(e.server) === server && (e.admitted || evidenceControls.countRefusedStarts));
 }
+/** The harness's own controls, for its tests only: count refused Starts as runs, as the old evidence did. */
+export const evidenceControls = { countRefusedStarts: false, globalTests: false };
 
 function runOf(r: WireRun, x: NativeRec): number {
   if (x.kind === 'write') return x.epoch;
@@ -593,7 +592,9 @@ export const H14: Check = (r) => {
     // Each list_changed that reached the client's reads, whether or not its stream got to its end.
     const changes = recs.reduce((n, x) => n + (x.changesDelivered ?? 0), 0);
     const recoveries = recs.filter((x) => x.body?.method === 'initialize').length - 1;
-    const tests = r.evidence.filter((e) => e.what === 'test').length;
+    // A Test is a run of its own (admittedStarts), whose one walk is that run's first: a Test elsewhere, on
+    // this server or another, allows this run no walk.
+    const tests = evidenceControls.globalTests ? r.evidence.filter((e) => e.what === 'test').length : 0;
     if (firsts > 1 + changes + Math.max(0, recoveries) + tests) problems.push(`H14: ${firsts} walks on a run with ${changes} list_changed and ${Math.max(0, recoveries)} recoveries`);
   }
   // The exe's own redirect follow (the pre-pass contract, 4.3) is the exe's, not the client's.
@@ -697,7 +698,7 @@ export const H15: Check = (r) => {
 
 /** Every native handoff up to a step, whole: kind, server, method, URL, headers and bytes (the twin rule). */
 export function handoffHistory(r: WireRun, upTo: number): string {
-  return JSON.stringify(r.exe.log.filter((x) => x.start <= upTo).map((x) => [x.kind, x.server, x.method, x.url ?? null, Object.entries(x.headers).sort(), x.start, x.raw ?? null]));
+  return JSON.stringify(r.exe.log.filter((x) => x.start <= upTo).map((x) => [x.kind, x.server, x.method, x.url ?? null, [...(x.headerPairs ?? Object.entries(x.headers))].map(([k, v]) => [k.toLowerCase(), v]).sort(), x.start, x.raw ?? null]));
 }
 
 export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14, H15 };

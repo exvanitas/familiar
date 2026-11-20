@@ -145,6 +145,41 @@ function callAtReady(where: 'local' | 'remote'): Named {
 }
 
 export const SCHEDULES: Named[] = [
+  {
+    // S28: S26 with a Start made while Ready, which the client refuses: it begins no run, so the run's
+    // walks are still judged together (H14), and its era too (H12).
+    name: 'S28 a refused Start splits no run',
+    options: {
+      mode: { ...quiet, changeOnList: true, changeOnListAt: 2, listChanged: 1 },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.start();
+          d.call('echo');
+        })
+    },
+    expect: (r) => {
+      const refused = r.evidence.filter((e) => e.what === 'start' && !e.admitted).length;
+      if (!refused) return 'no refused Start';
+      return r.exe.log.filter((x) => x.body?.method === 'tools/list').length >= 3 ? undefined : 'no refresh carrying list_changed';
+    }
+  },
+  {
+    // S29: S26 on s1 while s2 is Tested: a Test on another server allows s1's run no extra walk (H14).
+    name: 'S29 a walk beside a walk, with a Test elsewhere',
+    options: {
+      servers: 2,
+      mode: { ...quiet, changeOnList: true, changeOnListAt: 2, listChanged: 1 },
+      schedule: (d) =>
+        d.when('ready', () => d.idle('s1') && d.ready('s2'), () => {
+          d.stop('s2');
+          d.when('s2 stopped', () => d.client.get('s2')?.phase === 'stopped', () => {
+            d.test('s2');
+            d.call('echo');
+          });
+        })
+    },
+    expect: (r) => (r.evidence.some((e) => e.what === 'tested' && e.server === 's2') ? undefined : 'no Test of s2')
+  },
   callAtReady('local'),
   callAtReady('remote'),
   {
