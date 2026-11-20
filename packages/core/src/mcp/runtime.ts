@@ -234,8 +234,15 @@ export class ServerRuntime {
     return { kind: 'stopped' };
   }
 
-  /** Test's own start failed: back to Stopped, as it was. */
-  settle(): void {
+  /** The token of the start made last: read right after calling `start`, it names that start. */
+  get token(): number {
+    return this.startToken;
+  }
+
+  /** Test's own start failed: back to Stopped, as it was. Only while that start is still the latest: a
+      start made since keeps its own outcome, a failure included. */
+  settle(token: number): void {
+    if (token !== this.startToken && !(__FAMILIAR_MUTATIONS__ && mutant('stale-settle'))) return;
     if (this.phaseNow === 'failed') this.set('stopped');
   }
 }

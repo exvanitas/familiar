@@ -237,11 +237,14 @@ export class McpClient {
     const s = this.owner.server(id);
     if (!rt || !s) return { ok: false, failure: { kind: 'failed', words: 'No server is saved with that id.' } };
     if (rt.phase !== 'stopped' && rt.phase !== 'failed') return { ok: false, failure: { kind: 'busy', words: 'Stop the server to test it. Test never disturbs a running server.' } };
-    const r = await rt.start();
+    const starting = rt.start();
+    // Test's own start, by its token: read in the same step as the call, before any await.
+    const token = rt.token;
+    const r = await starting;
     // Test's own run: the one it stops at the end, and the only one it reports.
     const run = r.kind === 'ready' ? rt.runNow : undefined;
     if (r.kind !== 'ready' || (run === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop')))) {
-      rt.settle();
+      rt.settle(token);
       const failure: Failure = r.kind === 'failed' ? r.failure : r.kind === 'refused' ? { kind: 'failed', words: r.words } : { kind: 'failed', words: 'The server was stopped before it was ready.' };
       return { ok: false, failure };
     }
