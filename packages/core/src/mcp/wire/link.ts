@@ -181,9 +181,9 @@ export class ServerLink {
   private readonly idle: (() => void)[] = [];
   /** Cleanup the exe refused for good: the slot is held until Familiar restarts, and these are the words. */
   private stuck?: Failure;
-  private stuckNow!: () => void;
-  /** Resolves when the slot is held for good: an exchange waiting for it stops waiting. */
-  private readonly stuckAt = new Promise<void>((r) => (this.stuckNow = r));
+  /** Exchanges waiting for the slot, each woken if the slot is held for good: registered only while one
+      waits, and taken away when its wait ends, so a long-lived link keeps nothing per exchange. */
+  private readonly stuckWaiters = new Set<() => void>();
   private runs = 0;
 
   readonly serverId: string;
@@ -215,6 +215,28 @@ export class ServerLink {
     const r = this.run;
     return r && !r.ended ? { run: r.id, era: r.era, ready: r.ready, stale: r.stale, tools: r.tools, notOffered: r.notOffered, launch: r.launch, ...(r.sessionId ? { sessionId: r.sessionId } : {}), ...(r.version ? { version: r.version } : {}) } : undefined;
   }
+  /** How many exchanges are waiting for the slot now (for the tests: none, once it's idle). */
+  get waiting(): number {
+    return this.stuckWaiters.size;
+  }
+
+  /** Waits for the slot to be Idle, the deadline, or the slot held for good, whichever comes first. */
+  private slotWait(deadline: Deadline, wakeOnStuck = true): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const end = () => {
+        if (done) return;
+        done = true;
+        if (!(__FAMILIAR_MUTATIONS__ && mutant('stuck-waiter-kept'))) this.stuckWaiters.delete(end);
+        resolve();
+      };
+      if (wakeOnStuck) this.stuckWaiters.add(end);
+      if (!this.busy) return end();
+      this.idle.push(end);
+      void deadline.over.then(end);
+    });
+  }
+
   /** Resolves when the slot is next Idle. */
   drained(): Promise<void> {
     if (!this.busy) return Promise.resolve();
@@ -297,7 +319,7 @@ export class ServerLink {
       }
       // Ready only once the list's own exchange has drained (its write acknowledged, its request ended),
       // within the start's deadline: a call made the moment Start answers is admitted, never refused busy.
-      if (this.busy && !(__FAMILIAR_MUTATIONS__ && mutant('ready-before-drain'))) await Promise.race([this.drained(), deadline.over, this.stuckAt]);
+      if (this.busy && !(__FAMILIAR_MUTATIONS__ && mutant('ready-before-drain'))) await this.slotWait(deadline);
       // And only a run still alive: an exit that came with (or right after) the last reply ended it.
       const gone: Failure | undefined = deadline.expired && this.busy ? { kind: 'timed-out', words: "The server didn't finish starting in time." } : run.ended || run.closing || this.stuck ? this.startWords(run, { t: 'run-ended' }) : undefined;
       if (gone) {
@@ -629,7 +651,7 @@ export class ServerLink {
     // A local idle ping can take the slot between two of the walk's own steps: wait for it too, but never
     // past the step's deadline, whatever a server keeps sending.
     for (;;) {
-      if (!this.early(kind)) await Promise.race([this.drained(), deadline.over, ...((__FAMILIAR_MUTATIONS__ && (mutant('forget-exhaustion') || mutant('no-stuck-wake'))) ? [] : [this.stuckAt])]);
+      if (!this.early(kind)) await this.slotWait(deadline, !((__FAMILIAR_MUTATIONS__ && (mutant('forget-exhaustion') || mutant('no-stuck-wake')))));
       if (this.stuck && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return { end: { t: 'run-ended' } };
       if (deadline.expired) return { end: { t: 'timeout' } };
       if (run.ended || run.closing) return { end: { t: 'run-ended' } };
@@ -840,7 +862,7 @@ export class ServerLink {
         this.stuck = failure;
         const run = this.run;
         if (run && !run.ended) this.endRun(run, failure, true);
-        this.stuckNow();
+        for (const w of [...this.stuckWaiters]) w();
       }
     );
   }
