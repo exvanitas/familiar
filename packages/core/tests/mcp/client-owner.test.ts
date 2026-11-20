@@ -29,27 +29,29 @@ const ownerPorts = (store: SettingsStore): OwnerPorts => ({
 /** A process port where each server's runs answer the handshake and list `echo`. */
 function speakingPort(hold?: (id: string, msg: any) => Promise<void> | undefined, describe: () => string = () => 'the echo tool') {
   const starts: string[] = [];
+  // Each run its own process, routed by its run id, as the exe does: a run that ended never meets the
+  // setup's next one.
   const procs = new Map<string, ReturnType<typeof fakeProcess>>();
-  const runOf = new Map<string, string>();
+  const setupOf = new Map<string, string>();
   const port: ProcessPort = {
     async start(setup, onEvent) {
       starts.push(setup.id);
       const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'echo', description: describe(), inputSchema: { type: 'object', properties: {} } }] } })] : []));
-      procs.set(setup.id, fp);
-      const { run } = await fp.port.start(setup, onEvent);
       const id = `${setup.id}-${starts.length}`;
-      runOf.set(id, setup.id);
-      void run;
+      procs.set(id, fp);
+      setupOf.set(id, setup.id);
+      await fp.port.start(setup, onEvent);
       return { run: id };
     },
     async write(run, bytes) {
-      const id = runOf.get(run)!;
+      const fp = procs.get(run);
+      if (!fp) throw Object.assign(new Error('no such run'), { kind: 'not-running' });
       const msg = JSON.parse(new TextDecoder().decode(bytes));
-      await hold?.(id, msg);
-      return procs.get(id)!.port.write('p1', bytes);
+      await hold?.(setupOf.get(run)!, msg);
+      return fp.port.write('p1', bytes);
     },
     async stop(run) {
-      return procs.get(runOf.get(run)!)!.port.stop('p1');
+      return procs.get(run)?.port.stop('p1');
     },
     async forget() {}
   };
@@ -389,6 +391,22 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
     const failing: SettingsStore = { ...store, putIf: async () => false };
     const other = await clientOf(failing, speakingPort().port);
     expect(await other.revoke('s1', 'echo', 'never')).toMatchObject({ ok: false, words: expect.stringMatching(/not saved/) });
+  });
+});
+
+describe('the process fake routes by run, as the exe does', () => {
+  it("a write to a run that ended never reaches the setup's next run", async () => {
+    const { port } = speakingPort();
+    const setup = { id: 'l1', label: 'L', program: 'node', args: [], cwd: '.', env: [], secrets: [] };
+    const heard: string[][] = [[], []];
+    const one = await port.start(setup, (e) => e.t === 'out' && heard[0]!.push(e.line));
+    await port.stop(one.run);
+    const two = await port.start(setup, (e) => e.t === 'out' && heard[1]!.push(e.line));
+    expect(two.run).not.toBe(one.run);
+    const init = new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }));
+    await port.write(one.run, init).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(heard[1]).toEqual([]);
   });
 });
 
