@@ -35,11 +35,39 @@ interface Budget {
   readonly hold: () => boolean;
   /** Store writes in flight now, and the most at once. */
   readonly writes: { now: number; most: number };
+  /** Every port and store call asked so far, spent or hung: progress, as `settle` reads it. */
+  calls: number;
+}
+
+/**
+ * Whether `p` settles in this life, by progress, never by the wall clock: it yields a macrotask at a time
+ * (a held call waits one), and gives up only once several pass with `p` unsettled and no port or store call
+ * asked meanwhile. Every port here answers within a macrotask, so that means `p` waits on a call that hangs.
+ */
+async function settle<T>(p: Promise<T>, budget: Budget): Promise<{ readonly done: true; readonly value: T } | { readonly done: false }> {
+  let out: { done: true; value: T } | undefined;
+  let failed = false;
+  p.then(
+    (value) => void (out = { done: true, value }),
+    () => void (failed = true)
+  );
+  let seen = budget.calls;
+  for (let quiet = 0; quiet < 4; ) {
+    await new Promise<void>((res) => setTimeout(res, 0));
+    if (out) return out;
+    if (failed) return { done: true, value: undefined as T };
+    if (budget.calls === seen) quiet++;
+    else {
+      seen = budget.calls;
+      quiet = 0;
+    }
+  }
+  return { done: false };
 }
 
 /** Each call spends the budget; once it's spent, every call hangs. A held call waits a macrotask first. */
 const gateOf = (budget: Budget) => <T>(f: () => Promise<T>): Promise<T> =>
-  budget.killed || budget.left-- <= 0 ? never : budget.hold() ? new Promise<void>((r) => setTimeout(r, 0)).then(() => (budget.killed ? never : f())) : f();
+  (budget.calls++, budget.killed || budget.left-- <= 0) ? never : budget.hold() ? new Promise<void>((r) => setTimeout(r, 0)).then(() => (budget.killed ? never : f())) : f();
 
 function killable(store: SettingsStore, budget: Budget): SettingsStore {
   const gate = gateOf(budget);
@@ -113,7 +141,9 @@ interface ChoiceChange {
 
 const witness = { marks: 0, tombstones: 0, catalogWrites: 0, catalogWhileBusy: 0, overlapping: 0, strictChecks: 0 };
 
-async function history(seed: number, repairs = true): Promise<string[]> {
+/** `lastRepair: 'during'` is the control: life 4's invariants read while its repair may still be running, as
+    the old 20 ms race could when repair lost it. */
+async function history(seed: number, repairs = true, lastRepair: 'awaited' | 'during' = 'awaited'): Promise<string[]> {
   const r = rng(seed);
   // The held steps and the catalog writes have their own stream, so the changes are the seed's alone.
   const r2 = rng(seed * 31 + 7);
@@ -130,8 +160,9 @@ async function history(seed: number, repairs = true): Promise<string[]> {
   let pending = 0;
   for (let life = 1; life <= 4; life++) {
     // Each life runs until its budget of port and store calls is spent, then hangs.
-    const budget: Budget = { left: life === 4 ? Infinity : 5 + Math.floor(r() * 60), hold: () => r2() < 0.3, writes: { now: 0, most: 0 } };
-    const client = await Promise.race([clientOf(ports(store, exe, budget)).catch(() => undefined), new Promise<undefined>((res) => setTimeout(() => res(undefined), 20))]);
+    const budget: Budget = { left: life === 4 ? Infinity : 5 + Math.floor(r() * 60), hold: () => r2() < 0.3, writes: { now: 0, most: 0 }, calls: 0 };
+    const opening = await settle(clientOf(ports(store, exe, budget)).catch(() => undefined), budget);
+    const client = opening.done ? opening.value : undefined;
     if (!client) {
       budget.killed = true;
       continue; // the life died while opening
@@ -151,7 +182,10 @@ async function history(seed: number, repairs = true): Promise<string[]> {
     const before = (await store.get(OWNER_KEY))?.value as any;
     if (before?.mark) witness.marks++;
     if (Object.values(before?.tombstones ?? {}).some((t: any) => Object.keys(t).length > 1)) witness.tombstones++;
-    const opened = await Promise.race([(repairs ? owner.repair() : Promise.resolve()).then(() => true), new Promise<boolean>((res) => setTimeout(() => res(false), 20))]);
+    // Life 4 never hangs, so its repair is awaited to the end: the invariants are read on what it left, never
+    // mid-repair. Earlier lives settle it by progress.
+    const repairing = (repairs ? owner.repair() : Promise.resolve()).then(() => true);
+    const opened = life === 4 ? (lastRepair === 'during' ? await Promise.race([repairing, Promise.resolve(false)]) : await repairing) : (await settle(repairing, budget)).done;
     if (life === 4 || opened) {
       // Invariants after a repair that finished.
       const doc = (await store.get(OWNER_KEY))?.value as any;
@@ -250,7 +284,7 @@ async function history(seed: number, repairs = true): Promise<string[]> {
       sameKey = undefined;
       if (when >= 0.2 && when < 0.45) catalog();
       else if (when >= 0.45 && when < 0.7) setTimeout(catalog, 0);
-      const done = await Promise.race([op.then((v) => (notSaved(v), true), () => true), new Promise<boolean>((res) => setTimeout(() => res(false), 20))]);
+      const done = (await settle(op.then((v) => (notSaved(v), true), () => true), budget)).done;
       if (when >= 0.7 && when < 0.85) catalog();
       if (!done) break; // the life is over: this change is cut off where it stood
     }
@@ -297,6 +331,12 @@ describe('T3: the owner, across seeded histories with kills', () => {
       mutations.clear();
     }
     expect.fail(`revoke-denied-shortcut: no seed where the strictness invariant fails only in the mutant (${tried.slice(0, 4).join('; ') || 'the switch never fired or the invariant never failed'})`);
+  }, 300_000);
+
+  it("the control: life 4's invariants read while its repair runs find a removing record's missing address", async () => {
+    let failed = 0;
+    for (let seed = 1; seed <= 400 && !failed; seed++) if ((await history(seed, true, 'during')).some((p) => /life 4: a record holds missing address/.test(p))) failed++;
+    expect(failed).toBeGreaterThan(0);
   }, 300_000);
 
   it('the control: with no repair at start, the same histories leave marks, orphans or unfinished cleanup', async () => {
