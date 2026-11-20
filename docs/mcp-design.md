@@ -249,7 +249,7 @@ There's no queue, no second exchange, and no timer that isn't an exchange's own.
 The client's surface toward the wire:
 
 - `start(run)` and `stop(run)`, called by the runtime lifecycle (5.4);
-- `list(run)`, called at start, on Test, and on a legacy run whenever `list_changed` has set the stale bit: after the call whose stream carried it, or at once if it arrived while the slot was Idle (a local server can send it unprompted). Otherwise a stale catalog would refuse every call until Stop and Start;
+- `list(run)`, called at start, on Test, and on a legacy run whenever `list_changed` has set the stale bit: after the call whose stream carried it, or at once if it arrived while the slot was Idle (a local server can send it unprompted). Otherwise a stale catalog would refuse every call until Stop and Start; The refresh after `list_changed` waits for the slot like the walk's own pages, within the list's deadline: an idle ping that takes the slot first only delays it, and the catalog never stays stale for want of a free slot.
 - `send(decision, signal)`, the only way a tool call reaches a server (3.6).
 
 T1 fixes the export list.
@@ -794,7 +794,7 @@ An upgrade of pi-durable must run these, and T13, again.
 
 **What runs:** the real client (`McpClient`, its links and the exchange machine) and the real journal on the real pi-durable 1.5.2. There are two harnesses, both in `packages/core/tests/harness/`:
 
-- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H15 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S29;
+- **the wire harness** (`wire.ts`, checks in `checks.ts`, named schedules in `schedules.ts`): the client against a scripted fake server, through an unkind fake exe. CI runs H1 to H3 and H10 to H15 over 500 seeds (20,000 locally with `FAMILIAR_SEEDS`), plus H4 and H5 in the pass build, and the named schedules S1, S2, S3, S8 and S10 to S30;
 - **the journal harness** (`journal.ts`, checks in `journal-checks.ts`): the real journal over a fake IndexedDB that outlives each life, with a gated fake model. It runs H6 to H9 over seeded runs (40 by default, `FAMILIAR_JSEEDS`), and the named schedule S5.
 
 **The fake MCP server, scripted per seed.** Its legacy modes, local and remote, can:
@@ -858,7 +858,7 @@ The **pass build** adds P4's detach bound (1 s), the server cap, the refusal pas
   - no two requests in a run carry the same body once the JSON-RPC id is removed, unless the log shows two separately answered or "may run on its own" decisions for them. T7 (j) is the positive witness: two identical calls, approved separately, each go out once;
   - judged per run: after a 404 on a Ready run, the next request is an `initialize` with no session id, then `initialized` with the new one, and no call is admitted until the re-handshake's list has completed, each tried call refused as the run not being Ready, not only by the busy slot. An empty history there is a missed re-handshake;
   - a 404 before a page or call has completed after the recovery's own walk, or a failed re-handshake, ends the run with no further request;
-  - nothing without the session id goes out between a 404 and its recovery's `initialize`, and a run walks its list no more often than its Start, its `list_changed`s, its recoveries and its Tests account for;
+  - nothing without the session id goes out between a 404 and its recovery's `initialize`, and a run walks its list no more often than its Start, its `list_changed`s and its recoveries account for;
   - a run is one admitted Start (or Test) to its end, on one server: admission is read from the server going to Starting in the step it was asked, never from the reply, so a Start refused (busy, already running, the owner busy) begins none; Ready means the Start answered ready; and a run's walks are allowed by its own Start, `list_changed`s and recoveries only, never by a Test elsewhere;
   - under the redirect mode, a redirected call fails, and nothing follows it.
 - **H15.** Test acts on its own run: a Test that met a Stop never reports success, and no Test reports success with no tools where the server listed some.
@@ -900,6 +900,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 | `ready-after-stop`: a start answers ready though Stop came during its catalog write | H15 under S19 |
 | `media-prefix`: a media type read by its prefix (`application/jsonp` as JSON) | H10 under S21; `tests/mcp/regress/parse.test.ts` (a lookalike with a body valid for what it looks like, and no read of it) |
 | `walk-beside-walk`: a list_changed schedules a walk beside the one under way | H14 under S26, S28 and S29 |
+| `refresh-through-list`: the refresh after `list_changed` through the public `list()`, which answers busy to an idle ping's pong | S30's expectation; `tests/mcp/regress/refresh.test.ts` |
 | `stop-before-exit`: a local Stop answers once the run has ended, not at the exit | H2 under S11, during initialize |
 | `stop-twice`: Stop and the run's end each ask the exe to stop the process | H2 under S11, during initialize |
 | `ready-before-drain`: a start answers Ready while its list's exchange still drains | H1 under S27, local and remote; `tests/mcp/regress/start-drain.test.ts` |
@@ -985,6 +986,7 @@ Since the twin's identical prefix passes, the mutant's failure lies at or after 
 - **S26, `list_changed` on a refresh's own page:** one retry, and no walk beside it (H14).
 - **S28, a refused Start splits no run:** S26 with a Start made while Ready, which the client refuses; the run's walks are judged together (H14).
 - **S29, a walk beside a walk, with a Test elsewhere:** S26 on one server while another is Tested; the Test allows that run no extra walk (H14).
+- **S30, an idle ping right after a `list_changed`:** a local call's answer carries `list_changed`, and the fake exe delivers an idle ping the moment the call's write is acknowledged, between its drain and the refresh. The refresh still runs, and the next calls go out on a fresh catalog (the schedule's expectation; `refresh-through-list` fails it, and `tests/mcp/regress/refresh.test.ts`).
 - **S27, a call the moment Start answers Ready,** local with the exe acknowledging writes late, and remote with the list's `net_cancel` still pending: the call is admitted and answered (H1).
 
 ### 7.3 The exchange machine's exhaustive walk (W)

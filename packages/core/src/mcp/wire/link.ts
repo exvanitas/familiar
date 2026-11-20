@@ -384,6 +384,15 @@ export class ServerLink {
     if (!run || run.ended || !run.ready) return { kind: 'failed', words: 'The server is not running.' };
     // One walk at a time: one under way (between its pages the slot is idle) answers busy too.
     if (this.busy || (run.walker && !(__FAMILIAR_MUTATIONS__ && mutant('walk-beside-walk')))) return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
+    return this.relist(run);
+  }
+
+  /**
+   * A walk of the run's list, published if it completes, under the list's deadline. Each of its pages waits
+   * for the slot like any administrative exchange, so a refresh after list_changed isn't lost to an idle
+   * ping that took the slot first. A failed walk ends the run.
+   */
+  private async relist(run: Run): Promise<readonly ListedTool[] | Failure> {
     const { deadline, cancel } = this.deadline(run, this.limits.listMs);
     try {
       const r = await this.walk(run, deadline).catch((e: unknown) => ({ failure: unexpected(e) }));
@@ -980,7 +989,9 @@ export class ServerLink {
         run.relisting = true;
         void this.drained().then(() => {
           run.relisting = false;
-          return run.ended || !run.stale || (run.walker && !beside) ? undefined : this.list();
+          if (run.ended || run.closing || !run.ready || !run.stale || (run.walker && !beside)) return undefined;
+          // Through the slot's own wait, never the public list(), which answers busy to an idle ping's pong.
+          return (__FAMILIAR_MUTATIONS__ && mutant('refresh-through-list')) ? this.list() : this.relist(run);
         });
       }
     }

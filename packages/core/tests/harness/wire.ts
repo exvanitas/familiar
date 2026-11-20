@@ -104,6 +104,9 @@ export interface Mode {
   /** Local: the exe acknowledges each write only after the server's answer to it has reached the client
       (S27: a Start answers Ready while its last write is still unacknowledged). */
   readonly lateAcks?: boolean;
+  /** Local, with lateAcks: an idle ping delivered the moment a call's write is acknowledged, in the very
+      window between its exchange's drain and anything waiting on that drain (S30). */
+  readonly pingAtDrain?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -713,6 +716,12 @@ export class FakeExe {
           w.rec.end = this.sched.step;
           w.rec.endAt = this.sched.now;
           w.done();
+          if (this.server.mode.pingAtDrain && w.rec.body?.method === 'tools/call') {
+            const id = `i${w.rec.n}d`;
+            this.server.pings.push({ id, on: `w${w.rec.n}`, afterFinal: false });
+            // After the write's own release (queued first, when it resolved), before what that release wakes.
+            queueMicrotask(() => !p.exited && deliver(run, JSON.stringify({ jsonrpc: '2.0', id, method: 'ping' })));
+          }
         };
         // Late acknowledgements: the write ends only once everything the server wrote back has been read.
         if (this.server.mode.lateAcks) {

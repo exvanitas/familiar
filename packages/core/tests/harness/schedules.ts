@@ -180,6 +180,37 @@ export const SCHEDULES: Named[] = [
     },
     expect: (r) => (r.evidence.some((e) => e.what === 'tested' && e.server === 's2') ? undefined : 'no Test of s2')
   },
+  {
+    // S30: a local call whose answer carries list_changed, with an idle ping right behind it: the refresh
+    // waits for the ping's pong and runs, and the next calls go out on a fresh catalog (H1, H3).
+    name: 'S30 an idle ping right after a list_changed',
+    options: {
+      mode: { ...quiet, where: 'local', listChanged: 1, lateAcks: true, pingAtDrain: true },
+      schedule: (d) => {
+        let made = 0;
+        const next = () => {
+          if (made++ >= 4) return;
+          d.call('echo');
+          const token = lastToken(d);
+          const call = () => d.exe.log.findIndex((x) => x.body?.method === 'tools/call' && x.body.params?.arguments?.text === token);
+          // The refresh the call's list_changed asked for has come back: a tools/list written after the call,
+          // answered. Then the next call, on the fresh catalog.
+          // (A call refused busy, its slot taken by a pong, sent nothing: the person tries again.)
+          const relisted = () => call() < 0 || d.exe.log.some((x, i) => i > call() && x.body?.method === 'tools/list' && d.exe.responded.has(`${x.epoch}:${x.body.id}`));
+          d.when(`relisted ${made}`, () => d.evidence.some((e) => e.what === 'outcome' && e.token === token) && relisted() && d.idle(), next);
+        };
+        d.when('ready', () => d.idle(), next);
+      }
+    },
+    expect: (r) => {
+      const outs = r.evidence.filter((e) => e.what === 'outcome');
+      if (outs.length < 4) return `only ${outs.length} calls answered: a refresh never came back`;
+      // Busy is a pong in the slot, tried again; a call refused on a stale catalog is the dropped refresh.
+      const stale = outs.find((e) => e.outcome?.kind === 'error' && e.outcome.reason === 'changed');
+      if (stale) return `a call came back ${JSON.stringify(stale.outcome).slice(0, 80)}`;
+      return outs.some((e) => e.outcome?.kind === 'result') ? undefined : 'no call answered with a result';
+    }
+  },
   callAtReady('local'),
   callAtReady('remote'),
   {
