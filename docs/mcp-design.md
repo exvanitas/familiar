@@ -489,7 +489,7 @@ A server's answers are untrusted. The parser (`wire/parse.ts`) checks them befor
 
 - **Size:** 4 MiB for a call's or a page's response, and 64 KiB for a handshake's, with `net_fetch`'s own caps underneath. The same per event-stream event, and the exe's 4 MiB line cap locally. A larger one fails the exchange.
 - **Shape, per message kind.** Every message must be valid JSON, nested at most 64 deep, an object with `jsonrpc: "2.0"`. Then by kind:
-  - **a response:** an `id` equal to an id this exchange is waiting on, and exactly one of `result` or `error`. `error.code` must be an integer, and `error.message` is a string, cut to 1 KiB;
+  - **a response:** an `id` equal to an id this exchange is waiting on, and exactly one of `result` or `error`. `error.code` must be an integer, and `error.message` is a string, cut to 1 KiB counted in UTF-8 bytes, on a character boundary;
   - **a request:** a `method` string of at most 128 bytes, an `id` that's a string of at most 128 bytes or a safe integer, and `params` an object if present;
   - **a notification:** a `method` string of at most 128 bytes, no `id`, and `params` an object if present.
 

@@ -195,6 +195,28 @@ describe('cuts by character, and bounds by byte', () => {
     expect(m.error.message.length).toBeLessThanOrEqual(1024);
   });
 
+  it('an error message is bounded at 1 KiB in UTF-8 bytes, on a character boundary: CJK, emoji, and ASCII at the edge', async () => {
+    const { parseMessage } = await import('../../../src/mcp/wire/parse.ts');
+    const { wellFormed } = await import('../../../src/mcp/wire/headers.ts');
+    const cut = (message: string) => {
+      const m = parseMessage(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -1, message } }));
+      if (m.t !== 'response' || !m.error) throw new Error('not an error response');
+      return m.error.message;
+    };
+    const bytes = (t: string) => new TextEncoder().encode(t).length;
+    const cjk = cut('字'.repeat(2000));
+    expect(bytes(cjk)).toBeLessThanOrEqual(1024);
+    expect(bytes(cjk)).toBeGreaterThan(1020);
+    expect(cjk).toBe('字'.repeat(341));
+    for (const pad of [1020, 1021, 1022, 1023]) {
+      const e = cut(`${'a'.repeat(pad)}😀😀`);
+      expect(bytes(e)).toBeLessThanOrEqual(1024);
+      expect(wellFormed(e)).toBe(true);
+      expect(e).toBe(pad === 1020 ? `${'a'.repeat(1020)}😀` : 'a'.repeat(pad));
+    }
+    expect(cut('a'.repeat(1024))).toBe('a'.repeat(1024));
+  });
+
   it("the server's last output is bounded in bytes: eight long lines of CJK text keep at most 16 KiB", async () => {
     const { LastOutput, LAST_BYTES } = await import('../../../src/mcp/last-output.ts');
     const last = new LastOutput();

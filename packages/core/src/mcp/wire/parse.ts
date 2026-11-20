@@ -11,6 +11,7 @@ import { legacyVersion } from './framing.ts';
 export const MAX_DEPTH = 64;
 export const MAX_METHOD_BYTES = 128;
 export const MAX_ID_BYTES = 128;
+/** An error message's bound, in UTF-8 bytes. */
 export const MAX_ERROR_MESSAGE = 1024;
 export const MAX_CURSOR_BYTES = 1024;
 /** One response or event, for a call or a page. */
@@ -50,6 +51,21 @@ export function cutText(text: string, n: number): string {
   return /[\uD800-\uDBFF]$/.test(s) ? s.slice(0, -1) : s;
 }
 
+/** The longest start of `text` that fits `max` UTF-8 bytes, cut on a character boundary. */
+export function cutBytes(text: string, max: number): string {
+  let used = 0;
+  let i = 0;
+  while (i < text.length) {
+    const c = text.codePointAt(i)!;
+    // A lone surrogate is written as U+FFFD, three bytes.
+    const size = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (used + size > max) break;
+    used += size;
+    i += c >= 0x10000 ? 2 : 1;
+  }
+  return text.slice(0, i);
+}
+
 export function parseMessage(text: string, maxBytes = MAX_MESSAGE_BYTES): Inbound {
   if (text.length > maxBytes || bytes(text) > maxBytes) throw new Invalid('a message past its size bound');
   let v: unknown;
@@ -78,7 +94,7 @@ export function parseMessage(text: string, maxBytes = MAX_MESSAGE_BYTES): Inboun
   }
   const e = v.error;
   if (!isObject(e) || !Number.isInteger(e.code) || typeof e.message !== 'string') throw new Invalid('a bad error object');
-  return { t: 'response', id: v.id as RpcId, error: { code: e.code as number, message: cutText(e.message, MAX_ERROR_MESSAGE), ...('data' in e ? { data: e.data } : {}) } };
+  return { t: 'response', id: v.id as RpcId, error: { code: e.code as number, message: cutBytes(e.message, MAX_ERROR_MESSAGE), ...('data' in e ? { data: e.data } : {}) } };
 }
 
 /* ---------- the event stream ---------- */
