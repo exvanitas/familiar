@@ -294,13 +294,12 @@ export class ServerLink {
       }
       // Ready only once the list's own exchange has drained (its write acknowledged, its request ended),
       // within the start's deadline: a call made the moment Start answers is admitted, never refused busy.
-      if (!(__FAMILIAR_MUTATIONS__ && mutant('ready-before-drain'))) {
-        if (this.busy) await Promise.race([this.drained(), deadline.over, this.stuckAt]);
-        const failure: Failure | undefined = deadline.expired && this.busy ? { kind: 'timed-out', words: "The server didn't finish starting in time." } : run.ended || run.closing || this.stuck ? this.startWords(run, { t: 'run-ended' }) : undefined;
-        if (failure) {
-          this.endRun(run, failure, false);
-          return { ok: false, failure };
-        }
+      if (this.busy && !(__FAMILIAR_MUTATIONS__ && mutant('ready-before-drain'))) await Promise.race([this.drained(), deadline.over, this.stuckAt]);
+      // And only a run still alive: an exit that came with (or right after) the last reply ended it.
+      const gone: Failure | undefined = deadline.expired && this.busy ? { kind: 'timed-out', words: "The server didn't finish starting in time." } : run.ended || run.closing || this.stuck ? this.startWords(run, { t: 'run-ended' }) : undefined;
+      if (gone) {
+        this.endRun(run, gone, false);
+        return { ok: false, failure: gone };
       }
       run.ready = true;
       return { ok: true, run: run.id, tools: run.tools };

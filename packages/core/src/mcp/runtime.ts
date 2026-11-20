@@ -35,6 +35,8 @@ export class ServerRuntime {
   /** The current start's token. A start's continuation acts only while its token is current: a Stop, or a
       later start, makes it stale, so it can never take a later start's Starting for its own. */
   private startToken = 0;
+  /** The last run that ended before this runtime knew it was its run: a start then answers for it. */
+  private endedEarly: { readonly run: string; readonly failure: Failure } | undefined;
   readonly id: string;
   readonly link: ServerLink;
   private readonly owner: Owner;
@@ -56,7 +58,10 @@ export class ServerRuntime {
     this.limits = limits;
     this.link = new ServerLink(id, { net: ports.net, processes: ports.processes }, ports.clock, {
       ended: (run, failure) => {
-        if (run !== this.runId) return;
+        if (run !== this.runId) {
+          this.endedEarly = { run, failure };
+          return;
+        }
         this.runId = undefined;
         if (this.phaseNow === 'stopping') return;
         this.set('failed', failure);
@@ -179,6 +184,13 @@ export class ServerRuntime {
       return { kind: 'failed', failure: r.failure };
     }
     const run = r.run;
+    // A run that ended before this start knew its id (its exit right behind the last reply) is never shown
+    // Ready: the start fails with the run's own words.
+    const early = this.endedEarly?.run === run ? this.endedEarly.failure : this.link.current?.run !== run ? { kind: 'exited' as const, words: 'The server stopped as it started.' } : undefined;
+    if (early) {
+      this.set('failed', early);
+      return { kind: 'failed', failure: early };
+    }
     this.runId = run;
     this.set('ready');
     // The catalog write is an owner effect of its own (5.1): Ready is answered once it has settled, so the
