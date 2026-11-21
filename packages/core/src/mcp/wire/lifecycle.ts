@@ -76,8 +76,9 @@ export interface Run {
   readonly dropped: 0 | 1;
   readonly recovered: boolean;
   readonly deadline?: { readonly which: DeadlineKind; readonly id: number };
-  /** The start's own deadline, still running for its answer while its first catalog write saves (the step
-      itself may meanwhile hold a refresh's list deadline). */
+  /** The start's (or Test's) own deadline, armed once at admission and kept, for that action's answer only,
+      while the step holds a deadline of its own (grace, a refresh's list, cleanup's stop) or none (Ready
+      with its first catalog write saving). Disarmed when the action is answered. */
   readonly saveBy?: number;
   /** Why the run is ending, once it is: the words every waiter of it gets. */
   readonly cause?: Cause;
@@ -91,6 +92,8 @@ export interface Run {
   readonly firstGen: number;
   /** The unanswered list's words, kept through the relaunch grace. */
   readonly graceFailure?: Failure;
+  /** A later catalog write failed: its generation, kept until a retry lands (one retry). */
+  readonly unsaved?: number;
 }
 export interface Waiter {
   readonly kind: 'start' | 'test' | 'stop';
@@ -100,6 +103,8 @@ export interface Waiter {
 export interface Orphan {
   readonly run: string;
   readonly process: string;
+  /** How its stop ended: the exe refused it, or the stop deadline outran the exit. Its words follow. */
+  readonly how?: 'refused' | 'unconfirmed';
 }
 export interface LcState {
   readonly id: string;
@@ -273,8 +278,25 @@ class Tx {
     this.fx.push(e);
   }
   answer(token: string, reply: Reply): void {
-    this.s.waiters = this.s.waiters.filter((w) => w.token !== token);
+    const w = this.s.waiters.find((x) => x.token === token);
+    this.s.waiters = this.s.waiters.filter((x) => x.token !== token);
     this.emit({ t: 'answer', token, reply });
+    // The action's own deadline goes once its last start or Test waiter is answered.
+    const r = this.s.run;
+    if (!w || w.kind === 'stop' || !r || w.run !== r.id || this.actionOpen()) return;
+    if (r.saveBy !== undefined) {
+      this.emit({ t: 'disarm', id: r.saveBy });
+      this.setRun({ saveBy: undefined });
+    }
+    if (r.deadline?.which === 'start') {
+      this.emit({ t: 'disarm', id: r.deadline.id });
+      this.setRun({ deadline: undefined });
+    }
+  }
+  /** A start or Test of the current run still waits. */
+  actionOpen(): boolean {
+    const r = this.s.run;
+    return !!r && this.s.waiters.some((x) => x.run === r.id && x.kind !== 'stop');
   }
   arm(which: DeadlineKind): void {
     this.disarm();
@@ -282,10 +304,16 @@ class Tx {
     this.setRun({ deadline: { which, id } });
     this.emit({ t: 'arm', id, which });
   }
+  /** The step's deadline goes. A start deadline whose action still waits is kept, not disarmed: it moves
+      aside (saveBy) and still answers that action at its original time (one deadline per action). */
   disarm(): void {
     const d = this.s.run?.deadline;
     if (!d) return;
     this.setRun({ deadline: undefined });
+    if (d.which === 'start' && this.actionOpen() && this.s.run!.saveBy === undefined && !(__FAMILIAR_MUTATIONS__ && mutant('lc-start-deadline-dropped'))) {
+      this.setRun({ saveBy: d.id });
+      return;
+    }
     this.emit({ t: 'disarm', id: d.id });
   }
   /** The step's administrative exchange, issued now if the slot is Idle, and the slot marked busy at once. */
@@ -354,11 +382,7 @@ function step(tx: Tx, e: LcEvent): void {
     case 'exhausted':
       return exhausted(tx, e.failure);
     case 'deadline':
-      if (tx.run?.saveBy !== undefined && tx.run.saveBy === e.id) {
-        // Ready, its first catalog write still saving: the start's answer doesn't wait past its deadline.
-        tx.setRun({ saveBy: undefined, firstSave: 'done' });
-        return answerReady(tx);
-      }
+      if (tx.run?.saveBy !== undefined && tx.run.saveBy === e.id) return actionDeadline(tx);
       if (!tx.run?.deadline || tx.run.deadline.id !== e.id) return;
       return deadline(tx, tx.run.deadline.which);
     case 'saved':
@@ -379,7 +403,7 @@ function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   }
   if (e.facts.record !== 'ok') return refuseStart(tx, e.token, RECORD_WORDS[e.facts.record]);
   // A process whose stop was refused may still be running: nothing starts beside it (I2).
-  if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-start-beside-orphan'))) return refuseStart(tx, e.token, { kind: 'failed', failure: STOP_REFUSED });
+  if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-start-beside-orphan'))) return refuseStart(tx, e.token, { kind: 'failed', failure: orphanWords(s) });
   if (!e.facts.ownerFree) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'refused', words: e.facts.ownerWords ?? '' } });
   if (s.slot === 'busy') return refuseStart(tx, e.token, { kind: 'failed', failure: { kind: 'busy', words: BUSY_SLOT } });
   const id = `${s.id}#${++s.nextRun}`;
@@ -428,7 +452,7 @@ function stop(tx: Tx, token: string): void {
   const r = s.run;
   if (!r) {
     // After a refused stop the process may still run: every later Stop says so, until its exit (r33 #4).
-    if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-second-stop-stopped'))) return tx.emit({ t: 'answer', token, reply: { kind: 'failed', failure: STOP_REFUSED } });
+    if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-second-stop-stopped'))) return tx.emit({ t: 'answer', token, reply: { kind: 'failed', failure: orphanWords(s) } });
     return tx.emit({ t: 'answer', token, reply: { kind: 'stopped' } });
   }
   if (r.step === 'relaunch') {
@@ -446,6 +470,9 @@ function stop(tx: Tx, token: string): void {
     return end(tx, 'person-stop', { kind: 'exited', words: STOPPED_WORDS });
   }
   s.waiters = [...s.waiters, { kind: 'stop', token, run: r.id }];
+  // A Stop during Test's own cleanup is the person's: Test then answers no success (4.7), with still one
+  // native stop.
+  if (r.step === 'closing' && r.cause === 'test-done' && !(__FAMILIAR_MUTATIONS__ && mutant('lc-test-ok-after-stop'))) tx.setRun({ cause: 'person-stop', failure: { kind: 'exited', words: STOPPED_WORDS } });
   if (r.step === 'closing') {
     // Every Stop has a deadline: one made after an earlier Stop's deadline was answered arms it again.
     if (!r.deadline && !(__FAMILIAR_MUTATIONS__ && mutant('lc-no-stop-deadline'))) tx.arm('stop');
@@ -471,9 +498,11 @@ function started(tx: Tx, e: Extract<LcEvent, { t: 'started' }>): void {
   }
   tx.setRun({ native: { ...r.native!, start: 'ok', process: e.process } });
   if (r.step === 'closing') {
-    // Stopped while the exe was still starting it: the process it then started is stopped now.
+    // Stopped while the exe was still starting it: the process it then started is stopped now, under a
+    // stop deadline of its own (the earlier one may have answered already): past it, an orphan.
     tx.setRun({ native: { ...tx.run!.native!, stop: 'pending' }, killed: true });
     tx.emit({ t: 'native-stop', run: r.id, process: e.process });
+    if (!tx.run!.deadline && !(__FAMILIAR_MUTATIONS__ && mutant('lc-late-start-unbounded'))) tx.arm('stop');
     return;
   }
   // A modern relaunch skips the opening: the era was decided by the refusal on the first launch.
@@ -498,9 +527,13 @@ function exit(tx: Tx, process: string, failure: Failure): void {
   // A modern-only stdio server that ended its process after refusing the legacy opening, before its list
   // was answered: one relaunch (3.9).
   if (r.step === 'grace' || (r.step === 'walking' && relaunchable(tx.run!))) {
+    // The exited process's exchange (its unanswered list) ends first, as the run's end: the slot frees, and
+    // the relaunch's own list can go out. Then its writes, then the relaunch's facts.
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-relaunch-keeps-exchange'))) tx.emit({ t: 'end-live', run: r.id });
     tx.emit({ t: 'release-writes', process });
+    // The grace deadline goes; the admission's own deadline (kept aside) still bounds the start.
+    if (tx.run!.deadline?.which !== 'start') tx.disarm();
     tx.setRun({ step: 'relaunch', want: undefined, inFlight: undefined });
-    if (tx.run!.deadline?.which !== 'start') tx.arm('start');
     tx.emit({ t: 'readmit-check', run: r.id });
     return;
   }
@@ -544,7 +577,8 @@ function settle(tx: Tx): void {
   if (purpose === 'recovery') tx.setRun({ recovered: true });
   if (purpose === 'start' && r.firstSave === 'none') {
     // The start's deadline keeps running, for its answer only, until the first catalog write settles.
-    tx.setRun({ firstSave: 'pending', firstGen: r.gen, saveBy: r.deadline?.id, deadline: undefined });
+    tx.setRun({ firstSave: 'pending', firstGen: r.gen });
+    tx.disarm();
     tx.saveCatalog();
     return;
   }
@@ -711,6 +745,29 @@ function deadline(tx: Tx, which: DeadlineKind): void {
   return endAnswering(tx, 'list-unanswered', r.graceFailure ?? { kind: 'exited', words: 'The server closed the connection.' });
 }
 
+/**
+ * The start's (or Test's) own deadline, kept aside while the step had another: the action is answered now,
+ * at its original time. A run already closing answers it from its kept cause and carries on with its
+ * cleanup under the stop deadline; any other step ends as the start deadline ends it.
+ */
+function actionDeadline(tx: Tx): void {
+  const r = tx.run!;
+  tx.setRun({ saveBy: undefined });
+  if (r.step === 'closing') {
+    const failure: Failure = r.native?.start === 'pending' ? START_UNANSWERED : r.cause === 'test-done' ? START_TIMEOUT : (r.failure ?? START_TIMEOUT);
+    for (const w of tx.s.waiters.filter((x) => x.run === r.id && x.kind !== 'stop')) {
+      tx.answer(w.token, w.kind === 'start' && (r.cause === 'person-stop' || r.cause === 'turned-off') ? { kind: 'stopped' } : { kind: 'failed', failure });
+    }
+    return;
+  }
+  return deadline(tx, 'start');
+}
+
+/** The words an orphan gives every later action, by how its stop ended. */
+function orphanWords(s: LcState): Failure {
+  return s.orphans.some((o) => o.how === 'refused' || o.how === undefined) ? STOP_REFUSED : STOP_UNCONFIRMED;
+}
+
 /** A deadline ends the run, and answers its start or Test at once, in the cause's words: the person's action
     never waits on the process's own stop (I9). A Stop's waiter keeps waiting for the stop, under its own
     deadline. */
@@ -736,14 +793,21 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
     s.dirty = false;
     if (r && r.gen > gen && r.step !== 'closing') tx.saveCatalog();
   }
-  if (!r || r.firstSave !== 'pending' || r.firstGen !== gen) return;
+  const first = !!r && r.firstSave === 'pending' && r.firstGen === gen;
+  // A later catalog write that failed keeps its generation and is tried once more; a second failure is the
+  // owner's to report (the client shows it), and the generation stays marked unsaved.
+  if (r && !first && r.step !== 'closing') {
+    if (outcome === 'failed' && r.gen === gen && !s.saving && r.unsaved !== gen && !(__FAMILIAR_MUTATIONS__ && mutant('lc-failed-save-dropped'))) {
+      tx.setRun({ unsaved: gen });
+      tx.saveCatalog();
+      return;
+    }
+    if (outcome !== 'failed' && r.unsaved !== undefined && r.unsaved <= gen) tx.setRun({ unsaved: undefined });
+  }
+  if (!r || !first) return;
   tx.setRun({ firstSave: 'done' });
   // Already ending (a Stop, a crash): its waiters get the kept cause's words when it ends.
   if (r.step === 'closing') return;
-  if (r.saveBy !== undefined) {
-    tx.emit({ t: 'disarm', id: r.saveBy });
-    tx.setRun({ saveBy: undefined });
-  }
   if (outcome === 'failed') return end(tx, 'catalog-failed', CATALOG_FAILED);
   answerReady(tx);
 }
@@ -769,12 +833,13 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   if (r.mode === 'auto' && !f.enabled) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: 'It is turned off.' });
   if (f.launch !== r.launch) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'The setup changed. Press Start again.' });
   const id = `${s.id}#${++s.nextRun}`;
-  s.run = { ...emptyRun(id, 'local', r.mode, r.launch), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false }, ...(r.deadline ? { deadline: r.deadline } : {}) };
+  // The admission's own deadline carries over: the relaunch gets no fresh budget.
+  s.run = { ...emptyRun(id, 'local', r.mode, r.launch), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false }, ...(r.deadline ? { deadline: r.deadline } : {}), ...(r.saveBy !== undefined ? { saveBy: r.saveBy } : {}) };
   s.waiters = s.waiters.map((w) => (w.run === r.id ? { ...w, run: id } : w));
   s.owner = 'start';
   tx.emit({ t: 'owner-hold' });
   tx.emit({ t: 'native-start', run: id, era: 'modern' });
-  if (!tx.run!.deadline) tx.arm('start');
+  if (__FAMILIAR_MUTATIONS__ && mutant('lc-relaunch-fresh-budget')) tx.arm('start');
 }
 
 function emptyRun(id: string, where: Where, mode: Mode, launch: string): Run {
@@ -799,10 +864,6 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
   const r = tx.run!;
   if (r.step === 'closing') return;
   tx.disarm();
-  if (r.saveBy !== undefined) {
-    tx.emit({ t: 'disarm', id: r.saveBy });
-    tx.setRun({ saveBy: undefined });
-  }
   const unfenced = cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'));
   if (!unfenced) tx.emit({ t: 'end-live', run: r.id });
   tx.setRun({ cause, failure, step: 'closing', ...((__FAMILIAR_MUTATIONS__ && mutant('lc-admit-after-fence')) || unfenced ? {} : { want: undefined }) });
@@ -836,9 +897,13 @@ function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Caus
   const failure = r.failure ?? failureNow ?? { kind: 'exited', words: STOPPED_WORDS };
   const alive = !!r.native?.process && !r.native.exited;
   const mayRun = alive && how !== 'done';
-  if (alive) s.orphans = [...s.orphans, { run: r.id, process: r.native!.process! }];
+  if (alive) s.orphans = [...s.orphans, { run: r.id, process: r.native!.process!, how: how === 'refused' ? 'refused' : 'unconfirmed' }];
   else if (r.native?.process) tx.emit({ t: 'release-writes', process: r.native.process });
   const stillWords = how === 'refused' ? STOP_REFUSED : STOP_UNCONFIRMED;
+  if (r.saveBy !== undefined && !s.waiters.some((w) => w.run === r.id && w.kind !== 'stop')) {
+    tx.emit({ t: 'disarm', id: r.saveBy });
+    tx.setRun({ saveBy: undefined });
+  }
   const own = cause === 'person-stop' || cause === 'test-done' || cause === 'turned-off';
   const words: Failure = mayRun ? (own ? stillWords : { kind: failure.kind, words: `${failure.words} ${stillWords.words}` }) : failure;
   for (const w of s.waiters.filter((x) => x.run === r.id)) {

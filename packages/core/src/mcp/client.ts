@@ -88,6 +88,8 @@ export interface ServerStatus {
   readonly unpinned?: Unpinned;
   /** The tools as last seen, with whether the person has reviewed each as it is now. */
   readonly tools: readonly SavedTool[];
+  /** Set while the run's latest tool list couldn't be saved (tried twice): the saved list is older. */
+  readonly unsaved?: string;
 }
 
 export interface TestedTool extends ListedTool {
@@ -136,6 +138,8 @@ export class McpClient {
   private readonly clears = new Map<string, { readonly server: string; readonly tool: string; readonly fingerprint: string }>();
   /** Catalog writes under way: a durable clear waits for them, never taking the owner first. */
   private seeing = 0;
+  /** Servers whose latest catalog write failed, with the words shown until one lands. */
+  private readonly unsaved = new Map<string, string>();
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {
@@ -278,7 +282,8 @@ export class McpClient {
     const rt = this.runtimes.get(id);
     if (!s || s.removing || !rt) return undefined;
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
-    return { id, label: s.setup.label, key: s.key, kind: s.setup.kind, enabled: s.enabled, phase: rt.phase, ...(rt.failure ? { failure: rt.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: s.tools };
+    const unsaved = this.unsaved.get(id);
+    return { id, label: s.setup.label, key: s.key, kind: s.setup.kind, enabled: s.enabled, phase: rt.phase, ...(rt.failure ? { failure: rt.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: s.tools, ...(unsaved ? { unsaved } : {}) };
   }
 
   /** Adds a draft as a server, stopped and not yet enabled. Returns the refs Settings must store its
@@ -591,6 +596,11 @@ export class McpClient {
     this.seeing++;
     try {
       await this.owner.seen(id, tools, current);
+      if (this.unsaved.delete(id)) this.o.onChange?.(id);
+    } catch (e) {
+      this.unsaved.set(id, "Familiar couldn't save this server's latest tool list; it shows the list it saved before.");
+      this.o.onChange?.(id);
+      throw e;
     } finally {
       this.seeing--;
       this.clearGrants();
