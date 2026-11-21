@@ -83,11 +83,26 @@ export interface Run {
   readonly killed: boolean;
   /** This run's opening was refused by a modern-only server: a local one may be relaunched once (3.9). */
   readonly modernOpening: boolean;
-  /** The run's first catalog write: the start (or Test) is answered once it settles. */
-  readonly firstSave: 'none' | 'pending' | 'done';
+  /** The run's first catalog write: the start (or Test) is answered once it lands (6b.13).
+      'owed': the run's settle asked for it while another write was in flight, so it waits in the run's queue;
+      'pending': it was issued and is in flight, carrying `firstGen`; 'done': it landed. */
+  readonly firstSave: 'none' | 'owed' | 'pending' | 'done';
+  /** The generation the run's first write carries, fixed when that write is issued (a newer one may have
+      superseded the one the settle asked for). */
   readonly firstGen: number;
+  /** This run asked for a write while another was in flight. When that one lands, the run's newest generation
+      is written, if the run is still current and not closing. The queue is the run's own: it goes with the run. */
+  readonly queued?: true;
   /** The unanswered list's words, kept through the relaunch grace. */
   readonly graceFailure?: Failure;
+  /** The newest generation of this run whose write was issued (6b.13: each is written once, plus its one
+      retry; its settle writes nothing once a write of it went out). Set wherever a save is issued for this run. */
+  readonly written?: number;
+  /** A later catalog write failed once: its generation, tried once more (6b.13). */
+  readonly retried?: number;
+  /** That generation failed again: marked unsaved, and shown (noteOf), until a write of it or a newer one
+      lands (6b.13). */
+  readonly unsaved?: number;
 }
 export interface Waiter {
   readonly kind: 'start' | 'test' | 'stop';
@@ -115,9 +130,9 @@ export interface LcState {
   readonly held?: Failure;
   /** After a run: Stopped, or Failed with words. */
   readonly after?: { readonly failed: boolean; readonly failure?: Failure };
-  /** The catalog write in flight, and whether a newer catalog was published while it was. */
+  /** The catalog write in flight: whose it is and its generation, fixed when it was issued. One at a time, across
+      runs (I11). A run's own queued write is `Run.queued`. */
   readonly saving?: { readonly run: string; readonly gen: number };
-  readonly dirty: boolean;
   /** Under a named mutation only: a relaunch Stop cancelled, still answerable. */
   readonly zombie?: string;
 }

@@ -237,7 +237,11 @@ export function walkSpec(w: Walked, where: Where, maxDepth: number, origin: Spec
   for (; depth < maxDepth && frontier.length; depth++) {
     if (opts.budgetMs !== undefined && performance.now() - t0 > opts.budgetMs) return result();
     const nf: Node[] = [];
+    let expanded = 0;
     for (const n of frontier) {
+      // The budget is kept inside a depth too: past it, the result is the last depth completed, its frontier
+      // still to expand.
+      if (opts.budgetMs !== undefined && ++expanded % 1024 === 0 && performance.now() - t0 > opts.budgetMs) return result();
       for (const [e, c2] of alphabet(n.s as never, n.h, n.c, where)) {
         const st = stepSpec(w, n.s, n.h, e);
         if (!st) continue;
@@ -306,7 +310,7 @@ export function driveSpec(w: Walked, where: Where, name: string, picks: readonly
 const startOk = is('start', (e) => e.mode === 'start' && e.facts.record === 'ok' && e.facts.ownerFree);
 const page = is('admin-done', (e) => e.outcome.k === 'page' && !e.outcome.more && e.outcome.catalog === 'ok');
 
-/** The eight named checkpoints, through the spec's alphabet, with what each must be. */
+/** The nine named checkpoints, through the spec's alphabet, with what each must be. */
 export function specCheckpoints(w: Walked = THIS): { origin: SpecOrigin; where: Where; holds: (s: LcState) => boolean }[] {
   const saving = driveSpec(w, 'local', 'local Ready, its save in flight', [startOk, is('started', (e) => e.ok), is('admin-done', (e) => e.outcome.k === 'legacy'), is('admin-done', (e) => e.outcome.k === 'ok'), page, is('slot', (e) => e.idle)]);
   const ready = driveSpec(w, 'local', 'local Ready', [is('saved', (e) => e.outcome === 'saved')], saving);
@@ -317,6 +321,10 @@ export function specCheckpoints(w: Walked = THIS): { origin: SpecOrigin; where: 
   const rsaving = driveSpec(w, 'remote', 'remote Ready, its save in flight', [startOk, is('admin-done', (e) => e.outcome.k === 'legacy'), is('admin-done', (e) => e.outcome.k === 'ok'), page, is('slot', (e) => e.idle)]);
   const rready = driveSpec(w, 'remote', 'remote Ready', [is('saved', (e) => e.outcome === 'saved')], rsaving);
   const recovering = driveSpec(w, 'remote', 'remote recovering', [is('slot', (e) => !e.idle), is('call-ended', (e) => e.end === 'session-ended')], rready);
+  // Ready with its first write in flight and a newer write queued behind it: if the run ends now (its start
+  // deadline, say), the write in flight lands late, for a run that has left, and the queue must have gone with
+  // the run (6b.13).
+  const queued = driveSpec(w, 'remote', 'remote Ready, its first write in flight, a newer one queued', [is('notice'), page, is('slot', (e) => e.idle)], rsaving);
   return [
     { origin: ready, where: 'local', holds: (s) => phaseOf(s) === 'ready' && !s.saving },
     { origin: saving, where: 'local', holds: (s) => s.run?.step === 'ready' && !!s.saving },
@@ -325,7 +333,8 @@ export function specCheckpoints(w: Walked = THIS): { origin: SpecOrigin; where: 
     { origin: relaunch, where: 'local', holds: (s) => s.run?.step === 'relaunch' },
     { origin: run2, where: 'local', holds: (s) => s.run?.step === 'launching' && s.orphans.length === 0 },
     { origin: rready, where: 'remote', holds: (s) => phaseOf(s) === 'ready' && !s.saving },
-    { origin: recovering, where: 'remote', holds: (s) => s.run?.purpose === 'recovery' }
+    { origin: recovering, where: 'remote', holds: (s) => s.run?.purpose === 'recovery' },
+    { origin: queued, where: 'remote', holds: (s) => s.run?.step === 'ready' && s.run.firstSave === 'pending' && !!s.saving && !!s.run.queued }
   ];
 }
 
@@ -388,10 +397,27 @@ describe('W with the spec checks', () => {
     ['lc-failed-save-dropped', 'local', 'local Ready'],
     ['lc-relaunch-keeps-exchange', 'local', 'initial'],
     ['lc-start-waits-cleanup', 'local', 'initial'],
-    ['lc-taken-not-ended', 'local', 'initial']
+    ['lc-taken-not-ended', 'local', 'initial'],
+    ['lc-queue-outlives-run', 'remote', 'remote Ready, its first write in flight, a newer one queued']
   ];
   // lc-old-run-events is W's alone (lifecycle.walk.test.ts): it widens only `started`, and the spec world can't
   // deliver an old run's `started`, since a pending native start always belongs to the current run (I2.one, I6).
+  /** The twin: a violating trace replayed on the unmutated machine, and what it breaks there (nothing). */
+  const twinOf = (trace: readonly Spec.LcEvent[]): string[] => {
+    let s = initialState('s') as LcState;
+    let h = initialHistory();
+    const twin: string[] = [];
+    for (const e of trace) {
+      const st = stepSpec(THIS, s, h, e);
+      if (!st) {
+        twin.push(`${e.t} not an event this machine takes`);
+        break;
+      }
+      twin.push(...st.problems);
+      ({ s, h } = st);
+    }
+    return twin;
+  };
   const SPEC_CONTROL_DEPTH = Number(process.env.FAMILIAR_LC_SPEC_CONTROL_DEPTH ?? 7);
   // Two are not caught within the CI depth from these origins (W's own checks catch them in CI); their
   // spec-check catch is the local deep run's (FAMILIAR_LC_SPEC_DEEP=1, depth 8 from the initial state).
@@ -407,20 +433,7 @@ describe('W with the spec checks', () => {
         mutations.clear();
       }
       expect(r.violation, `${mutation}: no violation to depth ${SPEC_CONTROL_DEPTH} from ${from}`).toBeDefined();
-      // The twin: the same trace on the unmutated machine breaks nothing.
-      let s = initialState('s') as LcState;
-      let h = initialHistory();
-      const twin: string[] = [];
-      for (const e of r.violation!.trace) {
-        const st = stepSpec(THIS, s, h, e);
-        if (!st) {
-          twin.push(`${e.t} not an event this machine takes`);
-          break;
-        }
-        twin.push(...st.problems);
-        ({ s, h } = st);
-      }
-      expect(twin, `${mutation}'s trace on the unmutated machine`).toEqual([]);
+      expect(twinOf(r.violation!.trace), `${mutation}'s trace on the unmutated machine`).toEqual([]);
     }, 900_000);
 
   // The generation marks (a later write retried, marked unsaved, the newest written) are ranked with the
@@ -498,24 +511,61 @@ describe('W with the spec checks', () => {
       expect(merged).toBeGreaterThan(0);
     }, 900_000);
 
+  /** The small world's budgets (FAMILIAR_LC_SPEC_SMALL): every budget at one, the person's actions at
+      FAMILIAR_LC_SPEC_PERSONS (default 2: Ctx counts them together, and one allows no Start then Stop). */
+  const SMALL_CTX: Ctx = { persons: Number(process.env.FAMILIAR_LC_SPEC_PERSONS ?? 2), notices: 1, pings: 1, calls: 1, pages: 1, stale: 1, exhaust: 1, watchdog: 1 };
   const fixLog = (line: string) => {
     if (process.env.FAMILIAR_LC_LOG) appendFileSync(process.env.FAMILIAR_LC_LOG, `${new Date().toISOString()} ${line}\n`);
   };
+  const fmt = (label: string, r: SpecResult) => `${label}: ${r.done ? 'fixpoint' : 'STOPPED'} at depth ${r.depth}, ${r.states} states, ${r.transitions} transitions, frontier ${r.frontier}, ${Math.round(r.ms / 1000)} s, peak heap ${r.peakHeapMb} MB${r.violation ? `, VIOLATION ${r.violation.problems.join('; ')} after ${show(r.violation.trace)}` : ''}`;
+  // The full budgets, run locally (FAMILIAR_LC_SPEC_FIXPOINT=1) for about 40 minutes: keyed by the SHA-256 of
+  // the renumbered form (FAMILIAR_LC_SPEC_FIXPOINT=exact: of the plain canonical form). It can't empty in that
+  // time (the spec alphabet offers every outcome at every point under Ctx's eight budgets, which multiply the
+  // states far more than History does), so it asserts no violation only. At 7254177 with the 134-clause checks,
+  // no violation in 40 minutes each: local through depth 12 (1,911,897 states, 13,094,456 transitions, frontier
+  // 1,079,770); remote through depth 15 (1,683,128 states, 14,969,883 transitions, frontier 747,972); peak heap
+  // 3.7 GB.
   for (const where of ['local', 'remote'] as const)
-    it.skipIf(!process.env.FAMILIAR_LC_SPEC_FIXPOINT)(`the spec checks hold to the fixpoint, ${where}`, () => {
-      const fmt = (label: string, r: SpecResult) => `${label}: ${r.done ? 'fixpoint' : 'STOPPED'} at depth ${r.depth}, ${r.states} states, ${r.transitions} transitions, frontier ${r.frontier}, ${Math.round(r.ms / 1000)} s, peak heap ${r.peakHeapMb} MB${r.violation ? `, VIOLATION ${r.violation.problems.join('; ')} after ${show(r.violation.trace)}` : ''}`;
-      // Keyed by the SHA-256 of the renumbered form (FAMILIAR_LC_SPEC_FIXPOINT=exact: of the plain canonical
-      // form), for about 40 minutes at most. It doesn't empty in that time: the spec alphabet offers every
-      // outcome at every point under Ctx's eight budgets, which multiply the states far more than History
-      // does, and renumbering merges only a few percent. At becbdf0, no violation: local stopped after depth
-      // 12 (1,911,897 states, 13,094,456 transitions, frontier 1,079,770, 2,565 s); remote after depth 14
-      // (934,600 states, 8,080,085 transitions, frontier 426,608, 2,925 s); peak heap 3.5 GB.
+    it.skipIf(!process.env.FAMILIAR_LC_SPEC_FIXPOINT)(`the spec checks hold over the full budgets for 40 minutes, ${where}`, () => {
       const renumber = process.env.FAMILIAR_LC_SPEC_FIXPOINT !== 'exact';
-      const r = walkSpec(THIS, where, Infinity, SPEC0(), { digest: true, renumber, budgetMs: 40 * 60_000, progress: (p) => fixLog(fmt(`spec progress ${where}${renumber ? ' renumbered' : ''}`, p)) });
-      fixLog(fmt(`SPEC FIXPOINT ${where}${renumber ? ' renumbered' : ''}`, r));
+      const label = `${where}${renumber ? ' renumbered' : ''}`;
+      const r = walkSpec(THIS, where, Infinity, SPEC0(), { digest: true, renumber, budgetMs: 40 * 60_000, progress: (p) => fixLog(fmt(`spec progress ${label}`, p)) });
+      fixLog(fmt(`SPEC FULL ${label}`, r));
+      expect(r.violation, r.violation?.problems.join('; ')).toBeUndefined();
+    }, 45 * 60_000);
+
+  // The small world, walked to its end (FAMILIAR_LC_SPEC_SMALL=1, locally): every Ctx budget at one, the
+  // person's actions at FAMILIAR_LC_SPEC_PERSONS. A fixpoint shows no violation in any interleaving within those
+  // budgets: evidence of its own beside the bounded walk above. Each mutation the spec checks catch in CI is run
+  // in it too, from the initial state. At 7254177 with the 134-clause checks:
+  // - persons 1: the fixpoint, no violation; local depth 25, 223,617 states, 1,475,004 transitions, 142 s;
+  //   remote depth 35, 29,700 states, 167,281 transitions, 17 s. It catches 19 of the 24 mutations and misses
+  //   five: lc-second-stop-stopped, lc-two-native-stops, lc-readmit-after-stop and lc-start-beside-orphan need a
+  //   second person action, lc-queue-outlives-run a second run.
+  // - persons 2 (the default): remote, the fixpoint, no violation, depth 42, 1,331,969 states, 11,478,938
+  //   transitions, 1,367 s; local doesn't empty in 40 minutes (no violation through depth 16, 2,020,489
+  //   states, frontier 720,206), so its fixpoint test fails by design. All five persons 1 misses are caught
+  //   here (depths 5, 4, 6, 5 and 13), twins clean.
+  for (const where of ['local', 'remote'] as const)
+    it.skipIf(!process.env.FAMILIAR_LC_SPEC_SMALL)(`the spec checks hold to the fixpoint of the small world, ${where}`, () => {
+      const r = walkSpec(THIS, where, Infinity, { ...SPEC0(), c: SMALL_CTX }, { digest: true, renumber: true, budgetMs: 40 * 60_000, progress: (p) => fixLog(fmt(`spec small progress ${where} ${canon(SMALL_CTX)}`, p)) });
+      fixLog(fmt(`SPEC SMALL ${where} ${canon(SMALL_CTX)}`, r));
       expect(r.violation, r.violation?.problems.join('; ')).toBeUndefined();
       expect(r.done, `stopped at depth ${r.depth} with ${r.frontier} in the frontier`).toBe(true);
     }, 45 * 60_000);
+  for (const [mutation, where] of LC.filter(([m]) => !DEEP.has(m)))
+    it.skipIf(!process.env.FAMILIAR_LC_SPEC_SMALL)(`${mutation} is caught in the small world, and its trace replays clean unmutated`, () => {
+      mutations.set([mutation]);
+      let r: SpecResult;
+      try {
+        r = walkSpec(THIS, where, Infinity, { ...SPEC0(), c: SMALL_CTX }, { digest: true, renumber: true, budgetMs: 20 * 60_000 });
+      } finally {
+        mutations.clear();
+      }
+      fixLog(`SPEC SMALL ${mutation}: ${r.violation ? `caught at depth ${r.depth}` : `not caught (${r.done ? 'fixpoint' : 'stopped'} at depth ${r.depth})`}, ${r.states} states`);
+      expect(r.violation, `${mutation}: not caught in the small world`).toBeDefined();
+      expect(twinOf(r.violation!.trace), `${mutation}'s trace on the unmutated machine`).toEqual([]);
+    }, 25 * 60_000);
 });
 
 export { mutations };

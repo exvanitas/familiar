@@ -446,10 +446,12 @@ describe('W for the run lifecycle', () => {
   // The fixpoint, run locally as the close's evidence (FAMILIAR_LC_FIXPOINT=1): the same walk with no depth
   // bound, keyed by the SHA-256 of the renumbered form, until the frontier is empty or about 30 minutes pass
   // (FAMILIAR_LC_FIXPOINT=exact keys the plain canonical form; it doesn't finish in that time). Progress goes
-  // to FAMILIAR_LC_LOG. At 1eb9cd0: local, the fixpoint at depth 45, 3,772,366 states, 33,463,682 transitions, 1,406 s;
-  // remote at depth 56, 782,230 states, 8,290,434 transitions. (At 22e6800: local depth 41, 2,681,234; remote depth 48,
-  // 411,602. Remote was already 691,192 at depth 53 by 8bc698a, pass 5's machine; 6b.13's retry marks took it to
-  // 882,502 at depth 55, and writing each generation once brought it to 782,230.)
+  // to FAMILIAR_LC_LOG. At 7254177: local, the fixpoint at depth 35, 2,038,928 states, 18,389,550 transitions, 554 s;
+  // remote at depth 42, 301,598 states, 3,176,914 transitions, 79 s. (At 22e6800: local depth 41, 2,681,234; remote
+  // depth 48, 411,602. Remote was 691,192 at depth 53 by 8bc698a; 6b.13's retry marks took it to 882,502 at depth 55;
+  // writing each generation once, 782,230 at depth 56 (local 3,772,366 at depth 45); the queue going with its run,
+  // 481,652 at depth 48 (local 2,290,292 at depth 36); and each write's identity fixed when issued, 301,598, since
+  // the queue now lives on its run and states no longer split on a queue flag that can no longer fire.)
   const fixpointLog = (line: string) => {
     if (process.env.FAMILIAR_LC_LOG) appendFileSync(process.env.FAMILIAR_LC_LOG, `${new Date().toISOString()} ${line}\n`);
   };
