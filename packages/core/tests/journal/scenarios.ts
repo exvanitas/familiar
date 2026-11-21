@@ -8,7 +8,7 @@
 // No Node imports here: this file is bundled into the page.
 
 import { createFakeModel, type FakeReply } from '../../src/testing/index.ts';
-import { decideByRules, defineJournalDoc, openJournal, type GatePolicy, type Decision, type DecisionPort, type PersonaEvent, type FamiliarTool, type Journal, type JournalClock, type JournalStore, type OwnerLock, type PresenceSnapshot, type ModelRequest } from '../../src/index.ts';
+import { decideByRules, defineJournalDoc, McpClient, openJournal, posixPaths, type GatePolicy, type Decision, type DecisionPort, type PersonaEvent, type FamiliarTool, type Journal, type JournalClock, type JournalStore, type OwnerLock, type PresenceSnapshot, type ModelRequest, type ProcessEvent, type ProcessPort, type SettingsStore, type Stored } from '../../src/index.ts';
 
 export interface Counters {
   get(name: string): number;
@@ -178,6 +178,10 @@ export interface OpenOptions {
   readonly earlyTimersMs?: number;
   /** The person's per-tool choices, as step 8's Settings will give them. */
   readonly policy?: GatePolicy;
+  /** The gate's policy read at each call, in place of a fixed one (a real client's, say). */
+  readonly policyNow?: () => GatePolicy;
+  /** The tools the turn holds, from the fake ones (a real server's wrappers in place of one, say). */
+  readonly tools?: (fakes: FamiliarTool[]) => FamiliarTool[];
 }
 
 /** Opens the scenario's journal over the shared store, with the fake model, tools and ports. */
@@ -197,7 +201,7 @@ export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
     model,
     modelId: 'fake-1',
     caps: { config: { maxReplyTokens: 200, ...o.caps }, call: { persona: 'olive', price: { inputPerMTok: 1, outputPerMTok: 2 } } },
-    tools: fakeTools(env, o.hang ?? (() => false), o.onRun),
+    tools: (o.tools ?? ((t) => t))(fakeTools(env, o.hang ?? (() => false), o.onRun)),
     clock,
     wake: { wakeAt: (at) => wakes.push(at) },
     consent: {
@@ -215,7 +219,7 @@ export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
     newGen: o.newGen,
     stepCap: o.stepCap,
     resendDelayMs: 50,
-    policy: o.policy ? () => o.policy! : undefined,
+    policy: o.policyNow ?? (o.policy ? () => o.policy! : undefined),
     // A notifier that shows each id once, as the real one must. Calls and ids are counted apart.
     notifier: {
       notify: (n) => {
@@ -233,6 +237,80 @@ export async function openFor(env: Env, store: JournalStore, o: OpenOptions) {
 }
 
 const callOnce = (name: string, args: unknown): FakeReply => ({ text: 'On it.', toolCalls: [{ id: 'call-1', name, arguments: args }] });
+
+/** A settings store kept in the counters, so the client's saved record (its servers and the person's
+    choices) outlives a life as the app's own store does. Two faults for the controls: `drop-grant-write`
+    keeps every write without its choices (a grant that never reached the store, though life 1 holds it in
+    memory); `lose-grant`, life 2 reads the record with its choices gone (a grant saved but not reloaded). */
+export function countersSettings(env: Env): SettingsStore {
+  const { counters } = env;
+  const keys = (): string[] => JSON.parse(counters.note('settings-keys') || '[]');
+  const read = (key: string): Stored | undefined => {
+    const text = counters.note(`settings:${key}`);
+    if (!text) return undefined;
+    const r = JSON.parse(text) as Stored;
+    if (env.life === 2 && counters.get('lose-grant') && r.value && typeof r.value === 'object' && 'choices' in r.value) return { ...r, value: { ...r.value, choices: {} } };
+    return r;
+  };
+  const write = (key: string, record: Stored | undefined) => {
+    if (record && counters.get('drop-grant-write') && record.value && typeof record.value === 'object' && 'choices' in record.value) record = { ...record, value: { ...record.value, choices: {} } };
+    counters.note(`settings:${key}`, record ? JSON.stringify(record) : '');
+    const all = new Set(keys());
+    if (record) all.add(key);
+    else all.delete(key);
+    counters.note('settings-keys', JSON.stringify([...all].sort()));
+  };
+  return {
+    get: async (key) => read(key),
+    put: async (key, record) => write(key, record),
+    delete: async (key) => write(key, undefined),
+    keys: async (prefix) => keys().filter((k) => k.startsWith(prefix)),
+    putIf: async (key, record, guard) => (guard(read(key)) ? (write(key, record), true) : false),
+    deleteIf: async (key, guard) => (guard(read(key)) ? (write(key, undefined), true) : false)
+  };
+}
+
+/** A local MCP server as the exe's process port shows it: it lists `server_lookup`, and counts each call that
+    reaches it, which only the client's send() can make. In life 1 the call reaches it and is never
+    answered: the step is under way at the kill. */
+function lookupServer(env: Env): ProcessPort {
+  let emit: (e: ProcessEvent) => void = () => {};
+  const send = (m: unknown) => queueMicrotask(() => emit({ t: 'out', line: JSON.stringify(m) }));
+  return {
+    async start(_setup, on) {
+      emit = on;
+      return { run: `life-${env.life}` };
+    },
+    async write(_run, bytes) {
+      const m = JSON.parse(new TextDecoder().decode(bytes));
+      if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'srv' } } });
+      else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'server_lookup', description: "An MCP server's tool.", inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'], additionalProperties: false } }] } });
+      else if (m.method === 'tools/call') {
+        env.counters.bump('starts:server_lookup');
+        if (env.life === 1) return void env.counters.bump('hung:server_lookup');
+        send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: `server says: ${m.params?.arguments?.q}` }] } });
+      }
+    },
+    async stop() {
+      queueMicrotask(() => emit({ t: 'exit', code: 0 }));
+    },
+    async forget() {}
+  };
+}
+
+/** The real client over the counters' store and the fake server, Ready; in life 1 the server is added and
+    "may run on its own" saved for its tool, through the client, as Settings saves it. */
+async function grantedClient(env: Env) {
+  const client = await McpClient.open({ store: countersSettings(env), processes: lookupServer(env), net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: offsetClock(env.counters), paths: posixPaths });
+  if (env.life === 1) await client.add({ setup: { kind: 'local', id: 'srv', label: 'Srv', program: '/usr/bin/srv', args: [], cwd: '/', env: [], secrets: [] }, problems: [] });
+  const started = await client.start('srv');
+  if (started.kind !== 'ready') throw new Error(`The server didn't start: ${JSON.stringify(started)}`);
+  const wrappers = client.tools();
+  const lookup = wrappers.find((t) => t.serverName === 'server_lookup');
+  if (!lookup) throw new Error('The server offers no server_lookup.');
+  if (env.life === 1) await client.choose('srv', 'server_lookup', { policy: 'own', fingerprint: lookup.fingerprint, setupFingerprint: lookup.setupFingerprint });
+  return { client, wrappers, name: lookup.name };
+}
 const answerTool = (r: ModelRequest): FakeReply => ({ text: `Done. (${lastText(r)})` });
 
 /** A scenario where the first reply calls one tool, which hangs in life 1. */
@@ -305,34 +383,45 @@ export const SCENARIOS: readonly Scenario[] = [
 
   // The same, with the tool marked "may run on its own", and a model that calls it again on its own, with a new id,
   // as soon as it sees the interruption. The turn ends instead: the model gets no request, and nothing
-  // runs until the person picks Run again.
-  toolKill(
-    'server-reissue',
-    'server-reissue',
-    'server_lookup',
-    { q: 'trains' },
-    async (env, j) => {
-      const [question] = await j.questions();
+  // runs until the person picks Run again. The grant is a real one: saved through the client in life 1,
+  // reloaded from its store in life 2, and the tool is the client's own wrapper, sending through send().
+  {
+    name: 'server-reissue',
+    async run(env) {
+      const store = await env.openStore('server-reissue');
+      const { client, wrappers, name } = await grantedClient(env);
+      const { journal } = await openFor(env, store, {
+        tools: (fakes) => [...fakes.filter((t) => t.name !== 'server_lookup'), ...wrappers],
+        policyNow: () => client.policy(wrappers),
+        script: (r) => {
+          const last = r.messages.at(-1);
+          if (last?.role === 'user' && last.content.startsWith('Run ')) return { toolCalls: [{ id: 'call-3', name, arguments: { q: 'trains' } }] };
+          if (lastIsTool(r) && /may have partially run/.test(last!.content)) {
+            env.counters.bump('reissue-asked');
+            return { toolCalls: [{ id: 'call-2', name, arguments: { q: 'trains' } }] };
+          }
+          return lastIsTool(r) ? answerTool(r) : callOnce(name, { q: 'trains' });
+        }
+      });
+      if (env.life === 1) {
+        void journal.send('Please do the thing.', 'turn-1');
+        while (env.counters.get('hung:server_lookup') < 1) await sleep(10);
+        env.ready(() => journal.kill());
+        return undefined;
+      }
+      const end = await journal.turn(await turnId(journal)).wait();
+      const [question] = await journal.questions();
       const asksBefore = env.counters.get('reissue-asked');
       const startsBefore = env.counters.get('starts:server_lookup');
       const cardsBefore = env.counters.get('consent-asks');
-      const turn = question ? await j.answer(question.id, true, 'rerun-1') : undefined;
+      const turn = question ? await journal.answer(question.id, true, 'rerun-1') : undefined;
       const rerun = turn ? await turn.wait() : undefined;
-      return { asksBefore, startsBefore, cardsBefore, rerun, startsAfter: env.counters.get('starts:server_lookup'), cardsAfter: env.counters.get('consent-asks') };
-    },
-    (env) => ({
-      policy: { perTool: { server_lookup: 'own' } },
-      script: (r) => {
-        const last = r.messages.at(-1);
-        if (last?.role === 'user' && last.content.startsWith('Run ')) return { toolCalls: [{ id: 'call-3', name: 'server_lookup', arguments: { q: 'trains' } }] };
-        if (lastIsTool(r) && /may have partially run/.test(last!.content)) {
-          env.counters.bump('reissue-asked');
-          return { toolCalls: [{ id: 'call-2', name: 'server_lookup', arguments: { q: 'trains' } }] };
-        }
-        return lastIsTool(r) ? answerTool(r) : callOnce('server_lookup', { q: 'trains' });
-      }
-    })
-  ),
+      const summary = { end, asksBefore, startsBefore, cardsBefore, rerun, startsAfter: env.counters.get('starts:server_lookup'), cardsAfter: env.counters.get('consent-asks'), transcript: await journal.transcript() };
+      await journal.close();
+      await client.stop('srv');
+      return summary;
+    }
+  },
 
   // Skip: the turn goes on without it, and a call the model makes to it again doesn't run in this turn.
   toolKill(

@@ -14,6 +14,20 @@ describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its c
   }
 });
 
+// server-reissue's grant is a real one, saved through the client and reloaded from its store: with the
+// grant lost on its way to life 2, in saving or in reloading, life 2 asks for a card, and the check fails.
+describe("server-reissue's grant, lost across the reopen (the controls)", () => {
+  for (const fault of ['drop-grant-write', 'lose-grant'])
+    it(`${fault}: the rerun asks, and the check fails`, async () => {
+      const world = nodeWorld();
+      world.counters.set(fault, 1);
+      const s = (await killAndResume(scenario('server-reissue'), world)) as any;
+      expect(() => CHECKS['server-reissue']!.verify(s)).toThrow();
+      expect(s.cardsBefore).toBe(0);
+      expect(s.cardsAfter).toBe(1);
+    });
+});
+
 // A built-in write killed at every point of its window: right after each transaction from the tool's
 // start to past the turn's end. Whatever the point, exactly one row is committed, and the step's result
 // carries that row's token.
