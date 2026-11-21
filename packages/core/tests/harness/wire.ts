@@ -1201,8 +1201,8 @@ export class Driver {
   test(id = 's1'): void {
     const before = this.client.get(id)?.phase;
     const token = `test-${++this.tests}`;
-    // Whether Test reaches the machine: only from Stopped or Failed (otherwise the client answers at once).
-    const e = this.note({ what: 'test', server: id, token, reaches: before === 'stopped' || before === 'failed' || before === undefined });
+    // Every Test reaches the machine, which refuses one while a run is under way (G27, r35b #14).
+    const e = this.note({ what: 'test', server: id, token, reaches: true });
     const testing = this.client.test(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void testing.then(
