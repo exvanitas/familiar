@@ -37,20 +37,13 @@ export class ServerRuntime {
   private readonly owner: Owner;
   /** Hears a run's tool list, with whether that run is still this server's run; settles once it's saved. */
   private readonly onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void;
-  /** What the start under way was asked as: an automatic start's relaunch rechecks the enabled flag. */
-  private asked?: { readonly auto: boolean; readonly setup: OwnedServer['setup'] };
-
-  /** The link's limits: one object the link reads at each use, set again from the record at each Start. */
-  private readonly limits: { -readonly [K in keyof LinkLimits]: LinkLimits[K] };
   private readonly portLimits: Partial<LinkLimits> | undefined;
 
-  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void, transition?: LinkEvents['transition']) {
+  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void, hooks: { readonly transition?: LinkEvents['transition']; readonly exchange?: LinkEvents['exchange'] } = {}) {
     this.id = id;
     this.owner = owner;
     this.onListed = onListed;
     this.portLimits = ports.limits;
-    const limits = { ...LINK_LIMITS, ...linkLimitsOf(owner.server(id)), ...ports.limits };
-    this.limits = limits;
     this.link = new ServerLink(id, { net: ports.net, processes: ports.processes }, ports.clock, {
       changed: onChange,
       ended: () => onChange(),
@@ -64,22 +57,14 @@ export class ServerRuntime {
         const a = this.owner.admit('start', { start: true });
         return 'release' in a ? a : { words: a.ok ? '' : a.words };
       },
-      readmit: () => {
+      // The committed record now, for the machine's relaunch decision: nothing here decides.
+      record: () => {
         const now = this.owner.server(this.id);
-        const again = this.owner.admit('start', { start: true });
-        if (!('release' in again)) return { ok: false, words: 'Familiar is saving another change. Press Start again.' };
-        if (this.asked?.auto && !now?.enabled) {
-          again.release();
-          return { ok: false, words: 'It is turned off.', off: true };
-        }
-        if (JSON.stringify(now?.setup) !== JSON.stringify(this.asked?.setup)) {
-          again.release();
-          return { ok: false, words: 'The setup changed. Press Start again.' };
-        }
-        return { ok: true, release: again.release };
+        return { enabled: !!now?.enabled && !now.removing, launch: now && !now.removing ? setupFingerprint(now.setup) : '' };
       },
-      ...(transition ? { transition } : {})
-    }, limits);
+      ...(hooks.transition ? { transition: hooks.transition } : {}),
+      ...(hooks.exchange ? { exchange: hooks.exchange } : {})
+    }, { ...LINK_LIMITS, ...linkLimitsOf(owner.server(id)), ...ports.limits });
   }
 
   get phase(): Phase {
@@ -107,8 +92,9 @@ export class ServerRuntime {
     return this.run?.id;
   }
 
-  /** The record's facts for a start, read in the same step as the admission (5.4), and its target. */
-  private prepare(auto: boolean): { readonly facts: Partial<StartFacts>; readonly target?: Target; readonly launch?: string } {
+  /** The record's facts for a start, read in the same step as the admission (5.4), its target and its
+      limits. It writes nothing: a start the machine refuses leaves every run as it was. */
+  private prepare(auto: boolean): { readonly facts: Partial<StartFacts>; readonly target?: Target; readonly launch?: string; readonly limits?: LinkLimits } {
     const record: OwnedServer | undefined = this.owner.server(this.id);
     if (!record) return { facts: { record: this.owner.unreadableServers().includes(this.id) ? 'unreadable' : 'missing' } };
     if (record.removing) return { facts: { record: 'removing' } };
@@ -117,10 +103,9 @@ export class ServerRuntime {
     if (setup.kind === 'remote' && setup.transport === 'sse') return { facts: { record: 'sse' } };
     try {
       const target: Target = setup.kind === 'local' ? { where: 'local', setup: processSetupOf(setup) } : { where: 'remote', address: setup.address ?? '', url: setup.url, headers: Object.entries(remoteHeaders(remoteTargetOf(setup))) };
-      // The committed record's limits, read in the same step: a handshake limit set since applies now.
-      Object.assign(this.limits, LINK_LIMITS, linkLimitsOf(record), this.portLimits);
-      this.asked = { auto, setup };
-      return { facts: { record: 'ok' }, target, launch: setupFingerprint(setup) };
+      // The committed record's limits, read in the same step: the run keeps them, whatever is saved later.
+      const limits: LinkLimits = { ...LINK_LIMITS, ...linkLimitsOf(record), ...this.portLimits };
+      return { facts: { record: 'ok' }, target, launch: setupFingerprint(setup), limits };
     } catch {
       return { facts: { record: 'unlaunchable' } };
     }
@@ -134,7 +119,7 @@ export class ServerRuntime {
   async start(options: { readonly auto?: boolean } = {}): Promise<Reply> {
     const p = this.prepare(!!options.auto);
     const placeholder: Target = { where: 'remote', address: '', url: '', headers: [] };
-    const r = await this.link.startReply(p.target ?? placeholder, p.launch ?? '', options.auto ? 'auto' : 'start', p.facts);
+    const r = await this.link.startReply(p.target ?? placeholder, p.launch ?? '', options.auto ? 'auto' : 'start', p.facts, p.limits);
     return replyOf(r);
   }
 
@@ -142,7 +127,7 @@ export class ServerRuntime {
   test(): ReturnType<ServerLink['test']> {
     const p = this.prepare(false);
     const placeholder: Target = { where: 'remote', address: '', url: '', headers: [] };
-    return this.link.test(p.target ?? placeholder, p.launch ?? '', p.facts);
+    return this.link.test(p.target ?? placeholder, p.launch ?? '', p.facts, p.limits);
   }
 
   /** Stops the run only if it is still `run`: never a run started since. */

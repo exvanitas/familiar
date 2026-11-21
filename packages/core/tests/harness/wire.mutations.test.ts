@@ -102,6 +102,11 @@ const CONTROLS: Control[] = [
   { mutation: 'ready-before-drain', check: 'H1', named: 'S27 a call the moment Start answers Ready, remote' },
   // The driver decides something outside next(): HC sees its state leave the machine's.
   { mutation: 'driver-decides', check: 'HC', mode: { ...remote, era: 'legacy', pings: 2, session404: 'none', redirect: 0 } },
+  // HC's independent records: a driver that skips an effect, makes an extra native call, or answers an
+  // action without its event.
+  { mutation: 'driver-skips-effect', check: 'HC', named: 'S11 Stop during a live local call' },
+  { mutation: 'stop-twice', check: 'HC', named: 'S11 Stop during initialize, local' },
+  { mutation: 'driver-answers-unasked', check: 'HC', named: 'S11 Stop during a live local call' },
   { mutation: 'cr-forgets-pair', check: 'H10', mode: { where: 'remote', era: 'legacy', sse: 1, session404: 'none', redirect: 0, earlyEnd: 0 } }
 ];
 

@@ -736,17 +736,57 @@ export const HC: Check = (r) => {
   const problems: string[] = [];
   for (const [server, records] of r.lifecycle) {
     let s = initialState(server);
-    for (let i = 0; i < records.length && problems.length < 3; i++) {
+    // What replay says the driver must have done, to compare with what the natives, the owner and the
+    // replies recorded independently.
+    let starts = 0;
+    let stops = 0;
+    let answers = 0;
+    const endLive: { run: string; i: number; seq: number }[] = [];
+    for (let i = 0; i < records.length; i++) {
       const rec = records[i]!;
-      s = next(s, rec.event).state;
-      if (canonical(s) !== canonical(rec.state)) {
+      const out = next(s, rec.event);
+      s = out.state;
+      for (const fx of out.effects) {
+        if (fx.t === 'native-start') starts++;
+        else if (fx.t === 'native-stop') stops++;
+        else if (fx.t === 'answer') answers++;
+        else if (fx.t === 'end-live') endLive.push({ run: fx.run, i, seq: rec.seq ?? 0 });
+      }
+      if (problems.length < 3 && canonical(s) !== canonical(rec.state)) {
         problems.push(`HC: ${server}'s state after event ${i} (${rec.event.t}) isn't the machine's`);
         s = rec.state;
       }
-      if (rec.quiet && (rec.state.slot === 'busy') !== rec.busy) problems.push(`HC: ${server}'s slot mirror says ${rec.state.slot} after event ${i} (${rec.event.t}), the exchange machine ${rec.busy ? 'busy' : 'idle'}`);
+      if (problems.length < 3 && rec.quiet && (rec.state.slot === 'busy') !== rec.busy) problems.push(`HC: ${server}'s slot mirror says ${rec.state.slot} after event ${i} (${rec.event.t}), the exchange machine ${rec.busy ? 'busy' : 'idle'}`);
+    }
+    // Each native-start effect is one port start; each native-stop one port stop.
+    const ported = r.exe.processStarts.filter((t) => t.server === server);
+    if (starts !== ported.length) problems.push(`HC: ${server}: replay asks ${starts} native starts, the port saw ${ported.length}`);
+    const epochs = new Set(ported.map((t) => t.epoch));
+    const stopped = r.exe.stopsAsked.filter((t) => epochs.has(t.epoch)).length;
+    if (stops !== stopped) problems.push(`HC: ${server}: replay asks ${stops} native stops, the port saw ${stopped}`);
+    // Each answer is one reply, and no reply comes without one.
+    const replies = r.evidence.filter((e) => (e.server ?? 's1') === server && (e.what === 'started' || e.what === 'stopped' || (e.what === 'tested' && r.evidence.some((t) => t.what === 'test' && t.reaches && t.seq < e.seq && (t.server ?? 's1') === server && !r.evidence.some((u) => u.what === 'tested' && u.seq > t.seq && u.seq < e.seq))))).length;
+    if (answers !== replies) problems.push(`HC: ${server}: replay answers ${answers} actions, ${replies} replies came`);
+    // Every exchange admitted for a run ends, by the exchange machine's own terminal step, once that run is
+    // over; an end-live effect for a run with an exchange still open is followed by its end.
+    const ex = r.exchanges.get(server) ?? [];
+    // An end-live for a run with an exchange still open ends that exchange, as the run's end.
+    for (const e of endLive) {
+      const open = ex.filter((x) => x.t === 'admit' && x.run === e.run && x.seq < e.seq && !ex.some((y) => y.t === 'ended' && y.n === x.n && y.seq < e.seq));
+      for (const o of open) if (!ex.some((y) => y.t === 'ended' && y.n === o.n && y.end === 'run-ended')) problems.push(`HC: ${server}: end-live for run ${e.run} at event ${e.i}, and its exchange ${o.n} (${o.kind}) didn't end as the run's end`);
+    }
+    const current = s.run?.id;
+    for (const a of ex.filter((x) => x.t === 'admit')) {
+      const ended = ex.some((x) => x.t === 'ended' && x.n === a.n);
+      if (!ended && a.run !== current) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) of run ${a.run}, which is over, never ended`);
     }
   }
-  return problems.slice(0, 3);
+  // At each native start the owner is reserved, and by a start.
+  for (const t of r.exe.processStarts) {
+    const open = r.reservations.filter((x) => x.seq < t.seq && (x.released === undefined || x.released > t.seq));
+    if (open.length !== 1 || open[0]!.what !== 'start') problems.push(`HC: a native start went out with the owner ${open.length ? `held for ${open.map((x) => x.what).join(', ')}` : 'free'}`);
+  }
+  return problems.slice(0, 4);
 };
 
 export const WIRE_CHECKS: Record<string, Check> = { H1, H2, H3, H10, H11, H12, H13, H14, H15, HC };

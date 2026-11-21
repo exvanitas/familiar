@@ -35,6 +35,7 @@ const canonical = (v: unknown): string => {
 };
 
 const FAIL = { kind: 'protocol' as const, words: 'x' };
+const READMIT_OK = { ownerFree: true, enabled: true, launch: '' };
 
 /** Every event the world may deliver in `s`, given what the trace has used. */
 function alphabet(s: LcState, c: Ctx, where: Where): [LcEvent, Ctx][] {
@@ -55,9 +56,9 @@ function alphabet(s: LcState, c: Ctx, where: Where): [LcEvent, Ctx][] {
     add({ t: 'started', run: `${s.id}#0`, ok: true, process: 'p0' }, { stale: 1 });
     add({ t: 'admin-done', run: `${s.id}#0`, outcome: { k: 'legacy' } }, { stale: 1 });
     add({ t: 'deadline', id: 0 }, { stale: 1 });
-    add({ t: 'readmit', run: `${s.id}#0`, ok: true }, { stale: 1 });
+    add({ t: 'readmit', run: `${s.id}#0`, facts: READMIT_OK }, { stale: 1 });
   }
-  if (s.zombie) add({ t: 'readmit', run: s.zombie, ok: true });
+  if (s.zombie) add({ t: 'readmit', run: s.zombie, facts: READMIT_OK });
   for (const o of s.orphans) add({ t: 'exit', process: o.process, failure: FAIL });
   if (!run) return out;
   const n = run.native;
@@ -106,8 +107,11 @@ function alphabet(s: LcState, c: Ctx, where: Where): [LcEvent, Ctx][] {
     add({ t: 'saved', gen: s.saving.gen, outcome: 'failed' });
   }
   if (run.step === 'relaunch') {
-    add({ t: 'readmit', run: run.id, ok: true });
-    add({ t: 'readmit', run: run.id, ok: false, words: 'The setup changed. Press Start again.' });
+    // The relaunch's facts read now: all well; the owner busy; the setup changed; turned off.
+    add({ t: 'readmit', run: run.id, facts: { ...READMIT_OK, launch: run.launch } });
+    add({ t: 'readmit', run: run.id, facts: { ...READMIT_OK, launch: run.launch, ownerFree: false, ownerWords: 'Saving another change.' } });
+    add({ t: 'readmit', run: run.id, facts: { ...READMIT_OK, launch: `${run.launch}+` } });
+    add({ t: 'readmit', run: run.id, facts: { ...READMIT_OK, launch: run.launch, enabled: false } });
   }
   return out;
 }

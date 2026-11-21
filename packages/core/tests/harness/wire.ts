@@ -395,7 +395,7 @@ export class FakeExe {
   /** Local: when each response line reached the client, by epoch and request id. */
   readonly responded = new Map<string, number>();
   /** Local: when the client asked the exe to stop each process run, by epoch. */
-  readonly stopsAsked: { epoch: number; step: number }[] = [];
+  readonly stopsAsked: { epoch: number; step: number; seq?: number }[] = [];
   /** Local: when each process run exited, by epoch. */
   readonly exits: { epoch: number; step: number }[] = [];
   /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2). */
@@ -825,7 +825,7 @@ export class FakeExe {
         }),
       stop: async (run) => {
         const asked = live.get(run);
-        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step });
+        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step, seq: this.tick() });
         if (this.server.mode.refuseStop) throw Object.assign(new Error('refused'), { kind: 'failed' });
         this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) });
       },
@@ -861,6 +861,8 @@ export interface Evidence {
   /** The scheduler's clock when it was noted, in ms. */
   readonly at?: number;
   readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant';
+  /** On a `test`: whether it reached the machine (Test from Stopped or Failed). */
+  readonly reaches?: boolean;
   /** On a `yes` minted from a saved grant: the fingerprint it was given on (H3 holds the call to it). */
   readonly grant?: string;
   /** Test's report: whether it listed, and the tool names it showed. */
@@ -883,15 +885,37 @@ export interface Evidence {
 
 /** One lifecycle transition as the driver made it: the event, the state it then held, and the exchange slot. */
 export interface LcRecord {
+  readonly seq?: number;
   readonly event: LcEvent;
   readonly state: LcState;
   readonly busy: boolean;
   readonly quiet: boolean;
 }
 
+/** The exchange machine's own outputs, as the driver reported them: each exchange admitted and ended. */
+export interface ExchangeRecord {
+  readonly t: 'admit' | 'ended';
+  readonly n: number;
+  readonly run: string;
+  readonly kind: string;
+  readonly end?: string;
+  readonly seq: number;
+}
+
+/** The owner's reservations, recorded at the owner itself: what each was for, and when it was released. */
+export interface Reservation {
+  readonly what: string;
+  readonly seq: number;
+  released?: number;
+}
+
 export interface WireRun {
   /** Each server's lifecycle record, in order (the conformance check replays it through next()). */
   readonly lifecycle: ReadonlyMap<string, readonly LcRecord[]>;
+  /** Each server's exchanges, admitted and ended (HC's independent record). */
+  readonly exchanges: ReadonlyMap<string, readonly ExchangeRecord[]>;
+  /** Every owner reservation (HC's independent record). */
+  readonly reservations: readonly Reservation[];
   readonly sched: Scheduler;
   readonly exe: FakeExe;
   readonly server: ScriptedServer;
@@ -928,8 +952,11 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   let addresses = 0;
   const store = holdable(memorySettingsStore());
   const lifecycle = new Map<string, LcRecord[]>();
+  const exchanges = new Map<string, ExchangeRecord[]>();
+  const reservations: Reservation[] = [];
   const client = await McpClient.open({
-    transition: (id, event, state, slot) => lifecycle.set(id, [...(lifecycle.get(id) ?? []), { event, state, ...slot }]),
+    transition: (id, event, state, slot) => lifecycle.set(id, [...(lifecycle.get(id) ?? []), { event, state, ...slot, seq: next() }]),
+    exchange: (id, e) => exchanges.set(id, [...(exchanges.get(id) ?? []), { ...e, seq: next() }]),
     store,
     processes: exe.processes(),
     net: exe.net(),
@@ -939,6 +966,20 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
     paths: { program: () => undefined, folder: () => undefined } as any,
     limits: { startMs: 60_000, listMs: 30_000 }
   });
+  // Every reservation, recorded at the owner itself, with its release.
+  const owner = client.owner;
+  const admit = owner.admit.bind(owner);
+  owner.admit = ((what: string, o?: { readonly start?: boolean }) => {
+    const a = admit(what, o);
+    if (!('release' in a)) return a;
+    const rec: Reservation = { what, seq: next() };
+    reservations.push(rec);
+    const release = a.release;
+    return { ...a, release: () => {
+      rec.released ??= next();
+      release();
+    } };
+  }) as typeof owner.admit;
   const ids = Array.from({ length: options.servers ?? 1 }, (_, i) => `s${i + 1}`);
   for (const id of ids) {
     const setup = mode.where === 'remote' ? { kind: 'remote' as const, id, label: `Scripted ${id}`, url: `https://${id}.example/mcp`, transport: 'http' as const, headers: [] } : { kind: 'local' as const, id, label: `Scripted ${id}`, program: 'node', args: [], cwd: '/', env: [], secrets: [] };
@@ -951,7 +992,7 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   await sched.run(options.steps ?? 1500);
   if (options.mutation && firstHit === undefined && mutations.hits(options.mutation) > 0) firstHit = sched.step;
   mutations.clear();
-  return { sched, exe, server, evidence, firstHit, lifecycle };
+  return { sched, exe, server, evidence, firstHit, lifecycle, exchanges, reservations };
 }
 
 export class Driver {
@@ -1088,7 +1129,8 @@ export class Driver {
   /** Test, as Settings runs it: its report, with the tools it showed. */
   test(id = 's1'): void {
     const before = this.client.get(id)?.phase;
-    const e = this.note({ what: 'test', server: id });
+    // Whether Test reaches the machine: only from Stopped or Failed (otherwise the client answers at once).
+    const e = this.note({ what: 'test', server: id, reaches: before === 'stopped' || before === 'failed' || before === undefined });
     const testing = this.client.test(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void testing.then(

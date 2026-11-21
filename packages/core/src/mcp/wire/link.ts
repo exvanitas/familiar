@@ -93,13 +93,17 @@ export interface LinkEvents {
   listed?(run: string, tools: readonly ListedTool[]): Promise<'saved' | 'skipped' | 'failed' | void> | 'saved' | 'skipped' | 'failed' | void;
   /** The owner's admission for a native start: held while the exe answers it (5.1). */
   admit?(): { readonly release: () => void } | { readonly words: string };
-  /** The relaunch's second admission, with the committed record read again (3.9). */
-  readmit?(run: string): { readonly ok: true; readonly release?: () => void } | { readonly ok: false; readonly words: string; readonly off?: boolean };
+  /** The committed record now, for a relaunch the machine decides (3.9): whether it's enabled, and its
+      launch fingerprint ('' when the record is gone). The owner's admission is asked separately. */
+  record?(): { readonly enabled: boolean; readonly launch: string };
   /** The phase or its words changed. */
   changed?(): void;
   /** The test build's conformance record: every event fed, the state the driver then holds, and the
       exchange machine's slot (busy or not), with whether the queue had drained. */
   transition?(event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }): void;
+  /** The test build's record of the exchange machine's own outputs: each exchange admitted, for which run, and
+      its terminal end (the conformance check matches the machine's end-live effects against them). */
+  exchange?(e: { readonly t: 'admit' | 'ended'; readonly n: number; readonly run: string; readonly kind: string; readonly end?: string }): void;
 }
 
 /** What one exchange gave back. */
@@ -115,6 +119,8 @@ interface Wire {
   readonly id: string;
   readonly target: Target;
   readonly launch: string;
+  /** The limits the run was admitted with: its own, never changed by a later action. */
+  readonly limits: LinkLimits;
   era: Era;
   version?: string;
   sessionId?: string;
@@ -169,6 +175,8 @@ export class ServerLink {
   /** Native request id per handle, remote. */
   private readonly natives = new Map<string, string>();
   private readonly idle: (() => void)[] = [];
+  /** The number of the exchange exchangeNow last admitted. */
+  private admitted = 0;
 
   /* The lifecycle: its state lives only in the machine (lifecycle.ts); the driver feeds it events and does
      its effects, and decides nothing. */
@@ -184,10 +192,16 @@ export class ServerLink {
   private tokens = 0;
   /** The owner's admission while the machine holds it (a native start), released by its effect. */
   private ownerHold?: () => void;
-  /** What the next run the machine starts is: its target and launch. */
-  private next?: { readonly target: Target; readonly launch: string };
-  /** Test-only listeners for a catalog published (list()). */
-  private readonly published: ((run: string) => void)[] = [];
+  /** Each start asked but not yet consumed by the machine: what its run would be, and the owner's
+      reservation bound to its token until next() decides (kept, if the machine holds the owner; released,
+      if not). Nothing about it touches any other run. */
+  private readonly asked = new Map<string, { readonly target: Target; readonly launch: string; readonly limits: LinkLimits; readonly release?: () => void }>();
+  /** The relaunch's owner reservation, bound to its run until the machine decides its readmit. */
+  private readmitHold?: { readonly run: string; readonly release: () => void };
+  /** Test-only watchers, called after every drain (list()). */
+  private readonly watchers = new Set<() => void>();
+  /** Test reports, captured when a Test run publishes: never read from a wire a later run replaced. */
+  private readonly reports = new Map<string, { readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] }>();
   /** The exe's cleanup refusal for good, as words (the machine holds the same). */
   private stuck?: Failure;
 
@@ -260,8 +274,10 @@ export class ServerLink {
     try {
       while (this.queue.length) {
         const ev = this.queue.shift()!;
+        const before = this.lc;
         const out = next(this.lc, ev);
         this.lc = out.state;
+        this.bind(ev, before, out.state);
         for (const fx of out.effects) this.apply(fx);
         // A driver that decides outside next() (the conformance check's control).
         if (__FAMILIAR_MUTATIONS__ && ev.t === 'slot' && !ev.idle && mutant('driver-decides')) this.lc = { ...this.lc, slot: 'idle' };
@@ -270,20 +286,53 @@ export class ServerLink {
     } finally {
       this.draining = false;
     }
+    for (const w of [...this.watchers]) w();
     if (`${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}` !== before) this.events.changed?.();
   }
 
-  private wireFor(run: string, era: Era): Wire {
-    let w = this.wires.get(run);
-    if (!w) {
-      const from = this.next!;
-      w = { id: run, target: from.target, launch: from.launch, era, tools: [], declarations: new Map(), notOffered: [], nextId: 1, last: new LastOutput(), pages: [] };
-      this.wires.set(run, w);
-      // Keep only what's still needed: the current run and any whose process may still be running.
-      for (const id of [...this.wires.keys()]) if (id !== run && id !== this.lc.run?.id && !this.lc.orphans.some((o) => o.run === id)) this.wires.delete(id);
+  /**
+   * What an action asked for, bound once next() has consumed its event: a new run gets its own wire (target,
+   * launch, limits), and the owner's reservation is kept only if the machine now holds the owner for a
+   * native start, released otherwise. A refused action leaves every run as it was.
+   */
+  private bind(ev: LcEvent, before: LcState, after: LcState): void {
+    const created = after.run && after.run.id !== before.run?.id ? after.run : undefined;
+    if (ev.t === 'start') {
+      const a = this.asked.get(ev.token);
+      this.asked.delete(ev.token);
+      if (!a) return;
+      if (created) this.newWire(created.id, a);
+      if (after.owner === 'start' && before.owner !== 'start' && created && !this.ownerHold) this.ownerHold = a.release;
+      else a.release?.();
+      return;
     }
+    if (ev.t === 'readmit') {
+      const h = this.readmitHold?.run === ev.run ? this.readmitHold : undefined;
+      if (h) this.readmitHold = undefined;
+      const from = this.wires.get(ev.run);
+      if (created && from) this.newWire(created.id, from);
+      if (h && after.owner === 'start' && before.owner !== 'start' && created && !this.ownerHold) this.ownerHold = h.release;
+      else h?.release();
+    }
+  }
+
+  private newWire(run: string, from: { readonly target: Target; readonly launch: string; readonly limits: LinkLimits }): void {
+    this.wires.set(run, { id: run, target: from.target, launch: from.launch, limits: from.limits, era: 'legacy', tools: [], declarations: new Map(), notOffered: [], nextId: 1, last: new LastOutput(), pages: [] });
+    // Keep only what's still needed: the current run and any whose process may still be running.
+    for (const id of [...this.wires.keys()]) if (id !== run && id !== this.lc.run?.id && !this.lc.orphans.some((o) => o.run === id)) this.wires.delete(id);
+  }
+
+  /** The run's wire, made when its admission was bound (bind()). */
+  private wireFor(run: string, era: Era): Wire {
+    const w = this.wires.get(run)!;
     w.era = era;
     return w;
+  }
+
+  /** The limits of the run the machine is on now (deadlines are armed for it), else the link's own. */
+  private limitsNow(): LinkLimits {
+    const r = this.lc.run;
+    return (r && this.wires.get(r.id)?.limits) ?? this.limits;
   }
 
   private apply(fx: LcEffect): void {
@@ -291,7 +340,14 @@ export class ServerLink {
       case 'native-start': {
         const w = this.wireFor(fx.run, fx.era);
         const setup = (w.target as Extract<Target, { where: 'local' }>).setup;
-        this.ports.processes!.start(setup, (e) => this.processEvent(w, e)).then(
+        // A port that throws before returning its promise is a rejected start, the same event.
+        let starting: Promise<{ readonly run: string }>;
+        try {
+          starting = this.ports.processes!.start(setup, (e) => this.processEvent(w, e));
+        } catch (e) {
+          starting = Promise.reject(e);
+        }
+        starting.then(
           (started) => {
             w.process = started.run;
             this.feed({ t: 'started', run: fx.run, ok: true, process: started.run });
@@ -304,7 +360,14 @@ export class ServerLink {
       }
       case 'native-stop': {
         const stop = () =>
-          this.ports.processes!.stop(fx.process).then(
+          // A port that throws before returning its promise is a refused stop, the same event.
+          new Promise<void>((res, rej) => {
+            try {
+              this.ports.processes!.stop(fx.process).then(res, rej);
+            } catch (e) {
+              rej(e);
+            }
+          }).then(
             () => this.feed({ t: 'stop-answered', run: fx.run, ok: true }),
             () => {
               const w = this.wires.get(fx.run);
@@ -319,12 +382,15 @@ export class ServerLink {
       case 'admin':
         return this.admin(fx.run, fx.want, fx.era);
       case 'end-live': {
+        // (The named mutation: a driver that skips an effect the machine asked for.)
+        if (__FAMILIAR_MUTATIONS__ && mutant('driver-skips-effect')) return;
         const ex = this.slot.ex;
         if (ex && ex.phase === 'live' && this.pending.get(ex.n)?.run.id === fx.run) this.input({ t: 'terminal', n: ex.n, end: { t: 'run-ended' } });
         return;
       }
       case 'arm': {
-        const ms = { start: this.limits.startMs, list: this.limits.listMs, recovery: this.limits.startMs, grace: this.limits.graceMs, stop: this.limits.stopMs }[fx.which];
+        const l = this.limitsNow();
+        const ms = { start: l.startMs, list: l.listMs, recovery: l.startMs, grace: l.graceMs, stop: l.stopMs }[fx.which];
         const cancel = this.clock.setTimer(() => {
           this.timers.delete(fx.id);
           this.feed({ t: 'deadline', id: fx.id });
@@ -337,10 +403,8 @@ export class ServerLink {
         this.timers.delete(fx.id);
         return;
       case 'owner-hold':
-        if (!this.ownerHold) {
-          const a = this.events.admit?.();
-          if (a && 'release' in a) this.ownerHold = a.release;
-        }
+        // The reservation was taken before the event and bound to it (bind()): nothing is acquired here, so a
+        // native start never goes out on an admission that failed.
         return;
       case 'owner-release': {
         const r = this.ownerHold;
@@ -360,7 +424,8 @@ export class ServerLink {
           const resend = __FAMILIAR_MUTATIONS__ && mutant('resend-404-call') ? w.lastCall?.body : undefined;
           if (resend) void this.drained().then(() => this.exchangeNow(w, 'call', w.nextId++, resend, 'tools/call'));
         }
-        for (const l of this.published.splice(0)) l(fx.run);
+        // A Test's report, captured as its run publishes.
+        if (this.lc.run?.id === fx.run && this.lc.run.mode === 'test') this.reports.set(fx.run, { tools: w.tools, notOffered: w.notOffered });
         return;
       }
       case 'save': {
@@ -387,12 +452,12 @@ export class ServerLink {
         this.events.ended?.(fx.run, fx.failure ?? { kind: 'exited', words: 'The server stopped.' });
         return;
       case 'readmit-check': {
-        // The relaunch's second admission, with the committed record read again (3.9).
-        const facts = this.events.readmit ? this.events.readmit(fx.run) : ({ ok: true } as const);
-        if (facts.ok && 'release' in facts && facts.release) this.ownerHold = facts.release;
-        const from = this.wires.get(fx.run);
-        if (from) this.next = { target: from.target, launch: from.launch };
-        this.feed({ t: 'readmit', run: fx.run, ok: facts.ok, ...(facts.ok ? {} : { words: facts.words, ...(facts.off ? { off: true } : {}) }) });
+        // The relaunch's facts, read now: the owner's admission (bound to this run until the machine decides)
+        // and the committed record. The machine decides (3.9).
+        const a = this.events.admit ? this.events.admit() : { release: () => {} };
+        if ('release' in a) this.readmitHold = { run: fx.run, release: a.release };
+        const rec = this.events.record ? this.events.record() : { enabled: true, launch: this.wires.get(fx.run)?.launch ?? '' };
+        this.feed({ t: 'readmit', run: fx.run, facts: { ownerFree: 'release' in a, ...('words' in a ? { ownerWords: a.words } : {}), enabled: rec.enabled, launch: rec.launch } });
         return;
       }
       case 'new-session': {
@@ -421,7 +486,7 @@ export class ServerLink {
    * A Start (or Test, by `mode`) as the machine answers it. `facts` are read by the caller in the same
    * step; the owner's admission is asked here, once, and handed to the machine as a fact.
    */
-  startReply(target: Target, launch: string, mode: Mode = 'start', facts: Partial<StartFacts> = {}): Promise<Reply> {
+  startReply(target: Target, launch: string, mode: Mode = 'start', facts: Partial<StartFacts> = {}, limits: LinkLimits = this.limits): Promise<Reply> {
     if (this.busy && (__FAMILIAR_MUTATIONS__ && mutant('slot-per-run'))) {
       this.slot = emptySlot;
       this.feed({ t: 'slot', idle: true });
@@ -430,7 +495,7 @@ export class ServerLink {
     let ownerFree = facts.ownerFree ?? true;
     let ownerWords = facts.ownerWords;
     let admitted: (() => void) | undefined;
-    if (record === 'ok' && ownerFree && !this.lc.run && !this.ownerHold && this.events.admit) {
+    if (record === 'ok' && ownerFree && this.events.admit) {
       const a = this.events.admit();
       if ('release' in a) admitted = a.release;
       else {
@@ -438,15 +503,11 @@ export class ServerLink {
         ownerWords = a.words;
       }
     }
-    this.next = { target, launch };
-    if (admitted) this.ownerHold = admitted;
-    const reply = this.ask((token) => ({ t: 'start', token, mode, facts: { record, ownerFree, ...(ownerWords !== undefined ? { ownerWords } : {}), where: target.where } }));
-    // The machine holds the owner only for a local native start: any other admission is released at once.
-    if (admitted && this.lc.owner !== 'start' && this.ownerHold === admitted) {
-      this.ownerHold = undefined;
-      admitted();
-    }
-    return reply;
+    // Bound to the action's token: consumed (kept or released) only once next() has decided (bind()).
+    return this.ask((token) => {
+      this.asked.set(token, { target, launch, limits, ...(admitted ? { release: admitted } : {}) });
+      return { t: 'start', token, mode, facts: { record, ownerFree, ...(ownerWords !== undefined ? { ownerWords } : {}), where: target.where, launch } };
+    });
   }
 
   /** The old shape, for the wire's own tests: Ready with the run and its tools, or a failure in words. */
@@ -462,11 +523,12 @@ export class ServerLink {
   }
 
   /** Test: a start whose run, once listed, stops itself; ok only once that run has ended. */
-  async test(target: Target, launch: string, facts: Partial<StartFacts> = {}): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] } | { readonly ok: false; readonly failure: Failure; readonly refused?: true }> {
-    const r = await this.startReply(target, launch, 'test', facts);
+  async test(target: Target, launch: string, facts: Partial<StartFacts> = {}, limits: LinkLimits = this.limits): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] } | { readonly ok: false; readonly failure: Failure; readonly refused?: true }> {
+    const r = await this.startReply(target, launch, 'test', facts, limits);
     if (r.kind === 'tested') {
-      const w = this.wires.get(r.run);
-      return { ok: true, run: r.run, tools: w?.tools ?? [], notOffered: w?.notOffered ?? [] };
+      const report = this.reports.get(r.run);
+      this.reports.delete(r.run);
+      return { ok: true, run: r.run, tools: report?.tools ?? [], notOffered: report?.notOffered ?? [] };
     }
     if (r.kind === 'failed') return { ok: false, failure: r.failure };
     if (r.kind === 'refused') return { ok: false, failure: { kind: 'failed', words: r.words }, refused: true };
@@ -475,6 +537,8 @@ export class ServerLink {
 
   /** Stop, as the machine answers it. */
   stopReply(): Promise<Reply> {
+    // (The named mutation: a driver that answers an action without feeding its event.)
+    if (__FAMILIAR_MUTATIONS__ && this.lc.run && mutant('driver-answers-unasked')) return Promise.resolve({ kind: 'stopped' });
     const r = this.lc.run;
     if (r && r.where === 'remote' && r.step !== 'closing' && (__FAMILIAR_MUTATIONS__ && mutant('delete-at-stop'))) {
       const w = this.wires.get(r.id);
@@ -497,13 +561,18 @@ export class ServerLink {
     if (!r || phaseOf(this.lc) !== 'ready') return { kind: 'failed', words: 'The server is not running.' };
     if (!callable(this.lc) || r.era !== 'legacy') return { kind: 'busy', words: 'The server is busy. Try again in a moment.' };
     const id = r.id;
-    const done = new Promise<void>((res) => this.published.push(() => res()));
-    this.feed({ t: 'notice', run: id });
-    const ended = new Promise<void>((res) => {
-      const check = () => (this.lc.run?.id !== id ? res() : void this.clock.setTimer(check, 5, { background: true }));
-      check();
+    const gen = r.gen;
+    // One watcher, settled and unregistered on either outcome: a newer catalog published, or the run over.
+    await new Promise<void>((res) => {
+      const watch = () => {
+        const now = this.lc.run;
+        if (now?.id === id && now.gen === gen) return;
+        this.watchers.delete(watch);
+        res();
+      };
+      this.watchers.add(watch);
+      this.feed({ t: 'notice', run: id });
     });
-    await Promise.race([done, ended]);
     await this.drained();
     const w = this.wires.get(id);
     return this.lc.run?.id === id && w ? w.tools : (this.lc.held ?? failureOf(this.lc) ?? { kind: 'failed', words: 'The server is not running.' });
@@ -652,7 +721,9 @@ export class ServerLink {
     if (__FAMILIAR_MUTATIONS__) run.lastCall = { body, args: canonicalArguments };
     const outcome = this.exchangeNow(run, 'call', id, body, 'tools/call', extra);
     if (!outcome) return undefined;
-    const n = this.slot.ex!.n;
+    // The exchange this call was admitted as, kept here: the slot may have moved on by now (an exit the
+    // port delivered from inside its own call).
+    const n = this.admitted;
     const timer = this.clock.setTimer(() => this.input({ t: 'terminal', n, end: { t: 'timeout' } }), ms, { background: false });
     const onAbort = () => {
       this.input({ t: 'terminal', n, end: { t: 'stopped' } });
@@ -679,8 +750,8 @@ export class ServerLink {
       const r = o.response;
       if (r.error) {
         if (run.era === 'modern' && r.error.code === -32022) {
-          // The server changed its mind about the era: the run ends, with its versions in words.
-          this.feed({ t: 'call-ended', run: run.id, end: 'era-refusal', failure: refusedWords(r.error) });
+          // The server changed its mind about the era: the run ended in the exchange's terminal step (effect()).
+          if (__FAMILIAR_MUTATIONS__ && mutant('era-refusal-late')) this.feed({ t: 'call-ended', run: run.id, end: 'era-refusal', failure: refusedWords(r.error) });
           return { kind: 'interrupted' };
         }
         if (run.era === 'modern' && r.error.code === -32020) return { kind: 'result', text: "The server said the call's headers didn't match its body. Familiar didn't send it again.", isError: true };
@@ -743,15 +814,24 @@ export class ServerLink {
     };
     const n = this.slot.next;
     this.pending.set(n, { n, kind, run, ...(requestId !== undefined ? { requestId } : {}), body, done: resolve, ...(method ? { method } : {}), ...(extra ? { extra } : {}) });
-    this.input({ t: 'admit', kind, where: run.target.where, era: run.era, ...(requestId !== undefined ? { requestId } : {}) });
-    this.feed({ t: 'slot', idle: false });
+    this.events.exchange?.({ t: 'admit', n, run: run.id, kind });
+    // Busy is both machines' before any port is invoked: the exchange machine takes the admission, the
+    // lifecycle hears busy, and only then do the admission's effects (the port's call) run. A callback the
+    // port makes from inside its own call finds the slot busy in both. (An admin exchange's busy is the
+    // lifecycle's own, set when it issued it; the event then changes nothing.)
+    const late = __FAMILIAR_MUTATIONS__ && mutant('busy-after-handoff');
+    this.input({ t: 'admit', kind, where: run.target.where, era: run.era, ...(requestId !== undefined ? { requestId } : {}) }, late ? undefined : () => this.feed({ t: 'slot', idle: false }));
+    if (late) this.feed({ t: 'slot', idle: false });
+    this.admitted = n;
     return promise;
   }
 
-  /** Feeds the exchange machine one input and does its effects, synchronously. */
-  private input(input: Input): void {
+  /** Feeds the exchange machine one input and does its effects, synchronously; `between` runs after its new
+      state is taken and before any of its effects. */
+  private input(input: Input, between?: () => void): void {
     const s = step(this.slot, input);
     this.slot = s.slot;
+    between?.();
     this.effecting++;
     try {
       for (const e of s.effects) this.effect(e);
@@ -772,10 +852,15 @@ export class ServerLink {
       case 'ended': {
         const p = this.pending.get(e.n);
         if (!p) return;
+        this.events.exchange?.({ t: 'ended', n: e.n, run: p.run.id, kind: p.kind, end: e.end.t });
         p.done({ end: e.end, ...(p.response ? { response: p.response } : {}), ...(p.offeredSession !== undefined ? { offered: p.offeredSession } : {}) });
         // A call that completes rearms a recovered session's 404 bound; a call that met a 404 is the
         // lifecycle's (3.8). An administrative exchange's outcome reaches it through its own classifier.
-        if (p.kind === 'call' && e.end.t === 'done') this.feed({ t: 'call-ended', run: p.run.id, end: 'done' });
+        // A modern server's era refusal on a call is classified here, in the exchange's own terminal step, so
+        // the machine ends the run before the slot is published Idle: no second call can reach it.
+        const eraRefusal = p.kind === 'call' && e.end.t === 'done' && p.run.era === 'modern' && p.response?.error?.code === -32022 && !(__FAMILIAR_MUTATIONS__ && mutant('era-refusal-late'));
+        if (eraRefusal) this.feed({ t: 'call-ended', run: p.run.id, end: 'era-refusal', failure: refusedWords(p.response!.error!) });
+        else if (p.kind === 'call' && e.end.t === 'done') this.feed({ t: 'call-ended', run: p.run.id, end: 'done' });
         if (p.kind === 'call' && e.end.t === 'session-ended') this.feed({ t: 'call-ended', run: p.run.id, end: 'session-ended' });
         return;
       }
@@ -819,8 +904,15 @@ export class ServerLink {
     // The page's watchdog on this write: past the bound, the server has stopped reading.
     const watchdog = (__FAMILIAR_MUTATIONS__ && mutant('no-write-bound'))
       ? undefined
-      : this.clock.setTimer(() => this.feed({ t: 'write-bound', run: run.id }), this.limits.writeMs, { background: false });
-    this.ports.processes!.write(run.process, enc.encode(`${text}\n`)).then(
+      : this.clock.setTimer(() => this.feed({ t: 'write-bound', run: run.id }), run.limits.writeMs, { background: false });
+    // A port that throws before returning its promise fails the write, the same way.
+    let writing: Promise<void>;
+    try {
+      writing = this.ports.processes!.write(run.process, enc.encode(`${text}\n`));
+    } catch (e) {
+      writing = Promise.reject(e);
+    }
+    writing.then(
       () => {
         watchdog?.();
         this.input({ t: 'released', handle });
@@ -907,10 +999,17 @@ export class ServerLink {
       method: 'POST',
       headers: [...this.headers(run, request?.method), ...(request?.extra ?? []).map(([k, v]) => [k, v] as [string, string])],
       maxBytes: request?.kind === 'initialize' ? MAX_HANDSHAKE_BYTES : 2 * MAX_MESSAGE_BYTES,
-      headersMs: pong ? this.limits.pongMs : this.limits.headersMs,
-      idleMs: pong ? this.limits.pongMs : this.limits.idleMs
+      headersMs: pong ? run.limits.pongMs : run.limits.headersMs,
+      idleMs: pong ? run.limits.pongMs : run.limits.idleMs
     };
-    this.ports.net!.fetch(spec, enc.encode(text)).then(
+    // A port that throws before returning its promise fails the request, the same way.
+    let fetching: ReturnType<NetPort['fetch']>;
+    try {
+      fetching = this.ports.net!.fetch(spec, enc.encode(text));
+    } catch (e) {
+      fetching = Promise.reject(e);
+    }
+    fetching.then(
       (head) => {
         if (pong) return this.input({ t: 'pong-head', handle });
         if (request) void this.response(run, request, id, head);

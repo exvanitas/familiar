@@ -72,6 +72,8 @@ export interface McpClientOptions {
   readonly onChange?: (id: string) => void;
   /** The test build's conformance record: each server's lifecycle events and the states they gave. */
   readonly transition?: (id: string, event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }) => void;
+  /** The test build's record of each exchange admitted and ended, per server (the conformance check). */
+  readonly exchange?: (id: string, e: { readonly t: 'admit' | 'ended'; readonly n: number; readonly run: string; readonly kind: string; readonly end?: string }) => void;
 }
 
 export interface ServerStatus {
@@ -153,7 +155,10 @@ export class McpClient {
         { processes: this.o.processes, net: this.o.net, clock: this.o.clock, ...(this.o.limits ? { limits: this.o.limits } : {}) },
         () => this.o.onChange?.(id),
         (tools, current, run) => this.seen(id, tools, current, run),
-        this.o.transition ? (event, state, slot) => this.o.transition!(id, event, state, slot) : undefined
+        {
+          ...(this.o.transition ? { transition: (event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }) => this.o.transition!(id, event, state, slot) } : {}),
+          ...(this.o.exchange ? { exchange: (e: Parameters<NonNullable<McpClientOptions['exchange']>>[1]) => this.o.exchange!(id, e) } : {})
+        }
       );
       this.runtimes.set(id, rt);
     }

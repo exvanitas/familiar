@@ -52,6 +52,8 @@ export interface Walk {
 export interface Run {
   readonly id: string;
   readonly where: Where;
+  /** The setup's launch fingerprint, as admitted: a relaunch runs only this launch. */
+  readonly launch: string;
   readonly era: 'legacy' | 'modern';
   readonly mode: Mode;
   readonly relaunched: boolean;
@@ -128,6 +130,17 @@ export type StartFacts = {
   readonly ownerFree: boolean;
   readonly ownerWords?: string;
   readonly where: Where;
+  /** The committed setup's launch fingerprint, read in the admission's step. */
+  readonly launch?: string;
+};
+/** The relaunch's facts, read again when it is due: the owner's admission and the committed record now. */
+export type ReadmitFacts = {
+  readonly ownerFree: boolean;
+  readonly ownerWords?: string;
+  /** The record is enabled now (an automatic start's relaunch needs it). */
+  readonly enabled: boolean;
+  /** The committed setup's launch fingerprint now ('' when the record is gone). */
+  readonly launch: string;
 };
 export type AdminOutcome =
   | { readonly k: 'legacy' }
@@ -153,7 +166,7 @@ export type LcEvent =
   | { readonly t: 'exhausted'; readonly failure: Failure }
   | { readonly t: 'deadline'; readonly id: number }
   | { readonly t: 'saved'; readonly gen: number; readonly outcome: 'saved' | 'skipped' | 'failed' }
-  | { readonly t: 'readmit'; readonly run: string; readonly ok: boolean; readonly words?: string; readonly off?: boolean };
+  | { readonly t: 'readmit'; readonly run: string; readonly facts: ReadmitFacts };
 
 export type Reply = { readonly kind: 'ready' } | { readonly kind: 'stopped' } | { readonly kind: 'failed'; readonly failure: Failure } | { readonly kind: 'refused'; readonly words: string } | { readonly kind: 'tested'; readonly run: string };
 export type LcEffect =
@@ -376,6 +389,7 @@ function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   s.run = {
     id,
     where: e.facts.where,
+    launch: e.facts.launch ?? '',
     era: 'legacy',
     mode: e.mode,
     relaunched: false,
@@ -736,10 +750,10 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
 
 function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   const s = tx.s;
-  if ((__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-after-stop')) && s.zombie === e.run && !s.run && e.ok) {
+  if ((__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-after-stop')) && s.zombie === e.run && !s.run && e.facts.ownerFree) {
     // The mutation: the relaunch Stop cancelled launches anyway.
     const id = `${s.id}#${++s.nextRun}`;
-    s.run = { ...emptyRun(id, 'local', 'start'), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false } };
+    s.run = { ...emptyRun(id, 'local', 'start', e.facts.launch), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false } };
     s.owner = 'start';
     tx.emit({ t: 'owner-hold' });
     tx.emit({ t: 'native-start', run: id, era: 'modern' });
@@ -747,11 +761,15 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   }
   const r = s.run;
   if (!r || r.id !== e.run || r.step !== 'relaunch') return;
+  // Decided here, from the run's own admitted mode and launch and the facts read now: never from anything a
+  // later action changed.
+  const f = e.facts;
+  if (!f.ownerFree) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'Familiar is saving another change. Press Start again.' });
   // Turned off meanwhile (an automatic start's relaunch): Stopped, as it was asked.
-  if (!e.ok && e.off) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: e.words ?? 'It is turned off.' });
-  if (!e.ok) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: e.words ?? 'Press Start again.' });
+  if (r.mode === 'auto' && !f.enabled) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: 'It is turned off.' });
+  if (f.launch !== r.launch) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'The setup changed. Press Start again.' });
   const id = `${s.id}#${++s.nextRun}`;
-  s.run = { ...emptyRun(id, 'local', r.mode), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false }, ...(r.deadline ? { deadline: r.deadline } : {}) };
+  s.run = { ...emptyRun(id, 'local', r.mode, r.launch), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false }, ...(r.deadline ? { deadline: r.deadline } : {}) };
   s.waiters = s.waiters.map((w) => (w.run === r.id ? { ...w, run: id } : w));
   s.owner = 'start';
   tx.emit({ t: 'owner-hold' });
@@ -759,8 +777,8 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   if (!tx.run!.deadline) tx.arm('start');
 }
 
-function emptyRun(id: string, where: Where, mode: Mode): Run {
-  return { id, where, era: 'legacy', mode, relaunched: false, purpose: 'start', step: 'launching', changes: 0, gen: 0, refreshOwed: false, dropped: 0, recovered: false, killed: false, modernOpening: false, firstSave: 'none', firstGen: 0 };
+function emptyRun(id: string, where: Where, mode: Mode, launch: string): Run {
+  return { id, where, launch, era: 'legacy', mode, relaunched: false, purpose: 'start', step: 'launching', changes: 0, gen: 0, refreshOwed: false, dropped: 0, recovered: false, killed: false, modernOpening: false, firstSave: 'none', firstGen: 0 };
 }
 
 function exhausted(tx: Tx, failure: Failure): void {
