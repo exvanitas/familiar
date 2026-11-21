@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest';
 import { callable, failureOf, initialState, next, noteOf, offering, phaseOf, type LcEffect, type LcEvent, type LcState } from '../../src/mcp/wire/lifecycle.ts';
 import { mutations } from '../../src/mutations.ts';
 import type * as Spec from './lifecycle.spec-types.ts';
+import { SETUP_CHANGED } from './lifecycle.spec-types.ts';
 import { advance, alphabet, canon, checkState, checkTransition, CLAUSES, CONTROLS, CTX0, histFromState, initialHistory, stubMachine, type Control, type Ctx, type History, type Machine } from './lifecycle.spec-checks.ts';
 
 type Where = 'local' | 'remote';
@@ -90,6 +91,8 @@ export const THIS: Walked = {
     const launch = r?.launch ?? '';
     if (e.ok) return { t: 'readmit', run: e.run, facts: { ownerFree: true, enabled: true, launch } };
     if (e.off) return { t: 'readmit', run: e.run, facts: { ownerFree: true, enabled: false, launch } };
+    // Row 175's "setup changed", in the contract's words: the owner free, the launch not the run's.
+    if (e.words === SETUP_CHANGED.words) return { t: 'readmit', run: e.run, facts: { ownerFree: true, enabled: true, launch: `${launch}+` } };
     return { t: 'readmit', run: e.run, facts: { ownerFree: false, ...(e.words !== undefined ? { ownerWords: e.words } : {}), enabled: true, launch } };
   }
 };
@@ -392,6 +395,7 @@ describe('W with the spec checks', () => {
     ['lc-crash-words-lost', 'local', 'local Ready, its save in flight'],
     ['lc-start-deadline-dropped', 'local', 'initial'],
     ['lc-relaunch-fresh-budget', 'local', 'relaunch pending'],
+    ['lc-readmit-ignores-launch', 'local', 'relaunch pending'],
     ['lc-late-start-unbounded', 'local', 'initial'],
     ['lc-test-ok-after-stop', 'local', 'initial'],
     ['lc-failed-save-dropped', 'local', 'local Ready'],

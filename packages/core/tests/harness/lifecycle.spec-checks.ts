@@ -12,7 +12,7 @@
 import type { LcState, LcEvent, LcEffect, Run, Failure, Reply, DeadlineKind, Cause, Mode, Where, Waiter, StartFacts } from './lifecycle.spec-types.ts';
 import {
   STOPPED_WORDS, STOP_REFUSED, STOP_UNCONFIRMED, START_UNANSWERED, START_TIMEOUT, LIST_TIMEOUT, SESSION_ENDED,
-  KEPT_CHANGING, TOO_MANY_PAGES, WATCHDOG, CATALOG_FAILED, MAX_PAGES,
+  KEPT_CHANGING, TOO_MANY_PAGES, WATCHDOG, CATALOG_FAILED, MAX_PAGES, SETUP_CHANGED,
 } from './lifecycle.spec-types.ts';
 
 export type Phase = 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed' | 'held';
@@ -676,9 +676,7 @@ export function checkTransition(
     const newest = hist.runPublish.find((p) => p.run === r!.id)?.last;
     if (ended || left) v('SAVE.goes-on', `run ${r!.id} ended on its later catalog write's failure (gen ${e.gen})`);
     else if (newest !== e.gen) {
-      // Superseded: nothing more is due here, unless the newest's save was already asked for (History, never the state's save fields).
-      const asked = hist.askedFor;
-      if (asked && asked.run === r!.id && asked.gen === newest && !saves.some((f) => f.gen === newest)) v('SAVE.turn', `gen ${newest} settled while gen ${e.gen} was in flight, and gen ${e.gen}'s failure didn't save it in its turn`);
+      // Superseded: no retry. Whether the newer generation is written here is SAVE.turn's (pass 5i, below).
     }
     else if (tries === 0 && saves.length !== 1) v('SAVE.retry', `the later catalog write of gen ${e.gen} failed and wasn't tried once more`);
     else if (tries >= 1 && saves.some((f) => f.gen === e.gen)) v('SAVE.retry', `gen ${e.gen} failed twice and was tried a third time`);
@@ -697,6 +695,45 @@ export function checkTransition(
   // 6b.13: closing issues no new save; a write already in flight just settles.
   const closingSave = (f: Extract<LcEffect, { t: 'save' }>) => (!!r && r.id === f.run && r.step === 'closing') || (!!n && n.id === f.run && n.step === 'closing');
   for (const f of effects) if (f.t === 'save' && closingSave(f)) v('SAVE.closing', `save of gen ${f.gen} for run ${f.run}, which is closing`);
+  // Pass 5i (r35): a write is checked as its whole pair, (run, generation), never by its generation alone.
+  {
+    const saveList = effects.filter((f): f is Extract<LcEffect, { t: 'save' }> => f.t === 'save');
+    const landing = e.t === 'saved' && hist.saving === e.gen;
+    const curRun = r && n && r.id === n.id && !prev.held && !next.held ? n.id : undefined;
+    const lateLeft = landing && hist.savingRun !== undefined && hist.savingRun !== r?.id;
+    // SAVE.whose: every save is the current run's write of its own newest published generation (History
+    // runPublish). A closing run's save is SAVE.closing's; a late landing's save for anyone but the current run is
+    // SAVE.own-queue's; a generation that isn't the newest published is I11.newest's.
+    const accepted: Extract<LcEffect, { t: 'save' }>[] = [];
+    for (const f of saveList) {
+      if (closingSave(f)) continue;
+      if (f.run !== curRun) { if (!lateLeft) v('SAVE.whose', `save of gen ${f.gen} for run ${f.run}, which isn't the current running run ${curRun ?? '(none)'}`); continue; }
+      if (f.gen !== h2.lastPublish) continue;
+      const own = h2.runPublish.find((p) => p.run === f.run)?.last;
+      if (own !== f.gen) { v('SAVE.whose', `save of gen ${f.gen} for run ${f.run}, whose own newest published generation is ${own ?? 'none'}`); continue; }
+      accepted.push(f);
+    }
+    // SAVE.turn: a generation is written in its turn: at its settle (the transition entering Ready), or on a
+    // landing. On a landing of the current run's own write, a save of a generation other than the landed one is
+    // the run's queued write, so the run must have asked for one: a settle came while that write was in flight
+    // (History askedFor, never the state). A save at any other moment is outside every turn. The landed
+    // generation's own retry or rewrite is SAVE.retry's and SAVE.once's; a late landing's is SAVE.own-queue's.
+    const asked = curRun !== undefined && hist.askedFor?.run === curRun;
+    const entersReady = curRun !== undefined && n!.step === 'ready' && r!.step !== 'ready';
+    for (const f of accepted) {
+      if (entersReady || lateLeft) continue;
+      if (landing) {
+        if (e.t === 'saved' && f.gen !== e.gen && !asked) v('SAVE.turn', `the landing of gen ${e.gen} wrote gen ${f.gen}, which run ${curRun} never asked for (no settle came while gen ${e.gen} was in flight)`);
+        continue;
+      }
+      v('SAVE.turn', `save of gen ${f.gen} on ${e.t}, outside its turn (neither its settle nor a landing)`);
+    }
+    // ...and when a write lands, a run that asked gets its newest generation written in that transition, if it is
+    // still running. In Ready with nothing in flight, I11.owed reports a missing one.
+    if (landing && asked && n!.cause === undefined && !['closing', 'relaunch', 'ready'].includes(n!.step) && !saveList.some((f) => f.run === curRun)) {
+      v('SAVE.turn', `run ${curRun} asked for a write while gen ${e.t === 'saved' ? e.gen : '?'} was in flight, and its landing didn't write the run's newest generation`);
+    }
+  }
   // 6b.13: each generation is written once, plus its one retry, issued in its first failure's own transition.
   // A save SAVE.closing, SAVE.retry's third-try branch or I11.newest (not the newest published) reports is theirs.
   {
@@ -1056,7 +1093,8 @@ export function checkState(s: LcState, m: Machine, h: History): string[] {
     if (f && (f.words === UNSAVED_NOTE || UNSAVED_RE.test(f.words))) v('P.failure-note', `failureOf carries the unsaved note "${f.words}"`);
   }
   // Catalog writes (I11).
-  if ((s.saving?.gen) !== h.saving) v('I11.mirror', `saving ${s.saving?.gen}, in flight ${h.saving}`);
+  // Pass 5i: the write in flight is mirrored as its pair, whose it is and its generation.
+  if (s.saving?.gen !== h.saving || s.saving?.run !== (h.saving === undefined ? undefined : h.savingRun)) v('I11.mirror', `saving ${canon(s.saving)}, in flight ${h.saving === undefined ? 'none' : `${h.savingRun} gen ${h.saving}`}`);
   if (h.saving === undefined && r && !s.held && r.step === 'ready') {
     const last = h.runPublish.find((p) => p.run === r.id)?.last;
     if (last !== undefined && h.lastSave !== last) v('I11.owed', `Ready on gen ${last}, last saved ${h.lastSave}, nothing in flight`);
@@ -1100,6 +1138,12 @@ export const RUN_ENDED_F: Failure = { kind: 'exited', words: 'The run ended.' };
 export const BAD_CATALOG_F: Failure = { kind: 'protocol', words: 'Two tools share one name.' };
 export const ERA_F: Failure = { kind: 'protocol', words: 'The server now speaks only versions 2026-xx.' };
 export const OWNER_WORDS = 'Familiar is saving another change. Try again in a moment.';
+/** Every StartFacts record value, and every mode, the alphabet offers (pass 5i). The type below fails to compile
+    if T gains a record value this list lacks. */
+export const RECORDS = ['ok', 'disabled', 'missing', 'unreadable', 'removing', 'sse', 'unlaunchable'] as const satisfies readonly StartFacts['record'][];
+export const MODES = ['start', 'auto', 'test'] as const satisfies readonly Mode[];
+type Unoffered = Exclude<StartFacts['record'], (typeof RECORDS)[number]> | Exclude<Mode, (typeof MODES)[number]>;
+export const EVERY_RECORD_OFFERED: [Unoffered] extends [never] ? true : never = true;
 
 const procOf = (run: string) => `${run}:p`;
 
@@ -1115,12 +1159,10 @@ export function alphabet(s: LcState, h: History, ctx: Ctx, where: Where): [LcEve
     const c = { ...ctx, persons: ctx.persons - 1 };
     const token = `p${ctx.persons}`;
     const facts = (p: Partial<StartFacts> = {}): StartFacts => ({ record: 'ok', ownerFree: true, where, ...p });
-    add({ t: 'start', token, mode: 'start', facts: facts() }, c);
-    add({ t: 'start', token, mode: 'auto', facts: facts() }, c);
-    add({ t: 'start', token, mode: 'auto', facts: facts({ record: 'disabled' }) }, c);
-    add({ t: 'start', token, mode: 'test', facts: facts() }, c);
+    // Pass 5i: every record value T declares, once per mode. 4.1's refusals (missing, unreadable, removing, SSE,
+    // and the types-only unlaunchable) refuse every mode; disabled refuses only auto, and admits start and Test.
+    for (const mode of MODES) for (const record of RECORDS) add({ t: 'start', token, mode, facts: facts({ record }) }, c);
     add({ t: 'start', token, mode: 'start', facts: facts({ ownerFree: false, ownerWords: OWNER_WORDS }) }, c);
-    add({ t: 'start', token, mode: 'start', facts: facts({ record: 'missing' }) }, c);
     add({ t: 'stop', token }, c);
   }
   // Native starts Windows hasn't answered, the current run's or a late one's.
@@ -1175,6 +1217,10 @@ export function alphabet(s: LcState, h: History, ctx: Ctx, where: Where): [LcEve
   for (const run of h.readmit) {
     add({ t: 'readmit', run, ok: true });
     add({ t: 'readmit', run, ok: false, words: OWNER_WORDS });
+    // Row 175's third refusal, the setup changed (lead, from r35 #4). 6b.11 ends it Failed "in the readmit's words",
+    // so the event carries words of its own, distinct from the owner's: with none, the kept words would be '*' and
+    // I3.kept and PHASE.after-words would pass any words (pass 5i).
+    add({ t: 'readmit', run, ok: false, words: SETUP_CHANGED.words });
     add({ t: 'readmit', run, ok: false, off: true, words: 'The server was turned off.' });
   }
   // The save in flight.
@@ -1237,7 +1283,7 @@ export const CLAUSES: Record<string, string> = {
   'ADMIT.fresh-id': 'M1: "nextRun: number // run ids are `${server}#${n}`, never reused"',
   'ADMIT.busy-reply': 'M4.1: "| starting, ready, stopping | start / test | — | same | answer(refused, \\"It is starting / already running / stopping\\") |"',
   'ADMIT.only': 'Appendix: "admission and owner-hold are one transition". M4.1/M4.3: a run is made only by an admitted start or by "readmit | ownerFree, setup unchanged … | new run #n+1"',
-  'PERSON.unchanged': 'D5.4: "A refused Start or Test changes nothing: the failure shown before stays." M4.1: "| stopped, failed | stop | no orphan | same | answer(stopped) |"',
+  'PERSON.unchanged': 'D5.4: "A refused Start or Test changes nothing: the failure shown before stays." M4.1: "| stopped, failed | start / test | record missing, unreadable, removing, SSE, or `auto` and disabled | same | answer(refused or failed, its words) |", "| stopped, failed | stop | no orphan | same | answer(stopped) |"',
   'HELD.words': 'M4.1: "| held | start, test, stop | — | held | answer(restart words) |". D5.4: "every action answers them until Familiar restarts"',
   // native, owner, orphans
   'I2.one': 'I2: "At most one process per setup: a pending `server_start` or a run\'s process, plus orphans, counts at most one not seen to exit"',
@@ -1340,13 +1386,14 @@ export const CLAUSES: Record<string, string> = {
   // catalog writes
   'I11.one': 'M4.4: "At most one `save-catalog` is in flight (`catalog.saving`)."',
   'I11.newest': 'M7: "I11 as W checks it: at most one save in flight, and every save issued is for the newest catalog published"',
-  'I11.mirror': 'M1: "catalog: { saving?: runId } // the catalog write in flight, if any"',
+  'I11.mirror': 'M1: "catalog: { saving?: runId } // the catalog write in flight, if any". T LcState.saving: "The catalog write in flight: whose it is and its generation, fixed when it was issued."',
   'SAVE.retry': 'M6b.13: "A later catalog write that fails (a refresh\'s or a recovery\'s, not the first) keeps its generation and is tried once more, one save at a time (I11)." "A newer publication supersedes an older unsaved generation, and is saved in its turn."',
   'SAVE.unsaved': 'M6b.13: "A second failure leaves that generation marked unsaved". "`noteOf` returns \"Familiar couldn\'t save this server\'s latest tool list; it shows the list it saved before.\" while the run is current and its newest published generation is marked unsaved."',
   'SAVE.note-none': 'M6b.13: "`noteOf` … returns nothing otherwise: not after the first failure (the retry is still due)". (Nothing marked unsaved, no note.)',
   'SAVE.note-cleared': 'M6b.13: "`noteOf` returns … while the run is current and its newest published generation is marked unsaved. It returns nothing otherwise: … and not once a newer generation has saved."',
   'P.failure-note': 'M6b.13: "It\'s a note beside a Ready server, not a failure, so `failureOf` doesn\'t carry it."',
-  'SAVE.turn': 'M6b.13: "\"In its turn\" is the newer generation\'s own save: at its settle, or in the failure\'s own transition if its save was already asked for while the failed one was in flight (I11\'s one-at-a-time rule)."',
+  'SAVE.turn': 'M6b.13: "\"In its turn\" is the newer generation\'s own save: at its settle, or in the failure\'s own transition if its save was already asked for while the failed one was in flight (I11\'s one-at-a-time rule)." "So a failure that lands after a newer generation is published retries nothing. Nothing more is due in that transition unless the newer generation\'s save was already asked for." T Run.queued: "This run asked for a write while another was in flight. When that one lands, the run\'s newest generation is written, if the run is still current and not closing."',
+  'SAVE.whose': 'M6b.13: "Every write\'s identity is fixed when it is issued: whose it is, its generation, and whether it is the run\'s first." "A queued re-save belongs to the run that queued it. When that run leaves, its queue goes with it." "keeps its generation and is tried once more". T Run.queued: "the run\'s newest generation is written, if the run is still current and not closing."',
   'SAVE.closing': 'M6b.13: "Closing issues no new save, so it issues no retry."',
   'SAVE.own-queue': 'M6b.13: "A queued re-save belongs to the run that queued it. When that run leaves, its queue goes with it. … A write that lands late for a run that has left issues only a write the current run itself queued (its settle came while that write was in flight)."',
   'SAVE.once': 'M6b.13: "Each generation is written once, plus its one retry." "Once any write of a generation has been issued, landed, failed or still in flight, its settle writes nothing for it. The only further write of that generation is the one retry after its first failure."',
@@ -1620,10 +1667,16 @@ const B = {
   recordRefused: (): Tr => { const s = mkSt(); return { prev: s, e: startEv('b', 'start', { record: 'missing' }), next: s, effects: [ans('b', { kind: 'refused', words: "The server isn't saved." })] }; },
   busyStart: (): Tr => { const s = mkSt({ run: mkRun() }); return { prev: s, e: startEv('b'), next: s, effects: [ans('b', { kind: 'refused', words: 'It is already running.' })] }; },
   held: (): Tr => { const s = mkSt({ held: HELD_FAILURE }); return { prev: s, e: startEv('b'), next: s, effects: [ans('b', failed(HELD_FAILURE))] }; },
-  saveDirty: (): Tr => ({
-    prev: mkSt({ saving: { run: R1, gen: 1 }, run: mkRun({ gen: 2 }) }), e: { t: 'saved', gen: 1, outcome: 'saved' },
-    next: mkSt({ saving: { run: R1, gen: 2 }, run: mkRun({ gen: 2 }) }), effects: [{ t: 'save', run: R1, gen: 2 }],
-  }),
+  // Ready on gen 2 with gen 1 in flight: gen 2 settled while gen 1 was in flight, so the run asked (queued) for its
+  // write, which is what `advance` records at that settle (pass 5i: a newer write on a landing needs the ask).
+  saveDirty: (): Tr => {
+    const prev = mkSt({ saving: { run: R1, gen: 1 }, run: mkRun({ gen: 2, queued: true }) });
+    return {
+      prev, e: { t: 'saved', gen: 1, outcome: 'saved' },
+      next: mkSt({ saving: { run: R1, gen: 2 }, run: mkRun({ gen: 2, written: 2 }) }), effects: [{ t: 'save', run: R1, gen: 2 }],
+      hist: histFromState(prev, { askedFor: { run: R1, gen: 2 } }),
+    };
+  },
   exhausted: (): Tr => ({
     prev: mkSt({ nextDeadline: 11, slot: 'busy', waiters: [A], run: walking(REMOTE) }), e: { t: 'exhausted', failure: HELD_FAILURE },
     next: mkSt({ nextDeadline: 11, slot: 'busy', held: HELD_FAILURE }),
@@ -1726,7 +1779,9 @@ const B = {
   // `newer`: gen 3 was published while it saved, and supersedes it.
   laterSaveFail: (tries: number, out: 'retry' | 'drop' | 'end', newer = false): Tr => {
     const gen = newer ? 3 : 2;
-    const prev = mkSt({ nextGen: 4, saving: { run: R1, gen: 2 }, run: mkRun({ gen }) });
+    // `newer`: the run is Ready on gen 3, so gen 3 settled while gen 2 was in flight and the run asked for its write
+    // (pass 5i: what `advance` records at that settle).
+    const prev = mkSt({ nextGen: 4, saving: { run: R1, gen: 2 }, run: mkRun({ gen, ...(newer ? { queued: true as const } : {}) }) });
     const next = out === 'retry' ? mkSt({ nextGen: 4, saving: { run: R1, gen }, run: mkRun({ gen }) })
       : out === 'drop' ? mkSt({ nextGen: 4, run: mkRun({ gen }) })
       : mkSt({ nextGen: 4, nextDeadline: 11, run: closingRun({ cause: 'catalog-failed', gen }) });
@@ -1734,7 +1789,7 @@ const B = {
       : out === 'drop' ? [] : [{ t: 'end-live', run: R1 }, { t: 'native-stop', run: R1, process: P1 }, { t: 'arm', id: 10, which: 'stop' }];
     return {
       prev, e: { t: 'saved', gen: 2, outcome: 'failed' }, next, effects,
-      hist: histFromState(prev, { saveFails: tries ? [{ gen: 2, count: tries }] : [], lastSave: 2 }),
+      hist: histFromState(prev, { saveFails: tries ? [{ gen: 2, count: tries }] : [], lastSave: 2, ...(newer ? { askedFor: { run: R1, gen: 3 } } : {}) }),
     };
   },
   // 6b.13: gen 2 was marked unsaved; gen 3, published since, now saves
@@ -1756,11 +1811,12 @@ const B = {
   },
   // 6b.13: gen 3 settled (Ready entered) while gen 2 was in flight, so its save was asked for; a notice has since
   // begun another refresh walk. Gen 2's first failure must save gen 3 in its turn (`save`), here.
-  askedTurn: (save: boolean): Tr => {
+  // Pass 5i: `outcome` 'saved' is the same ask met by a write that lands well: the run's newest is due there too.
+  askedTurn: (save: boolean, outcome: 'saved' | 'failed' = 'failed'): Tr => {
     const run = mkRun({ step: 'walking', purpose: 'refresh', gen: 3, changes: 3, published: 2, walk: { attempt: 0, page: 1, startedAt: 3, answered: false }, inFlight: { kind: 'list', page: 1 }, deadline: { which: 'list', id: 10 } });
     const prev = mkSt({ nextDeadline: 11, nextGen: 4, slot: 'busy', saving: { run: R1, gen: 2 }, run });
     return {
-      prev, e: { t: 'saved', gen: 2, outcome: 'failed' },
+      prev, e: { t: 'saved', gen: 2, outcome },
       next: mkSt({ nextDeadline: 11, nextGen: 4, slot: 'busy', run, ...(save ? { saving: { run: R1, gen: 3 } } : {}) }),
       effects: save ? [{ t: 'save', run: R1, gen: 3 }] : [],
       hist: histFromState(prev, { askedFor: { run: R1, gen: 3 } }),
@@ -1837,6 +1893,42 @@ const B = {
       hist: histFromState(prev, { saveFails: [{ gen: 2, count: 1 }] }),
     };
   },
+  // Pass 5i: a refresh walk's last page publishes gen 2 and enters settling; its save is due only at the settle.
+  // `early`: the machine writes gen 2 at the publish instead.
+  refreshPublish: (early: boolean): Tr => {
+    const walk = { attempt: 0, page: 1, startedAt: 1, answered: false };
+    const prev = mkSt({ nextDeadline: 11, nextGen: 2, slot: 'busy', run: mkRun({ step: 'walking', purpose: 'refresh', changes: 1, walk, inFlight: { kind: 'list', page: 1 }, deadline: { which: 'list', id: 10 } }) });
+    return {
+      prev, e: { t: 'admin-done', run: R1, outcome: { k: 'page', more: false, catalog: 'ok' } },
+      next: mkSt({ nextDeadline: 11, nextGen: 3, slot: 'busy', ...(early ? { saving: { run: R1, gen: 2 } } : {}),
+        run: mkRun({ step: 'settling', purpose: 'refresh', changes: 1, published: 1, gen: 2, walk: { ...walk, answered: true }, deadline: { which: 'list', id: 10 }, ...(early ? { written: 2 } : {}) }) }),
+      effects: [{ t: 'publish', run: R1, gen: 2 }, ...(early ? [{ t: 'save', run: R1, gen: 2 } as LcEffect] : [])],
+    };
+  },
+  // Pass 5i: s#1 published and saved gen 1, then left; s#2 is walking its first list and has published nothing.
+  // `foreign`: s#2 issues a write of gen 1, s#1's catalog, under its own name.
+  foreignGen: (foreign: boolean): Tr => {
+    const prev = mkSt({ nextRun: 3, nextDeadline: 11, nextGen: 2, slot: 'busy', waiters: [Wt('start', 'b', R2)], run: walking({ ...REMOTE, id: R2 }) });
+    return {
+      prev, e: { t: 'slot', idle: false },
+      next: foreign ? { ...prev, saving: { run: R2, gen: 1 }, run: { ...prev.run!, written: 1 } } : prev,
+      effects: foreign ? [{ t: 'save', run: R2, gen: 1 }] : [],
+      hist: histFromState(prev, { runs: [R1, R2], runPublish: [{ run: R1, last: 1 }], lastPublish: 1, lastSave: 1, firstSave: [{ run: R1, gen: 1, outcome: 'saved' }], writes: [{ run: R1, gen: 1, count: 1 }] }),
+    };
+  },
+  // Pass 5i, task 2: a Start, auto start or Test from Stopped or Failed on a record 4.1 refuses: answered, and the
+  // state the same (the failure shown before stays).
+  recordRefusal: (record: StartFacts['record'], mode: Mode, fromFailed: boolean, kind: 'refused' | 'failed'): Tr => {
+    const s = mkSt(fromFailed ? { after: { failed: true, failure: WIRE_F } } : {});
+    const words = `Record ${record}: Familiar can't start this server.`;
+    return { prev: s, e: startEv('b', mode, { record }), next: s, effects: [ans('b', kind === 'refused' ? { kind: 'refused', words } : failed(F(words)))] };
+  },
+  // Pass 5i, task 3: row 175's "setup changed" readmit refusal, in its own words; `answered` is what the waiter gets.
+  readmitSetup: (answered: string): Tr => ({
+    prev: B.graceExit().next, e: { t: 'readmit', run: R1, ok: false, words: SETUP_CHANGED.words },
+    next: mkSt({ nextDeadline: 12, slot: 'busy', after: { failed: true, failure: SETUP_CHANGED } }),
+    effects: [ans('a', failed(F(answered))), { t: 'ended', run: R1 }],
+  }),
   // a Stop waiter on a Ready remote run, with a hand-set world (I8.bound, I3.quiescent)
   stopWaiterWorld: (armed: Armed[]): Tr => {
     const prev = mkSt({ waiters: [Wt('stop', 's')], run: mkRun({ ...REMOTE, dropped: 1 }) });
@@ -1974,6 +2066,27 @@ C('P.failure-note', withM(B.laterSaveFail(1, 'drop'), NOTE), withM(B.laterSaveFa
 // a newer publication supersedes it: the retry saves the newer generation, and a second failure marks nothing
 ctl.push({ clause: 'SAVE.retry', good: true, ...B.laterSaveFail(0, 'retry', true) });
 ctl.push({ clause: 'SAVE.unsaved', good: true, ...B.laterSaveFail(1, 'retry', true) });
+// Pass 5i (r35): a write is checked as its pair. The retry written under another run's name (the reviewer's
+// mutation); a run writing an earlier run's catalog as its own.
+C('SAVE.whose', B.laterSaveFail(0, 'retry'), mod(B.laterSaveFail(0, 'retry'), (t) => { t.effects = [{ t: 'save', run: R2, gen: 2 }]; t.next.saving = { run: R2, gen: 2 }; }));
+C('SAVE.whose', B.foreignGen(false), B.foreignGen(true));
+// ...and written only in its turn. Gen 2 fails while gen 3 is published but still settling, with no ask: writing
+// gen 3 there is the reviewer's second case. The same on a landing that saved. A run that asked, met by a landing
+// that saved, gets its newest written. A save at the publish, before the settle, is outside every turn.
+C('SAVE.turn', B.supersededFail(false), mod(B.supersededFail(false), (t) => { t.effects = [{ t: 'save', run: R1, gen: 3 }]; t.next.saving = { run: R1, gen: 3 }; }));
+C('SAVE.turn', B.saveDirty(), mod(B.saveDirty(), (t) => { delete t.prev.run.queued; t.hist = histFromState(t.prev); }));
+C('SAVE.turn', B.askedTurn(true, 'saved'), B.askedTurn(false, 'saved'));
+C('SAVE.turn', B.refreshPublish(false), B.refreshPublish(true));
+C('I11.mirror', B.settleReady(), mod(B.settleReady(), (t) => { t.next.saving.run = R2; }));
+// Pass 5i, task 2: every record refusal leaves the state the same, from Stopped and from Failed, answered refused or failed
+C('PERSON.unchanged', B.recordRefusal('missing', 'start', true, 'failed'), mod(B.recordRefusal('missing', 'start', true, 'failed'), (t) => { t.next.after = { failed: true, failure: t.effects[0].reply.failure }; }));
+C('PERSON.unchanged', B.recordRefusal('unreadable', 'test', false, 'refused'), mod(B.recordRefusal('unreadable', 'test', false, 'refused'), (t) => { t.next.after = { failed: true, failure: F(t.effects[0].reply.words) }; }));
+C('PERSON.unchanged', B.recordRefusal('removing', 'auto', true, 'refused'), mod(B.recordRefusal('removing', 'auto', true, 'refused'), (t) => { t.next.after = { failed: false }; }));
+C('PERSON.unchanged', B.recordRefusal('sse', 'test', true, 'failed'), mod(B.recordRefusal('sse', 'test', true, 'failed'), (t) => { t.next.after = { failed: true, failure: t.effects[0].reply.failure }; }));
+C('PERSON.unchanged', B.recordRefusal('unlaunchable', 'start', false, 'failed'), mod(B.recordRefusal('unlaunchable', 'start', false, 'failed'), (t) => { t.next.nextRun = 3; }));
+C('PERSON.unchanged', B.recordRefusal('disabled', 'auto', true, 'refused'), mod(B.recordRefusal('disabled', 'auto', true, 'refused'), (t) => { t.next.after = { failed: true, failure: F(t.effects[0].reply.words) }; }));
+// Pass 5i, task 3: the setup-changed refusal is answered in its own words, not the owner's
+C('I3.kept', B.readmitSetup(SETUP_CHANGED.words), B.readmitSetup(OWNER_WORDS));
 // native, owner, orphans
 C('I2.stop-once', B.writeBound(), { ...B.writeBound(), hist: histFromState(B.writeBound().prev, { stopIssued: [R1] }) });
 C('I2.stop-target', B.writeBound(), mod(B.writeBound(), (t) => { t.effects[1].process = 'other:p'; }));

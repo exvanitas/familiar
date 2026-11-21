@@ -188,6 +188,8 @@ export type LcEffect =
   | { readonly t: 'new-session'; readonly run: string };
 
 export const STOPPED_WORDS = 'The server was stopped.';
+/** A relaunch's readmit that finds the setup changed since the run was admitted (row 175, 6b.11): its words. */
+export const SETUP_CHANGED: Failure = { kind: 'busy', words: 'The setup changed. Press Start again.' };
 export const STOP_REFUSED: Failure = { kind: 'failed', words: 'Familiar asked Windows to stop the server and was refused, so it may still be running. Familiar starts it again only once it has exited; restarting Familiar ends it for sure.' };
 export const STOP_UNCONFIRMED: Failure = { kind: 'failed', words: "Familiar asked Windows to stop the server and it hasn't exited yet, so it may still be running. Familiar starts it again only once it has exited; restarting Familiar ends it for sure." };
 export const START_UNANSWERED: Failure = { kind: 'timed-out', words: "The server didn't finish starting in time: Windows hasn't answered the start, so it may still be starting." };
