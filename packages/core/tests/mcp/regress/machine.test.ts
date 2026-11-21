@@ -293,6 +293,25 @@ describe('a queued re-save belongs to the run that queued it (6b.13)', () => {
       }));
 });
 
+describe("a run's first write is the first write issued for it, whatever generation it carries (6b.13)", () => {
+  it('a first write superseded while queued: the newer generation goes out as the first, and Start is answered Ready when it lands', () => {
+    const page: Ev = cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } }));
+    const g = run([
+      start('start', 'remote', 'k1'),
+      cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'modern-refusal' } })), idle, page, idle,
+      cur((r) => ({ t: 'deadline', id: r.saveBy ?? r.deadline!.id })),
+      start('start', 'remote', 'k2'),
+      cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'ok' } })), idle, page, idle,
+      cur((r) => ({ t: 'notice', run: r.id })), page,
+      { t: 'saved', gen: 1, outcome: 'saved' }
+    ]);
+    expect(g.s.run?.id).toBe('s#2');
+    expect(g.last).toContainEqual({ t: 'save', run: 's#2', gen: 3 });
+    const landed = run([{ t: 'saved', gen: 3, outcome: 'saved' }], g.s);
+    expect(answers(landed.last)).toEqual([{ t: 'answer', token: 'k2', reply: { kind: 'ready' } }]);
+  });
+});
+
 describe("the relaunch ends the exited process's exchange", () => {
   const local: Target = { where: 'local', setup: { id: 's1', label: 'S', program: 'node', args: [], cwd: '.', env: [], secrets: [] } };
   for (const mutation of [undefined, 'lc-relaunch-keeps-exchange'] as const)

@@ -87,9 +87,16 @@ export interface Run {
   readonly killed: boolean;
   /** This run's opening was refused by a modern-only server: a local one may be relaunched once (3.9). */
   readonly modernOpening: boolean;
-  /** The run's first catalog write: the start (or Test) is answered once it settles. */
-  readonly firstSave: 'none' | 'pending' | 'done';
+  /** The run's first catalog write (6b.13): the start (or Test) is answered once it lands. 'owed': the start's
+      settle asked for it while another write was in flight, so it waits in the run's queue; 'pending': it was
+      issued and is in flight, carrying `firstGen`; 'done': it landed. */
+  readonly firstSave: 'none' | 'owed' | 'pending' | 'done';
+  /** The generation the run's first write carries, fixed when that write is issued (a newer one may have
+      superseded the one the settle asked for). */
   readonly firstGen: number;
+  /** This run asked for a write while another was in flight: when that one lands, the run's newest catalog is
+      written, if the run is still current and not closing. The queue is the run's own: it goes with the run. */
+  readonly queued?: true;
   /** The unanswered list's words, kept through the relaunch grace. */
   readonly graceFailure?: Failure;
   /** The newest generation of this run whose write was issued (6b.13: each is written once, plus its one
@@ -135,11 +142,13 @@ export interface LcState {
   readonly held?: Failure;
   /** After a run: Stopped, or Failed with words. */
   readonly after?: { readonly failed: boolean; readonly failure?: Failure };
-  /** The catalog write in flight, and whether a newer catalog was published while it was. */
+  /** The one catalog write in flight, across runs (I11): whose it is and the generation it carries, fixed when
+      it was issued. A run's own queued write is `Run.queued`. */
   readonly saving?: { readonly run: string; readonly gen: number };
-  readonly dirty: boolean;
   /** Under a named mutation only: a relaunch Stop cancelled, still answerable. */
   readonly zombie?: string;
+  /** Under a named mutation only: a run's queued write left behind when the run ended. */
+  readonly strayQueue?: true;
 }
 
 export type StartFacts = {
@@ -232,7 +241,7 @@ const RECORD_WORDS: Record<Exclude<StartFacts['record'], 'ok'>, Reply> = {
 // Every switch is guarded at its own site by the build constant, so the app build drops it with its name.
 
 export function initialState(id: string): LcState {
-  return { id, nextRun: 0, nextDeadline: 0, nextGen: 0, orphans: [], waiters: [], owner: 'free', slot: 'idle', dirty: false };
+  return { id, nextRun: 0, nextDeadline: 0, nextGen: 0, orphans: [], waiters: [], owner: 'free', slot: 'idle' };
 }
 
 /** What Settings shows. */
@@ -353,15 +362,21 @@ class Tx {
     this.setRun({ inFlight: r.want, want: undefined });
     this.s.slot = 'busy';
   }
-  saveCatalog(): void {
+  /** The one way a catalog write is issued (6b.13), its identity fixed now: the current run's newest catalog.
+      Nothing for a closing run; behind a write in flight, the run's own queue; else the write, which is the
+      run's first if its first is owed. */
+  request(): void {
     const r = this.s.run!;
+    if (r.step === 'closing') return;
     if (this.s.saving && !(__FAMILIAR_MUTATIONS__ && mutant('lc-save-overlap'))) {
-      this.s.dirty = true;
+      this.setRun({ queued: true });
       return;
     }
-    this.s.saving = { run: r.id, gen: r.gen };
-    this.setRun({ written: r.gen });
-    this.emit({ t: 'save', run: r.id, gen: r.gen });
+    const gen = r.gen;
+    if (r.firstSave === 'owed') this.setRun({ firstSave: 'pending', firstGen: gen });
+    this.s.saving = { run: r.id, gen };
+    this.setRun({ written: gen });
+    this.emit({ t: 'save', run: r.id, gen });
   }
 }
 
@@ -615,15 +630,15 @@ function settle(tx: Tx): void {
   tx.setRun({ step: 'ready', walk: undefined, refreshOwed: beside, purpose: 'start' });
   if (purpose === 'recovery') tx.setRun({ recovered: true });
   if (purpose === 'start' && r.firstSave === 'none') {
-    // The start's deadline keeps running, for its answer only, until the first catalog write settles.
-    tx.setRun({ firstSave: 'pending', firstGen: r.gen });
+    // The start's deadline keeps running, for its answer only, until the first catalog write lands.
+    tx.setRun({ firstSave: 'owed' });
     tx.disarm();
-    tx.saveCatalog();
+    tx.request();
     return;
   }
   tx.disarm();
-  // A generation the queued re-save already wrote (landed, failed or in flight) gets nothing more here (6b.13).
-  if (r.written === undefined || r.written < r.gen) tx.saveCatalog();
+  // A generation already written (landed, failed or in flight) gets nothing more here (6b.13).
+  if (r.written === undefined || r.written < r.gen) tx.request();
   if (beside && tx.s.slot === 'idle') refresh(tx);
 }
 
@@ -838,26 +853,25 @@ function answerReady(tx: Tx): void {
 function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): void {
   const s = tx.s;
   if (s.saving?.gen !== gen) return;
+  // Whose write this was was fixed when it was issued (6b.13), never inferred now.
+  const of = s.saving.run;
   s.saving = undefined;
   const r = s.run;
-  const first = !!r && r.firstSave === 'pending' && r.firstGen === gen;
-  // A newer catalog published while this write was in flight is saved at the end of this transition, and
-  // only if the run is still current and not closing then: the transition that enters closing (the first
-  // write's failure, or Test's own cleanup once it lands) issues no new save (6b.13).
-  const queued = s.dirty;
-  s.dirty = false;
-  const resave = (): void => {
-    const now = tx.s.run;
-    if (queued && r && now?.id === r.id && now.step !== 'closing' && now.gen > gen) tx.saveCatalog();
-  };
-  // 6b.13: a later catalog write that fails keeps its generation and is tried once more (never for a closing
-  // run); a second failure marks it unsaved, which noteOf shows; the run goes on. The mark and its clearing
-  // apply in every step, closing included.
-  if (r && !first) {
-    if (outcome === 'failed' && r.step !== 'closing' && r.gen === gen && !s.saving && r.retried !== gen && !(__FAMILIAR_MUTATIONS__ && mutant('lc-failed-save-dropped'))) {
+  const own = !!r && of === r.id;
+  if (own && r.firstSave === 'pending') {
+    // The run's first write landed: Ready, or the run ends; nothing more if it is already ending (6b.1).
+    tx.setRun({ firstSave: 'done' });
+    if (r.step !== 'closing') {
+      if (outcome === 'failed') end(tx, 'catalog-failed', CATALOG_FAILED);
+      else answerReady(tx);
+    }
+  } else if (own) {
+    // A later write that fails keeps its generation and is tried once more (never for a closing run); a second
+    // failure marks it unsaved, which noteOf shows; the run goes on. The mark and its clearing apply in every
+    // step, closing included.
+    if (outcome === 'failed' && r.step !== 'closing' && r.gen === gen && r.retried !== gen && !(__FAMILIAR_MUTATIONS__ && mutant('lc-failed-save-dropped'))) {
       tx.setRun({ retried: gen });
-      tx.saveCatalog();
-      return;
+      return tx.request();
     }
     if (outcome === 'failed' && r.gen === gen && r.retried === gen) tx.setRun({ unsaved: gen });
     if (outcome !== 'failed') {
@@ -865,13 +879,15 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
       if (r.retried !== undefined && r.retried <= gen) tx.setRun({ retried: undefined });
     }
   }
-  if (!r || !first) return resave();
-  tx.setRun({ firstSave: 'done' });
-  // Already ending (a Stop, a crash): its waiters get the kept cause's words when it ends.
-  if (r.step === 'closing') return;
-  if (outcome === 'failed') return end(tx, 'catalog-failed', CATALOG_FAILED);
-  answerReady(tx);
-  resave();
+  // The current run's own queued write, now that the slot for writes is free, if it is still current and not
+  // closing (the transition that enters closing issues none).
+  const now = tx.s.run;
+  const stray = __FAMILIAR_MUTATIONS__ && mutant('lc-queue-outlives-run') && !!s.strayQueue;
+  if (now && now.step !== 'closing' && (now.queued || stray)) {
+    s.strayQueue = undefined;
+    tx.setRun({ queued: undefined });
+    tx.request();
+  }
 }
 
 function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
@@ -938,7 +954,7 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
     // starting (6b.2). Kind stopped is the Stop waiter's, once the exit is seen.
     for (const w of tx.s.waiters.filter((x) => x.run === r.id && (x.kind === 'start' || (x.kind === 'test' && cause !== 'test-done')))) {
       // (The named mutation answers a start Stop met during its catalog write as if it were ready.)
-      if (cause === 'person-stop' && r.firstSave === 'pending' && (__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop'))) tx.answer(w.token, w.kind === 'test' ? { kind: 'tested', run: r.id } : { kind: 'ready' });
+      if (cause === 'person-stop' && (r.firstSave === 'pending' || r.firstSave === 'owed') && (__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop'))) tx.answer(w.token, w.kind === 'test' ? { kind: 'tested', run: r.id } : { kind: 'ready' });
       else tx.answer(w.token, { kind: 'failed', failure: words });
     }
   }
@@ -1005,10 +1021,8 @@ function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Caus
   // A Test leaves the server Stopped unless the process may still run; a person's Stop too.
   const failed = mayRun || (!own && r.mode !== 'test');
   s.run = undefined;
-  // A queued re-save belongs to the run that queued it (6b.13): it goes with the run, and a later run's
-  // catalog is written at its own settle, as its first write, once the write in flight lands. A later run
-  // can queue one only from its own settle.
-  if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-queue-outlives-run'))) s.dirty = false;
+  // The run's queued write went with it (6b.13). (The named mutation leaves it behind for the next run.)
+  if (__FAMILIAR_MUTATIONS__ && mutant('lc-queue-outlives-run') && r.queued) s.strayQueue = true;
   // Beside Failed, a process that may still run shows its own words (section 6's residual, 6b.8); the cause's
   // words otherwise. (A waiter's words add "may still be running" to the cause's, 4.6.)
   s.after = failed ? { failed: true, failure: mayRun ? stillWords : words } : { failed: false };
