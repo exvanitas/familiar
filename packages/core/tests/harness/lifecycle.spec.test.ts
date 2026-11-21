@@ -375,7 +375,6 @@ describe('W with the spec checks', () => {
     ['lc-owner-held-on-stop', 'local', 'initial'],
     ['lc-no-stop-deadline', 'local', 'local Ready'],
     ['lc-two-native-stops', 'local', 'local Ready'],
-    ['lc-old-run-events', 'local', "run 2 launching after run 1's orphan exited"],
     ['lc-readmit-after-stop', 'local', 'relaunch pending'],
     ['lc-start-beside-orphan', 'local', 'closing after a refused stop, the orphan open'],
     ['lc-save-overlap', 'local', 'local Ready, its save in flight'],
@@ -391,10 +390,12 @@ describe('W with the spec checks', () => {
     ['lc-start-waits-cleanup', 'local', 'initial'],
     ['lc-taken-not-ended', 'local', 'initial']
   ];
+  // lc-old-run-events is W's alone (lifecycle.walk.test.ts): it widens only `started`, and the spec world can't
+  // deliver an old run's `started`, since a pending native start always belongs to the current run (I2.one, I6).
   const SPEC_CONTROL_DEPTH = Number(process.env.FAMILIAR_LC_SPEC_CONTROL_DEPTH ?? 7);
-  // Four are not caught within the CI depth from these origins (W's own checks catch them in CI); their
-  // spec-check catch is the local deep run's (FAMILIAR_LC_SPEC_DEEP=1, deeper), a named residual of pass 5.
-  const DEEP = new Set(['lc-test-ok-on-refusal', 'lc-old-run-events', 'lc-test-ok-after-stop', 'lc-failed-save-dropped']);
+  // Three are not caught within the CI depth from these origins (W's own checks catch them in CI); their
+  // spec-check catch is the local deep run's (FAMILIAR_LC_SPEC_DEEP=1, deeper).
+  const DEEP = new Set(['lc-test-ok-on-refusal', 'lc-test-ok-after-stop', 'lc-failed-save-dropped']);
   for (const [mutation, where, from] of LC)
     it.skipIf(DEEP.has(mutation) && !process.env.FAMILIAR_LC_SPEC_DEEP)(`${mutation} is caught by the spec checks from ${from}, and its trace replays clean unmutated`, () => {
       const origin = from === 'initial' ? SPEC0() : specCheckpoints().find((k) => k.origin.name === from)!.origin;
