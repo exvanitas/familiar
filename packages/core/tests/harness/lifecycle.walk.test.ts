@@ -446,8 +446,10 @@ describe('W for the run lifecycle', () => {
   // The fixpoint, run locally as the close's evidence (FAMILIAR_LC_FIXPOINT=1): the same walk with no depth
   // bound, keyed by the SHA-256 of the renumbered form, until the frontier is empty or about 30 minutes pass
   // (FAMILIAR_LC_FIXPOINT=exact keys the plain canonical form; it doesn't finish in that time). Progress goes
-  // to FAMILIAR_LC_LOG. On the machine as of 22e6800 (unchanged since): local, the fixpoint at depth 41, 2,681,234 states, about 25
-  // minutes; remote at depth 48, 411,602 states, about 3 minutes.
+  // to FAMILIAR_LC_LOG. At 1eb9cd0: local, the fixpoint at depth 45, 3,772,366 states, 33,463,682 transitions, 1,406 s;
+  // remote at depth 56, 782,230 states, 8,290,434 transitions. (At 22e6800: local depth 41, 2,681,234; remote depth 48,
+  // 411,602. Remote was already 691,192 at depth 53 by 8bc698a, pass 5's machine; 6b.13's retry marks took it to
+  // 882,502 at depth 55, and writing each generation once brought it to 782,230.)
   const fixpointLog = (line: string) => {
     if (process.env.FAMILIAR_LC_LOG) appendFileSync(process.env.FAMILIAR_LC_LOG, `${new Date().toISOString()} ${line}\n`);
   };
@@ -525,9 +527,9 @@ describe('W for the run lifecycle', () => {
     const x = s;
     const mark = x.run!.retried ?? x.run!.unsaved;
     expect(mark).toBe(x.run!.gen);
-    const shift = (st: LcState, marks: boolean): LcState => {
+    const shift = (st: LcState, marks: boolean, written = true): LcState => {
       const r = st.run!;
-      return { ...st, nextGen: st.nextGen + 5, saving: st.saving && { ...st.saving, gen: st.saving.gen + 5 }, run: { ...r, gen: r.gen + 5, firstGen: r.firstGen + 5, ...(marks && r.retried !== undefined ? { retried: r.retried + 5 } : {}), ...(marks && r.unsaved !== undefined ? { unsaved: r.unsaved + 5 } : {}), ...(r.written !== undefined ? { written: r.written + 5 } : {}) } };
+      return { ...st, nextGen: st.nextGen + 5, saving: st.saving && { ...st.saving, gen: st.saving.gen + 5 }, run: { ...r, gen: r.gen + 5, firstGen: r.firstGen + 5, ...(marks && r.retried !== undefined ? { retried: r.retried + 5 } : {}), ...(marks && r.unsaved !== undefined ? { unsaved: r.unsaved + 5 } : {}), ...(written && r.written !== undefined ? { written: r.written + 5 } : {}) } };
     };
     const alike = shift(x, true);
     const unlike = shift(x, false);
@@ -537,6 +539,9 @@ describe('W for the run lifecycle', () => {
     expect(fail(unlike).effects).not.toEqual(fail(x).effects);
     expect(renumbered(alike, CTX0)).toBe(renumbered(x, CTX0));
     expect(renumbered(unlike, CTX0)).not.toBe(renumbered(x, CTX0));
+    // The newest written generation is a mark too: left behind, the key changes.
+    expect(x.run!.written).toBe(x.run!.gen);
+    expect(renumbered(shift(x, true, false), CTX0)).not.toBe(renumbered(x, CTX0));
   });
 
   it('reaches each named checkpoint through next(), each the state it names', () => {

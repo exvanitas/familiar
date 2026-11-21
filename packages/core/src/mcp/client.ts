@@ -139,7 +139,6 @@ export class McpClient {
   private readonly clears = new Map<string, { readonly server: string; readonly tool: string; readonly fingerprint: string }>();
   /** Catalog writes under way: a durable clear waits for them, never taking the owner first. */
   private seeing = 0;
-  /** Servers whose latest catalog write failed, with the words shown until one lands. */
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {

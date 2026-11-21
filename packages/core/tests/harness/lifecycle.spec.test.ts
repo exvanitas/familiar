@@ -423,6 +423,31 @@ describe('W with the spec checks', () => {
       expect(twin, `${mutation}'s trace on the unmutated machine`).toEqual([]);
     }, 900_000);
 
+  // The generation marks (a later write retried, marked unsaved, the newest written) are ranked with the
+  // generations, in the state and in History alike. A later save's failure is past the merge check's depth, so
+  // the key is checked directly: a reached triple with every generation renamed keeps its key (each History
+  // field that names one included: saving, lastSave, lastPublish, runPublish[].last, firstSave[].gen,
+  // saveFails[].gen, writes[].gen, askedFor.gen, unsaved.gen); with one mark left behind, it doesn't.
+  it('renumbering ranks the generation marks with the generations, state and History', () => {
+    const ready = specCheckpoints().find((k) => k.origin.name === 'local Ready')!.origin;
+    const x = driveSpec(THIS, 'local', 'a later write retried', [is('notice'), page, is('slot', (e) => e.idle), is('saved', (e) => e.outcome === 'failed')], ready);
+    expect(x.s.run?.retried).toBe(x.s.run?.gen);
+    expect(x.s.run?.written).toBe(x.s.run?.gen);
+    const shift = (keep?: 'retried' | 'written') => {
+      const d = 5;
+      const up = (n: number | undefined) => (n === undefined ? undefined : n + d);
+      const r = x.s.run!;
+      const s: LcState = { ...x.s, nextGen: x.s.nextGen + d, saving: x.s.saving && { ...x.s.saving, gen: x.s.saving.gen + d }, run: { ...r, gen: r.gen + d, firstGen: r.firstGen + d, retried: keep === 'retried' ? r.retried : up(r.retried), written: keep === 'written' ? r.written : up(r.written), unsaved: up(r.unsaved) } };
+      const h0 = x.h as History & { writes?: { run: string; gen: number; count: number }[]; askedFor?: { run: string; gen: number } };
+      const h = { ...h0, saving: up(h0.saving), lastSave: up(h0.lastSave), lastPublish: up(h0.lastPublish), runPublish: h0.runPublish.map((p) => ({ ...p, last: p.last + d })), firstSave: h0.firstSave.map((f) => ({ ...f, gen: f.gen + d })), saveFails: h0.saveFails.map((f) => ({ ...f, gen: f.gen + d })), ...(h0.writes ? { writes: h0.writes.map((w) => ({ ...w, gen: w.gen + d })) } : {}), ...(h0.askedFor ? { askedFor: { ...h0.askedFor, gen: h0.askedFor.gen + d } } : {}), ...(h0.unsaved ? { unsaved: { ...h0.unsaved, gen: h0.unsaved.gen + d } } : {}) } as History;
+      return renumberedSpec(s, h, x.c);
+    };
+    const key = renumberedSpec(x.s, x.h, x.c);
+    expect(shift(), 'every generation renamed').toBe(key);
+    expect(shift('retried'), 'retried left behind').not.toBe(key);
+    expect(shift('written'), 'written left behind').not.toBe(key);
+  });
+
   // The renumbered key (the fixpoint's) merges only triples alike up to names: for every pair it merges in an
   // exact walk to depth 6, both have the same successors (by renumbered key) and the same verdicts (the clause
   // ids each transition breaks), event by event.
