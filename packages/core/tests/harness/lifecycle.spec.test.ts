@@ -138,17 +138,91 @@ export function stepSpec(w: Walked, s: LcState, h: History, e: Spec.LcEvent): { 
   return { s: out.state, h: h2, problems };
 }
 
-const keyOf = (n: { s: LcState; h: History; c: Ctx }, digest: boolean): string => {
-  const text = canon([n.s, n.h, n.c]);
+/**
+ * The (state, History, Ctx) triple with its names renumbered, as W's own fixpoint renumbers the state
+ * (lifecycle.walk.test.ts): tokens, run ids and processes by their order of first appearance in the canonical
+ * traversal (a process is its run's name with `:p`, as the alphabet mints it); deadline ids and catalog
+ * generations by rank, since the alphabet takes the newest dead deadline ids and the machine and the checks
+ * compare generations by order; and the state's counters that only mint fresh names dropped. Two triples
+ * alike up to such renaming have alike futures: the machine, the checks and the alphabet compare these names
+ * only for equality (deadline ids and generations for order too), and mint fresh ones above all present.
+ * History lists every deadline id ever armed (`ids`), so ranking over it keeps their order exactly. The CI
+ * check below compares the successors and verdicts of every pair this merges in an exact walk.
+ */
+export function renumberedSpec(s: LcState, h: History, c: Ctx): string {
+  const GEN = new Set(['gen', 'firstGen', 'unsaved', 'saving', 'lastSave', 'lastPublish', 'last']);
+  const DL = new Set(['saveBy', 'bound', 'deadline-id', 'ids']);
+  const gens = new Set<number>([0]);
+  const dls = new Set<number>();
+  const see = (v: unknown, k?: string, inDeadline = false): void => {
+    if (typeof v === 'number') {
+      if (k !== undefined && GEN.has(k)) gens.add(v);
+      if (k !== undefined && (DL.has(k) || (inDeadline && k === 'id'))) dls.add(v);
+      return;
+    }
+    if (v === null || typeof v !== 'object') return;
+    if (Array.isArray(v)) return v.forEach((x) => see(x, k));
+    const o = v as Record<string, unknown>;
+    const dl = 'which' in o && typeof o.id === 'number';
+    for (const kk in o) see(o[kk], kk, dl);
+  };
+  see(s);
+  see(h);
+  const rank = (xs: Set<number>, from: number) => new Map([...xs].sort((a, b) => a - b).map((x, i) => [x, i + from]));
+  const genRank = rank(gens, 0);
+  const dlRank = rank(dls, 1);
+  const names = new Map<string, string>();
+  const counts: Record<string, number> = {};
+  const rename = (kind: string, v: string): string => {
+    const key = `${kind}:${v}`;
+    let out = names.get(key);
+    if (out === undefined) names.set(key, (out = `${kind}${(counts[kind] = (counts[kind] ?? 0) + 1)}`));
+    return out;
+  };
+  const str = (v: unknown, k?: string, top = false): string => {
+    if (typeof v === 'string') {
+      // A first Stop answer is kept as canonical JSON text: renumber what it names, too.
+      if (k === 'reply' && v.startsWith('{')) return JSON.stringify(str(JSON.parse(v)));
+      if (/^p\d+$/.test(v)) return JSON.stringify(rename('k', v));
+      const proc = /^(.+#\d+):p$/.exec(v);
+      if (proc) return JSON.stringify(`${rename('r', proc[1]!)}:p`);
+      if (/^.+#\d+$/.test(v)) return JSON.stringify(rename('r', v));
+      return JSON.stringify(v);
+    }
+    if (typeof v === 'number') {
+      if (k !== undefined && GEN.has(k)) return String(genRank.get(v));
+      if (k !== undefined && DL.has(k)) return `d${dlRank.get(v)}`;
+      return String(v);
+    }
+    if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'undefined';
+    if (Array.isArray(v)) return `[${v.map((x) => str(x, k)).join(',')}]`;
+    const o = v as Record<string, unknown>;
+    const dl = 'which' in o && typeof o.id === 'number';
+    const parts: string[] = [];
+    for (const kk of Object.keys(o).sort()) {
+      if (o[kk] === undefined || (top && SPEC_DROPPED.has(kk))) continue;
+      parts.push(`${JSON.stringify(kk)}:${str(o[kk], dl && kk === 'id' ? 'deadline-id' : kk)}`);
+    }
+    return `{${parts.join(',')}}`;
+  };
+  return `[${str(s, undefined, true)},${str(h)},${str(c)}]`;
+}
+/** The state's counters that only mint fresh names, dropped from the renumbered form (its top level only). */
+const SPEC_DROPPED = new Set(['nextRun', 'nextDeadline', 'nextGen']);
+
+const keyOf = (n: { s: LcState; h: History; c: Ctx }, digest: boolean, renumber = false): string => {
+  const text = renumber ? renumberedSpec(n.s, n.h, n.c) : canon([n.s, n.h, n.c]);
   return digest ? createHash('sha256').update(text).digest().toString('latin1') : text;
 };
 
-/** Breadth first, exactly deduplicated over (state, history, ctx). */
-export function walkSpec(w: Walked, where: Where, maxDepth: number, origin: SpecOrigin = SPEC0(), opts: { stopAtFirst?: boolean; collect?: boolean; digest?: boolean; budgetMs?: number; progress?: (r: SpecResult) => void } = {}): SpecResult {
+/** Breadth first, exactly deduplicated over (state, history, ctx): by canonical form, or (`renumber`) by the
+    renumbered form; either one as itself or (`digest`) its SHA-256. */
+export function walkSpec(w: Walked, where: Where, maxDepth: number, origin: SpecOrigin = SPEC0(), opts: { stopAtFirst?: boolean; collect?: boolean; digest?: boolean; renumber?: boolean; budgetMs?: number; progress?: (r: SpecResult) => void } = {}): SpecResult {
   const t0 = performance.now();
   const stopAtFirst = opts.stopAtFirst ?? true;
   const digest = !!opts.digest;
-  const seen = new Set<string>([keyOf(origin, digest)]);
+  const renumber = !!opts.renumber;
+  const seen = new Set<string>([keyOf(origin, digest, renumber)]);
   let frontier: Node[] = [{ s: origin.s, h: origin.h, c: origin.c }];
   let transitions = 0;
   let depth = 0;
@@ -178,7 +252,7 @@ export function walkSpec(w: Walked, where: Where, maxDepth: number, origin: Spec
           if (opts.collect) continue;
         }
         const node: Node = { s: st.s, h: st.h, c: c2, step };
-        const key = keyOf(node, digest);
+        const key = keyOf(node, digest, renumber);
         if (seen.has(key)) continue;
         seen.add(key);
         nf.push(node);
@@ -348,17 +422,74 @@ describe('W with the spec checks', () => {
       expect(twin, `${mutation}'s trace on the unmutated machine`).toEqual([]);
     }, 900_000);
 
+  // The renumbered key (the fixpoint's) merges only triples alike up to names: for every pair it merges in an
+  // exact walk to depth 6, both have the same successors (by renumbered key) and the same verdicts (the clause
+  // ids each transition breaks), event by event.
+  const MERGE_DEPTH = Number(process.env.FAMILIAR_LC_SPEC_MERGE_DEPTH ?? 6);
+  for (const where of ['local', 'remote'] as const)
+    it(`renumbering merges only triples with alike futures, one step on, to depth ${MERGE_DEPTH}, ${where}`, () => {
+      const succ = (n: { s: LcState; h: History; c: Ctx }) =>
+        alphabet(n.s as never, n.h, n.c, where)
+          .map(([e, c2]) => {
+            const st = stepSpec(THIS, n.s, n.h, e);
+            if (!st) return 'not taken';
+            const verdict = [...new Set(st.problems.map((p) => p.slice(0, p.indexOf(':'))))].sort().join(',');
+            return `${renumberedSpec(st.s, st.h, c2)}|${verdict}`;
+          })
+          .sort()
+          .join('\n');
+      const exact = new Set<string>();
+      const reps = new Map<string, { s: LcState; h: History; c: Ctx }>();
+      let merged = 0;
+      const o = SPEC0();
+      let frontier: { s: LcState; h: History; c: Ctx }[] = [{ s: o.s, h: o.h, c: o.c }];
+      exact.add(canon([o.s, o.h, o.c]));
+      reps.set(renumberedSpec(o.s, o.h, o.c), frontier[0]!);
+      const bad: string[] = [];
+      for (let d = 0; d < MERGE_DEPTH; d++) {
+        const nf: typeof frontier = [];
+        for (const n of frontier)
+          for (const [e, c2] of alphabet(n.s as never, n.h, n.c, where)) {
+            const st = stepSpec(THIS, n.s, n.h, e);
+            if (!st) continue;
+            const m = { s: st.s, h: st.h, c: c2 };
+            const k = canon([m.s, m.h, m.c]);
+            if (exact.has(k)) continue;
+            exact.add(k);
+            nf.push(m);
+            const rk = renumberedSpec(m.s, m.h, m.c);
+            const rep = reps.get(rk);
+            if (!rep) reps.set(rk, m);
+            else {
+              merged++;
+              if (bad.length < 3 && succ(m) !== succ(rep)) bad.push(`merged unlike triples: ${k.slice(0, 300)}`);
+            }
+          }
+        frontier = nf;
+      }
+      if (process.env.FAMILIAR_VERBOSE) console.log(`LC-SPEC renumbering ${where}: ${exact.size} exact triples to depth ${MERGE_DEPTH}, ${reps.size} renumbered, ${merged} merged pairs checked`);
+      expect(bad).toEqual([]);
+      expect(merged).toBeGreaterThan(0);
+    }, 900_000);
+
   const fixLog = (line: string) => {
     if (process.env.FAMILIAR_LC_LOG) appendFileSync(process.env.FAMILIAR_LC_LOG, `${new Date().toISOString()} ${line}\n`);
   };
   for (const where of ['local', 'remote'] as const)
     it.skipIf(!process.env.FAMILIAR_LC_SPEC_FIXPOINT)(`the spec checks hold to the fixpoint, ${where}`, () => {
       const fmt = (label: string, r: SpecResult) => `${label}: ${r.done ? 'fixpoint' : 'STOPPED'} at depth ${r.depth}, ${r.states} states, ${r.transitions} transitions, frontier ${r.frontier}, ${Math.round(r.ms / 1000)} s, peak heap ${r.peakHeapMb} MB${r.violation ? `, VIOLATION ${r.violation.problems.join('; ')} after ${show(r.violation.trace)}` : ''}`;
-      const r = walkSpec(THIS, where, Infinity, SPEC0(), { digest: true, budgetMs: 60 * 60_000, progress: (p) => fixLog(fmt(`spec progress ${where}`, p)) });
-      fixLog(fmt(`SPEC FIXPOINT ${where}`, r));
+      // Keyed by the SHA-256 of the renumbered form (FAMILIAR_LC_SPEC_FIXPOINT=exact: of the plain canonical
+      // form), for about 40 minutes at most. It doesn't empty in that time: the spec alphabet offers every
+      // outcome at every point under Ctx's eight budgets, which multiply the states far more than History
+      // does, and renumbering merges only a few percent. At becbdf0, no violation: local stopped after depth
+      // 12 (1,911,897 states, 13,094,456 transitions, frontier 1,079,770, 2,565 s); remote after depth 14
+      // (934,600 states, 8,080,085 transitions, frontier 426,608, 2,925 s); peak heap 3.5 GB.
+      const renumber = process.env.FAMILIAR_LC_SPEC_FIXPOINT !== 'exact';
+      const r = walkSpec(THIS, where, Infinity, SPEC0(), { digest: true, renumber, budgetMs: 40 * 60_000, progress: (p) => fixLog(fmt(`spec progress ${where}${renumber ? ' renumbered' : ''}`, p)) });
+      fixLog(fmt(`SPEC FIXPOINT ${where}${renumber ? ' renumbered' : ''}`, r));
       expect(r.violation, r.violation?.problems.join('; ')).toBeUndefined();
-      expect(r.done).toBe(true);
-    }, 4_000_000);
+      expect(r.done, `stopped at depth ${r.depth} with ${r.frontier} in the frontier`).toBe(true);
+    }, 45 * 60_000);
 });
 
 export { mutations };
