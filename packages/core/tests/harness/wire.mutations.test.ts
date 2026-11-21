@@ -233,6 +233,57 @@ describe('H13 on a stream with no final response', () => {
     }, 120_000);
 });
 
+describe("HC's replay matched to the independent records, effect by effect", () => {
+  // Each control is a clean run whose independent record is then changed the way a driver defect would
+  // change it: HC must pass the clean run and flag the changed one. Counts alone (the old HC) miss all four.
+  const s = (prefix: string) => SCHEDULES.find((x) => x.name.startsWith(prefix))!.options;
+  const clean = async (seed: number, options: WireOptions) => {
+    const r = await wireRun(seed, options);
+    expect(PASS_CHECKS.HC!(r), `seed ${seed} clean`).toEqual([]);
+    return r;
+  };
+  it('a reply under another token: the admitted and refused Starts of S36 swapped', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S36'));
+      const started = r.evidence.filter((e) => e.what === 'started');
+      const refused = started.find((e) => e.failure === 'refused')!;
+      const admitted = started.filter((e) => e.ok).at(-1)!;
+      [(refused as { token?: string }).token, (admitted as { token?: string }).token] = [admitted.token, refused.token];
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it('a reply of another outcome: a Start answered ready, recorded as timed out', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const ready = r.evidence.find((e) => e.what === 'started' && e.ok)!;
+      Object.assign(ready, { ok: false, failure: 'timed-out', words: "The server didn't finish starting in time." });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a missing release: the native start's reservation never released", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const t = r.exe.processStarts[0]!;
+      const held = r.reservations.find((x) => x.what === 'start' && x.seq < t.seq && (x.released ?? Infinity) > t.seq)!;
+      delete held.released;
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a stop sent to the wrong process: S34's Stop of the first run taken by the second run's process", async () => {
+    let forged = 0;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S34'));
+      const [first, second] = r.exe.processStarts;
+      const stop = r.exe.stopsAsked.find((x) => x.epoch === first?.epoch);
+      if (!first || !second || !stop) continue;
+      Object.assign(stop, { epoch: second.epoch, ...('run' in second ? { run: (second as { run?: string }).run } : {}) });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+      forged++;
+    }
+    expect(forged).toBeGreaterThan(0);
+  }, 60_000);
+});
+
 describe('the twin comparison itself', () => {
   it('counts two histories that differ only in one header as different', async () => {
     const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });

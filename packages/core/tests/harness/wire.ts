@@ -398,12 +398,13 @@ export class FakeExe {
   readonly build: 'prepass' | 'pass';
   /** Local: when each response line reached the client, by epoch and request id. */
   readonly responded = new Map<string, number>();
-  /** Local: when the client asked the exe to stop each process run, by epoch. */
-  readonly stopsAsked: { epoch: number; step: number; seq?: number }[] = [];
+  /** Local: when the client asked the exe to stop each process run, by epoch, and the handle it named. */
+  readonly stopsAsked: { epoch: number; step: number; seq?: number; run?: string }[] = [];
   /** Local: when each process run exited, by epoch. */
   readonly exits: { epoch: number; step: number }[] = [];
-  /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2). */
-  readonly processStarts: { epoch: number; seq: number; step: number; server: string; answered?: number }[] = [];
+  /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2), and the
+      handle the exe gave it. */
+  readonly processStarts: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number }[] = [];
   /** Holds the next process start's answer until `releaseStart()` (S11, Stop during a pending start). */
   holdNextStart = false;
   releaseStart?: () => void;
@@ -792,7 +793,7 @@ export class FakeExe {
         new Promise((resolve) => {
           const run = `p${++runs}`;
           this.epoch++;
-          const admitted: { epoch: number; seq: number; step: number; server: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id };
+          const admitted: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id, run };
           this.processStarts.push(admitted);
           live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch });
           const answer = () => this.sched.add({ label: `started:${run}`, fire: () => {
@@ -835,7 +836,7 @@ export class FakeExe {
         }),
       stop: async (run) => {
         const asked = live.get(run);
-        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step, seq: this.tick() });
+        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step, seq: this.tick(), run });
         if (this.server.mode.refuseStop) throw Object.assign(new Error('refused'), { kind: 'failed' });
         this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) });
       },
@@ -1150,16 +1151,19 @@ export class Driver {
     );
   }
 
-  /** Test, as Settings runs it: its report, with the tools it showed. */
+  /** Test, as Settings runs it: its report, with the tools it showed (and a failed one's words). Its report
+      carries the Test's own token, as a Start's reply does. */
+  private tests = 0;
   test(id = 's1'): void {
     const before = this.client.get(id)?.phase;
+    const token = `test-${++this.tests}`;
     // Whether Test reaches the machine: only from Stopped or Failed (otherwise the client answers at once).
-    const e = this.note({ what: 'test', server: id, reaches: before === 'stopped' || before === 'failed' || before === undefined });
+    const e = this.note({ what: 'test', server: id, token, reaches: before === 'stopped' || before === 'failed' || before === undefined });
     const testing = this.client.test(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void testing.then(
-      (report) => this.note({ what: 'tested', server: id, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] } }),
-      (e: unknown) => this.note({ what: 'tested', server: id, failure: 'threw', words: String(e).slice(0, 80) })
+      (report) => this.note({ what: 'tested', server: id, token, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] }, ...(report.ok ? {} : { words: report.failure.words }) }),
+      (e: unknown) => this.note({ what: 'tested', server: id, token, failure: 'threw', words: String(e).slice(0, 80) })
     );
   }
 
