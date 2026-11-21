@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
-import { MIRROR_VECTORS, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
+import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
 
 interface Control {
   readonly mutation: string;
@@ -209,25 +209,37 @@ describe('Start replies paired by token', () => {
 
 describe("H13 and the parser's own end", () => {
   // One chunk: a message the parser rejects, then pings, then the final, its cancel refused. The client
-  // ended at the rejected message, so the pings after it are departure 2.
-  const mode = { where: 'remote', era: 'legacy', pings: 2, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0, invalidFirst: true } as Partial<Mode>;
-  it('pings after the rejected message are excused; taken at the final only (the old reading), H13 blames the client', async () => {
-    let witnessed = 0;
-    for (let seed = 1; seed <= 6; seed++) {
-      const r = await wireRun(seed, { mode });
-      if (r.exe.log.some((x) => x.refusals && x.delivered.size)) witnessed++;
-      expect(PASS_CHECKS.H13!(r), `seed ${seed}`).toEqual([]);
-    }
-    expect(witnessed).toBeGreaterThan(0);
-    evidenceControls.finalOnly = true;
-    try {
-      let flagged = 0;
-      for (let seed = 1; seed <= 6; seed++) if (PASS_CHECKS.H13!(await wireRun(seed, { mode })).length) flagged++;
-      expect(flagged).toBeGreaterThan(0);
-    } finally {
-      evidenceControls.finalOnly = false;
-    }
-  }, 120_000);
+  // ended at the rejected message, so the pings after it are departure 2. Each of 3.10's rejections.
+  const mode = (invalidFirst: keyof typeof INVALID) => ({ where: 'remote', era: 'legacy', pings: 2, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0, invalidFirst }) as Partial<Mode>;
+  it("the harness's own shape reading rejects each fixture, and none of the messages the server sends otherwise", () => {
+    for (const [kind, m] of Object.entries(INVALID)) expect(rejectedByShape(m), kind).toBe(true);
+    const valid = [
+      { jsonrpc: '2.0', id: 'p1', method: 'ping' },
+      { jsonrpc: '2.0', id: 7, method: 'sampling/createMessage', params: {} },
+      { jsonrpc: '2.0', method: 'notifications/tools/list_changed' },
+      { jsonrpc: '2.0', id: 3, result: { content: [] } },
+      { jsonrpc: '2.0', id: 3, error: { code: -32022, message: 'no', data: { supported: [] } } }
+    ];
+    for (const m of valid) expect(rejectedByShape(m), JSON.stringify(m)).toBe(false);
+  });
+  for (const kind of Object.keys(INVALID) as (keyof typeof INVALID)[])
+    it(`pings after the rejected message (${kind}) are excused; taken at the final only (the old reading), H13 blames the client`, async () => {
+      let witnessed = 0;
+      for (let seed = 1; seed <= 6; seed++) {
+        const r = await wireRun(seed, { mode: mode(kind) });
+        if (r.exe.log.some((x) => x.refusals && x.delivered.size)) witnessed++;
+        expect(PASS_CHECKS.H13!(r), `seed ${seed}`).toEqual([]);
+      }
+      expect(witnessed).toBeGreaterThan(0);
+      evidenceControls.finalOnly = true;
+      try {
+        let flagged = 0;
+        for (let seed = 1; seed <= 6; seed++) if (PASS_CHECKS.H13!(await wireRun(seed, { mode: mode(kind) })).length) flagged++;
+        expect(flagged).toBeGreaterThan(0);
+      } finally {
+        evidenceControls.finalOnly = false;
+      }
+    }, 120_000);
 });
 
 describe('H13 on a stream with no final response', () => {

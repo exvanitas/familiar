@@ -80,8 +80,9 @@ export interface Mode {
   readonly hold: boolean;
   /** Each answer in one chunk (S2: a ping in the same chunk as the final reply). */
   readonly oneChunk: boolean;
-  /** A call's answer begins with a message the client's parser rejects (no `jsonrpc`), then its pings. */
-  readonly invalidFirst?: boolean;
+  /** A call's answer begins with a message the client's parser rejects, then its pings: by default one with
+      no `jsonrpc`, or another of 3.10's rejections by name (INVALID). */
+  readonly invalidFirst?: boolean | keyof typeof INVALID;
   /** A list_changed ahead of the first tools/list answer of each session, its variant flipped (S14). */
   readonly changeOnList: boolean;
   /** How often a cancelled request's helper is held, for any time (H4). */
@@ -286,7 +287,7 @@ export class ScriptedServer {
       this.lastId = body.id;
       const n = m.pings === 40 ? 40 : m.pings;
       // A message the client's parser rejects, ahead of the pings (S37): the exchange ends there.
-      if (m.invalidFirst && !modernReq) msgs.push({ method: 'notes/garbage', params: { note: 'no jsonrpc member' } } as Msg);
+      if (m.invalidFirst && !modernReq) msgs.push(structuredClone(INVALID[m.invalidFirst === true ? 'no-jsonrpc' : m.invalidFirst]) as Msg);
       if (!modernReq) for (let i = 0; i < n; i++) msgs.push(this.ping(on));
       if (!modernReq && this.r() < m.listChanged) {
         if (!m.reorder) this.variant = this.variant === 'a' ? 'b' : 'a';
@@ -336,6 +337,39 @@ function shuffled(t: Msg, r: () => number): Msg {
     [props[i], props[j]] = [props[j]!, props[i]!];
   }
   return { ...t, inputSchema: { ...t.inputSchema, properties: Object.fromEntries(props) } };
+}
+
+/** Messages 3.10's shape rules reject, one per rule: the parser ends its exchange at any of them. None is a
+    response to the call, so none is taken for its final. */
+export const INVALID = {
+  'no-jsonrpc': { method: 'notes/garbage', params: { note: 'no jsonrpc member' } },
+  'wrong-version': { jsonrpc: '1.0', method: 'notes/garbage', params: {} },
+  'array-params': { jsonrpc: '2.0', method: 'notes/garbage', params: [1, 2] },
+  'long-method': { jsonrpc: '2.0', method: 'm'.repeat(129) },
+  'bad-request-id': { jsonrpc: '2.0', id: { not: 'an id' }, method: 'ping' },
+  'both-members': { jsonrpc: '2.0', id: 'zz', result: {}, error: { code: 1, message: 'both' } },
+  'bad-error': { jsonrpc: '2.0', id: 'zz', error: { code: 1.5, message: 'not an integer code' } },
+  'too-deep': { jsonrpc: '2.0', method: 'notes/garbage', params: { deep: JSON.parse(`${'['.repeat(70)}${']'.repeat(70)}`) } }
+} as const;
+
+/** Whether 3.10's shape rules reject a message, as the harness reads them, never importing the parser: an
+    object, nested at most 64 deep, with `jsonrpc: "2.0"`; a request or notification with a method string of
+    at most 128 bytes, `params` an object if present, a request's id a string of at most 128 bytes or a safe
+    integer; a response with such an id and exactly one of `result` (an object) or `error` (an integer code
+    and a string message). */
+export function rejectedByShape(m: unknown): boolean {
+  const object = (v: unknown): v is Msg => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const within = (v: unknown, depth: number): boolean => depth <= 64 && (Array.isArray(v) ? v.every((x) => within(x, depth + 1)) : object(v) ? Object.values(v).every((x) => within(x, depth + 1)) : true);
+  const id = (v: unknown) => (typeof v === 'string' ? Buffer.byteLength(v) <= 128 : Number.isSafeInteger(v));
+  if (!object(m) || !within(m, 1) || m.jsonrpc !== '2.0') return true;
+  if ('method' in m) {
+    if (typeof m.method !== 'string' || Buffer.byteLength(m.method) > 128) return true;
+    if (m.params !== undefined && !object(m.params)) return true;
+    return 'id' in m && !id(m.id);
+  }
+  if (!('id' in m) || !id(m.id) || 'result' in m === 'error' in m) return true;
+  if ('result' in m) return !object(m.result);
+  return !object(m.error) || !Number.isInteger(m.error.code) || typeof m.error.message !== 'string';
 }
 
 /** Media types an answer may come with besides the two exact ones (oddMedia). */
@@ -615,8 +649,8 @@ export class FakeExe {
             // Never past the stream's own terminal message: one delivered after it in the same chunk came after
             // the client's end, not before it. A stream with no final response (`final` -1) has no such bound.
             // The client's actual terminal position: the final response, or the first message its parser
-            // rejects (not JSON-RPC 2.0), whichever comes first.
-            const rejected = plan && !(st as any).holdMsgs && !evidenceControls.finalOnly ? plan.messages.findIndex((m) => !m || typeof m !== 'object' || (m as { jsonrpc?: unknown }).jsonrpc !== '2.0') : -1;
+            // rejects (by 3.10's shape rules, read here on their own), whichever comes first.
+            const rejected = plan && !(st as any).holdMsgs && !evidenceControls.finalOnly ? plan.messages.findIndex(rejectedByShape) : -1;
             const final = plan && !(st as any).holdMsgs && plan.final !== undefined && (plan.final >= 0 || evidenceControls.finalSentinel) ? plan.final : Infinity;
             const terminal = rejected >= 0 ? Math.min(rejected, final) : final;
             rec.endedAt = this.sched.step * 1000 + Math.min(whole, terminal);
