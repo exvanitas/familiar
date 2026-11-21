@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
-import { MIRROR_VECTORS, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
+import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
 
 interface Control {
   readonly mutation: string;
@@ -65,6 +65,9 @@ const CONTROLS: Control[] = [
   // Under the named schedules.
   { mutation: 'slot-per-run', check: 'H1', named: 'S8' },
   { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1' },
+  // The changed tool on a walk's second page: H3's catalog is every page of a completed walk.
+  { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1 a fingerprint change while a card is shown, the tool on a later page' },
+  { mutation: 'own-ignores-fingerprint', check: 'H3', named: 'S38' },
   { mutation: 'cancel-pongs-at-drain', check: 'H13', named: 'S2' },
   { mutation: 'rehandshake-every-404', check: 'H14', named: 'S3' },
   { mutation: 'no-detach', check: 'H4', named: 'S8', build: 'pass' },
@@ -171,6 +174,24 @@ describe("the evidence's own controls", () => {
   }, 60_000);
 });
 
+describe("H2 and the stopped server's own process", () => {
+  // S35 calls the other, still-running server after the first one's Stop: its writes are its own process's,
+  // so H2 is clean. The same write, taken as one to the stopped server's process, is caught.
+  it("the other server's call after a Stop is its own; the same call to the stopped server's process fails H2", async () => {
+    const s35 = SCHEDULES.find((s) => s.name.startsWith('S35'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s35);
+      expect(PASS_CHECKS.H2!(r), `seed ${seed} clean`).toEqual([]);
+      const stop = r.evidence.find((e) => e.what === 'stop')!;
+      const fenced = r.exe.processStarts.filter((t) => t.server === stop.server && t.seq < stop.seq).at(-1)!;
+      const after = r.exe.log.find((x) => x.kind === 'write' && x.body?.method === 'tools/call' && x.seq > stop.seq)!;
+      expect(after.server, `seed ${seed}`).not.toBe(stop.server);
+      Object.assign(after, { server: fenced.server, epoch: fenced.epoch });
+      expect(PASS_CHECKS.H2!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/tools\/call sent to a run after its Stop/)]));
+    }
+  }, 60_000);
+});
+
 describe('Start replies paired by token', () => {
   it('two overlapping Starts, the refused one answered first (S36): clean by token; by order (the old pairing) H14 misreads the 404', async () => {
     const s36 = SCHEDULES.find((s) => s.name.startsWith('S36'))!.options;
@@ -188,25 +209,37 @@ describe('Start replies paired by token', () => {
 
 describe("H13 and the parser's own end", () => {
   // One chunk: a message the parser rejects, then pings, then the final, its cancel refused. The client
-  // ended at the rejected message, so the pings after it are departure 2.
-  const mode = { where: 'remote', era: 'legacy', pings: 2, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0, invalidFirst: true } as Partial<Mode>;
-  it('pings after the rejected message are excused; taken at the final only (the old reading), H13 blames the client', async () => {
-    let witnessed = 0;
-    for (let seed = 1; seed <= 6; seed++) {
-      const r = await wireRun(seed, { mode });
-      if (r.exe.log.some((x) => x.refusals && x.delivered.size)) witnessed++;
-      expect(PASS_CHECKS.H13!(r), `seed ${seed}`).toEqual([]);
-    }
-    expect(witnessed).toBeGreaterThan(0);
-    evidenceControls.finalOnly = true;
-    try {
-      let flagged = 0;
-      for (let seed = 1; seed <= 6; seed++) if (PASS_CHECKS.H13!(await wireRun(seed, { mode })).length) flagged++;
-      expect(flagged).toBeGreaterThan(0);
-    } finally {
-      evidenceControls.finalOnly = false;
-    }
-  }, 120_000);
+  // ended at the rejected message, so the pings after it are departure 2. Each of 3.10's rejections.
+  const mode = (invalidFirst: keyof typeof INVALID) => ({ where: 'remote', era: 'legacy', pings: 2, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0, invalidFirst }) as Partial<Mode>;
+  it("the harness's own shape reading rejects each fixture, and none of the messages the server sends otherwise", () => {
+    for (const [kind, m] of Object.entries(INVALID)) expect(rejectedByShape(m), kind).toBe(true);
+    const valid = [
+      { jsonrpc: '2.0', id: 'p1', method: 'ping' },
+      { jsonrpc: '2.0', id: 7, method: 'sampling/createMessage', params: {} },
+      { jsonrpc: '2.0', method: 'notifications/tools/list_changed' },
+      { jsonrpc: '2.0', id: 3, result: { content: [] } },
+      { jsonrpc: '2.0', id: 3, error: { code: -32022, message: 'no', data: { supported: [] } } }
+    ];
+    for (const m of valid) expect(rejectedByShape(m), JSON.stringify(m)).toBe(false);
+  });
+  for (const kind of Object.keys(INVALID) as (keyof typeof INVALID)[])
+    it(`pings after the rejected message (${kind}) are excused; taken at the final only (the old reading), H13 blames the client`, async () => {
+      let witnessed = 0;
+      for (let seed = 1; seed <= 6; seed++) {
+        const r = await wireRun(seed, { mode: mode(kind) });
+        if (r.exe.log.some((x) => x.refusals && x.delivered.size)) witnessed++;
+        expect(PASS_CHECKS.H13!(r), `seed ${seed}`).toEqual([]);
+      }
+      expect(witnessed).toBeGreaterThan(0);
+      evidenceControls.finalOnly = true;
+      try {
+        let flagged = 0;
+        for (let seed = 1; seed <= 6; seed++) if (PASS_CHECKS.H13!(await wireRun(seed, { mode: mode(kind) })).length) flagged++;
+        expect(flagged).toBeGreaterThan(0);
+      } finally {
+        evidenceControls.finalOnly = false;
+      }
+    }, 120_000);
 });
 
 describe('H13 on a stream with no final response', () => {
@@ -231,6 +264,57 @@ describe('H13 on a stream with no final response', () => {
         evidenceControls.finalSentinel = false;
       }
     }, 120_000);
+});
+
+describe("HC's replay matched to the independent records, effect by effect", () => {
+  // Each control is a clean run whose independent record is then changed the way a driver defect would
+  // change it: HC must pass the clean run and flag the changed one. Counts alone (the old HC) miss all four.
+  const s = (prefix: string) => SCHEDULES.find((x) => x.name.startsWith(prefix))!.options;
+  const clean = async (seed: number, options: WireOptions) => {
+    const r = await wireRun(seed, options);
+    expect(PASS_CHECKS.HC!(r), `seed ${seed} clean`).toEqual([]);
+    return r;
+  };
+  it('a reply under another token: the admitted and refused Starts of S36 swapped', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S36'));
+      const started = r.evidence.filter((e) => e.what === 'started');
+      const refused = started.find((e) => e.failure === 'refused')!;
+      const admitted = started.filter((e) => e.ok).at(-1)!;
+      [(refused as { token?: string }).token, (admitted as { token?: string }).token] = [admitted.token, refused.token];
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it('a reply of another outcome: a Start answered ready, recorded as timed out', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const ready = r.evidence.find((e) => e.what === 'started' && e.ok)!;
+      Object.assign(ready, { ok: false, failure: 'timed-out', words: "The server didn't finish starting in time." });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a missing release: the native start's reservation never released", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const t = r.exe.processStarts[0]!;
+      const held = r.reservations.find((x) => x.what === 'start' && x.seq < t.seq && (x.released ?? Infinity) > t.seq)!;
+      delete held.released;
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a stop sent to the wrong process: S34's Stop of the first run taken by the second run's process", async () => {
+    let forged = 0;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S34'));
+      const [first, second] = r.exe.processStarts;
+      const stop = r.exe.stopsAsked.find((x) => x.epoch === first?.epoch);
+      if (!first || !second || !stop) continue;
+      Object.assign(stop, { epoch: second.epoch, ...('run' in second ? { run: (second as { run?: string }).run } : {}) });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+      forged++;
+    }
+    expect(forged).toBeGreaterThan(0);
+  }, 60_000);
 });
 
 describe('the twin comparison itself', () => {

@@ -3,7 +3,7 @@
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import type { Evidence, NativeRec, WireRun } from './wire.ts';
-import { initialState, next } from '../../src/mcp/wire/lifecycle.ts';
+import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
 export type Check = (r: WireRun) => string[];
 
@@ -77,8 +77,8 @@ function runOf(r: WireRun, x: NativeRec): number {
 function readyBefore(r: WireRun, x: NativeRec): boolean {
   const s = admittedStarts(r, x.server)[runOf(r, x) - 1];
   if (!s) return false;
-  // Its own reply, by the action's token (a Test's by order, one at a time).
-  const reply = r.evidence.find((y) => y.what === (s.what === 'start' ? 'started' : 'tested') && y.server === s.server && y.seq > s.seq && (s.what !== 'start' || evidenceControls.startsByOrder || y.token === s.token));
+  // Its own reply, by the action's token.
+  const reply = r.evidence.find((y) => y.what === (s.what === 'start' ? 'started' : 'tested') && y.server === s.server && y.seq > s.seq && ((s.what === 'start' && evidenceControls.startsByOrder) || y.token === s.token));
   return !!reply && reply.seq < x.seq && !reply.failure && (reply.report?.ok ?? true);
 }
 
@@ -255,12 +255,13 @@ export const H2: Check = (r) => {
     for (const [epoch, n] of perEpoch) if (n > 1) problems.push(`H2: run ${epoch} was stopped natively ${n} times`);
   }
   // Nothing reaches a run after its Stop: no request, notification or pong of that run starts once the
-  // Stop was made.
+  // Stop was made. Locally the run is the stopped server's own process, the last the exe started for that
+  // setup before the Stop (whether or not anything was written to it yet); remotely, its address's last epoch.
   for (const e of r.evidence) {
     if (e.what !== 'stop') continue;
-    const address = r.server.mode.where === 'remote' ? `addr-${(e.server ?? 's1').slice(1)}` : 'local';
-    const before = r.exe.log.filter((x) => x.server === address && x.seq < e.seq);
-    const epoch = before.at(-1)?.epoch;
+    const local = r.server.mode.where === 'local';
+    const address = local ? (e.server ?? 's1') : `addr-${(e.server ?? 's1').slice(1)}`;
+    const epoch = local ? r.exe.processStarts.filter((t) => t.server === address && t.seq < e.seq).at(-1)?.epoch : r.exe.log.filter((x) => x.server === address && x.seq < e.seq).at(-1)?.epoch;
     if (epoch === undefined) continue;
     for (const x of r.exe.log) {
       if (x.server !== address || x.epoch !== epoch || x.seq < e.seq || !x.body) continue;
@@ -333,36 +334,54 @@ function staleCatalogCalls(r: WireRun): string[] {
   return problems;
 }
 
-/** The harness's own reading of a server's catalog: the tool's definition in the last first page of a
-    tools/list answer that reached the client before `step`. */
-/** Every listing of the tool the server answered in (from, to): its definitions, in order. */
-function listingsBetween(r: WireRun, server: string, from: number, to: number, tool: string): (string | undefined)[] {
-  const out: { at: number; def: string | undefined }[] = [];
+/** The harness's own reading of a server's catalogs: every walk that completed, from its first page to a
+    page with no nextCursor, each page answered and reached by the client, in one run (a process, or a
+    handshake's epoch), each page the one the page before it pointed to. Its tools are every page's, and it
+    counts from the step its last page reached the client. A walk cut off (a page unanswered, failed, or
+    not reached) is no catalog, and the next first page begins a new one. */
+function walks(r: WireRun, server: string): { at: number; tools: any[] }[] {
+  const done: { at: number; tools: any[] }[] = [];
+  let open: { epoch: number; next: string; tools: any[] } | undefined;
   for (const x of r.exe.log) {
-    if (x.server !== server || x.body?.method !== 'tools/list' || x.body.params?.cursor !== undefined || !x.plan) continue;
+    if (x.server !== server || x.body?.method !== 'tools/list') continue;
+    const cursor = x.body.params?.cursor;
     const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : r.exe.responded.get(`${x.epoch}:${x.body.id}`);
-    if (at === undefined || at <= from || at >= to) continue;
-    const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
-    if (!res) continue;
-    const def = res.tools?.find((d: any) => d.name === tool);
-    out.push({ at, def: def === undefined ? undefined : canonical(def) });
+    const res = x.plan?.messages.find((m) => m.id === x.body!.id && m.result)?.result;
+    const continues = cursor === undefined || (open !== undefined && open.epoch === x.epoch && open.next === cursor);
+    if (at === undefined || !res || !continues) {
+      open = undefined;
+      continue;
+    }
+    const tools = [...(cursor === undefined ? [] : open!.tools), ...((res.tools as any[] | undefined) ?? [])];
+    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools };
+    else {
+      open = undefined;
+      done.push({ at, tools });
+    }
   }
-  return out.sort((a, b) => a.at - b.at).map((x) => x.def);
+  return done;
 }
 
+/** A tool's definition in a walk, canonical, so a relist in another key order (S23) is the same tool, as
+    the fingerprint has it. */
+const defIn = (w: { tools: any[] }, tool: string): string | undefined => {
+  const def = w.tools.find((d: any) => d.name === tool);
+  return def === undefined ? undefined : canonical(def);
+};
+
+/** Every completed listing of the tool that reached the client in (from, to): its definitions, in order. */
+function listingsBetween(r: WireRun, server: string, from: number, to: number, tool: string): (string | undefined)[] {
+  return walks(r, server)
+    .filter((w) => w.at > from && w.at < to)
+    .sort((a, b) => a.at - b.at)
+    .map((w) => defIn(w, tool));
+}
+
+/** The tool's definition in the last completed walk that reached the client before `step`. */
 function listedAt(r: WireRun, server: string, step: number, tool: string): string | undefined {
-  let found: { at: number; def: string | undefined } | undefined;
-  for (const x of r.exe.log) {
-    if (x.server !== server || x.body?.method !== 'tools/list' || x.body.params?.cursor !== undefined || !x.plan) continue;
-    const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : r.exe.responded.get(`${x.epoch}:${x.body.id}`);
-    if (at === undefined || at >= step) continue;
-    const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
-    if (!res) continue;
-    // Canonical, so a relist in another key order (S23) is the same tool, as the fingerprint has it.
-    const def = res.tools?.find((d: any) => d.name === tool);
-    if (!found || at >= found.at) found = { at, def: def === undefined ? undefined : canonical(def) };
-  }
-  return found?.def;
+  let found: { at: number; tools: any[] } | undefined;
+  for (const w of walks(r, server)) if (w.at < step && (!found || w.at >= found.at)) found = w;
+  return found && defIn(found, tool);
 }
 
 function canonical(v: unknown): string {
@@ -733,47 +752,142 @@ export function handoffHistory(r: WireRun, upTo: number): string {
   return JSON.stringify(r.exe.log.filter((x) => x.start <= upTo).map((x) => [x.kind, x.server, x.method, x.url ?? null, [...(x.headerPairs ?? Object.entries(x.headers))].map(([k, v]) => [k.toLowerCase(), v]).sort(), x.start, x.raw ?? null]));
 }
 
+/** Whether a reply the driver noted says what the machine's answer did, as the client reads that answer:
+    the runtime's reading for a Start or Stop, Test's own for a Test (restated here, never imported). */
+function replyAgrees(action: 'start' | 'stop' | 'test', reply: Reply, e: Evidence): boolean {
+  if (action === 'test') {
+    if (reply.kind === 'tested') return e.report?.ok === true;
+    if (e.report?.ok !== false) return false;
+    return reply.kind === 'failed' ? e.words === reply.failure.words : reply.kind === 'refused' ? e.words === reply.words : true;
+  }
+  const kind = reply.kind === 'tested' ? 'stopped' : reply.kind;
+  if (action === 'start') {
+    if (kind === 'ready') return e.ok === true && e.failure === undefined;
+    if (e.ok) return false;
+    if (reply.kind === 'failed') return e.failure === reply.failure.kind && e.words === reply.failure.words;
+    if (reply.kind === 'refused') return e.failure === 'refused' && e.words === reply.words;
+    return e.failure === undefined;
+  }
+  if (kind === 'stopped') return e.stopOutcome === 'stopped';
+  if (reply.kind === 'refused') return e.stopOutcome === 'refused' && e.words === reply.words;
+  if (reply.kind === 'failed') return (e.stopOutcome === 'failed' || e.stopOutcome === 'may-still-run') && e.failure === reply.failure.kind && e.words === reply.failure.words;
+  return e.stopOutcome === 'failed' && e.failure === undefined;
+}
+
+/** An owner reservation replay says was taken: for the event at record `seq`, and released by the event
+    recorded in (after, before), or never (`open`). */
+interface OwedReservation {
+  readonly server: string;
+  readonly i: number;
+  readonly seq: number;
+  readonly released: { readonly after: number; readonly before: number } | 'open';
+}
+
 /**
  * HC, conformance: the real driver decided nothing outside the machine. Each server's record of events and
  * the states the driver then held is replayed through next() from the start, and every state must be the
  * one the machine gives; and whenever the driver's queue had drained, its slot mirror must match the
- * exchange machine's.
+ * exchange machine's. Replay's effects are then matched one by one, never by count, with what was recorded
+ * apart from the driver: each answer with the person's own action (the k-th action that reaches the machine
+ * is its k-th action event) and that action's reply (by its token, of the same outcome, after the answer,
+ * in the order answered); each native start and stop with the port's own start and stop made while its event
+ * was applied, a stop naming the very process its run's start launched; and each owner reservation taken
+ * with one recorded at the owner, released while the event that releases it was applied, or still held.
  */
 export const HC: Check = (r) => {
   const problems: string[] = [];
+  const owed: OwedReservation[] = [];
   for (const [server, records] of r.lifecycle) {
     let s = initialState(server);
-    // What replay says the driver must have done, to compare with what the natives, the owner and the
-    // replies recorded independently.
-    let starts = 0;
-    let stops = 0;
-    let answers = 0;
+    const actions = r.evidence.filter((e) => (e.server ?? 's1') === server && (e.what === 'start' || e.what === 'stop' || (e.what === 'test' && e.reaches)));
+    const asked = records.filter((x) => x.event.t === 'start' || x.event.t === 'stop');
+    if (asked.length !== actions.length) problems.push(`HC: ${server}: the machine took ${asked.length} actions, the person made ${actions.length}`);
+    const actionOf = new Map<string, Evidence>();
+    asked.forEach((x, k) => {
+      const a = actions[k];
+      const ev = x.event as Extract<LcEvent, { t: 'start' | 'stop' }>;
+      const kind = ev.t === 'stop' ? 'stop' : ev.mode === 'test' ? 'test' : 'start';
+      if (a && a.what !== kind) problems.push(`HC: ${server}: the machine's action ${k + 1} is a ${kind}, the person's a ${a.what}`);
+      if (a) actionOf.set(ev.token, a);
+    });
+    const ported = r.exe.processStarts.filter((t) => t.server === server);
+    const epochs = new Set(ported.map((t) => t.epoch));
+    const portStart = new Map<string, (typeof ported)[number]>();
+    const usedStarts = new Set<object>();
+    const usedStops = new Set<object>();
+    const usedReplies = new Set<Evidence>();
+    const lastReply = new Map<string, number>();
+    let holding: Omit<OwedReservation, 'released'> | undefined;
     const endLive: { run: string; i: number; seq: number }[] = [];
     for (let i = 0; i < records.length; i++) {
       const rec = records[i]!;
+      const seq = rec.seq ?? 0;
+      // An event's effects are applied after the record before it and before its own.
+      const after = i ? (records[i - 1]!.seq ?? 0) : -Infinity;
       const out = next(s, rec.event);
       s = out.state;
+      const ev = rec.event;
+      // A reservation was taken for this event: its admission asked the owner, and the owner said yes.
+      const takes = (ev.t === 'start' && ev.facts.record === 'ok' && ev.facts.ownerFree) || (ev.t === 'readmit' && ev.facts.ownerFree);
+      let kept = false;
       for (const fx of out.effects) {
-        if (fx.t === 'native-start') starts++;
-        else if (fx.t === 'native-stop') stops++;
-        else if (fx.t === 'answer') answers++;
-        else if (fx.t === 'end-live') endLive.push({ run: fx.run, i, seq: rec.seq ?? 0 });
+        if (fx.t === 'native-start') {
+          const t = ported.find((x) => !usedStarts.has(x) && x.seq > after && x.seq < seq);
+          if (!t) problems.push(`HC: ${server}: native-start for ${fx.run} at event ${i} (${ev.t}), and no port start in its step`);
+          else {
+            usedStarts.add(t);
+            portStart.set(fx.run, t);
+          }
+        } else if (fx.t === 'native-stop') {
+          // The process the run's own start launched, by the exe's own epoch and handle.
+          const want = portStart.get(fx.run);
+          const inStep = r.exe.stopsAsked.filter((x) => (x.seq ?? 0) > after && (x.seq ?? 0) < seq);
+          const t = inStep.find((x) => !usedStops.has(x) && x.epoch === want?.epoch && x.run === fx.process);
+          if (!t) problems.push(`HC: ${server}: native-stop for ${fx.run} (run ${want?.epoch ?? '?'}) at event ${i} (${ev.t}), and the port stopped ${inStep.map((x) => `run ${x.epoch}`).join(', ') || 'nothing'} in its step`);
+          else usedStops.add(t);
+        } else if (fx.t === 'answer') {
+          const act = actionOf.get(fx.token);
+          if (!act) {
+            problems.push(`HC: ${server}: event ${i} (${ev.t}) answers ${fx.token}, an action the person never made`);
+            continue;
+          }
+          const what = act.what === 'start' ? 'started' : act.what === 'stop' ? 'stopped' : 'tested';
+          const reply = r.evidence.find((e) => e.what === what && e.token === act.token && (e.server ?? 's1') === server && !usedReplies.has(e));
+          if (!reply) {
+            problems.push(`HC: ${server}: event ${i} (${ev.t}) answers ${act.token} ${fx.reply.kind}, and no reply came for it`);
+            continue;
+          }
+          usedReplies.add(reply);
+          if (reply.seq < seq) problems.push(`HC: ${server}: ${act.token}'s reply came before the event that answers it`);
+          if (!replyAgrees(act.what as 'start' | 'stop' | 'test', fx.reply, reply)) problems.push(`HC: ${server}: event ${i} answers ${act.token} ${fx.reply.kind}, its reply says ${reply.ok ? 'ready' : (reply.stopOutcome ?? reply.failure ?? (reply.report?.ok ? 'tested' : 'not tested'))}`);
+          // In order: one kind of action's replies come in the order the machine answered them.
+          if (reply.seq < (lastReply.get(what) ?? -Infinity)) problems.push(`HC: ${server}: ${act.token}'s reply came before an earlier answer's`);
+          lastReply.set(what, reply.seq);
+        } else if (fx.t === 'owner-hold') {
+          if (!takes) problems.push(`HC: ${server}: event ${i} (${ev.t}) holds the owner, with no reservation taken for it`);
+          else {
+            kept = true;
+            holding = { server, i, seq };
+          }
+        } else if (fx.t === 'owner-release' && holding) {
+          owed.push({ ...holding, released: { after, before: seq } });
+          holding = undefined;
+        } else if (fx.t === 'end-live') endLive.push({ run: fx.run, i, seq });
       }
+      // Taken and not kept: released as the machine refused or answered the action, in its own step.
+      if (takes && !kept) owed.push({ server, i, seq, released: { after, before: seq } });
       if (problems.length < 3 && canonical(s) !== canonical(rec.state)) {
         problems.push(`HC: ${server}'s state after event ${i} (${rec.event.t}) isn't the machine's`);
         s = rec.state;
       }
       if (problems.length < 3 && rec.quiet && (rec.state.slot === 'busy') !== rec.busy) problems.push(`HC: ${server}'s slot mirror says ${rec.state.slot} after event ${i} (${rec.event.t}), the exchange machine ${rec.busy ? 'busy' : 'idle'}`);
     }
-    // Each native-start effect is one port start; each native-stop one port stop.
-    const ported = r.exe.processStarts.filter((t) => t.server === server);
-    if (starts !== ported.length) problems.push(`HC: ${server}: replay asks ${starts} native starts, the port saw ${ported.length}`);
-    const epochs = new Set(ported.map((t) => t.epoch));
-    const stopped = r.exe.stopsAsked.filter((t) => epochs.has(t.epoch)).length;
-    if (stops !== stopped) problems.push(`HC: ${server}: replay asks ${stops} native stops, the port saw ${stopped}`);
-    // Each answer is one reply, and no reply comes without one.
-    const replies = r.evidence.filter((e) => (e.server ?? 's1') === server && (e.what === 'started' || e.what === 'stopped' || (e.what === 'tested' && r.evidence.some((t) => t.what === 'test' && t.reaches && t.seq < e.seq && (t.server ?? 's1') === server && !r.evidence.some((u) => u.what === 'tested' && u.seq > t.seq && u.seq < e.seq))))).length;
-    if (answers !== replies) problems.push(`HC: ${server}: replay answers ${answers} actions, ${replies} replies came`);
+    if (holding) owed.push({ ...holding, released: 'open' });
+    // No port start or stop that replay didn't ask for, and no reply to an action replay never answered.
+    for (const t of ported) if (!usedStarts.has(t)) problems.push(`HC: ${server}: the port started run ${t.epoch}, which no native-start asked for`);
+    for (const t of r.exe.stopsAsked) if (epochs.has(t.epoch) && !usedStops.has(t)) problems.push(`HC: ${server}: the port stopped run ${t.epoch}, which no native-stop asked for`);
+    const tokens = new Set(actions.map((a) => a.token));
+    for (const e of r.evidence) if ((e.what === 'started' || e.what === 'stopped' || e.what === 'tested') && (e.server ?? 's1') === server && tokens.has(e.token) && !usedReplies.has(e)) problems.push(`HC: ${server}: a reply to ${e.token} that replay never answered`);
     // Every exchange admitted for a run ends, by the exchange machine's own terminal step, once that run is
     // over; an end-live effect for a run with an exchange still open is followed by its end.
     const ex = r.exchanges.get(server) ?? [];
@@ -788,6 +902,16 @@ export const HC: Check = (r) => {
       if (!ended && a.run !== current) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) of run ${a.run}, which is over, never ended`);
     }
   }
+  // Each reservation replay took is one the owner recorded, taken before its event and released while the
+  // event replay releases it by was applied (or still held); and none the owner recorded that replay didn't.
+  const pool = r.reservations.filter((x) => x.what === 'start');
+  const used = new Set<object>();
+  for (const o of owed.sort((a, b) => a.seq - b.seq)) {
+    const m = pool.find((x) => !used.has(x) && x.seq < o.seq && (o.released === 'open' ? x.released === undefined : x.released !== undefined && x.released > o.released.after && x.released < o.released.before));
+    if (m) used.add(m);
+    else problems.push(`HC: ${o.server}: event ${o.i} took the owner, and no reservation was ${o.released === 'open' ? 'still held' : 'released as replay releases it'}`);
+  }
+  for (const x of pool) if (!used.has(x)) problems.push(`HC: a start reservation (${x.seq}) replay never took`);
   // At each native start the owner is reserved, and by a start.
   for (const t of r.exe.processStarts) {
     const open = r.reservations.filter((x) => x.seq < t.seq && (x.released === undefined || x.released > t.seq));

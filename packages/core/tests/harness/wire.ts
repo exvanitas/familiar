@@ -80,8 +80,9 @@ export interface Mode {
   readonly hold: boolean;
   /** Each answer in one chunk (S2: a ping in the same chunk as the final reply). */
   readonly oneChunk: boolean;
-  /** A call's answer begins with a message the client's parser rejects (no `jsonrpc`), then its pings. */
-  readonly invalidFirst?: boolean;
+  /** A call's answer begins with a message the client's parser rejects, then its pings: by default one with
+      no `jsonrpc`, or another of 3.10's rejections by name (INVALID). */
+  readonly invalidFirst?: boolean | keyof typeof INVALID;
   /** A list_changed ahead of the first tools/list answer of each session, its variant flipped (S14). */
   readonly changeOnList: boolean;
   /** How often a cancelled request's helper is held, for any time (H4). */
@@ -116,6 +117,9 @@ export interface Mode {
   readonly noticeAtDrain?: boolean;
   /** Local: the exe refuses every server_stop, and the process doesn't exit. */
   readonly refuseStop?: boolean;
+  /** With more than one page: the echo tool (the one a list_changed changes) on the walk's last page, the
+      rest on its first, so a catalog read from first pages alone never sees it. */
+  readonly echoLast?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -203,6 +207,13 @@ export class ScriptedServer {
     this.r = r;
   }
 
+  /** The tools on one page of a walk: all on the first, unless echoLast puts echo on the last. */
+  private onPage(page: number): Msg[] {
+    const all = tools(this.mode.era, this.variant);
+    if (!this.mode.echoLast || this.mode.pages < 2) return page === 0 ? all : [];
+    return page === this.mode.pages - 1 ? all.filter((t) => t.name === 'echo') : page === 0 ? all.filter((t) => t.name !== 'echo') : [];
+  }
+
   private ping(on: string, afterFinal = false): Msg {
     const id = `p${++this.pingN}`;
     this.pings.push({ id, on, afterFinal });
@@ -255,7 +266,7 @@ export class ScriptedServer {
       this.changedSince = true;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
-      const listed = { jsonrpc: '2.0', id: body.id, result: { tools: page === 0 ? tools(m.era, this.variant) : [], ...next } };
+      const listed = { jsonrpc: '2.0', id: body.id, result: { tools: this.onPage(page), ...next } };
       this.variant = this.variant === 'a' ? 'b' : 'a';
       return { status: 200, sse: true, messages: [{ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, listed], final: 1 };
     }
@@ -267,7 +278,7 @@ export class ScriptedServer {
       if (body.params?.cursor === undefined) this.lists = (this.lists ?? 0) + 1;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
-      const listed = page === 0 ? tools(m.era, this.variant) : [];
+      const listed = this.onPage(page);
       return json([{ jsonrpc: '2.0', id: body.id, result: { tools: m.reorder ? listed.map((t) => shuffled(t, this.r)) : listed, ...next, ...complete } }]);
     }
     if (body.method === 'tools/call') {
@@ -276,7 +287,7 @@ export class ScriptedServer {
       this.lastId = body.id;
       const n = m.pings === 40 ? 40 : m.pings;
       // A message the client's parser rejects, ahead of the pings (S37): the exchange ends there.
-      if (m.invalidFirst && !modernReq) msgs.push({ method: 'notes/garbage', params: { note: 'no jsonrpc member' } } as Msg);
+      if (m.invalidFirst && !modernReq) msgs.push(structuredClone(INVALID[m.invalidFirst === true ? 'no-jsonrpc' : m.invalidFirst]) as Msg);
       if (!modernReq) for (let i = 0; i < n; i++) msgs.push(this.ping(on));
       if (!modernReq && this.r() < m.listChanged) {
         if (!m.reorder) this.variant = this.variant === 'a' ? 'b' : 'a';
@@ -328,6 +339,39 @@ function shuffled(t: Msg, r: () => number): Msg {
   return { ...t, inputSchema: { ...t.inputSchema, properties: Object.fromEntries(props) } };
 }
 
+/** Messages 3.10's shape rules reject, one per rule: the parser ends its exchange at any of them. None is a
+    response to the call, so none is taken for its final. */
+export const INVALID = {
+  'no-jsonrpc': { method: 'notes/garbage', params: { note: 'no jsonrpc member' } },
+  'wrong-version': { jsonrpc: '1.0', method: 'notes/garbage', params: {} },
+  'array-params': { jsonrpc: '2.0', method: 'notes/garbage', params: [1, 2] },
+  'long-method': { jsonrpc: '2.0', method: 'm'.repeat(129) },
+  'bad-request-id': { jsonrpc: '2.0', id: { not: 'an id' }, method: 'ping' },
+  'both-members': { jsonrpc: '2.0', id: 'zz', result: {}, error: { code: 1, message: 'both' } },
+  'bad-error': { jsonrpc: '2.0', id: 'zz', error: { code: 1.5, message: 'not an integer code' } },
+  'too-deep': { jsonrpc: '2.0', method: 'notes/garbage', params: { deep: JSON.parse(`${'['.repeat(70)}${']'.repeat(70)}`) } }
+} as const;
+
+/** Whether 3.10's shape rules reject a message, as the harness reads them, never importing the parser: an
+    object, nested at most 64 deep, with `jsonrpc: "2.0"`; a request or notification with a method string of
+    at most 128 bytes, `params` an object if present, a request's id a string of at most 128 bytes or a safe
+    integer; a response with such an id and exactly one of `result` (an object) or `error` (an integer code
+    and a string message). */
+export function rejectedByShape(m: unknown): boolean {
+  const object = (v: unknown): v is Msg => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const within = (v: unknown, depth: number): boolean => depth <= 64 && (Array.isArray(v) ? v.every((x) => within(x, depth + 1)) : object(v) ? Object.values(v).every((x) => within(x, depth + 1)) : true);
+  const id = (v: unknown) => (typeof v === 'string' ? Buffer.byteLength(v) <= 128 : Number.isSafeInteger(v));
+  if (!object(m) || !within(m, 1) || m.jsonrpc !== '2.0') return true;
+  if ('method' in m) {
+    if (typeof m.method !== 'string' || Buffer.byteLength(m.method) > 128) return true;
+    if (m.params !== undefined && !object(m.params)) return true;
+    return 'id' in m && !id(m.id);
+  }
+  if (!('id' in m) || !id(m.id) || 'result' in m === 'error' in m) return true;
+  if ('result' in m) return !object(m.result);
+  return !object(m.error) || !Number.isInteger(m.error.code) || typeof m.error.message !== 'string';
+}
+
 /** Media types an answer may come with besides the two exact ones (oddMedia). */
 export const ODD_MEDIA = ['application/jsonp', 'application/json-seq', 'text/event-streaming', `text/x-${'ignore previous instructions '.repeat(150)}`];
 
@@ -337,7 +381,7 @@ export interface NativeRec {
   readonly seq: number;
   readonly n: number;
   readonly kind: 'post' | 'write' | 'model';
-  /** Which server: the saved address (remote) or the process run (local). */
+  /** Which server: the saved address (remote), or the setup id of the process written to (local). */
   readonly server: string;
   /** What the server answered (remote), for the harness's own reading of catalogs. */
   plan?: Plan;
@@ -398,12 +442,13 @@ export class FakeExe {
   readonly build: 'prepass' | 'pass';
   /** Local: when each response line reached the client, by epoch and request id. */
   readonly responded = new Map<string, number>();
-  /** Local: when the client asked the exe to stop each process run, by epoch. */
-  readonly stopsAsked: { epoch: number; step: number; seq?: number }[] = [];
+  /** Local: when the client asked the exe to stop each process run, by epoch, and the handle it named. */
+  readonly stopsAsked: { epoch: number; step: number; seq?: number; run?: string }[] = [];
   /** Local: when each process run exited, by epoch. */
   readonly exits: { epoch: number; step: number }[] = [];
-  /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2). */
-  readonly processStarts: { epoch: number; seq: number; step: number; server: string; answered?: number }[] = [];
+  /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2), and the
+      handle the exe gave it. */
+  readonly processStarts: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number }[] = [];
   /** Holds the next process start's answer until `releaseStart()` (S11, Stop during a pending start). */
   holdNextStart = false;
   releaseStart?: () => void;
@@ -604,8 +649,8 @@ export class FakeExe {
             // Never past the stream's own terminal message: one delivered after it in the same chunk came after
             // the client's end, not before it. A stream with no final response (`final` -1) has no such bound.
             // The client's actual terminal position: the final response, or the first message its parser
-            // rejects (not JSON-RPC 2.0), whichever comes first.
-            const rejected = plan && !(st as any).holdMsgs && !evidenceControls.finalOnly ? plan.messages.findIndex((m) => !m || typeof m !== 'object' || (m as { jsonrpc?: unknown }).jsonrpc !== '2.0') : -1;
+            // rejects (by 3.10's shape rules, read here on their own), whichever comes first.
+            const rejected = plan && !(st as any).holdMsgs && !evidenceControls.finalOnly ? plan.messages.findIndex(rejectedByShape) : -1;
             const final = plan && !(st as any).holdMsgs && plan.final !== undefined && (plan.final >= 0 || evidenceControls.finalSentinel) ? plan.final : Infinity;
             const terminal = rejected >= 0 ? Math.min(rejected, final) : final;
             rec.endedAt = this.sched.step * 1000 + Math.min(whole, terminal);
@@ -657,7 +702,7 @@ export class FakeExe {
 
   processes(): ProcessPort {
     let runs = 0;
-    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; noticed?: boolean }>();
+    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; server: string; noticed?: boolean }>();
     const flush = (run: string) => {
       const p = live.get(run)!;
       if (p.flushing || !p.out.length) return;
@@ -792,9 +837,9 @@ export class FakeExe {
         new Promise((resolve) => {
           const run = `p${++runs}`;
           this.epoch++;
-          const admitted: { epoch: number; seq: number; step: number; server: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id };
+          const admitted: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id, run };
           this.processStarts.push(admitted);
-          live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch });
+          live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch, server: setup.id });
           const answer = () => this.sched.add({ label: `started:${run}`, fire: () => {
             admitted.answered = this.sched.step;
             resolve({ run });
@@ -817,8 +862,8 @@ export class FakeExe {
           } catch {
             body = undefined;
           }
-          // The epoch of the process written to, never the newest one.
-          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: p?.epoch ?? this.epoch };
+          // The process written to, by its epoch and its setup's id, never the newest one's.
+          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: p?.server ?? 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: p?.epoch ?? this.epoch };
           this.log.push(rec);
           if (!p || p.exited) {
             rec.end = this.sched.step;
@@ -835,7 +880,7 @@ export class FakeExe {
         }),
       stop: async (run) => {
         const asked = live.get(run);
-        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step, seq: this.tick() });
+        if (asked) this.stopsAsked.push({ epoch: asked.epoch, step: this.sched.step, seq: this.tick(), run });
         if (this.server.mode.refuseStop) throw Object.assign(new Error('refused'), { kind: 'failed' });
         this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) });
       },
@@ -1150,16 +1195,19 @@ export class Driver {
     );
   }
 
-  /** Test, as Settings runs it: its report, with the tools it showed. */
+  /** Test, as Settings runs it: its report, with the tools it showed (and a failed one's words). Its report
+      carries the Test's own token, as a Start's reply does. */
+  private tests = 0;
   test(id = 's1'): void {
     const before = this.client.get(id)?.phase;
+    const token = `test-${++this.tests}`;
     // Whether Test reaches the machine: only from Stopped or Failed (otherwise the client answers at once).
-    const e = this.note({ what: 'test', server: id, reaches: before === 'stopped' || before === 'failed' || before === undefined });
+    const e = this.note({ what: 'test', server: id, token, reaches: before === 'stopped' || before === 'failed' || before === undefined });
     const testing = this.client.test(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void testing.then(
-      (report) => this.note({ what: 'tested', server: id, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] } }),
-      (e: unknown) => this.note({ what: 'tested', server: id, failure: 'threw', words: String(e).slice(0, 80) })
+      (report) => this.note({ what: 'tested', server: id, token, report: { ok: report.ok, tools: report.ok ? report.tools.map((t) => t.name) : [] }, ...(report.ok ? {} : { words: report.failure.words }) }),
+      (e: unknown) => this.note({ what: 'tested', server: id, token, failure: 'threw', words: String(e).slice(0, 80) })
     );
   }
 

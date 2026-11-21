@@ -244,14 +244,22 @@ const LIFECYCLE: Named[] = [
               if (n < 3) startOther(n + 1);
             });
           startOther(1);
-          d.when('both ready', () => d.idle('s1') && d.idle('s2'), () => d.stop(first));
+          d.when('both ready', () => d.idle('s1') && d.idle('s2'), () => {
+            d.stop(first);
+            // The other server, still running, called once the Stop has answered: its writes go to its own
+            // process, never the stopped one's (H2 picks the stopped server's process by its setup).
+            d.when('stop answered', () => d.evidence.some((e) => e.what === 'stopped'), () => d.call('echo', {}, false, other));
+          });
         });
       }
     },
     expect: (r) => {
       const stopped = r.evidence.find((e) => e.what === 'stopped');
       const other = stopped?.server === 's1' ? 's2' : 's1';
-      return stopped && r.exe.processStarts.some((t) => t.server === other) ? undefined : 'no Stop of one server beside the other started';
+      if (!stopped || !r.exe.processStarts.some((t) => t.server === other)) return 'no Stop of one server beside the other started';
+      const call = r.evidence.find((e) => e.what === 'call' && e.server === other && e.seq > stopped.seq);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === call?.token)?.outcome;
+      return out?.kind === 'result' ? undefined : `the other server's call after the Stop came back ${JSON.stringify(out)}`;
     }
   },
   {
@@ -582,6 +590,51 @@ export const SCHEDULES: Named[] = [
       const sent = r.exe.log.some((x) => x.body?.method === 'tools/call' && x.body.params?.arguments?.text === card?.token);
       const out = r.evidence.find((e) => e.what === 'outcome' && e.token === card?.token)?.outcome;
       return !card ? 'no card shown' : sent ? 'the F1 Yes was handed off' : out?.kind !== 'error' || out.reason !== 'changed' ? `the F1 Yes came back ${JSON.stringify(out)}` : undefined;
+    }
+  },
+  {
+    // S1 with the changed tool on the walk's second page: the catalog H3 reads is every page of a walk.
+    name: 'S1 a fingerprint change while a card is shown, the tool on a later page',
+    options: {
+      mode: { ...quiet, listChanged: 1, pages: 2, echoLast: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          const card = d.card('echo')!;
+          d.call('slow');
+          const lists = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.final !== undefined).length;
+          d.when('relisted', () => d.idle() && lists() >= 2, () => d.yes(card));
+        })
+    },
+    expect: (r) => {
+      const card = r.evidence.find((e) => e.what === 'card' && e.tool === 'echo');
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === card?.token)?.outcome;
+      return !card ? 'no card shown' : out?.kind !== 'error' || out.reason !== 'changed' ? `the F1 Yes came back ${JSON.stringify(out)}` : undefined;
+    }
+  },
+  {
+    // S38: "may run on its own" for a tool on the walk's second page, which then changes and changes back
+    // (A, B, A): the grant no longer stands, so the call under it is refused (H3 reads every page of a walk).
+    name: 'S38 a granted tool on a later page changes and changes back',
+    options: {
+      mode: { ...quiet, listChanged: 1, pages: 2, echoLast: true },
+      schedule: (d) => {
+        const walks = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor !== undefined && x.final !== undefined).length;
+        d.when('ready', () => d.idle(), () => {
+          void d.grantOwn('echo')?.then(() => {
+            d.call('slow');
+            d.when('B listed', () => d.idle() && walks() >= 2, () => {
+              d.call('slow');
+              d.when('A again', () => d.idle() && walks() >= 3, () => d.own('echo'));
+            });
+          });
+        });
+      }
+    },
+    expect: (r) => {
+      if (!r.evidence.some((e) => e.what === 'grant')) return 'no grant saved';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'error' ? undefined : `the call under a grant for A, after B, came back ${JSON.stringify(out)}`;
     }
   },
   {
