@@ -17,7 +17,7 @@ import type { Draft } from './paste.ts';
 import type { ProcessPort } from './process.ts';
 import { ServerRuntime, type Phase } from './runtime.ts';
 import { fresh, type SavedTool, type ServerLimits } from './saved.ts';
-import { choiceKey, ownHolds, serverTool, toolChanges, toolPolicies, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
+import { choiceKey, ownHolds, parseChoiceKey, serverTool, toolChanges, toolPolicies, type ServerTool, type ToolChanges, type ToolChoice } from './server-tools.ts';
 import type { GatePolicy, GateVerdict } from '../journal/gate.ts';
 
 
@@ -26,12 +26,8 @@ export const REVOKE_NOT_SAVED = 'Revoked for now, but not saved: it comes back w
 
 /** The built-in tool a choice key names, or undefined for a server's tool or a key that names nothing. */
 function builtInTool(key: string): string | undefined {
-  try {
-    const k: unknown = JSON.parse(key);
-    return Array.isArray(k) && k.length === 2 && k[0] === BUILT_IN && typeof k[1] === 'string' ? k[1] : undefined;
-  } catch {
-    return undefined;
-  }
+  const k = parseChoiceKey(key);
+  return k && k[0] === BUILT_IN ? k[1] : undefined;
 }
 import { secretRefs, setupFingerprint, setupProblems, type ServerSetup } from './setup.ts';
 import type { CallOutcome, Failure, ListedTool, Reply } from './types.ts';
@@ -520,7 +516,9 @@ export class McpClient {
     // exactly as it did.
     const listed = new Map(now.map(t => [t.name, t.fingerprint]));
     for (const [key, c] of Object.entries(this.owner.choices())) {
-      const [server, tool] = JSON.parse(key) as [string, string];
+      const k = parseChoiceKey(key);
+      if (!k) continue;
+      const [server, tool] = k;
       if (server !== id || c.policy !== 'own') continue;
       const fp = listed.get(tool);
       if (fp === undefined && (__FAMILIAR_MUTATIONS__ && mutant('own-kept-on-absence'))) continue;
@@ -530,8 +528,8 @@ export class McpClient {
       this.clears.set(key, { server: id, tool, fingerprint: c.fingerprint });
     }
     for (const [key, g] of this.granting) {
-      const [server, tool] = JSON.parse(key) as [string, string];
-      if (server === id && listed.get(tool) !== g.fingerprint) g.spoiled = true;
+      const k = parseChoiceKey(key);
+      if (k && k[0] === id && listed.get(k[1]) !== g.fingerprint) g.spoiled = true;
     }
     this.clearGrants();
     const s = this.owner.server(id);

@@ -18,6 +18,8 @@ on:
   push:
     paths:
       - apps/desktop/**
+      # The shell checks (security.mcp.* through the real exe) run core's MCP client, so a core-only change needs them too.
+      - packages/core/**
       - .github/workflows/shell.yml
 
 permissions:

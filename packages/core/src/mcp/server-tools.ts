@@ -138,6 +138,18 @@ export function choiceKey(serverId: string, toolName: string): string {
   return JSON.stringify([serverId, toolName]);
 }
 
+/** A choice key's server id and tool name; undefined for a key that isn't one (a stored record may hold
+    anything), which every reader skips. */
+export function parseChoiceKey(key: string): readonly [server: string, tool: string] | undefined {
+  let k: unknown;
+  try {
+    k = JSON.parse(key);
+  } catch {
+    return undefined;
+  }
+  return Array.isArray(k) && k.length === 2 && typeof k[0] === 'string' && typeof k[1] === 'string' ? [k[0], k[1]] : undefined;
+}
+
 /** Whether a "may run on its own" grant holds for this tool now: exactly its fingerprint and setup. */
 export function ownHolds(c: ToolChoice | undefined, fingerprint: string, setupFingerprint: string): boolean {
   if (c?.policy !== 'own' && !(c?.policy === 'allow' && (__FAMILIAR_MUTATIONS__ && mutant('server-always')))) return false;

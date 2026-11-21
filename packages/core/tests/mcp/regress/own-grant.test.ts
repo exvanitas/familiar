@@ -6,6 +6,7 @@ import { McpClient } from '../../../src/mcp/client.ts';
 import { mintDecision } from '../../../src/mcp/decision.ts';
 import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import { choiceKey } from '../../../src/mcp/server-tools.ts';
+import { OWNER_KEY } from '../../../src/mcp/owner.ts';
 import { memorySettingsStore } from '../../../src/settings/store.ts';
 import { mutations } from '../../../src/mutations.ts';
 import { createCardDesk, decideByRules, openJournal, systemClock, type ModelRequest } from '../../../src/index.ts';
@@ -68,7 +69,8 @@ async function world() {
     await sleep(10);
   };
   const echo = () => client.tools().find((t) => t.serverName === 'echo');
-  return { client, calls, relist, state, writes, echo };
+  const reopen = () => McpClient.open({ store, processes: port, net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: realClock, paths: testPaths });
+  return { client, calls, relist, state, writes, echo, store, reopen };
 }
 
 describe('a grant and a tool that changes and changes back', () => {
@@ -244,4 +246,33 @@ describe('the button counts only on the card showing now', () => {
         mutations.clear();
       }
     });
+});
+
+describe('a stored choice whose key is no choice key', () => {
+  it('is skipped: the listing still works, and a grant still stops on a changed listing', async () => {
+    const w = await world();
+    const f1 = w.echo()!;
+    await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+    await w.client.stop('l1');
+    // Keys that aren't JSON, or aren't a [server, tool] pair, beside the real grant, carrying an own choice.
+    const rec = (await w.store.get(OWNER_KEY))!;
+    const value = rec.value as { choices: Record<string, unknown> };
+    const grant = value.choices[choiceKey('l1', 'echo')];
+    expect(grant).toMatchObject({ policy: 'own' });
+    value.choices['{not json'] = grant;
+    value.choices['["l1"]'] = grant;
+    await w.store.put(OWNER_KEY, rec);
+    const client = await w.reopen();
+    expect((await client.start('l1')).kind).toBe('ready');
+    expect(client.policy(client.tools()).perTool).toEqual({ l__echo: 'own' });
+    // A changed listing still stops the real grant.
+    w.state.desc = 'B';
+    const was = client.tools()[0]!.fingerprint;
+    (client as unknown as { runtimes: Map<string, { link: { list(): Promise<unknown> } }> }).runtimes.get('l1')!.link.list();
+    for (let i = 0; i < 200 && client.tools()[0]?.fingerprint === was; i++) await sleep(5);
+    await sleep(10);
+    expect(client.tools()[0]!.fingerprint).not.toBe(was);
+    expect(client.policy(client.tools()).perTool).toEqual({ l__echo: 'ask' });
+    await client.stop('l1');
+  });
 });

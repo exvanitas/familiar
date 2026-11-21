@@ -21,7 +21,7 @@ import { unaskedBuiltIn } from '../journal/gate.ts';
 import { mutant } from '../mutations.ts';
 import { literalClass } from './native-rules.ts';
 import type { ServerLimits, SavedTool } from './saved.ts';
-import { choiceKey, type ChoicePolicy, type ToolChoice } from './server-tools.ts';
+import { choiceKey, parseChoiceKey, type ChoicePolicy, type ToolChoice } from './server-tools.ts';
 import { secretRefs, type ServerSetup } from './setup.ts';
 
 export const OWNER_KEY = 'mcp.owner';
@@ -51,13 +51,8 @@ export function choiceProblem(serverId: string, tool: string, choice: ToolChoice
 /** A saved choice as the gate may read it: one that can't be saved now (an old "always" for a server tool,
     an Allow for a built-in off the list) loads as "ask", never as what it said. */
 function loadable(key: string, c: ToolChoice): ToolChoice {
-  let k: unknown;
-  try {
-    k = JSON.parse(key);
-  } catch {
-    return { ...c, policy: 'ask' };
-  }
-  if (!Array.isArray(k) || k.length !== 2 || typeof k[0] !== 'string' || typeof k[1] !== 'string') return { ...c, policy: 'ask' };
+  const k = parseChoiceKey(key);
+  if (!k) return { ...c, policy: 'ask' };
   return choiceProblem(k[0], k[1], c) ? { ...c, policy: 'ask' } : c;
 }
 
