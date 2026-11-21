@@ -22,13 +22,17 @@ const setup = { kind: 'local' as const, id: 'l1', label: 'L', program: process.e
 async function world() {
   let emit!: (e: ProcessEvent) => void;
   // desc null: the server lists no echo at all.
-  const state: { desc: string | null } = { desc: 'A' };
+  const state: { desc: string | null; other?: string } = { desc: 'A' };
   // A gate on the owner's writes: while `held` is set, each write waits for its release.
-  const writes: { held?: Promise<void>; waiting: number } = { waiting: 0 };
+  const writes: { held?: Promise<void>; waiting: number; rejectNext?: boolean } = { waiting: 0 };
   const inner = memorySettingsStore();
   const store: typeof inner = {
     ...inner,
     putIf: async (k, r, g) => {
+      if (writes.rejectNext) {
+        writes.rejectNext = false;
+        throw new Error('the store failed once');
+      }
       if (writes.held) {
         writes.waiting++;
         await writes.held;
@@ -46,7 +50,11 @@ async function world() {
       const m = JSON.parse(new TextDecoder().decode(b));
       queueMicrotask(() => {
         if (m.method === 'initialize') emit({ t: 'out', line: JSON.stringify(initResult(m.id)) });
-        if (m.method === 'tools/list') emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { tools: state.desc === null ? [{ name: 'other', description: 'O', inputSchema: { type: 'object', properties: {} } }] : [{ name: 'echo', description: state.desc, inputSchema: { type: 'object', properties: {} } }] } }) });
+        if (m.method === 'tools/list') {
+          const other = { name: 'other', description: state.other ?? 'O', inputSchema: { type: 'object', properties: {} } };
+          const tools = state.desc === null ? [other] : [{ name: 'echo', description: state.desc, inputSchema: { type: 'object', properties: {} } }, ...(state.other !== undefined ? [other] : [])];
+          emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { tools } }) });
+        }
         if (m.method === 'tools/call') {
           calls.push(String(state.desc));
           emit({ t: 'out', line: JSON.stringify(textResult(m.id, 'ran')) });
@@ -61,9 +69,10 @@ async function world() {
   const client = await McpClient.open({ store, processes: port, net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: realClock, paths: testPaths });
   await client.add({ setup, problems: [] });
   expect((await client.start('l1')).kind).toBe('ready');
-  const relist = async (desc: string | null) => {
+  const relist = async (desc: string | null, other?: string) => {
     const was = JSON.stringify(client.tools().map((t) => t.fingerprint));
     state.desc = desc;
+    if (other !== undefined) state.other = other;
     emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) });
     for (let i = 0; i < 200 && JSON.stringify(client.tools().map((t) => t.fingerprint)) === was; i++) await sleep(5);
     await sleep(10);
@@ -94,7 +103,7 @@ describe('a grant and a tool that changes and changes back', () => {
           expect(out).toMatchObject({ kind: 'result' });
           return;
         }
-        expect(w.client.policy(w.client.tools()).perTool).toEqual({ l__echo: 'ask' });
+        expect(w.client.policy(w.client.tools()).perTool).toEqual({});
         expect(out).toMatchObject({ kind: 'error', words: expect.stringMatching(/no longer stands/) });
         expect(w.calls).toEqual([]);
         // And cleared for good once the owner was free.
@@ -114,7 +123,7 @@ async function ownCall(w: Awaited<ReturnType<typeof world>>) {
 }
 
 describe('a listing while the grant itself saves', () => {
-  for (const mutation of [undefined, 'own-grant-unchecked'] as const)
+  for (const mutation of [undefined, 'own-counter-ignored'] as const)
     it(`F2 listed during the grant's own save, then F1 again: it asks${mutation ? ` (control: ${mutation} runs it unasked)` : ''}`, async () => {
       mutations.set(mutation ? [mutation] : []);
       try {
@@ -136,7 +145,7 @@ describe('a listing while the grant itself saves', () => {
           expect(out).toMatchObject({ kind: 'result' });
           return;
         }
-        expect(w.client.policy(w.client.tools()).perTool).toEqual({ l__echo: 'ask' });
+        expect(w.client.policy(w.client.tools()).perTool).toEqual({});
         expect(out).toMatchObject({ kind: 'error' });
         expect(w.calls).toEqual([]);
         for (let i = 0; i < 100 && w.client.choices()[choiceKey('l1', 'echo')]; i++) await sleep(5);
@@ -147,15 +156,27 @@ describe('a listing while the grant itself saves', () => {
       }
     });
 
-  it('a grant for a version not listed now is refused, and nothing is saved', async () => {
-    const w = await world();
-    const f1 = w.echo()!;
-    await w.relist('B');
-    await expect(w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint })).rejects.toThrow(/changed/);
-    await expect(w.client.choose('l1', 'echo', { policy: 'own', fingerprint: w.echo()!.fingerprint, setupFingerprint: 'another setup' })).rejects.toThrow(/changed/);
-    expect(w.client.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
-    await w.client.stop('l1');
-  });
+  for (const mutation of [undefined, 'own-grant-unchecked'] as const)
+    it(`a grant for a version not listed now is refused, and nothing is saved${mutation ? ` (control: ${mutation} saves it)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const f1 = w.echo()!;
+        await w.relist('B');
+        const stale = w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+        if (mutation) {
+          await stale;
+          expect(w.client.choices()[choiceKey('l1', 'echo')]).toMatchObject({ policy: 'own', fingerprint: f1.fingerprint });
+          return;
+        }
+        await expect(stale).rejects.toThrow(/changed/);
+        await expect(w.client.choose('l1', 'echo', { policy: 'own', fingerprint: w.echo()!.fingerprint, setupFingerprint: 'another setup' })).rejects.toThrow(/changed/);
+        expect(w.client.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+        await w.client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
 });
 
 describe('a tool that leaves the listing and comes back', () => {
@@ -175,7 +196,7 @@ describe('a tool that leaves the listing and comes back', () => {
           expect(out).toMatchObject({ kind: 'result' });
           return;
         }
-        expect(w.client.policy(w.client.tools()).perTool).toEqual({ l__echo: 'ask' });
+        expect(w.client.policy(w.client.tools()).perTool).toEqual({});
         expect(out).toMatchObject({ kind: 'error' });
         expect(w.calls).toEqual([]);
         await w.client.stop('l1');
@@ -272,7 +293,120 @@ describe('a stored choice whose key is no choice key', () => {
     for (let i = 0; i < 200 && client.tools()[0]?.fingerprint === was; i++) await sleep(5);
     await sleep(10);
     expect(client.tools()[0]!.fingerprint).not.toBe(was);
-    expect(client.policy(client.tools()).perTool).toEqual({ l__echo: 'ask' });
+    expect(client.policy(client.tools()).perTool).toEqual({});
     await client.stop('l1');
+  });
+});
+
+describe('publications the machine coalesces into one catalog save', () => {
+  for (const mutation of [undefined, 'own-counter-ignored'] as const)
+    it(`granted at F1; another tool's save held; F2, then F1 published: it asks${mutation ? ` (control: ${mutation} runs it unasked)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        await w.relist('A', 'O1');
+        const f1 = w.echo()!;
+        await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+        let release!: () => void;
+        w.writes.held = new Promise<void>((r) => (release = r));
+        await w.relist('A', 'O2');
+        await w.relist('B');
+        await w.relist('A');
+        w.writes.held = undefined;
+        release();
+        await sleep(30);
+        expect(w.echo()!.fingerprint).toBe(f1.fingerprint);
+        const out = await ownCall(w);
+        if (mutation) {
+          expect(out).toMatchObject({ kind: 'result' });
+          return;
+        }
+        expect(w.client.policy(w.client.tools()).perTool).toEqual({});
+        expect(out).toMatchObject({ kind: 'error' });
+        expect(w.calls).toEqual([]);
+        await w.client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+});
+
+describe('two grant attempts', () => {
+  for (const mutation of [undefined, 'own-counter-ignored'] as const)
+    it(`the first's save held, a second refused, F2 then F1 listed: the first asks once saved${mutation ? ` (control: ${mutation} runs it unasked)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const f1 = w.echo()!;
+        let release!: () => void;
+        w.writes.held = new Promise<void>((r) => (release = r));
+        const grant = () => w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint }).then(() => 'saved', (e: Error) => e.message);
+        const first = grant();
+        for (let i = 0; i < 100 && !w.writes.waiting; i++) await sleep(2);
+        expect(await grant()).toMatch(/Saving another change/);
+        await w.relist('B');
+        await w.relist('A');
+        w.writes.held = undefined;
+        release();
+        expect(await first).toBe('saved');
+        await sleep(30);
+        const out = await ownCall(w);
+        if (mutation) {
+          expect(out).toMatchObject({ kind: 'result' });
+          return;
+        }
+        expect(out).toMatchObject({ kind: 'error' });
+        expect(w.calls).toEqual([]);
+        await w.client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+});
+
+describe("a grant's durable clear", () => {
+  for (const mutation of [undefined, 'clear-dropped-on-error'] as const)
+    it(`whose write fails once is kept and lands later: a reopen at F1 asks${mutation ? ` (control: ${mutation} loses it, and the reopen runs it unasked)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const f1 = w.echo()!;
+        await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+        const busy = w.client.owner.admit('other');
+        if (!('release' in busy)) throw new Error('not admitted');
+        await w.relist('B');
+        w.writes.rejectNext = true;
+        busy.release();
+        await sleep(30);
+        // No listing since: only the kept clear can land, at the next chance the owner gives (this write).
+        await w.client.setEnabled('l1', true);
+        await sleep(30);
+        await w.client.stop('l1');
+        // Back at F1 when Familiar next starts it.
+        w.state.desc = 'A';
+        const again = await w.reopen();
+        expect((await again.start('l1')).kind).toBe('ready');
+        const policy = again.policy(again.tools()).perTool;
+        if (mutation) expect(policy).toEqual({ l__echo: 'own' });
+        else {
+          expect(policy).toEqual({});
+          expect(again.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+        }
+        await again.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+
+  it("on the success path, waits for the catalog write: the changed catalog is saved", async () => {
+    const w = await world();
+    const f1 = w.echo()!;
+    await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+    await w.relist('B');
+    await sleep(40);
+    const saved = (await w.store.get(OWNER_KEY))!.value as { servers: Record<string, { tools: { fingerprint: string }[] }> };
+    expect(saved.servers.l1!.tools.map((t) => t.fingerprint)).toEqual([w.echo()!.fingerprint]);
+    expect(w.client.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+    await w.client.stop('l1');
   });
 });

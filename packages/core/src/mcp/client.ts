@@ -121,11 +121,21 @@ export class McpClient {
   private readonly listings = new Map<string, number>();
   private readonly runListing = new Map<string, number>();
   private reportCount = 0;
-  /** Grants being saved now, by key: spoiled when a listing during the save lacks the tool or lists it
-      otherwise. */
-  private readonly granting = new Map<string, { readonly fingerprint: string; spoiled: boolean }>();
-  /** Grants a changed listing cleared in memory, still to be cleared durably. */
+  /**
+   * "May run on its own" as one check at each call (5.6). Per server and tool, a counter bumped on every
+   * publication in which the tool's fingerprint or setup differs from the previous one, or the tool is
+   * absent. A grant holds only while the live fingerprint and setup are the grant's and the counter is the
+   * one the grant recorded when it was given. Nothing else is tracked.
+   */
+  private readonly changeCount = new Map<string, number>();
+  /** Each server's last publication, tool by tool (`fingerprint|launch`). */
+  private readonly lastPublished = new Map<string, Map<string, string>>();
+  /** Each grant's fingerprint, setup and counter, recorded as it was given (or as it loaded). */
+  private readonly grants = new Map<string, { readonly fingerprint: string; readonly setup: string; readonly counter: number }>();
+  /** Grants that no longer hold, still to be cleared from the record: cleanup only, kept until it lands. */
   private readonly clears = new Map<string, { readonly server: string; readonly tool: string; readonly fingerprint: string }>();
+  /** Catalog writes under way: a durable clear waits for them, never taking the owner first. */
+  private seeing = 0;
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {
@@ -133,9 +143,63 @@ export class McpClient {
     this.owner = owner;
     owner.onChange(() => {
       this.sync();
+      this.loadGrants();
       this.clearGrants();
     });
     this.sync();
+    this.loadGrants();
+  }
+
+  /** A grant in the record with no counter yet (loaded from disk, or saved there directly) starts at the
+      current counter: from now on, any change asks again. */
+  private loadGrants(): void {
+    for (const [key, c] of Object.entries(this.owner.choices())) {
+      if (c.policy !== 'own') continue;
+      const g = this.grants.get(key);
+      if (!g || g.fingerprint !== c.fingerprint || g.setup !== c.setupFingerprint) this.grants.set(key, { fingerprint: c.fingerprint, setup: c.setupFingerprint, counter: this.changeCount.get(key) ?? 0 });
+    }
+  }
+
+  /** Whether "may run on its own" stands for this tool now, at this fingerprint and setup. */
+  private ownNow(key: string, fingerprint: string, setup: string): boolean {
+    const c = this.owner.choices()[key];
+    if (!ownHolds(c, fingerprint, setup)) return false;
+    // (Named mutations: the old "always" back, or a grant kept whatever the tool became; neither counts.)
+    if (__FAMILIAR_MUTATIONS__ && (mutant('server-always') && c?.policy === 'allow' || mutant('own-ignores-fingerprint'))) return true;
+    const g = this.grants.get(key);
+    if (!g || g.fingerprint !== c!.fingerprint || g.setup !== c!.setupFingerprint) return false;
+    return (this.changeCount.get(key) ?? 0) === g.counter || !!(__FAMILIAR_MUTATIONS__ && mutant('own-counter-ignored'));
+  }
+
+  /**
+   * A run published its catalog: the counters move now, synchronously, before anything can read the new
+   * catalog. The first publication a client sees for a server compares with the saved catalog.
+   */
+  private published(id: string, tools: readonly ListedTool[], launch: string): void {
+    const prev = this.lastPublished.get(id) ?? new Map((this.owner.server(id)?.tools ?? []).map(t => [t.name, `${t.fingerprint}|${launch}`]));
+    const now = new Map(tools.map(t => [t.name, `${t.fingerprint}|${launch}`]));
+    for (const name of new Set([...prev.keys(), ...now.keys()])) {
+      const was = prev.get(name);
+      const is = now.get(name);
+      if (was === is) continue;
+      if (is === undefined && (__FAMILIAR_MUTATIONS__ && mutant('own-kept-on-absence'))) {
+        // (The named mutation: an absent tool counts as still listed as it was.)
+        now.set(name, was!);
+        continue;
+      }
+      if (is !== undefined && was !== undefined && (__FAMILIAR_MUTATIONS__ && mutant('own-kept-on-skip'))) continue;
+      const key = choiceKey(id, name);
+      this.changeCount.set(key, (this.changeCount.get(key) ?? 0) + 1);
+    }
+    this.lastPublished.set(id, now);
+    // Grants of this server that no longer hold: their durable clear is queued (cleanup only).
+    const listed = new Map(tools.map(t => [t.name, t.fingerprint]));
+    for (const [key, c] of Object.entries(this.owner.choices())) {
+      const k = parseChoiceKey(key);
+      if (!k || k[0] !== id || c.policy !== 'own') continue;
+      const fp = listed.get(k[1]);
+      if ((fp === undefined || !this.ownNow(key, fp, launch)) && !checkOnly()) this.clears.set(key, { server: id, tool: k[1], fingerprint: c.fingerprint });
+    }
   }
 
   /** Loads the owner's record. Nothing starts until `startEnabled`; `repair` first, in a fresh exe. */
@@ -155,6 +219,7 @@ export class McpClient {
         { processes: this.o.processes, net: this.o.net, clock: this.o.clock, ...(this.o.limits ? { limits: this.o.limits } : {}) },
         () => this.o.onChange?.(id),
         (tools, current, run) => this.seen(id, tools, current, run),
+        (tools, launch) => this.published(id, tools, launch),
         {
           ...(this.o.transition ? { transition: (event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }) => this.o.transition!(id, event, state, slot) } : {}),
           ...(this.o.exchange ? { exchange: (e: Parameters<NonNullable<McpClientOptions['exchange']>>[1]) => this.o.exchange!(id, e) } : {})
@@ -165,17 +230,26 @@ export class McpClient {
     for (const id of [...this.runtimes.keys()]) if (!ids.has(id)) this.runtimes.delete(id);
   }
 
-  /** The durable half of a grant's clearing: tried whenever the owner is free, until it lands. */
+  /**
+   * The durable clear of a grant that no longer holds: cleanup only, since the check at each call already
+   * refuses it. Tried whenever the owner is free and no catalog write is under way (never before one), and
+   * kept until its write lands; a write refused or lost is tried again at the next chance.
+   */
   private clearGrants(): void {
-    if (this.owner.busy || !this.clears.size) return;
+    if (this.owner.busy || this.seeing > 0 || !this.clears.size) return;
     for (const [key, c] of this.clears) {
       const now = this.owner.choices()[key];
       if (now?.policy !== 'own' || now.fingerprint !== c.fingerprint) {
         this.clears.delete(key);
         continue;
       }
-      this.clears.delete(key);
-      void this.owner.choose(c.server, c.tool, undefined).then((r) => (r.ok ? undefined : this.clears.set(key, c)));
+      if (__FAMILIAR_MUTATIONS__ && mutant('clear-dropped-on-error')) this.clears.delete(key);
+      void this.owner.choose(c.server, c.tool, undefined).then(
+        (r) => {
+          if (r.ok) this.clears.delete(key);
+        },
+        () => {}
+      );
       return;
     }
   }
@@ -327,35 +401,25 @@ export class McpClient {
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
     const key = choiceKey(serverId, tool);
     const before = this.revokes.get(key) ?? 0;
-    // "May run on its own" is granted only for the version the server lists now, with its setup; and any
-    // listing during the save that lacks the tool or lists it otherwise stops the grant as it lands (5.6).
+    // "May run on its own" is granted only for the version the server lists now, with its setup, and records
+    // the change counter here, synchronously, before any await: a change while it saves leaves it standing
+    // for nothing (5.6). This attempt's record is its own; a refused attempt records nothing.
     const own = choice?.policy === 'own' && serverId !== BUILT_IN;
+    let attempt: { readonly fingerprint: string; readonly setup: string; readonly counter: number } | undefined;
     if (own) {
       const live = this.tools().find(t => t.server.id === serverId && t.serverName === tool);
-      if (!live || live.fingerprint !== choice.fingerprint || live.setupFingerprint !== choice.setupFingerprint) throw new Error(`${tool} changed or stopped since you saw it, so "may run on its own" was not saved.`);
-      this.granting.set(key, { fingerprint: choice.fingerprint, spoiled: false });
+      if (!(__FAMILIAR_MUTATIONS__ && mutant('own-grant-unchecked')) && (!live || live.fingerprint !== choice.fingerprint || live.setupFingerprint !== choice.setupFingerprint)) throw new Error(`${tool} changed or stopped since you saw it, so "may run on its own" was not saved.`);
+      attempt = { fingerprint: choice.fingerprint, setup: choice.setupFingerprint, counter: this.changeCount.get(key) ?? 0 };
     }
-    let r: Awaited<ReturnType<Owner['choose']>>;
-    let spoiled = false;
-    try {
-      r = await this.owner.choose(serverId, tool, choice);
-    } finally {
-      if (own) {
-        spoiled = this.granting.get(key)?.spoiled === true;
-        this.granting.delete(key);
-      }
-    }
+    const r = await this.owner.choose(serverId, tool, choice);
     if (!r.ok) throw new Error(r.words);
-    if (own) {
+    if (attempt) {
+      this.grants.set(key, attempt);
+      // Already stale (a change while it saved): refused at every call; its record is cleaned up.
       const live = this.tools().find(t => t.server.id === serverId && t.serverName === tool);
-      const changed = spoiled || !live || live.fingerprint !== choice.fingerprint || live.setupFingerprint !== choice.setupFingerprint;
-      if (changed && !(__FAMILIAR_MUTATIONS__ && mutant('own-grant-unchecked'))) {
-        // Saved, but already stale: stopped in memory at once, cleared durably as soon as the owner is free.
-        if (this.overlay.get(key) !== 'never') this.overlay.set(key, 'ask');
-        this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
-        this.clears.set(key, { server: serverId, tool, fingerprint: choice.fingerprint });
+      if ((!live || !this.ownNow(key, live.fingerprint, live.setupFingerprint)) && !checkOnly()) {
+        this.clears.set(key, { server: serverId, tool, fingerprint: attempt.fingerprint });
         this.clearGrants();
-        return;
       }
     }
     if ((this.revokes.get(key) ?? 0) === before) this.overlay.delete(key);
@@ -370,6 +434,8 @@ export class McpClient {
   policy(wrappers: readonly ServerTool[]): GatePolicy {
     const choices = this.owner.choices();
     const perTool: Record<string, GateVerdict> = { ...toolPolicies(wrappers, choices) };
+    // "May run on its own" only while its grant still stands: the one check, at each call (5.6).
+    for (const w of wrappers) if (perTool[w.name] === 'own' && !this.ownNow(choiceKey(w.server.id, w.serverName), w.fingerprint, w.setupFingerprint)) delete perTool[w.name];
     for (const [key, c] of Object.entries(choices)) {
       const tool = builtInTool(key);
       if (tool !== undefined) perTool[tool] = c.policy;
@@ -481,7 +547,7 @@ export class McpClient {
     const choice = this.owner.choices()[key];
     const overlay = this.overlay.get(key);
     if (choice?.policy === 'deny' || overlay === 'never') return refuse('changed', `You chose never to run ${decision.tool} on this server, so Familiar didn't send the call.`);
-    if (decision.by === 'own' && (overlay === 'ask' || !ownHolds(choice, decision.fingerprint, decision.launch))) {
+    if (decision.by === 'own' && (overlay === 'ask' || !this.ownNow(key, decision.fingerprint, decision.launch))) {
       return refuse('changed', `Your "may run on its own" for ${decision.tool} on this server no longer stands, so Familiar didn't send the call. It will ask.`);
     }
     const ms = Math.min(CALL_MS_MAX, Math.max(CALL_MS_MIN, record.limits.callMs ?? CALL_MS));
@@ -514,29 +580,7 @@ export class McpClient {
       this.runListing.set(run, n);
       for (const old of this.runListing.keys()) if (this.runListing.size > REPORTS_KEPT) this.runListing.delete(old);
     }
-    // A "may run on its own" grant for a tool listed now with another fingerprint stops holding at once, in
-    // memory, whatever the owner is doing; its durable clear follows (in the catalog write, or as soon as the
-    // owner is free), so a tool that changes and changes back asks again (5.6).
-    // A listing that lacks the tool stops it too: the grant holds only while the server lists the tool
-    // exactly as it did.
-    const listed = new Map(now.map(t => [t.name, t.fingerprint]));
-    for (const [key, c] of Object.entries(this.owner.choices())) {
-      const k = parseChoiceKey(key);
-      if (!k) continue;
-      const [server, tool] = k;
-      if (server !== id || c.policy !== 'own') continue;
-      const fp = listed.get(tool);
-      if (fp === undefined && (__FAMILIAR_MUTATIONS__ && mutant('own-kept-on-absence'))) continue;
-      if (fp === c.fingerprint || (__FAMILIAR_MUTATIONS__ && (mutant('own-kept-on-skip') || mutant('own-ignores-fingerprint')))) continue;
-      if (this.overlay.get(key) !== 'never') this.overlay.set(key, 'ask');
-      this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
-      this.clears.set(key, { server: id, tool, fingerprint: c.fingerprint });
-    }
-    for (const [key, g] of this.granting) {
-      const k = parseChoiceKey(key);
-      if (k && k[0] === id && listed.get(k[1]) !== g.fingerprint) g.spoiled = true;
-    }
-    this.clearGrants();
+    // The catalog write goes first; a grant's durable clear waits for it (clearGrants).
     const s = this.owner.server(id);
     if (!s) return;
     const before = new Map(s.tools.map(t => [t.name, t]));
@@ -544,11 +588,23 @@ export class McpClient {
       const reviewed = before.get(t.name)?.reviewed;
       return { name: t.name, fingerprint: t.fingerprint, ...(reviewed ? { reviewed } : {}) };
     });
-    await this.owner.seen(id, tools, current);
+    this.seeing++;
+    try {
+      await this.owner.seen(id, tools, current);
+    } finally {
+      this.seeing--;
+      this.clearGrants();
+    }
   }
 }
 
 type OwnedServerRecord = import('./owner.ts').OwnedServer;
+
+/** Under the grant mutations, the durable clear (cleanup) is off too, so their controls measure the check at
+    each call alone: that check is what the guarantee rests on. */
+function checkOnly(): boolean {
+  return !!(__FAMILIAR_MUTATIONS__ && (mutant('own-kept-on-skip') || mutant('own-kept-on-absence') || mutant('own-counter-ignored') || mutant('own-ignores-fingerprint')));
+}
 
 /** An address as compared for an edit: the same exe identity. */
 function sameAddress(a: string, b: string): boolean {

@@ -586,7 +586,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       // those facts. A grant that isn't saved is reported; the Yes to this call stands either way.
       if (ok === 'own' && card.facts && options.grantOwn && !(__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) {
         const saved = await options.grantOwn(card.facts).catch(() => false);
-        if (!saved) report('own', 'The "may run on its own" choice was not saved. This call was still sent.');
+        // The grant's outcome, on its own: the call's outcome is reported where the call ends, as any call's.
+        if (!saved) report('own', 'The "may run on its own" choice was not saved. Familiar will ask about this tool again next time.');
       }
       return ok ? { allowedBy: 'asked', ...(card.facts ? { facts: card.facts } : {}) } : 'The person said no.';
     }

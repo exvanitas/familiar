@@ -98,6 +98,9 @@ export interface LinkEvents {
   record?(): { readonly enabled: boolean; readonly launch: string };
   /** The phase or its words changed. */
   changed?(): void;
+  /** A run's catalog was published (every publication, saved or not), with the run's launch: heard
+      synchronously, before anything else can see the new catalog. */
+  published?(run: string, tools: readonly ListedTool[], launch: string): void;
   /** The test build's conformance record: every event fed, the state the driver then holds, and the
       exchange machine's slot (busy or not), with whether the queue had drained. */
   transition?(event: LcEvent, state: LcState, slot: { readonly busy: boolean; readonly quiet: boolean }): void;
@@ -424,6 +427,7 @@ export class ServerLink {
           const resend = __FAMILIAR_MUTATIONS__ && mutant('resend-404-call') ? w.lastCall?.body : undefined;
           if (resend) void this.drained().then(() => this.exchangeNow(w, 'call', w.nextId++, resend, 'tools/call'));
         }
+        this.events.published?.(fx.run, w.tools, w.launch);
         // A Test's report, captured as its run publishes.
         if (this.lc.run?.id === fx.run && this.lc.run.mode === 'test') this.reports.set(fx.run, { tools: w.tools, notOffered: w.notOffered });
         return;
