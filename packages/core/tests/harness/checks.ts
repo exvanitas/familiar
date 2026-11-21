@@ -65,7 +65,8 @@ function admittedStarts(r: WireRun, server: string): Evidence[] {
   return r.evidence.filter((e) => (e.what === 'start' || e.what === 'test') && addressOf(e.server) === server && (e.admitted || evidenceControls.countRefusedStarts));
 }
 /** The harness's own controls, for its tests only: count refused Starts as runs, as the old evidence did. */
-export const evidenceControls = { countRefusedStarts: false, globalTests: false, globalStarts: false };
+import { evidenceControls } from './evidence-controls.ts';
+export { evidenceControls };
 
 function runOf(r: WireRun, x: NativeRec): number {
   if (x.kind === 'write') return x.epoch;

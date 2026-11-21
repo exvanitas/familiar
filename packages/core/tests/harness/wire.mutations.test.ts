@@ -166,6 +166,30 @@ describe("the evidence's own controls", () => {
   }, 60_000);
 });
 
+describe('H13 on a stream with no final response', () => {
+  // One chunk, its cancel refused, and no final response (earlyEnd 1): a dropped pong must still fail H13.
+  const mode = { where: 'remote', era: 'legacy', pings: 40, session404: 'none', redirect: 0, earlyEnd: 1, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0 } as Partial<Mode>;
+  for (const sentinel of [false, true])
+    it(`drop-pong-before-flood fails H13${sentinel ? ' only without the control (the -1 sentinel taken as an index: H13 misses it)' : ''}`, async () => {
+      evidenceControls.finalSentinel = sentinel;
+      try {
+        let fired = 0;
+        let caught = 0;
+        for (let seed = 1; seed <= 30; seed++) {
+          const r = await wireRun(seed, { mode, mutation: 'drop-pong-before-flood' });
+          if (r.firstHit === undefined) continue;
+          fired++;
+          if (PASS_CHECKS.H13!(r).length) caught++;
+        }
+        expect(fired).toBeGreaterThan(0);
+        if (sentinel) expect(caught).toBe(0);
+        else expect(caught).toBe(fired);
+      } finally {
+        evidenceControls.finalSentinel = false;
+      }
+    }, 120_000);
+});
+
 describe('the twin comparison itself', () => {
   it('counts two histories that differ only in one header as different', async () => {
     const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });

@@ -4,6 +4,7 @@
 // log of what the person did. The checks (checks.ts) read only those two logs.
 
 import { mutant, mutations } from '../../src/mutations.ts';
+import { evidenceControls } from './evidence-controls.ts';
 import { McpClient } from '../../src/mcp/client.ts';
 import { mintDecision } from '../../src/mcp/decision.ts';
 import type { NetHead, NetPort, NetSpec } from '../../src/mcp/wire/link.ts';
@@ -597,8 +598,8 @@ export class FakeExe {
             const sent: number = (st as any).sent ?? 0;
             const whole = plan && (plan.sse || (st as any).holdMsgs) && bounds ? bounds.filter((b) => b <= sent).length : 0;
             // Never past the stream's own terminal message: one delivered after it in the same chunk came after
-            // the client's end, not before it.
-            const terminal = plan && !(st as any).holdMsgs && plan.final !== undefined ? plan.final : Infinity;
+            // the client's end, not before it. A stream with no final response (`final` -1) has no such bound.
+            const terminal = plan && !(st as any).holdMsgs && plan.final !== undefined && (plan.final >= 0 || evidenceControls.finalSentinel) ? plan.final : Infinity;
             rec.endedAt = this.sched.step * 1000 + Math.min(whole, terminal);
           }
           // The exe may refuse a net_cancel and keep the request alive: once per request, as a passing fault.
