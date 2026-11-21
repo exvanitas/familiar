@@ -255,12 +255,13 @@ export const H2: Check = (r) => {
     for (const [epoch, n] of perEpoch) if (n > 1) problems.push(`H2: run ${epoch} was stopped natively ${n} times`);
   }
   // Nothing reaches a run after its Stop: no request, notification or pong of that run starts once the
-  // Stop was made.
+  // Stop was made. Locally the run is the stopped server's own process, the last the exe started for that
+  // setup before the Stop (whether or not anything was written to it yet); remotely, its address's last epoch.
   for (const e of r.evidence) {
     if (e.what !== 'stop') continue;
-    const address = r.server.mode.where === 'remote' ? `addr-${(e.server ?? 's1').slice(1)}` : 'local';
-    const before = r.exe.log.filter((x) => x.server === address && x.seq < e.seq);
-    const epoch = before.at(-1)?.epoch;
+    const local = r.server.mode.where === 'local';
+    const address = local ? (e.server ?? 's1') : `addr-${(e.server ?? 's1').slice(1)}`;
+    const epoch = local ? r.exe.processStarts.filter((t) => t.server === address && t.seq < e.seq).at(-1)?.epoch : r.exe.log.filter((x) => x.server === address && x.seq < e.seq).at(-1)?.epoch;
     if (epoch === undefined) continue;
     for (const x of r.exe.log) {
       if (x.server !== address || x.epoch !== epoch || x.seq < e.seq || !x.body) continue;

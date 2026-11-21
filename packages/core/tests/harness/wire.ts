@@ -337,7 +337,7 @@ export interface NativeRec {
   readonly seq: number;
   readonly n: number;
   readonly kind: 'post' | 'write' | 'model';
-  /** Which server: the saved address (remote) or the process run (local). */
+  /** Which server: the saved address (remote), or the setup id of the process written to (local). */
   readonly server: string;
   /** What the server answered (remote), for the harness's own reading of catalogs. */
   plan?: Plan;
@@ -658,7 +658,7 @@ export class FakeExe {
 
   processes(): ProcessPort {
     let runs = 0;
-    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; noticed?: boolean }>();
+    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; server: string; noticed?: boolean }>();
     const flush = (run: string) => {
       const p = live.get(run)!;
       if (p.flushing || !p.out.length) return;
@@ -795,7 +795,7 @@ export class FakeExe {
           this.epoch++;
           const admitted: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id, run };
           this.processStarts.push(admitted);
-          live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch });
+          live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch, server: setup.id });
           const answer = () => this.sched.add({ label: `started:${run}`, fire: () => {
             admitted.answered = this.sched.step;
             resolve({ run });
@@ -818,8 +818,8 @@ export class FakeExe {
           } catch {
             body = undefined;
           }
-          // The epoch of the process written to, never the newest one.
-          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: p?.epoch ?? this.epoch };
+          // The process written to, by its epoch and its setup's id, never the newest one's.
+          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: p?.server ?? 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: p?.epoch ?? this.epoch };
           this.log.push(rec);
           if (!p || p.exited) {
             rec.end = this.sched.step;

@@ -171,6 +171,24 @@ describe("the evidence's own controls", () => {
   }, 60_000);
 });
 
+describe("H2 and the stopped server's own process", () => {
+  // S35 calls the other, still-running server after the first one's Stop: its writes are its own process's,
+  // so H2 is clean. The same write, taken as one to the stopped server's process, is caught.
+  it("the other server's call after a Stop is its own; the same call to the stopped server's process fails H2", async () => {
+    const s35 = SCHEDULES.find((s) => s.name.startsWith('S35'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s35);
+      expect(PASS_CHECKS.H2!(r), `seed ${seed} clean`).toEqual([]);
+      const stop = r.evidence.find((e) => e.what === 'stop')!;
+      const fenced = r.exe.processStarts.filter((t) => t.server === stop.server && t.seq < stop.seq).at(-1)!;
+      const after = r.exe.log.find((x) => x.kind === 'write' && x.body?.method === 'tools/call' && x.seq > stop.seq)!;
+      expect(after.server, `seed ${seed}`).not.toBe(stop.server);
+      Object.assign(after, { server: fenced.server, epoch: fenced.epoch });
+      expect(PASS_CHECKS.H2!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/tools\/call sent to a run after its Stop/)]));
+    }
+  }, 60_000);
+});
+
 describe('Start replies paired by token', () => {
   it('two overlapping Starts, the refused one answered first (S36): clean by token; by order (the old pairing) H14 misreads the 404', async () => {
     const s36 = SCHEDULES.find((s) => s.name.startsWith('S36'))!.options;

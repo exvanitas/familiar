@@ -244,14 +244,22 @@ const LIFECYCLE: Named[] = [
               if (n < 3) startOther(n + 1);
             });
           startOther(1);
-          d.when('both ready', () => d.idle('s1') && d.idle('s2'), () => d.stop(first));
+          d.when('both ready', () => d.idle('s1') && d.idle('s2'), () => {
+            d.stop(first);
+            // The other server, still running, called once the Stop has answered: its writes go to its own
+            // process, never the stopped one's (H2 picks the stopped server's process by its setup).
+            d.when('stop answered', () => d.evidence.some((e) => e.what === 'stopped'), () => d.call('echo', {}, false, other));
+          });
         });
       }
     },
     expect: (r) => {
       const stopped = r.evidence.find((e) => e.what === 'stopped');
       const other = stopped?.server === 's1' ? 's2' : 's1';
-      return stopped && r.exe.processStarts.some((t) => t.server === other) ? undefined : 'no Stop of one server beside the other started';
+      if (!stopped || !r.exe.processStarts.some((t) => t.server === other)) return 'no Stop of one server beside the other started';
+      const call = r.evidence.find((e) => e.what === 'call' && e.server === other && e.seq > stopped.seq);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === call?.token)?.outcome;
+      return out?.kind === 'result' ? undefined : `the other server's call after the Stop came back ${JSON.stringify(out)}`;
     }
   },
   {
