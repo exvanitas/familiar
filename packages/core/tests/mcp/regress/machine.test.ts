@@ -262,6 +262,37 @@ describe('each generation is written once, plus its one retry (6b.13)', () => {
   });
 });
 
+describe('a queued re-save belongs to the run that queued it (6b.13)', () => {
+  for (const mutation of [undefined, 'lc-queue-outlives-run'] as const)
+    it(`a run that ends during its first write takes its queue with it; the next run writes at its own settle, as its first write${mutation ? ` (control: ${mutation} spends the old queue on the next run)` : ''}`, () =>
+      withMutation(mutation, () => {
+        const page: Ev = cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } }));
+        const g = run([
+          start('start', 'remote', 'k1'),
+          cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'ok' } })), idle, page, idle,
+          cur((r) => ({ t: 'notice', run: r.id })), page, idle,
+          cur((r) => ({ t: 'deadline', id: r.saveBy ?? r.deadline!.id })),
+          start('start', 'remote', 'k2'),
+          cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'modern-refusal' } })), idle, page,
+          { t: 'saved', gen: 1, outcome: 'saved' }
+        ]);
+        expect(g.s.run?.id).toBe('s#2');
+        expect(g.s.run?.step).toBe('settling');
+        if (mutation) {
+          expect(g.last).toContainEqual({ t: 'save', run: 's#2', gen: 3 });
+          return;
+        }
+        expect(g.last.filter((x) => x.t === 'save')).toEqual([]);
+        // s#2's settle writes gen 3 as its first write; its failure ends s#2 (catalog-failed), never a retry.
+        const settle = run([idle], g.s);
+        expect(settle.last).toContainEqual({ t: 'save', run: 's#2', gen: 3 });
+        const failed = run([{ t: 'saved', gen: 3, outcome: 'failed' }], settle.s);
+        expect(failed.last.filter((x) => x.t === 'save')).toEqual([]);
+        expect(failed.s.run).toBeUndefined();
+        expect(failureOf(failed.s)?.words).toMatch(/couldn't save the server's tool list/);
+      }));
+});
+
 describe("the relaunch ends the exited process's exchange", () => {
   const local: Target = { where: 'local', setup: { id: 's1', label: 'S', program: 'node', args: [], cwd: '.', env: [], secrets: [] } };
   for (const mutation of [undefined, 'lc-relaunch-keeps-exchange'] as const)

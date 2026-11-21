@@ -1005,6 +1005,10 @@ function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Caus
   // A Test leaves the server Stopped unless the process may still run; a person's Stop too.
   const failed = mayRun || (!own && r.mode !== 'test');
   s.run = undefined;
+  // A queued re-save belongs to the run that queued it (6b.13): it goes with the run, and a later run's
+  // catalog is written at its own settle, as its first write, once the write in flight lands. A later run
+  // can queue one only from its own settle.
+  if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-queue-outlives-run'))) s.dirty = false;
   // Beside Failed, a process that may still run shows its own words (section 6's residual, 6b.8); the cause's
   // words otherwise. (A waiter's words add "may still be running" to the cause's, 4.6.)
   s.after = failed ? { failed: true, failure: mayRun ? stillWords : words } : { failed: false };
