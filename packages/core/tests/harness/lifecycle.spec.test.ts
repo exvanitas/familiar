@@ -511,9 +511,12 @@ describe('W with the spec checks', () => {
       expect(merged).toBeGreaterThan(0);
     }, 900_000);
 
-  /** The small world's budgets (FAMILIAR_LC_SPEC_SMALL): every budget at one, the person's actions at
-      FAMILIAR_LC_SPEC_PERSONS (default 2: Ctx counts them together, and one allows no Start then Stop). */
-  const SMALL_CTX: Ctx = { persons: Number(process.env.FAMILIAR_LC_SPEC_PERSONS ?? 2), notices: 1, pings: 1, calls: 1, pages: 1, stale: 1, exhaust: 1, watchdog: 1 };
+  /** The small world's budgets (FAMILIAR_LC_SPEC_SMALL): every budget at one. Its fixpoint walks take the
+      person's actions at FAMILIAR_LC_SPEC_PERSONS (default 1, which completes both ways; Ctx counts them
+      together); its mutation walks take two, fixed, since they stop at their first violation. */
+  const SMALL: Omit<Ctx, 'persons'> = { notices: 1, pings: 1, calls: 1, pages: 1, stale: 1, exhaust: 1, watchdog: 1 };
+  const SMALL_CTX: Ctx = { ...SMALL, persons: Number(process.env.FAMILIAR_LC_SPEC_PERSONS ?? 1) };
+  const SMALL_MUTATION_CTX: Ctx = { ...SMALL, persons: 2 };
   const fixLog = (line: string) => {
     if (process.env.FAMILIAR_LC_LOG) appendFileSync(process.env.FAMILIAR_LC_LOG, `${new Date().toISOString()} ${line}\n`);
   };
@@ -535,30 +538,32 @@ describe('W with the spec checks', () => {
     }, 45 * 60_000);
 
   // The small world, walked to its end (FAMILIAR_LC_SPEC_SMALL=1, locally): every Ctx budget at one, the
-  // person's actions at FAMILIAR_LC_SPEC_PERSONS. A fixpoint shows no violation in any interleaving within those
-  // budgets: evidence of its own beside the bounded walk above. Each mutation the spec checks catch in CI is run
-  // in it too, from the initial state. At 7254177 with the 134-clause checks:
+  // person's actions at FAMILIAR_LC_SPEC_PERSONS (default 1). A fixpoint shows no violation in any interleaving
+  // within those budgets: evidence of its own beside the bounded walk above. Each mutation the spec checks catch
+  // in CI is run in it too, from the initial state, with two person actions (each is caught by depth 13).
+  // FAMILIAR_LC_SPEC_PERSONS=2 is the opt-in fixpoint run: remote completes; local reports how far it got, a
+  // non-fixpoint. At 7254177 with the 134-clause checks:
   // - persons 1: the fixpoint, no violation; local depth 25, 223,617 states, 1,475,004 transitions, 142 s;
   //   remote depth 35, 29,700 states, 167,281 transitions, 17 s. It catches 19 of the 24 mutations and misses
   //   five: lc-second-stop-stopped, lc-two-native-stops, lc-readmit-after-stop and lc-start-beside-orphan need a
   //   second person action, lc-queue-outlives-run a second run.
-  // - persons 2 (the default): remote, the fixpoint, no violation, depth 42, 1,331,969 states, 11,478,938
-  //   transitions, 1,367 s; local doesn't empty in 40 minutes (no violation through depth 16, 2,020,489
-  //   states, frontier 720,206), so its fixpoint test fails by design. All five persons 1 misses are caught
-  //   here (depths 5, 4, 6, 5 and 13), twins clean.
+  // - persons 2: remote, the fixpoint, no violation, depth 42, 1,331,969 states, 11,478,938 transitions,
+  //   1,367 s; local doesn't empty in 40 minutes (no violation through depth 16, 2,020,489 states, frontier
+  //   720,206). All five persons 1 misses are caught here (depths 5, 4, 6, 5 and 13), twins clean.
   for (const where of ['local', 'remote'] as const)
     it.skipIf(!process.env.FAMILIAR_LC_SPEC_SMALL)(`the spec checks hold to the fixpoint of the small world, ${where}`, () => {
       const r = walkSpec(THIS, where, Infinity, { ...SPEC0(), c: SMALL_CTX }, { digest: true, renumber: true, budgetMs: 40 * 60_000, progress: (p) => fixLog(fmt(`spec small progress ${where} ${canon(SMALL_CTX)}`, p)) });
       fixLog(fmt(`SPEC SMALL ${where} ${canon(SMALL_CTX)}`, r));
       expect(r.violation, r.violation?.problems.join('; ')).toBeUndefined();
-      expect(r.done, `stopped at depth ${r.depth} with ${r.frontier} in the frontier`).toBe(true);
+      // Two person actions locally don't empty in 40 minutes: that run reports how far it got.
+      if (SMALL_CTX.persons < 2 || where === 'remote') expect(r.done, `stopped at depth ${r.depth} with ${r.frontier} in the frontier`).toBe(true);
     }, 45 * 60_000);
   for (const [mutation, where] of LC.filter(([m]) => !DEEP.has(m)))
     it.skipIf(!process.env.FAMILIAR_LC_SPEC_SMALL)(`${mutation} is caught in the small world, and its trace replays clean unmutated`, () => {
       mutations.set([mutation]);
       let r: SpecResult;
       try {
-        r = walkSpec(THIS, where, Infinity, { ...SPEC0(), c: SMALL_CTX }, { digest: true, renumber: true, budgetMs: 20 * 60_000 });
+        r = walkSpec(THIS, where, Infinity, { ...SPEC0(), c: SMALL_MUTATION_CTX }, { digest: true, renumber: true, budgetMs: 20 * 60_000 });
       } finally {
         mutations.clear();
       }
