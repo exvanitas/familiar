@@ -94,6 +94,9 @@ export interface Run {
   readonly graceFailure?: Failure;
   /** A later catalog write failed: its generation, kept until a retry lands (one retry). */
   readonly unsaved?: number;
+  /** The first Stop's answer, once given: a later Stop of this run gets the same (4.6, I8). */
+  readonly stopAnswer?: Reply;
+
 }
 export interface Waiter {
   readonly kind: 'start' | 'test' | 'stop';
@@ -196,6 +199,8 @@ export const STOP_REFUSED: Failure = { kind: 'failed', words: 'Familiar asked Wi
 export const STOP_UNCONFIRMED: Failure = { kind: 'failed', words: "Familiar asked Windows to stop the server and it hasn't exited yet, so it may still be running. Familiar starts it again only once it has exited; restarting Familiar ends it for sure." };
 export const START_UNANSWERED: Failure = { kind: 'timed-out', words: "The server didn't finish starting in time: Windows hasn't answered the start, so it may still be starting." };
 export const START_TIMEOUT: Failure = { kind: 'timed-out', words: "The server didn't finish starting in time." };
+/** A Start answered as its run is stopped by the person, before it finished starting. */
+export const STOPPED_EARLY: Failure = { kind: 'exited', words: 'The server was stopped before it finished starting.' };
 export const LIST_TIMEOUT: Failure = { kind: 'timed-out', words: "The server's tool list didn't arrive in time." };
 export const SESSION_ENDED: Failure = { kind: 'http', words: 'The server ended its session.' };
 export const KEPT_CHANGING: Failure = { kind: 'protocol', words: "The server's tools kept changing while Familiar listed them." };
@@ -281,6 +286,7 @@ class Tx {
     const w = this.s.waiters.find((x) => x.token === token);
     this.s.waiters = this.s.waiters.filter((x) => x.token !== token);
     this.emit({ t: 'answer', token, reply });
+    if (w?.kind === 'stop' && this.s.run && w.run === this.s.run.id && !this.s.run.stopAnswer) this.setRun({ stopAnswer: reply });
     // The action's own deadline goes once its last start or Test waiter is answered.
     const r = this.s.run;
     if (!w || w.kind === 'stop' || !r || w.run !== r.id || this.actionOpen()) return;
@@ -405,7 +411,8 @@ function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   // A process whose stop was refused may still be running: nothing starts beside it (I2).
   if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-start-beside-orphan'))) return refuseStart(tx, e.token, { kind: 'failed', failure: orphanWords(s) });
   if (!e.facts.ownerFree) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'refused', words: e.facts.ownerWords ?? '' } });
-  if (s.slot === 'busy') return refuseStart(tx, e.token, { kind: 'failed', failure: { kind: 'busy', words: BUSY_SLOT } });
+  // (A slot still draining an earlier run's exchange doesn't refuse it: the new run's first request waits
+  // for Idle, as every administrative request does, 6b.5.)
   const id = `${s.id}#${++s.nextRun}`;
   const local = e.facts.where === 'local';
   s.after = undefined;
@@ -458,7 +465,7 @@ function stop(tx: Tx, token: string): void {
   if (r.step === 'relaunch') {
     // The relaunch is cancelled: its process already exited, and a readmit that comes later is for an
     // ended run.
-    for (const w of s.waiters.filter((x) => x.run === r.id)) tx.answer(w.token, { kind: 'stopped' });
+    for (const w of s.waiters.filter((x) => x.run === r.id)) tx.answer(w.token, w.kind === 'test' ? { kind: 'failed', failure: STOPPED_EARLY } : { kind: 'stopped' });
     tx.disarm();
     if ((__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-after-stop'))) s.zombie = r.id;
     s.run = undefined;
@@ -469,10 +476,15 @@ function stop(tx: Tx, token: string): void {
     tx.emit({ t: 'answer', token, reply: { kind: 'stopped' } });
     return end(tx, 'person-stop', { kind: 'exited', words: STOPPED_WORDS });
   }
+  // A second Stop after the first was answered gets that same answer (4.6, I8).
+  if (r.step === 'closing' && r.stopAnswer && !(__FAMILIAR_MUTATIONS__ && mutant('lc-second-stop-stopped'))) return tx.emit({ t: 'answer', token, reply: r.stopAnswer });
   s.waiters = [...s.waiters, { kind: 'stop', token, run: r.id }];
   // A Stop during Test's own cleanup is the person's: Test then answers no success (4.7), with still one
   // native stop.
-  if (r.step === 'closing' && r.cause === 'test-done' && !(__FAMILIAR_MUTATIONS__ && mutant('lc-test-ok-after-stop'))) tx.setRun({ cause: 'person-stop', failure: { kind: 'exited', words: STOPPED_WORDS } });
+  // 6b.3: it answers Test at once, failed; the kept cause stays Test's own cleanup.
+  if (r.step === 'closing' && r.cause === 'test-done' && !(__FAMILIAR_MUTATIONS__ && mutant('lc-test-ok-after-stop'))) {
+    for (const w of s.waiters.filter((x) => x.run === r.id && x.kind === 'test')) tx.answer(w.token, { kind: 'failed', failure: { kind: 'exited', words: STOPPED_WORDS } });
+  }
   if (r.step === 'closing') {
     // Every Stop has a deadline: one made after an earlier Stop's deadline was answered arms it again.
     if (!r.deadline && !(__FAMILIAR_MUTATIONS__ && mutant('lc-no-stop-deadline'))) tx.arm('stop');
@@ -531,8 +543,10 @@ function exit(tx: Tx, process: string, failure: Failure): void {
     // the relaunch's own list can go out. Then its writes, then the relaunch's facts.
     if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-relaunch-keeps-exchange'))) tx.emit({ t: 'end-live', run: r.id });
     tx.emit({ t: 'release-writes', process });
-    // The grace deadline goes; the admission's own deadline (kept aside) still bounds the start.
+    // The grace deadline goes; the admission's own deadline (kept aside through grace) is the relaunch's.
     if (tx.run!.deadline?.which !== 'start') tx.disarm();
+    const kept = tx.run!.saveBy;
+    if (kept !== undefined && !tx.run!.deadline) tx.setRun({ deadline: { which: 'start', id: kept }, saveBy: undefined });
     tx.setRun({ step: 'relaunch', want: undefined, inFlight: undefined });
     tx.emit({ t: 'readmit-check', run: r.id });
     return;
@@ -607,6 +621,12 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
   if (o.k === 'session-ended') return sessionEnded(tx);
   if (kind === 'initialize') {
     if (o.k === 'legacy') {
+      // A modern run's re-handshake answered in the legacy era: the run's era stays (G29), and a modern run
+      // sends no notifications/initialized; its walk follows.
+      if (r.era === 'modern') {
+        tx.setRun({ step: 'walking', walk: { attempt: 0, page: 1, startedAt: r.changes, answered: false }, want: { kind: 'list', page: 1 } });
+        return tx.issue();
+      }
       tx.setRun({ step: 'initialized', want: { kind: 'initialized' } });
       return tx.issue();
     }
@@ -620,7 +640,7 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
       tx.setRun({ era: 'modern', modernOpening: r.purpose === 'start', step: 'walking', walk: { attempt: 0, page: 1, startedAt: r.changes, answered: false }, want: { kind: 'list', page: 1 } });
       return tx.issue();
     }
-    if (r.purpose === 'recovery') return end(tx, 'session-ended', SESSION_ENDED);
+    // 4.5: a recovery runs the opening rows: a refusal or a bad answer ends it in the handshake's words.
     return end(tx, 'handshake', 'failure' in o ? o.failure : { kind: 'protocol', words: "The server's answer to the handshake was wrong." });
   }
   if (kind === 'initialized') {
@@ -628,7 +648,6 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
       tx.setRun({ step: 'walking', walk: { attempt: 0, page: 1, startedAt: r.changes, answered: false }, want: { kind: 'list', page: 1 } });
       return tx.issue();
     }
-    if (r.purpose === 'recovery') return end(tx, 'session-ended', SESSION_ENDED);
     return end(tx, 'handshake', 'failure' in o ? o.failure : { kind: 'protocol', words: 'The handshake failed.' });
   }
   // A page of the list.
@@ -641,13 +660,15 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
       tx.setRun({ walk: { ...walk, page: walk.page + 1, answered: true }, want: { kind: 'list', page: walk.page + 1 } });
       return tx.issue();
     }
-    if (o.catalog !== 'ok') return end(tx, 'list-answered', o.catalog ?? KEPT_CHANGING);
+    // 4.3's rows in order, the first that matches: a notice outran the walk (walk again, or kept changing),
+    // then a catalog that fails its bounds, then the publish. A retry keeps that the list was answered.
     const now = tx.run!;
     if (now.changes !== walk.startedAt && !(__FAMILIAR_MUTATIONS__ && (mutant('lc-ready-stale') || mutant('publish-stale-walk')))) {
       if (walk.attempt + 1 >= MAX_ATTEMPTS) return end(tx, 'list-answered', KEPT_CHANGING);
-      tx.setRun({ walk: { attempt: walk.attempt + 1, page: 1, startedAt: now.changes, answered: false }, want: { kind: 'list', page: 1 } });
+      tx.setRun({ walk: { attempt: walk.attempt + 1, page: 1, startedAt: now.changes, answered: true }, want: { kind: 'list', page: 1 } });
       return tx.issue();
     }
+    if (o.catalog !== undefined && o.catalog !== 'ok') return end(tx, 'list-answered', o.catalog);
     const gen = ++tx.s.nextGen;
     // (The named mutation publishes a walk a notice outran, as if it were fresh.)
     tx.setRun({ published: (__FAMILIAR_MUTATIONS__ && (mutant('lc-ready-stale') || mutant('publish-stale-walk'))) ? now.changes : walk.startedAt, gen, step: 'settling', walk: { ...walk, answered: true } });
@@ -687,7 +708,8 @@ function unanswered(tx: Tx, failure: Failure): void {
 function sessionEnded(tx: Tx): void {
   const r = tx.run!;
   if (r.where !== 'remote') return end(tx, 'list-unanswered', SESSION_ENDED);
-  const fromReady = r.step === 'ready' || (r.purpose === 'refresh' && r.step !== 'settling');
+  // Ready, or refreshing (a refresh's walk, its settling included): one recovery (4.5).
+  const fromReady = r.step === 'ready' || (r.purpose === 'refresh' && ['opening', 'initialized', 'walking', 'settling'].includes(r.step));
   if (r.purpose === 'refresh' && r.step !== 'ready' && (__FAMILIAR_MUTATIONS__ && mutant('end-on-refresh-404'))) return end(tx, 'session-ended', SESSION_ENDED);
   if ((!fromReady || r.dropped > 0) && !(__FAMILIAR_MUTATIONS__ && mutant('rehandshake-every-404'))) return end(tx, 'session-ended', SESSION_ENDED);
   // One fresh handshake, then the tool list; calls are refused meanwhile.
@@ -704,7 +726,12 @@ function callEnded(tx: Tx, e: Extract<LcEvent, { t: 'call-ended' }>): void {
     if (r.recovered) tx.setRun({ dropped: 0, recovered: false });
     return;
   }
-  if (e.end === 'era-refusal') return end(tx, 'era-changed', e.failure ?? { kind: 'protocol', words: 'The server changed its protocol version.' });
+  // 4.5: an era refusal ends a modern run that is Ready (or refreshing or recovering on it); on a legacy run,
+  // or one not yet Ready, it is that call's alone (G18).
+  if (e.end === 'era-refusal') {
+    if (r.era !== 'modern' || phaseOf(tx.s as LcState) !== 'ready') return;
+    return end(tx, 'era-changed', e.failure ?? { kind: 'protocol', words: 'The server changed its protocol version.' });
+  }
   sessionEnded(tx);
 }
 
@@ -828,7 +855,7 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   // Decided here, from the run's own admitted mode and launch and the facts read now: never from anything a
   // later action changed.
   const f = e.facts;
-  if (!f.ownerFree) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'Familiar is saving another change. Press Start again.' });
+  if (!f.ownerFree) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: f.ownerWords || 'Familiar is saving another change. Press Start again.' });
   // Turned off meanwhile (an automatic start's relaunch): Stopped, as it was asked.
   if (r.mode === 'auto' && !f.enabled) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: 'It is turned off.' });
   if (f.launch !== r.launch) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'The setup changed. Press Start again.' });
@@ -867,6 +894,23 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
   const unfenced = cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence'));
   if (!unfenced) tx.emit({ t: 'end-live', run: r.id });
   tx.setRun({ cause, failure, step: 'closing', ...((__FAMILIAR_MUTATIONS__ && mutant('lc-admit-after-fence')) || unfenced ? {} : { want: undefined }) });
+  // 6b.2 and 6b.3: a Start, and a Test (but for its own cleanup), is answered now, as its run begins closing,
+  // in the kept cause's words: it never waits on cleanup. Only Stop waits for the exit.
+  if (!(__FAMILIAR_MUTATIONS__ && mutant('lc-start-waits-cleanup'))) {
+    const words: Failure = cause === 'person-stop' ? STOPPED_EARLY : failure;
+    // Kind failed, in the kept cause's words; a person's Stop in words saying it was stopped before it finished
+    // starting (6b.2). Kind stopped is the Stop waiter's, once the exit is seen.
+    for (const w of tx.s.waiters.filter((x) => x.run === r.id && (x.kind === 'start' || (x.kind === 'test' && cause !== 'test-done')))) {
+      // (The named mutation answers a start Stop met during its catalog write as if it were ready.)
+      if (cause === 'person-stop' && r.firstSave === 'pending' && (__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop'))) tx.answer(w.token, w.kind === 'test' ? { kind: 'tested', run: r.id } : { kind: 'ready' });
+      else tx.answer(w.token, { kind: 'failed', failure: words });
+    }
+  }
+  // Test's own cleanup: its waiter moves to the stop deadline armed below (the one rebinding allowed).
+  if (cause === 'test-done' && tx.run!.saveBy !== undefined) {
+    tx.emit({ t: 'disarm', id: tx.run!.saveBy });
+    tx.setRun({ saveBy: undefined });
+  }
   if (r.where === 'remote') return finish(tx, 'done');
   const n = r.native!;
   if (n.start === 'pending') {
@@ -898,7 +942,8 @@ function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Caus
   const alive = !!r.native?.process && !r.native.exited;
   const mayRun = alive && how !== 'done';
   if (alive) s.orphans = [...s.orphans, { run: r.id, process: r.native!.process!, how: how === 'refused' ? 'refused' : 'unconfirmed' }];
-  else if (r.native?.process) tx.emit({ t: 'release-writes', process: r.native.process });
+  // Once per exit: a relaunch released them when its process exited.
+  else if (r.native?.process && r.step !== 'relaunch') tx.emit({ t: 'release-writes', process: r.native.process });
   const stillWords = how === 'refused' ? STOP_REFUSED : STOP_UNCONFIRMED;
   if (r.saveBy !== undefined && !s.waiters.some((w) => w.run === r.id && w.kind !== 'stop')) {
     tx.emit({ t: 'disarm', id: r.saveBy });
@@ -907,13 +952,19 @@ function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Caus
   const own = cause === 'person-stop' || cause === 'test-done' || cause === 'turned-off';
   const words: Failure = mayRun ? (own ? stillWords : { kind: failure.kind, words: `${failure.words} ${stillWords.words}` }) : failure;
   for (const w of s.waiters.filter((x) => x.run === r.id)) {
-    if (w.kind === 'stop') tx.answer(w.token, mayRun || (alive && !(__FAMILIAR_MUTATIONS__ && mutant('lc-stopped-on-refusal'))) ? { kind: 'failed', failure: words } : { kind: 'stopped' });
+    // A Stop's own answer is the stop's outcome: the orphan's words when it may still run (6b.8).
+    if (w.kind === 'stop') tx.answer(w.token, mayRun || (alive && !(__FAMILIAR_MUTATIONS__ && mutant('lc-stopped-on-refusal'))) ? { kind: 'failed', failure: mayRun ? stillWords : words } : { kind: 'stopped' });
+    else if (w.kind === 'test' && cause === 'turned-off') tx.answer(w.token, { kind: 'failed', failure: { kind: 'exited', words: STOPPED_WORDS } });
     else if (w.kind === 'test') tx.answer(w.token, (cause === 'test-done' || (cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('ready-after-stop')))) && (!mayRun || (__FAMILIAR_MUTATIONS__ && mutant('lc-test-ok-on-refusal'))) ? { kind: 'tested', run: r.id } : { kind: 'failed', failure: words });
     else tx.answer(w.token, (cause === 'person-stop' || cause === 'turned-off' || (__FAMILIAR_MUTATIONS__ && mutant('lc-crash-words-lost'))) && !mayRun ? { kind: 'stopped' } : { kind: 'failed', failure: words });
   }
   // A Test leaves the server Stopped unless the process may still run; a person's Stop too.
   const failed = mayRun || (!own && r.mode !== 'test');
   s.run = undefined;
-  s.after = failed ? { failed: true, failure: words } : { failed: false };
-  if (failed && r.mode !== 'test') tx.emit({ t: 'ended', run: r.id, failure: words });
+  // Beside Failed, a process that may still run shows its own words (section 6's residual, 6b.8); the cause's
+  // words otherwise. (A waiter's words add "may still be running" to the cause's, 4.6.)
+  s.after = failed ? { failed: true, failure: mayRun ? stillWords : words } : { failed: false };
+  // Reported whenever the person didn't ask for it (4.6: "report-ended (if not person-asked)"): every end
+  // but their Stop and Test's own cleanup, a Test's failure included.
+  if (cause !== 'person-stop' && cause !== 'test-done' && cause !== 'turned-off' && cause !== 'held') tx.emit({ t: 'ended', run: r.id, failure: words });
 }

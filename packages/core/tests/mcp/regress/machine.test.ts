@@ -2,7 +2,7 @@
 // relaunch's old exchange ended, a late native start bounded, a failed later catalog write kept, an
 // orphan's own words, and a Stop during Test's cleanup. Each over the pure machine, with its mutation.
 import { describe, expect, it } from 'vitest';
-import { initialState, next, phaseOf, START_TIMEOUT, STOP_UNCONFIRMED, STOPPED_WORDS, type LcEffect, type LcEvent, type LcState } from '../../../src/mcp/wire/lifecycle.ts';
+import { initialState, next, phaseOf, START_TIMEOUT, STOP_UNCONFIRMED, STOPPED_EARLY, STOPPED_WORDS, type LcEffect, type LcEvent, type LcState } from '../../../src/mcp/wire/lifecycle.ts';
 import { ServerLink, LINK_LIMITS, type Target } from '../../../src/mcp/wire/link.ts';
 import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import { mutations } from '../../../src/mutations.ts';
@@ -71,25 +71,25 @@ describe('one deadline per person action', () => {
         const g = run([...toGrace, { t: 'exit', process: 'p1', failure: F }, cur((r) => ({ t: 'readmit', run: r.id, facts: { ownerFree: true, enabled: true, launch: '' } }))]);
         const armed = g.all.filter((x) => x.t === 'arm' && x.which === 'start').length;
         expect(armed).toBe(mutation ? 2 : 1);
-        if (!mutation) expect(g.s.run?.saveBy).toBe(1);
+        // The admission's own deadline (id 1) is the relaunch's.
+        if (!mutation) expect(g.s.run?.deadline).toEqual({ which: 'start', id: 1 });
       }));
 
-  for (const mutation of [undefined, 'lc-start-deadline-dropped'] as const)
-    it(`a Stop near the start deadline: Start is answered "stopped" at its own deadline, the cleanup goes on${mutation ? ` (control: ${mutation} leaves Start to the stop deadline)` : ''}`, () =>
+  for (const mutation of [undefined, 'lc-start-waits-cleanup'] as const)
+    it(`a Stop during the start: Start is answered at once, in words saying it was stopped before it finished starting; the cleanup goes on (6b.2)${mutation ? ` (control: ${mutation} leaves Start waiting on the cleanup)` : ''}`, () =>
       withMutation(mutation, () => {
         const g = run([start(), ...toReady.slice(0, 3), { t: 'stop', token: 'k2' }]);
         expect(g.s.run?.step).toBe('closing');
         if (mutation) {
-          expect(g.s.run?.saveBy).toBeUndefined();
+          expect(answers(g.last)).toEqual([]);
           return;
         }
-        expect(g.s.run?.saveBy).toBe(1);
-        const fired = run([{ t: 'deadline', id: 1 }], g.s);
-        expect(answers(fired.last)).toEqual([{ t: 'answer', token: 'k1', reply: { kind: 'stopped' } }]);
-        // The Stop still waits for the exit, under its own deadline.
-        expect(fired.s.run?.step).toBe('closing');
-        expect(fired.s.waiters.map((w) => w.kind)).toEqual(['stop']);
-        expect(fired.s.run?.deadline?.which).toBe('stop');
+        expect(answers(g.last)).toEqual([{ t: 'answer', token: 'k1', reply: { kind: 'failed', failure: STOPPED_EARLY } }]);
+        // The Stop still waits for the exit, under its own deadline; the start's deadline is gone.
+        expect(g.s.waiters.map((w) => w.kind)).toEqual(['stop']);
+        expect(g.s.run?.deadline?.which).toBe('stop');
+        expect(g.s.run?.saveBy).toBeUndefined();
+        expect(g.last).toContainEqual({ t: 'disarm', id: 1 });
       }));
 
   it('the first catalog write still saving at the start deadline: Start fails in time\'s words, and the run ends', () => {

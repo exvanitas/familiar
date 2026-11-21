@@ -185,7 +185,7 @@ describe('5.1: a saved setup, as the owner keeps it', () => {
 describe('5.4: one start at a time owns the phase', () => {
   for (const variant of ['net-held', 'net-cancel-late'] as const) {
     // net-cancel-late is a preserved-behaviour control: it held before the start tokens too, and stays.
-    it(`a start stopped and started again before it settles: the earlier answers stopped and never sets the later start's phase (${variant === 'net-cancel-late' ? 'net-cancel-late, a preserved behaviour' : variant})`, async () => {
+    it(`a start stopped and started again before it settles: the earlier answers "stopped" and never sets the later start's phase (${variant === 'net-cancel-late' ? 'net-cancel-late, a preserved behaviour' : variant})`, async () => {
       const store = memorySettingsStore();
       let fetches = 0;
       let releaseA!: () => void;
@@ -217,7 +217,8 @@ describe('5.4: one start at a time owns the phase', () => {
       const b = client.start('r');
       await tick(1);
       releaseA();
-      expect((await a).kind).toBe('stopped');
+      // 6b.2: a Start answered as its run is stopped is failed, in words saying it was stopped.
+      expect(await a).toMatchObject({ kind: 'failed', failure: { words: expect.stringMatching(/stopped/) } });
       const bReply = await b;
       await tick(20);
       if (variant === 'net-held') {
@@ -226,10 +227,11 @@ describe('5.4: one start at a time owns the phase', () => {
         expect(client.get('r')!.phase).toBe('ready');
         expect(client.tools().map((t) => t.serverName)).toEqual(['echo']);
       } else {
-        // A's cancel still draining: the link refuses B on its own (one exchange per server, cleanup
-        // included), and the phase is B's outcome, not A's.
-        expect(bReply).toMatchObject({ kind: 'failed', failure: { kind: 'busy' } });
-        expect(client.get('r')).toMatchObject({ phase: 'failed', failure: (bReply as { failure: unknown }).failure });
+        // A's cancel still draining: B is admitted (4.1 has no slot guard), and its first request waits for
+        // the slot to drain (one exchange per server, cleanup included, 6b.5); then B runs. The phase is B's
+        // outcome, not A's.
+        expect(bReply).toEqual({ kind: 'ready' });
+        expect(client.get('r')!.phase).toBe('ready');
       }
     });
   }
