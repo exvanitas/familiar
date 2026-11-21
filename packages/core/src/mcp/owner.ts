@@ -216,6 +216,8 @@ export class Owner {
   /** The whole record couldn't be read: nothing loads, nothing is written. */
   readonly unreadable: boolean;
   private effect: { readonly what: string; readonly since: number } | undefined;
+  /** A grant's durable clear under way (clearChoice): cleanup, which a catalog write waits for. */
+  private cleaning: Promise<void> | undefined;
   /** The one reservation granted and not yet acknowledged (5.8): it holds the effect. */
   private reservation: { readonly id: string; readonly ref: string; readonly release: () => void } | undefined;
   private readonly ports: OwnerPorts;
@@ -292,6 +294,11 @@ export class Owner {
    * Admits one effect, synchronously, or refuses at once. While a mark is left unfinished, only Retry and
    * starts are admitted.
    */
+  /** The record's revision: it moves with every commit that lands, and with nothing else. */
+  get revision(): number {
+    return this.doc.rev;
+  }
+
   admit(what: string, options: { readonly start?: boolean } = {}): { readonly release: () => void } | Outcome {
     if (this.unreadable) return no("Familiar can't read its saved servers, so it changes nothing. Restart Familiar.");
     if (this.effect) return no(BUSY_WORDS);
@@ -332,15 +339,20 @@ export class Owner {
    * admitted in the same synchronous step as `current` is checked (the listing's run is still the server's
    * run). It's skipped, never queued, when the owner is busy or the run is gone: the list is re-derived at
    * the next listing, and until then a tool missing from it only reads as unreviewed. Admitted while a mark
-   * is unfinished, like a start: it changes no setup.
+   * is unfinished, like a start: it changes no setup. A write the store refuses rejects, as one that fails.
    */
   async seen(id: string, tools: readonly SavedTool[], current: () => boolean = () => true): Promise<void> {
+    // Cleanup yields: a grant's clear holding the owner is waited for, never a reason to skip the list
+    // (r35b #12). Everything is checked again once it's done.
+    while (this.cleaning && !(__FAMILIAR_MUTATIONS__ && mutant('seen-skips-cleanup'))) await this.cleaning;
     const s = this.server(id);
     if (!s || s.removing || JSON.stringify(s.tools) === JSON.stringify(tools) || !current()) return;
     const t = this.admit('seen', { start: true });
     if (!('release' in t)) return;
     try {
-      await this.commit((d) => {
+      // A write the store refuses (its revision guard, or a record it can't read) is a failed write, as one that
+      // throws is: the machine is told so, never that the list was saved (6b.13, r35b #3).
+      const written = await this.commit((d) => {
         const cur = readServer(d.servers[id]);
         if (cur) d.servers[id] = { ...cur, tools } as unknown as JsonValue;
         // A "may run on its own" grant for a tool listed now with another fingerprint is cleared in the same
@@ -351,6 +363,7 @@ export class Owner {
           if (c?.policy === 'own' && c.fingerprint !== t.fingerprint && !(__FAMILIAR_MUTATIONS__ && mutant('own-ignores-fingerprint'))) delete d.choices[key];
         }
       });
+      if (!written && !(__FAMILIAR_MUTATIONS__ && mutant('seen-refusal-saved'))) throw new Error('The tool list was not saved.');
     } finally {
       t.release();
     }
@@ -627,6 +640,24 @@ export class Owner {
       return (await this.commit((d) => (choice ? (d.choices[key] = choice as unknown as JsonValue) : delete d.choices[key]))) ? ok : no('The choice was not saved.');
     } finally {
       t.release();
+    }
+  }
+
+  /** A grant that no longer holds, cleared from the record: cleanup only. A catalog write that comes while it
+      holds the owner waits for it instead of being skipped (5.6). */
+  async clearChoice(serverId: string, tool: string): Promise<Outcome> {
+    const t = this.admit('clear');
+    if (!('release' in t)) return t;
+    let done!: () => void;
+    const cleaning = new Promise<void>((r) => (done = r));
+    this.cleaning = cleaning;
+    try {
+      const key = choiceKey(serverId, tool);
+      return (await this.commit((d) => void delete d.choices[key])) ? ok : no('The choice was not saved.');
+    } finally {
+      if (this.cleaning === cleaning) this.cleaning = undefined;
+      t.release();
+      done();
     }
   }
 }

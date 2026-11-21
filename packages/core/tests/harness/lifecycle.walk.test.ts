@@ -175,6 +175,8 @@ function check(prev: LcState, e: LcEvent, s: LcState, effects: readonly LcEffect
   if ((s.owner === 'start') !== !!pending) bad.push(`I6: owner ${s.owner} with the native start ${run?.native?.start ?? 'none'}`);
   // I7: a relaunch only after an unanswered list, never after Familiar ended the run.
   if (effects.some((x) => x.t === 'readmit-check') && prev.run && (prev.run.killed || prev.run.walk?.answered)) bad.push('I7: a relaunch after a Familiar-caused end or an answered list');
+  // I7: a readmit whose setup changed since the run was admitted is refused: no native start, the run ended.
+  if (e.t === 'readmit' && prev.run?.step === 'relaunch' && e.run === prev.run.id && e.facts.launch !== prev.run.launch && (effects.some((x) => x.t === 'native-start') || s.run?.id !== undefined && s.run.id !== prev.run.id)) bad.push('I7: a relaunch went on with its setup changed');
   // I8, I9: a deadline that fires answers the waiters it bounds.
   if (e.t === 'deadline' && e.id === prev.run?.deadline?.id) {
     const which = prev.run.deadline.which;
@@ -580,7 +582,8 @@ describe('W for the run lifecycle', () => {
     { mutation: 'lc-save-overlap', where: 'local', finding: 'I11: two catalog saves in flight' },
     { mutation: 'lc-admit-after-fence', where: 'local', finding: 'r30b #4: an exchange admitted after Stop' },
     { mutation: 'lc-era-on-recovery', where: 'remote', finding: 'r30 #5: a recovery changing the era' },
-    { mutation: 'lc-crash-words-lost', where: 'local', finding: 'F05: a start answered stopped after a crash' }
+    { mutation: 'lc-crash-words-lost', where: 'local', finding: 'F05: a start answered stopped after a crash' },
+    { mutation: 'lc-readmit-ignores-launch', where: 'local', finding: 'r35 #4: a relaunch on a changed setup' }
   ];
   // Where each control is caught: the initial state, or the named checkpoint (FAMILIAR_LC_CAUGHT=1 prints,
   // for each control, every origin whose depth-8 walk catches it).
@@ -604,7 +607,8 @@ describe('W for the run lifecycle', () => {
     'lc-save-overlap': 'local Ready, its save in flight',
     'lc-admit-after-fence': 'refreshing',
     'lc-era-on-recovery': 'remote recovering',
-    'lc-crash-words-lost': 'local Ready, its save in flight'
+    'lc-crash-words-lost': 'local Ready, its save in flight',
+    'lc-readmit-ignores-launch': 'relaunch pending'
   };
   for (const c of CONTROLS) {
     it(`${c.mutation} is caught (${c.finding}) from ${CAUGHT_FROM[c.mutation] ?? 'initial'}, and its trace passes unmutated`, () => {

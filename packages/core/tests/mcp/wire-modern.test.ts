@@ -120,6 +120,24 @@ describe('3.5: the x-mcp-header scan', () => {
         mutations.clear();
       }
     });
+    it('a declaration in an array under properties is outside a chain of properties: refused, never a path through an index (r35 #1)', () => {
+      const x = { type: 'string', 'x-mcp-header': 'Region' };
+      const cases = [
+        { type: 'object', properties: { region: [x] } },
+        { type: 'object', properties: { region: [[x]] } },
+        { type: 'object', properties: { region: [x], alias: { $ref: '#/properties/region/0' } } },
+        { type: 'object', properties: { outer: { type: 'object', properties: { region: [{ type: 'object', properties: { inner: x } }] } } } }
+      ];
+      for (const c of cases) expect(scanDeclarations(c), JSON.stringify(c)).toMatchObject({ ok: false, reason: expect.stringMatching(/only on a property reached through "properties"/) });
+      // The control: an array keeping its parent's reachability (array-keeps-reach, pass 5's walk) offers the
+      // tool, with an index in the argument's path.
+      mutations.set(['array-keeps-reach']);
+      try {
+        expect(scanDeclarations(cases[0])).toEqual({ ok: true, declarations: [{ path: ['region', '[0]'], name: 'Region', type: 'string' }] });
+      } finally {
+        mutations.clear();
+      }
+    });
     it('a $ref to a node that is no schema (a map of them) fails closed', () => {
       expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, y: { $ref: '#/properties' } } }).ok).toBe(false);
     });

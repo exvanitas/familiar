@@ -156,6 +156,78 @@ describe('a port that throws, or calls back, from inside its own call', () => {
     });
 });
 
+describe("a Test's report outlives no run (r35b #10)", () => {
+  for (const mutation of [undefined, 'report-kept-after-run'] as const)
+  it(`three Tests that publish and then fail (their first write refused) leave no report behind${mutation ? ` (control: ${mutation} keeps all three)` : ''}`, async () => {
+    mutations.set(mutation ? [mutation] : []);
+    try {
+    const s = server();
+    const base = memorySettingsStore();
+    let refuse = false;
+    const store = { ...base, putIf: async (k: string, r: any, g: any) => (refuse ? false : base.putIf(k, r, g)) } as typeof base;
+    const client = await open(s.port, { store });
+    await client.add({ setup, problems: [] });
+    refuse = true;
+    for (let i = 0; i < 3; i++) expect((await client.test('l1')).ok).toBe(false);
+    const link = (client as any).runtimes.get('l1').link;
+    if (mutation) {
+      expect(link.reports.size).toBe(3);
+      return;
+    }
+    expect(link.reports.size).toBe(0);
+    refuse = false;
+    const ok = await client.test('l1');
+    expect(ok.ok).toBe(true);
+    expect(ok.ok && ok.tools.length).toBe(1);
+    expect(link.reports.size).toBe(0);
+    expect(link.delivered.size).toBe(0);
+    } finally {
+      mutations.clear();
+    }
+  });
+});
+
+describe('an idle pong whose write delivers the exit (r35b #5)', () => {
+  for (const mutation of [undefined, 'pong-busy-after-handoff'] as const)
+    it(`both machines are Idle after it, and the next Start reaches its new process${mutation ? ` (control: ${mutation} leaves the lifecycle busy)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        let armed = false;
+        const s = server();
+        const asyncWrite = s.port.write;
+        s.port.write = ((run: string, b: Uint8Array) => {
+          const m = JSON.parse(new TextDecoder().decode(b));
+          // The pong: a reply to the server's ping, with no method.
+          if (armed && m.method === undefined && m.id === 'ping-1') {
+            armed = false;
+            s.emits.get(run)!({ t: 'exit', code: 1 });
+            return Promise.resolve();
+          }
+          return asyncWrite(run, b);
+        }) as ProcessPort['write'];
+        const client = await open(s.port);
+        await client.add({ setup, problems: [] });
+        expect((await client.start('l1')).kind).toBe('ready');
+        armed = true;
+        s.emits.get('p1')!({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', id: 'ping-1', method: 'ping' }) });
+        await sleep(30);
+        const link = (client as any).runtimes.get('l1').link;
+        if (mutation) {
+          expect(link.state.slot).toBe('busy');
+          return;
+        }
+        expect(link.state.slot).toBe('idle');
+        expect(link.busy).toBe(false);
+        const again = await Promise.race([client.start('l1'), sleep(3000).then(() => ({ kind: 'hung' }))]);
+        expect(again).toMatchObject({ kind: 'ready' });
+        expect(s.writes).toContain('p2:initialize');
+        await client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+});
+
 describe("a modern server's era refusal on a call", () => {
   for (const mutation of [undefined, 'era-refusal-late'] as const)
     it(`ends the run in the call's own terminal step: a second send right after reaches nothing${mutation ? ` (control: ${mutation} lets it through)` : ''}`, async () => {

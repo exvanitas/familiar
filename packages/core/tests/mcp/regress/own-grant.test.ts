@@ -24,11 +24,17 @@ async function world() {
   // desc null: the server lists no echo at all.
   const state: { desc: string | null; other?: string } = { desc: 'A' };
   // A gate on the owner's writes: while `held` is set, each write waits for its release.
-  const writes: { held?: Promise<void>; waiting: number; rejectNext?: boolean } = { waiting: 0 };
+  const writes: { held?: Promise<void>; waiting: number; rejectNext?: boolean; rejectAll?: boolean; tries: number } = { waiting: 0, tries: 0 };
   const inner = memorySettingsStore();
   const store: typeof inner = {
     ...inner,
     putIf: async (k, r, g) => {
+      writes.tries++;
+      if (writes.rejectAll) {
+        // As a real store fails: on a later task.
+        await new Promise<void>((r) => setTimeout(r, 0));
+        throw new Error('the store keeps failing');
+      }
       if (writes.rejectNext) {
         writes.rejectNext = false;
         throw new Error('the store failed once');
@@ -150,6 +156,46 @@ describe('a listing while the grant itself saves', () => {
         expect(w.calls).toEqual([]);
         for (let i = 0; i < 100 && w.client.choices()[choiceKey('l1', 'echo')]; i++) await sleep(5);
         expect(w.client.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+        await w.client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+
+  for (const mutation of [undefined, 'own-commit-counter-now'] as const)
+    it(`F2 and F1 again both listed during the grant's own save: no window at its commit where it holds (r35 #2)${mutation ? ` (control: ${mutation} runs it unasked)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const f1 = w.echo()!;
+        let release!: () => void;
+        w.writes.held = new Promise<void>((r) => (release = r));
+        const granting = w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint }).then(() => 'saved', (e: Error) => e.message);
+        for (let i = 0; i < 100 && !w.writes.waiting; i++) await sleep(2);
+        expect(w.writes.waiting).toBe(1);
+        await w.relist('B');
+        await w.relist('A');
+        expect(w.echo()!.fingerprint).toBe(f1.fingerprint);
+        // The grant's commit: the client's own listener runs first (it registered first), then this one, which
+        // looks at once and calls in a microtask, before choose() has resumed.
+        const atCommit: { perTool?: unknown; out?: Promise<unknown> } = {};
+        const off = w.client.owner.onChange(() => {
+          if (atCommit.perTool !== undefined || w.client.choices()[choiceKey('l1', 'echo')]?.policy !== 'own') return;
+          atCommit.perTool = w.client.policy(w.client.tools()).perTool;
+          queueMicrotask(() => (atCommit.out = ownCall(w)));
+        });
+        w.writes.held = undefined;
+        release();
+        expect(await granting).toBe('saved');
+        off();
+        const out = await atCommit.out;
+        if (mutation) {
+          expect(out).toMatchObject({ kind: 'result' });
+          return;
+        }
+        expect(atCommit.perTool).toEqual({});
+        expect(out).toMatchObject({ kind: 'error' });
+        expect(w.calls).toEqual([]);
         await w.client.stop('l1');
       } finally {
         mutations.clear();
@@ -393,6 +439,111 @@ describe("a grant's durable clear", () => {
           expect(again.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
         }
         await again.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+
+  for (const mutation of [undefined, 'clear-retry-on-own-release'] as const)
+    it(`whose write keeps failing is tried once per change to the record, never again on its own release (r35b #4)${mutation ? ` (control: ${mutation} retries it at once, over and over)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const f1 = w.echo()!;
+        await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+        const busy = w.client.owner.admit('other');
+        if (!('release' in busy)) throw new Error('not admitted');
+        await w.relist('B');
+        await w.relist('A');
+        w.writes.rejectAll = true;
+        const before = w.writes.tries;
+        busy.release();
+        await sleep(30);
+        const tried = w.writes.tries - before;
+        if (mutation) {
+          expect(tried).toBeGreaterThan(5);
+          w.writes.rejectAll = false;
+          await sleep(10);
+          return;
+        }
+        expect(tried).toBe(1);
+        // Still refused at every call meanwhile.
+        expect(await ownCall(w)).toMatchObject({ kind: 'error' });
+        // A change to the record (here the store recovered, and another write landed) is its next chance.
+        w.writes.rejectAll = false;
+        await w.client.setEnabled('l1', true);
+        for (let i = 0; i < 100 && w.client.choices()[choiceKey('l1', 'echo')]; i++) await sleep(5);
+        expect(w.client.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+        await w.client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+
+  for (const mutation of [undefined, 'clear-by-fingerprint'] as const)
+    it(`names the grant it was queued for: a fresh Yes for the same version, saved first, stands (r35b #8)${mutation ? ` (control: ${mutation} erases the fresh grant)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const key = choiceKey('l1', 'echo');
+        const f1 = w.echo()!;
+        await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+        const busy = w.client.owner.admit('other');
+        if (!('release' in busy)) throw new Error('not admitted');
+        await w.relist('B');
+        await w.relist('A');
+        // The old grant no longer holds; its clear is queued. Another catalog write is under way (as when a
+        // second server's write is held), so the clear waits while the owner is free for the person.
+        const c = w.client as unknown as { seeing: number; clearGrants(): void };
+        c.seeing++;
+        busy.release();
+        await sleep(10);
+        expect(w.client.choices()[key]?.policy).toBe('own');
+        const f = w.echo()!;
+        await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f.fingerprint, setupFingerprint: f.setupFingerprint });
+        c.seeing--;
+        c.clearGrants();
+        await sleep(30);
+        if (mutation) {
+          expect(w.client.choices()[key]).toBeUndefined();
+          return;
+        }
+        expect(w.client.choices()[key]).toMatchObject({ policy: 'own', fingerprint: f.fingerprint });
+        expect(w.client.policy(w.client.tools()).perTool).toEqual({ l__echo: 'own' });
+        expect(await ownCall(w)).toMatchObject({ kind: 'result' });
+        await w.client.stop('l1');
+      } finally {
+        mutations.clear();
+      }
+    });
+
+  for (const mutation of [undefined, 'seen-skips-cleanup'] as const)
+    it(`never costs a catalog write: a list published while the clear's write is held is saved after it (r35b #12)${mutation ? ` (control: ${mutation} skips the list)` : ''}`, async () => {
+      mutations.set(mutation ? [mutation] : []);
+      try {
+        const w = await world();
+        const f1 = w.echo()!;
+        await w.client.choose('l1', 'echo', { policy: 'own', fingerprint: f1.fingerprint, setupFingerprint: f1.setupFingerprint });
+        const busy = w.client.owner.admit('other');
+        if (!('release' in busy)) throw new Error('not admitted');
+        await w.relist('B');
+        // The clear's write, held.
+        let release!: () => void;
+        w.writes.held = new Promise<void>((r) => (release = r));
+        busy.release();
+        for (let i = 0; i < 100 && !w.writes.waiting; i++) await sleep(2);
+        expect(w.writes.waiting).toBe(1);
+        await w.relist('C');
+        const c = w.echo()!.fingerprint;
+        w.writes.held = undefined;
+        release();
+        await sleep(40);
+        const saved = (await w.store.get(OWNER_KEY))!.value as { servers: Record<string, { tools: { fingerprint: string }[] }> };
+        const fps = saved.servers.l1!.tools.map((t) => t.fingerprint);
+        if (mutation) expect(fps).not.toContain(c);
+        else expect(fps).toEqual([c]);
+        expect(w.client.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+        await w.client.stop('l1');
       } finally {
         mutations.clear();
       }

@@ -226,6 +226,7 @@ export const TOO_MANY_PAGES: Failure = { kind: 'protocol', words: "The server's 
 export const WATCHDOG: Failure = { kind: 'protocol', words: 'The server stopped reading what Familiar sent, so it was stopped.' };
 export const CATALOG_FAILED: Failure = { kind: 'failed', words: "Familiar couldn't save the server's tool list, so it was stopped. Try again." };
 export const BUSY_SLOT = 'The server is still finishing its last request. Try again in a moment.';
+export const TEST_WHILE_RUNNING = 'Stop the server to test it. Test never disturbs a running server.';
 export const MAX_PAGES = 16;
 const MAX_ATTEMPTS = 3;
 
@@ -440,10 +441,12 @@ function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   const s = tx.s;
   if (s.held && !(__FAMILIAR_MUTATIONS__ && mutant('forget-exhaustion'))) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'failed', failure: s.held } });
   if (s.run) {
-    const words = s.run.step === 'ready' ? 'It is already running.' : `It is ${phaseOf(s)}.`;
+    // Test never disturbs a running server (G27): refused here, in the machine, in Test's own words.
+    const words = e.mode === 'test' ? TEST_WHILE_RUNNING : s.run.step === 'ready' ? 'It is already running.' : `It is ${phaseOf(s)}.`;
     return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'refused', words } });
   }
-  if (e.facts.record !== 'ok') return refuseStart(tx, e.token, RECORD_WORDS[e.facts.record]);
+  // Turned off gates only an automatic start (row 126, 6b.11); every other record refusal gates them all.
+  if (e.facts.record !== 'ok' && !(e.facts.record === 'disabled' && e.mode !== 'auto')) return refuseStart(tx, e.token, RECORD_WORDS[e.facts.record]);
   // A process whose stop was refused may still be running: nothing starts beside it (I2).
   if (s.orphans.length && !(__FAMILIAR_MUTATIONS__ && mutant('lc-start-beside-orphan'))) return refuseStart(tx, e.token, { kind: 'failed', failure: orphanWords(s) });
   if (!e.facts.ownerFree) return tx.emit({ t: 'answer', token: e.token, reply: { kind: 'refused', words: e.facts.ownerWords ?? '' } });
@@ -482,10 +485,10 @@ function start(tx: Tx, e: Extract<LcEvent, { t: 'start' }>): void {
   } else tx.issue();
 }
 
-/** A start answered at once. A failure (a setup that can't be launched, a slot still draining, a process
-    that may still run) is the server's state, so it shows beside Failed; a refusal changes nothing. */
+/** A start answered at once, refused or failed in its words: the state stays as it was (rows 126 and 127, r35b
+    #13). The phase and any failure shown before are unchanged; the answer carries the words. */
 function refuseStart(tx: Tx, token: string, reply: Reply): void {
-  if (reply.kind === 'failed') tx.s.after = { failed: true, failure: reply.failure };
+  if (reply.kind === 'failed' && (__FAMILIAR_MUTATIONS__ && mutant('refused-start-shows-failed'))) tx.s.after = { failed: true, failure: reply.failure };
   tx.emit({ t: 'answer', token, reply });
 }
 
@@ -826,6 +829,10 @@ function actionDeadline(tx: Tx): void {
     }
     return;
   }
+  // The step's own deadline (grace's, a refresh's) ends with the step: disarmed here, never left armed for a
+  // run that is gone (r35b #17).
+  const step = r.deadline;
+  if (step && !(__FAMILIAR_MUTATIONS__ && mutant('lc-step-deadline-dropped'))) tx.emit({ t: 'disarm', id: step.id });
   return deadline(tx, 'start');
 }
 
@@ -909,7 +916,7 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   if (!f.ownerFree) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: f.ownerWords || 'Familiar is saving another change. Press Start again.' });
   // Turned off meanwhile (an automatic start's relaunch): Stopped, as it was asked.
   if (r.mode === 'auto' && !f.enabled) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: 'It is turned off.' });
-  if (f.launch !== r.launch) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'The setup changed. Press Start again.' });
+  if (f.launch !== r.launch && !(__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-ignores-launch'))) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'The setup changed. Press Start again.' });
   endTaken(tx);
   const id = `${s.id}#${++s.nextRun}`;
   // The admission's own deadline carries over: the relaunch gets no fresh budget.

@@ -90,7 +90,8 @@ describe('5.1: a saved setup, as the owner keeps it', () => {
     const r = await client.start('l1');
     expect(r).toMatchObject({ kind: 'failed' });
     expect(client.owner.busy).toBe(false);
-    expect(client.get('l1')!.phase).toBe('failed');
+    // Answered at once, in its words: the state stays as it was (row 126, r35b #13).
+    expect(client.get('l1')!.phase).toBe('stopped');
   });
 
   it('each nested field is checked on load', async () => {
@@ -589,8 +590,31 @@ describe("5.4: a server's limits apply from the next start", () => {
   });
 });
 
+describe('the change counters a server leaves behind (r35b #11)', () => {
+  it('a server that lists fresh tool names, over and over, leaves counters only for what is listed or granted', async () => {
+    let listed = 0;
+    const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: `tool${++listed}`, description: 'a tool', inputSchema: { type: 'object', properties: {} } }] } })] : []));
+    const client = await clientOf(memorySettingsStore(), fp.port);
+    await client.add({ setup: local('l1'), problems: [] });
+    expect((await client.start('l1')).kind).toBe('ready');
+    for (let i = 0; i < 30; i++) {
+      const was = listed;
+      fp.emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) });
+      for (let j = 0; j < 200 && (listed === was || client.tools()[0]?.serverName !== `tool${listed}`); j++) await tick(2);
+    }
+    expect(listed).toBeGreaterThan(30);
+    const counters = (client as unknown as { changeCount: Map<string, number> }).changeCount;
+    expect(counters.size).toBeLessThanOrEqual(1);
+    await client.stop('l1');
+    await client.remove('l1');
+    expect(counters.size).toBe(0);
+  });
+});
+
 describe("6b.13: a later tool list that couldn't be saved, as the machine marks it", () => {
-  it('no words after a first failure while its retry is due; words after the second; gone once a newer list saves', async () => {
+  // A write fails when the store throws, and when it refuses the write (its revision guard, r35b #3).
+  for (const how of ['throws', 'refuses'] as const)
+  it(`no words after a first failure while its retry is due; words after the second; gone once a newer list saves (the store ${how})`, async () => {
     const base = memorySettingsStore();
     // Each catalog write waits for the test's word: true lands it, false loses it.
     let hold = false;
@@ -600,7 +624,8 @@ describe("6b.13: a later tool list that couldn't be saved, as the machine marks 
       putIf: async (key, record, guard) => {
         if (!hold) return base.putIf(key, record, guard);
         const ok = await new Promise<boolean>((r) => pending.push(r));
-        if (!ok) throw new Error('The disk is full.');
+        if (!ok && how === 'throws') throw new Error('The disk is full.');
+        if (!ok) return false;
         return base.putIf(key, record, guard);
       }
     };
@@ -634,5 +659,29 @@ describe("6b.13: a later tool list that couldn't be saved, as the machine marks 
     await tick(20);
     expect(client.get('l1')!.unsaved).toBeUndefined();
     await client.stop('l1');
+  });
+
+  for (const mutation of [undefined, 'seen-refusal-saved'] as const)
+  it(`a first write the store refuses ends the start, catalog-failed: never Ready on a list that was not saved (r35b #3)${mutation ? ` (control: ${mutation} reaches Ready)` : ''}`, async () => {
+    mutations.set(mutation ? [mutation] : []);
+    try {
+    const base = memorySettingsStore();
+    let refuse = false;
+    const store: SettingsStore = { ...base, putIf: async (key, record, guard) => (refuse ? false : base.putIf(key, record, guard)) };
+    const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'echo', description: 'the echo tool', inputSchema: { type: 'object', properties: {} } }] } })] : []));
+    const client = await clientOf(store, fp.port);
+    await client.add({ setup: local('l1'), problems: [] });
+    refuse = true;
+    const r = await client.start('l1');
+    if (mutation) {
+      expect(r.kind).toBe('ready');
+      await client.stop('l1');
+      return;
+    }
+    expect(r.kind).toBe('failed');
+    expect(client.get('l1')!.tools ?? []).toEqual([]);
+    } finally {
+      mutations.clear();
+    }
   });
 });

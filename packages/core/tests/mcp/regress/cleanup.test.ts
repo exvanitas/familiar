@@ -2,6 +2,7 @@
 // slot as if the request or the process had ended.
 import { describe, expect, it } from 'vitest';
 import { LINK_LIMITS, ServerLink, type Target } from '../../../src/mcp/wire/link.ts';
+import { mutations } from '../../../src/mutations.ts';
 import { fakeNet, fakeProcess, initResult, json, listResult, realClock, textResult } from '../wire-fakes.ts';
 
 const remote: Target = { where: 'remote', address: 'a1', url: 'https://h.example/mcp', headers: [] };
@@ -29,6 +30,62 @@ describe('cleanup the exe refused', () => {
     await sleep(20);
     expect(link.busy).toBe(true);
     expect(link.handoff('look', '{}', new AbortController().signal, 5000)).toBeUndefined();
+  });
+
+  for (const mutation of [undefined, 'cancel-throw-escapes'] as const)
+  it(`a net_cancel that throws synchronously is a refused one: tried again, and the start answered (r35b #6)${mutation ? ` (control: ${mutation} leaves the start hanging)` : ''}`, async () => {
+    mutations.set(mutation ? [mutation] : []);
+    try {
+    const net = fakeNet((b) => {
+      if (b.method === 'initialize') return json(initResult(b.id));
+      if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+      if (b.method === 'tools/list') return json(listResult(b.id, ['look']));
+      return json(textResult(b.id, 'ok'));
+    });
+    const cancel = net.port.cancel.bind(net.port);
+    let tries = 0;
+    net.port.cancel = ((id: string) => {
+      if (++tries === 1) throw Object.assign(new Error('nope'), { kind: 'failed' });
+      return cancel(id);
+    }) as typeof net.port.cancel;
+    const link = new ServerLink('s', { net: net.port }, realClock, { ended: () => {} });
+    const r = await Promise.race([link.start(remote, 'L').catch(() => ({ ok: 'threw' })), sleep(mutation ? 1500 : 4000).then(() => ({ ok: 'hung' }))]);
+    if (mutation) {
+      expect(r).not.toMatchObject({ ok: true });
+      return;
+    }
+    expect(r).toMatchObject({ ok: true });
+    expect(tries).toBeGreaterThanOrEqual(2);
+    expect(link.busy).toBe(false);
+    } finally {
+      mutations.clear();
+    }
+  });
+
+  it("the test-only list() settles when cancellation is refused for good: no wait is left registered (r35b #16)", async () => {
+    let refuse = false;
+    let listed = 0;
+    const net = fakeNet((b) => {
+      if (b.method === 'initialize') return json(initResult(b.id));
+      if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+      if (b.method === 'tools/list') return json(listResult(b.id, [`look${++listed}`]));
+      return json(textResult(b.id, 'ok'));
+    });
+    const cancel = net.port.cancel.bind(net.port);
+    net.port.cancel = async (id) => {
+      if (refuse) throw Object.assign(new Error('nope'), { kind: 'failed' });
+      return cancel(id);
+    };
+    // Retries come at once, so cancellation is refused for good within the test.
+    const quick = { now: () => Date.now(), setTimer: (cb: () => void) => { const t = setTimeout(cb, 0); return () => clearTimeout(t); } };
+    const link = new ServerLink('s', { net: net.port }, quick, { ended: () => {} });
+    await link.start(remote, 'L');
+    refuse = true;
+    const r = await Promise.race([link.list(), sleep(3000).then(() => 'hung' as const)]);
+    expect(r).not.toBe('hung');
+    const l = link as unknown as { idle: unknown[]; watchers: Set<unknown> };
+    expect(l.idle.length).toBe(0);
+    expect(l.watchers.size).toBe(0);
   });
 
   it('a rejected server_stop keeps the run\'s writes open until an exit is seen', async () => {

@@ -30,11 +30,12 @@ export function scanDeclarations(schema: unknown): ScanResult {
   const names = new Map<string, string>();
   let numberFault: string | undefined;
   const visit = (node: unknown, path: readonly string[], reachable: boolean): string | undefined => {
-    // An array at any depth is walked through, its items at the same reachability: a declaration nested in
-    // arrays of arrays is still found.
+    // An array at any depth is walked through, so a declaration nested in arrays of arrays is still found. An
+    // array is never a property, even one sitting under `properties`: whatever it holds is outside a chain of
+    // properties, so a declaration there fails the tool, and an index never becomes an argument's path.
     if (Array.isArray(node) && !(__FAMILIAR_MUTATIONS__ && mutant('arrays-one-deep'))) {
       for (const [i, item] of node.entries()) {
-        const f = visit(item, [...path, `[${i}]`], reachable);
+        const f = visit(item, [...path, `[${i}]`], __FAMILIAR_MUTATIONS__ && mutant('array-keeps-reach') ? reachable : false);
         if (f) return f;
       }
       return undefined;

@@ -358,3 +358,61 @@ describe("the relaunch ends the exited process's exchange", () => {
       }
     });
 });
+
+describe('a start answered at once leaves the state as it was (row 126, r35b #13)', () => {
+  for (const record of ['missing', 'unreadable', 'removing', 'sse', 'unlaunchable'] as const)
+    for (const mode of ['start', 'test'] as const)
+      it(`${mode} with record ${record}, from Stopped: answered in its words, the phase still Stopped, no failure shown`, () => {
+        const s0 = initialState('s');
+        const r = next(s0, { t: 'start', token: 'k1', mode, facts: { record, ownerFree: true, where: 'remote' } });
+        expect(r.state).toEqual(s0);
+        expect(phaseOf(r.state)).toBe('stopped');
+        expect(failureOf(r.state)).toBeUndefined();
+        const answer = r.effects.find((e) => e.t === 'answer');
+        expect(answer && answer.t === 'answer' && answer.reply.kind).toMatch(/refused|failed/);
+      });
+  it('and from Failed: the failure shown before stays, unchanged', () => {
+    const before: LcState = { ...initialState('s'), after: { failed: true, failure: F } };
+    for (const record of ['sse', 'unlaunchable'] as const) {
+      const r = next(before, { t: 'start', token: 'k2', mode: 'start', facts: { record, ownerFree: true, where: 'remote' } });
+      expect(r.state).toEqual(before);
+      expect(failureOf(r.state)).toEqual(F);
+    }
+  });
+});
+
+describe('the control for row 126', () => {
+  it('refused-start-shows-failed marks Failed on an SSE start', () => {
+    mutations.set(['refused-start-shows-failed']);
+    try {
+      const r = next(initialState('s'), { t: 'start', token: 'k1', mode: 'start', facts: { record: 'sse', ownerFree: true, where: 'remote' } });
+      expect(phaseOf(r.state)).toBe('failed');
+    } finally {
+      mutations.clear();
+    }
+  });
+});
+
+describe("the start's own deadline, fired while a step has its own (r35b #17)", () => {
+  /** The timers armed and never disarmed or fired: each must belong to the run still there. */
+  const leftArmed = (fx: readonly LcEffect[], fired: readonly number[]) => {
+    const armed = new Set<number>();
+    for (const x of fx) {
+      if (x.t === 'arm') armed.add(x.id);
+      if (x.t === 'disarm') armed.delete(x.id);
+    }
+    for (const id of fired) armed.delete(id);
+    return [...armed];
+  };
+  for (const mutation of [undefined, 'lc-step-deadline-dropped'] as const)
+    it(`fired in grace, it disarms grace's: after the exit, no timer is left armed${mutation ? ` (control: ${mutation} leaves grace's armed)` : ''}`, () =>
+      withMutation(mutation, () => {
+        const g = run(toGrace);
+        expect(g.s.run?.step).toBe('grace');
+        const fired = run([{ t: 'deadline', id: 1 }, { t: 'exit', process: 'p1', failure: F }], g.s);
+        expect(fired.s.run).toBeUndefined();
+        const left = leftArmed([...g.all, ...fired.all], [1]);
+        if (mutation) expect(left.length).toBeGreaterThan(0);
+        else expect(left).toEqual([]);
+      }));
+});

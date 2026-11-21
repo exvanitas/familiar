@@ -205,6 +205,9 @@ export class ServerLink {
   private readonly watchers = new Set<() => void>();
   /** Test reports, captured when a Test run publishes: never read from a wire a later run replaced. */
   private readonly reports = new Map<string, { readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] }>();
+  /** A passing Test's report, handed over with its answer for test() to take. Every other report goes when its
+      run ends (r35b #10): none outlives its run. */
+  private readonly delivered = new Map<string, { readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] }>();
   /** The exe's cleanup refusal for good, as words (the machine holds the same). */
   private stuck?: Failure;
 
@@ -293,6 +296,7 @@ export class ServerLink {
     } finally {
       this.draining = false;
     }
+    if (!(__FAMILIAR_MUTATIONS__ && mutant('report-kept-after-run'))) for (const run of [...this.reports.keys()]) if (run !== this.lc.run?.id) this.reports.delete(run);
     for (const w of [...this.watchers]) w();
     if (`${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}:${noteOf(this.lc) ?? ''}` !== before) this.events.changed?.();
   }
@@ -448,6 +452,10 @@ export class ServerLink {
       case 'answer': {
         const a = this.answers.get(fx.token);
         this.answers.delete(fx.token);
+        if (fx.reply.kind === 'tested') {
+          const report = this.reports.get(fx.reply.run);
+          if (report) this.delivered.set(fx.reply.run, report);
+        }
         a?.(fx.reply);
         return;
       }
@@ -533,11 +541,9 @@ export class ServerLink {
   /** Test: a start whose run, once listed, stops itself; ok only once that run has ended. */
   async test(target: Target, launch: string, facts: Partial<StartFacts> = {}, limits: LinkLimits = this.limits): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] } | { readonly ok: false; readonly failure: Failure; readonly refused?: true }> {
     const r = await this.startReply(target, launch, 'test', facts, limits);
-    if (r.kind === 'tested') {
-      const report = this.reports.get(r.run);
-      this.reports.delete(r.run);
-      return { ok: true, run: r.run, tools: report?.tools ?? [], notOffered: report?.notOffered ?? [] };
-    }
+    const report = r.kind === 'tested' ? this.delivered.get(r.run) : undefined;
+    this.delivered.clear();
+    if (r.kind === 'tested') return { ok: true, run: r.run, tools: report?.tools ?? [], notOffered: report?.notOffered ?? [] };
     if (r.kind === 'failed') return { ok: false, failure: r.failure };
     if (r.kind === 'refused') return { ok: false, failure: { kind: 'failed', words: r.words }, refused: true };
     return { ok: false, failure: { kind: 'failed', words: 'The server was stopped before it was ready.' } };
@@ -581,7 +587,22 @@ export class ServerLink {
       this.watchers.add(watch);
       this.feed({ t: 'notice', run: id });
     });
-    await this.drained();
+    // Then the slot Idle, or the link held, or the run over: one wait, settled and unregistered on whichever
+    // comes first (r35b #16).
+    await new Promise<void>((res) => {
+      if (!this.busy) return res();
+      const finish = () => {
+        this.watchers.delete(watch);
+        const i = this.idle.indexOf(finish);
+        if (i >= 0) this.idle.splice(i, 1);
+        res();
+      };
+      const watch = () => {
+        if (this.lc.held || this.lc.run?.id !== id) finish();
+      };
+      this.idle.push(finish);
+      this.watchers.add(watch);
+    });
     const w = this.wires.get(id);
     return this.lc.run?.id === id && w ? w.tools : (this.lc.held ?? failureOf(this.lc) ?? { kind: 'failed', words: 'The server is not running.' });
   }
@@ -1037,7 +1058,16 @@ export class ServerLink {
   private cancel(handle: string, attempt = 0): void {
     const id = this.natives.get(handle);
     if (id === undefined) return this.input({ t: 'released', handle });
-    this.ports.net!.cancel(id).then(
+    // A port that throws from inside its own call is a port that refused (pass 5 Track D, r35b #6): the throw
+    // goes down the same path as a rejected promise, and the exchange's other effects still run.
+    let asked: Promise<void>;
+    try {
+      asked = this.ports.net!.cancel(id);
+    } catch (err) {
+      if (__FAMILIAR_MUTATIONS__ && mutant('cancel-throw-escapes')) throw err;
+      asked = Promise.reject(err);
+    }
+    asked.then(
       () => this.input({ t: 'released', handle }),
       () => {
         if ((__FAMILIAR_MUTATIONS__ && mutant('release-on-refused-cancel'))) return this.input({ t: 'released', handle });
@@ -1164,8 +1194,11 @@ export class ServerLink {
   private idlePing(run: Wire, id: RpcId): void {
     const n = this.slot.next;
     this.pending.set(n, { n, kind: 'pong', run, body: frame({ kind: 'pong', id }, run.era, 'local'), done: () => {} });
-    this.input({ t: 'admit', kind: 'pong', where: 'local', era: run.era });
-    this.feed({ t: 'slot', idle: false });
+    // As every admission: busy is both machines' before the port's write, so an exit the port delivers from
+    // inside that write finds both busy, and its cleanup leaves both Idle (r35b #5).
+    const late = __FAMILIAR_MUTATIONS__ && mutant('pong-busy-after-handoff');
+    this.input({ t: 'admit', kind: 'pong', where: 'local', era: run.era }, late ? undefined : () => this.feed({ t: 'slot', idle: false }));
+    if (late) this.feed({ t: 'slot', idle: false });
   }
 
   /* ---------- the wire's end of a process ---------- */
