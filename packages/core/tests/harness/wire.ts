@@ -116,6 +116,9 @@ export interface Mode {
   readonly noticeAtDrain?: boolean;
   /** Local: the exe refuses every server_stop, and the process doesn't exit. */
   readonly refuseStop?: boolean;
+  /** With more than one page: the echo tool (the one a list_changed changes) on the walk's last page, the
+      rest on its first, so a catalog read from first pages alone never sees it. */
+  readonly echoLast?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -203,6 +206,13 @@ export class ScriptedServer {
     this.r = r;
   }
 
+  /** The tools on one page of a walk: all on the first, unless echoLast puts echo on the last. */
+  private onPage(page: number): Msg[] {
+    const all = tools(this.mode.era, this.variant);
+    if (!this.mode.echoLast || this.mode.pages < 2) return page === 0 ? all : [];
+    return page === this.mode.pages - 1 ? all.filter((t) => t.name === 'echo') : page === 0 ? all.filter((t) => t.name !== 'echo') : [];
+  }
+
   private ping(on: string, afterFinal = false): Msg {
     const id = `p${++this.pingN}`;
     this.pings.push({ id, on, afterFinal });
@@ -255,7 +265,7 @@ export class ScriptedServer {
       this.changedSince = true;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
-      const listed = { jsonrpc: '2.0', id: body.id, result: { tools: page === 0 ? tools(m.era, this.variant) : [], ...next } };
+      const listed = { jsonrpc: '2.0', id: body.id, result: { tools: this.onPage(page), ...next } };
       this.variant = this.variant === 'a' ? 'b' : 'a';
       return { status: 200, sse: true, messages: [{ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, listed], final: 1 };
     }
@@ -267,7 +277,7 @@ export class ScriptedServer {
       if (body.params?.cursor === undefined) this.lists = (this.lists ?? 0) + 1;
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
-      const listed = page === 0 ? tools(m.era, this.variant) : [];
+      const listed = this.onPage(page);
       return json([{ jsonrpc: '2.0', id: body.id, result: { tools: m.reorder ? listed.map((t) => shuffled(t, this.r)) : listed, ...next, ...complete } }]);
     }
     if (body.method === 'tools/call') {

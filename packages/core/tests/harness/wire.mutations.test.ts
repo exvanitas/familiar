@@ -65,6 +65,9 @@ const CONTROLS: Control[] = [
   // Under the named schedules.
   { mutation: 'slot-per-run', check: 'H1', named: 'S8' },
   { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1' },
+  // The changed tool on a walk's second page: H3's catalog is every page of a completed walk.
+  { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1 a fingerprint change while a card is shown, the tool on a later page' },
+  { mutation: 'own-ignores-fingerprint', check: 'H3', named: 'S38' },
   { mutation: 'cancel-pongs-at-drain', check: 'H13', named: 'S2' },
   { mutation: 'rehandshake-every-404', check: 'H14', named: 'S3' },
   { mutation: 'no-detach', check: 'H4', named: 'S8', build: 'pass' },

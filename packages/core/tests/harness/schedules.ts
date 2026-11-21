@@ -593,6 +593,51 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S1 with the changed tool on the walk's second page: the catalog H3 reads is every page of a walk.
+    name: 'S1 a fingerprint change while a card is shown, the tool on a later page',
+    options: {
+      mode: { ...quiet, listChanged: 1, pages: 2, echoLast: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          const card = d.card('echo')!;
+          d.call('slow');
+          const lists = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.final !== undefined).length;
+          d.when('relisted', () => d.idle() && lists() >= 2, () => d.yes(card));
+        })
+    },
+    expect: (r) => {
+      const card = r.evidence.find((e) => e.what === 'card' && e.tool === 'echo');
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === card?.token)?.outcome;
+      return !card ? 'no card shown' : out?.kind !== 'error' || out.reason !== 'changed' ? `the F1 Yes came back ${JSON.stringify(out)}` : undefined;
+    }
+  },
+  {
+    // S38: "may run on its own" for a tool on the walk's second page, which then changes and changes back
+    // (A, B, A): the grant no longer stands, so the call under it is refused (H3 reads every page of a walk).
+    name: 'S38 a granted tool on a later page changes and changes back',
+    options: {
+      mode: { ...quiet, listChanged: 1, pages: 2, echoLast: true },
+      schedule: (d) => {
+        const walks = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor !== undefined && x.final !== undefined).length;
+        d.when('ready', () => d.idle(), () => {
+          void d.grantOwn('echo')?.then(() => {
+            d.call('slow');
+            d.when('B listed', () => d.idle() && walks() >= 2, () => {
+              d.call('slow');
+              d.when('A again', () => d.idle() && walks() >= 3, () => d.own('echo'));
+            });
+          });
+        });
+      }
+    },
+    expect: (r) => {
+      if (!r.evidence.some((e) => e.what === 'grant')) return 'no grant saved';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'error' ? undefined : `the call under a grant for A, after B, came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S2: a ping in the same chunk as the final reply: its pong is still handed off.
     name: 'S2 a ping in the same chunk as the final reply',
     options: { mode: { ...quiet, pingWithFinal: 1, oneChunk: true, sse: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },

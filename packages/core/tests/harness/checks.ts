@@ -334,36 +334,54 @@ function staleCatalogCalls(r: WireRun): string[] {
   return problems;
 }
 
-/** The harness's own reading of a server's catalog: the tool's definition in the last first page of a
-    tools/list answer that reached the client before `step`. */
-/** Every listing of the tool the server answered in (from, to): its definitions, in order. */
-function listingsBetween(r: WireRun, server: string, from: number, to: number, tool: string): (string | undefined)[] {
-  const out: { at: number; def: string | undefined }[] = [];
+/** The harness's own reading of a server's catalogs: every walk that completed, from its first page to a
+    page with no nextCursor, each page answered and reached by the client, in one run (a process, or a
+    handshake's epoch), each page the one the page before it pointed to. Its tools are every page's, and it
+    counts from the step its last page reached the client. A walk cut off (a page unanswered, failed, or
+    not reached) is no catalog, and the next first page begins a new one. */
+function walks(r: WireRun, server: string): { at: number; tools: any[] }[] {
+  const done: { at: number; tools: any[] }[] = [];
+  let open: { epoch: number; next: string; tools: any[] } | undefined;
   for (const x of r.exe.log) {
-    if (x.server !== server || x.body?.method !== 'tools/list' || x.body.params?.cursor !== undefined || !x.plan) continue;
+    if (x.server !== server || x.body?.method !== 'tools/list') continue;
+    const cursor = x.body.params?.cursor;
     const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : r.exe.responded.get(`${x.epoch}:${x.body.id}`);
-    if (at === undefined || at <= from || at >= to) continue;
-    const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
-    if (!res) continue;
-    const def = res.tools?.find((d: any) => d.name === tool);
-    out.push({ at, def: def === undefined ? undefined : canonical(def) });
+    const res = x.plan?.messages.find((m) => m.id === x.body!.id && m.result)?.result;
+    const continues = cursor === undefined || (open !== undefined && open.epoch === x.epoch && open.next === cursor);
+    if (at === undefined || !res || !continues) {
+      open = undefined;
+      continue;
+    }
+    const tools = [...(cursor === undefined ? [] : open!.tools), ...((res.tools as any[] | undefined) ?? [])];
+    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools };
+    else {
+      open = undefined;
+      done.push({ at, tools });
+    }
   }
-  return out.sort((a, b) => a.at - b.at).map((x) => x.def);
+  return done;
 }
 
+/** A tool's definition in a walk, canonical, so a relist in another key order (S23) is the same tool, as
+    the fingerprint has it. */
+const defIn = (w: { tools: any[] }, tool: string): string | undefined => {
+  const def = w.tools.find((d: any) => d.name === tool);
+  return def === undefined ? undefined : canonical(def);
+};
+
+/** Every completed listing of the tool that reached the client in (from, to): its definitions, in order. */
+function listingsBetween(r: WireRun, server: string, from: number, to: number, tool: string): (string | undefined)[] {
+  return walks(r, server)
+    .filter((w) => w.at > from && w.at < to)
+    .sort((a, b) => a.at - b.at)
+    .map((w) => defIn(w, tool));
+}
+
+/** The tool's definition in the last completed walk that reached the client before `step`. */
 function listedAt(r: WireRun, server: string, step: number, tool: string): string | undefined {
-  let found: { at: number; def: string | undefined } | undefined;
-  for (const x of r.exe.log) {
-    if (x.server !== server || x.body?.method !== 'tools/list' || x.body.params?.cursor !== undefined || !x.plan) continue;
-    const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : r.exe.responded.get(`${x.epoch}:${x.body.id}`);
-    if (at === undefined || at >= step) continue;
-    const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
-    if (!res) continue;
-    // Canonical, so a relist in another key order (S23) is the same tool, as the fingerprint has it.
-    const def = res.tools?.find((d: any) => d.name === tool);
-    if (!found || at >= found.at) found = { at, def: def === undefined ? undefined : canonical(def) };
-  }
-  return found?.def;
+  let found: { at: number; tools: any[] } | undefined;
+  for (const w of walks(r, server)) if (w.at < step && (!found || w.at >= found.at)) found = w;
+  return found && defIn(found, tool);
 }
 
 function canonical(v: unknown): string {
