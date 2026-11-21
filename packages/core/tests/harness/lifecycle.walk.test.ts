@@ -234,7 +234,7 @@ const traceOf = (origin: Origin, step: Step | undefined): LcEvent[] => {
 /**
  * The (state, ctx) pair with its names renumbered: tokens, run ids, processes and deadline ids by their order
  * of first appearance in the canonical traversal (from 1, so the stale events' reserved `#0`, `p0` and
- * deadline 0 stay apart), catalog generations by rank (the machine compares them by order), and the
+ * deadline 0 stay apart), catalog generations and the marks naming them by rank (the machine compares them by order), and the
  * counters that only mint fresh names dropped. Two pairs alike up to such renaming have alike futures: the
  * machine and the alphabet compare these names only for equality (generations for order), and mint fresh
  * ones above all present.
@@ -243,7 +243,7 @@ function renumbered(s: LcState, c: Ctx): string {
   const gens = new Set<number>([0]);
   const seeGen = (v: unknown, k?: string): void => {
     if (v === null || typeof v !== 'object') {
-      if ((k === 'gen' || k === 'firstGen') && typeof v === 'number') gens.add(v);
+      if (k !== undefined && GEN_KEYS.has(k) && typeof v === 'number') gens.add(v);
       return;
     }
     for (const kk in v as Record<string, unknown>) seeGen((v as Record<string, unknown>)[kk], kk);
@@ -267,7 +267,7 @@ function renumbered(s: LcState, c: Ctx): string {
       return JSON.stringify(v);
     }
     if (typeof v === 'number') {
-      if (k === 'gen' || k === 'firstGen') return String(rank.get(v));
+      if (k !== undefined && GEN_KEYS.has(k)) return String(rank.get(v));
       if (k === 'saveBy' || k === 'deadline-id') return JSON.stringify(rename('d', v));
       return String(v);
     }
@@ -285,6 +285,9 @@ function renumbered(s: LcState, c: Ctx): string {
   };
   return `[${str(s)},${str(c)}]`;
 }
+/** The fields that hold a catalog generation, ranked together: the machine compares the marks (a later
+    write retried, or marked unsaved) with the generations. */
+const GEN_KEYS = new Set(['gen', 'firstGen', 'retried', 'unsaved']);
 /** The counters that only mint fresh names, dropped from the renumbered form (top level only). */
 const DROPPED = new Set(['nextRun', 'nextDeadline', 'nextGen', 'tokens']);
 
@@ -496,6 +499,45 @@ describe('W for the run lifecycle', () => {
       if (process.env.FAMILIAR_VERBOSE) console.log(`LC-W renumbering ${where}: ${exact.size} exact states to depth 7, ${reps.size} renumbered, ${merged} merged pairs checked`);
       expect(merged).toBeGreaterThan(0);
     }, 600_000);
+
+  // A mark that names a generation (a later write retried, or marked unsaved) is ranked with the generations:
+  // the machine compares it with them. A later save's failure is about 13 events in, past the merge check's
+  // depth, so the key is checked here directly: a reached state, its generations all renamed (alike, one key),
+  // and the same with only the generations renamed and the mark left (unlike: a failure then retries in one
+  // and marks unsaved in the other).
+  it('renumbering ranks the generation marks with the generations', () => {
+    let s = initialState('s');
+    const feed = (e: LcEvent | ((s: LcState) => LcEvent)) => (s = next(s, typeof e === 'function' ? e(s) : e).state);
+    const cur = (f: (id: string) => LcEvent) => (st: LcState) => f(st.run!.id);
+    feed({ t: 'start', token: 'k1', mode: 'start', facts: { record: 'ok', ownerFree: true, where: 'local' } });
+    feed(cur((id) => ({ t: 'started', run: id, ok: true, process: 'p1' })));
+    feed(cur((id) => ({ t: 'admin-done', run: id, outcome: { k: 'legacy' } })));
+    feed({ t: 'slot', idle: true });
+    feed(cur((id) => ({ t: 'admin-done', run: id, outcome: { k: 'ok' } })));
+    feed({ t: 'slot', idle: true });
+    feed(cur((id) => ({ t: 'admin-done', run: id, outcome: { k: 'page', more: false, catalog: 'ok' } })));
+    feed({ t: 'slot', idle: true });
+    feed((st) => ({ t: 'saved', gen: st.saving!.gen, outcome: 'saved' }));
+    feed(cur((id) => ({ t: 'notice', run: id })));
+    feed(cur((id) => ({ t: 'admin-done', run: id, outcome: { k: 'page', more: false, catalog: 'ok' } })));
+    feed({ t: 'slot', idle: true });
+    feed((st) => ({ t: 'saved', gen: st.saving!.gen, outcome: 'failed' }));
+    const x = s;
+    const mark = x.run!.retried ?? x.run!.unsaved;
+    expect(mark).toBe(x.run!.gen);
+    const shift = (st: LcState, marks: boolean): LcState => {
+      const r = st.run!;
+      return { ...st, nextGen: st.nextGen + 5, saving: st.saving && { ...st.saving, gen: st.saving.gen + 5 }, run: { ...r, gen: r.gen + 5, firstGen: r.firstGen + 5, ...(marks && r.retried !== undefined ? { retried: r.retried + 5 } : {}), ...(marks && r.unsaved !== undefined ? { unsaved: r.unsaved + 5 } : {}) } };
+    };
+    const alike = shift(x, true);
+    const unlike = shift(x, false);
+    const fail = (st: LcState) => next(st, { t: 'saved', gen: st.saving!.gen, outcome: 'failed' });
+    // The unlike pair's futures differ: the alike one marks unsaved, as x does; the unlike one retries.
+    expect(fail(alike).effects).toEqual(fail(x).effects);
+    expect(fail(unlike).effects).not.toEqual(fail(x).effects);
+    expect(renumbered(alike, CTX0)).toBe(renumbered(x, CTX0));
+    expect(renumbered(unlike, CTX0)).not.toBe(renumbered(x, CTX0));
+  });
 
   it('reaches each named checkpoint through next(), each the state it names', () => {
     for (const k of checkpoints()) expect(k.holds(k.origin.s), k.origin.name).toBe(true);
