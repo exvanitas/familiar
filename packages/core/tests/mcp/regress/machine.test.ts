@@ -2,7 +2,7 @@
 // relaunch's old exchange ended, a late native start bounded, a failed later catalog write kept, an
 // orphan's own words, and a Stop during Test's cleanup. Each over the pure machine, with its mutation.
 import { describe, expect, it } from 'vitest';
-import { initialState, next, phaseOf, START_TIMEOUT, STOP_UNCONFIRMED, STOPPED_EARLY, STOPPED_WORDS, type LcEffect, type LcEvent, type LcState } from '../../../src/mcp/wire/lifecycle.ts';
+import { failureOf, initialState, next, phaseOf, SESSION_ENDED, START_TIMEOUT, STOP_UNCONFIRMED, STOPPED_EARLY, STOPPED_WORDS, type LcEffect, type LcEvent, type LcState } from '../../../src/mcp/wire/lifecycle.ts';
 import { ServerLink, LINK_LIMITS, type Target } from '../../../src/mcp/wire/link.ts';
 import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import { mutations } from '../../../src/mutations.ts';
@@ -159,6 +159,27 @@ describe('a later catalog write that fails', () => {
         expect(again.last).toEqual([]);
         expect(again.s.run?.unsaved).toBe(2);
       }));
+});
+
+describe("a modern run's recovery answered in the legacy era (6b.10)", () => {
+  it('ends the run with session-ended: the era was decided once, at the opening (G29), and no tool list follows', () => {
+    const g = run([
+      start('start', 'remote'),
+      cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'modern-refusal' } })),
+      idle,
+      cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } })),
+      idle,
+      (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'saved' }),
+      cur((r) => ({ t: 'call-ended', run: r.id, end: 'session-ended' }))
+    ]);
+    expect(g.s.run?.era).toBe('modern');
+    expect(g.s.run?.purpose).toBe('recovery');
+    const after = run([cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } }))], g.s);
+    expect(after.last.filter((x) => x.t === 'admin')).toEqual([]);
+    expect(after.s.run).toBeUndefined();
+    expect(failureOf(after.s)).toEqual(SESSION_ENDED);
+    expect(after.last).toContainEqual({ t: 'ended', run: 's#1', failure: SESSION_ENDED });
+  });
 });
 
 describe("the relaunch ends the exited process's exchange", () => {

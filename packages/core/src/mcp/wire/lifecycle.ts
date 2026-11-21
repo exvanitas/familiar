@@ -621,12 +621,10 @@ function adminDone(tx: Tx, o: AdminOutcome): void {
   if (o.k === 'session-ended') return sessionEnded(tx);
   if (kind === 'initialize') {
     if (o.k === 'legacy') {
-      // A modern run's re-handshake answered in the legacy era: the run's era stays (G29), and a modern run
-      // sends no notifications/initialized; its walk follows.
-      if (r.era === 'modern') {
-        tx.setRun({ step: 'walking', walk: { attempt: 0, page: 1, startedAt: r.changes, answered: false }, want: { kind: 'list', page: 1 } });
-        return tx.issue();
-      }
+      // A modern run's re-handshake answered in the legacy era (only a recovery re-handshakes a modern run):
+      // the era was decided once, at the run's opening (G29), so the run ends as an opening refusal during
+      // recovery does (6b.10).
+      if (r.era === 'modern') return end(tx, 'session-ended', SESSION_ENDED);
       tx.setRun({ step: 'initialized', want: { kind: 'initialized' } });
       return tx.issue();
     }
