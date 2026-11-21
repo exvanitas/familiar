@@ -88,7 +88,8 @@ export interface ServerStatus {
   readonly unpinned?: Unpinned;
   /** The tools as last seen, with whether the person has reviewed each as it is now. */
   readonly tools: readonly SavedTool[];
-  /** Set while the run's latest tool list couldn't be saved (tried twice): the saved list is older. */
+  /** Set while the run's latest tool list couldn't be saved (tried twice): the saved list is older. The
+      machine decides it (noteOf, 6b.13). */
   readonly unsaved?: string;
 }
 
@@ -139,7 +140,6 @@ export class McpClient {
   /** Catalog writes under way: a durable clear waits for them, never taking the owner first. */
   private seeing = 0;
   /** Servers whose latest catalog write failed, with the words shown until one lands. */
-  private readonly unsaved = new Map<string, string>();
   private readonly o: McpClientOptions;
 
   private constructor(options: McpClientOptions, owner: Owner) {
@@ -282,7 +282,7 @@ export class McpClient {
     const rt = this.runtimes.get(id);
     if (!s || s.removing || !rt) return undefined;
     const flag = s.setup.kind === 'local' ? unpinned(s.setup.program, s.setup.args) : undefined;
-    const unsaved = this.unsaved.get(id);
+    const unsaved = rt.note;
     return { id, label: s.setup.label, key: s.key, kind: s.setup.kind, enabled: s.enabled, phase: rt.phase, ...(rt.failure ? { failure: rt.failure } : {}), ...(flag ? { unpinned: flag } : {}), tools: s.tools, ...(unsaved ? { unsaved } : {}) };
   }
 
@@ -595,12 +595,8 @@ export class McpClient {
     });
     this.seeing++;
     try {
+      // A write that fails throws to the driver, which feeds the machine; the machine decides what shows.
       await this.owner.seen(id, tools, current);
-      if (this.unsaved.delete(id)) this.o.onChange?.(id);
-    } catch (e) {
-      this.unsaved.set(id, "Familiar couldn't save this server's latest tool list; it shows the list it saved before.");
-      this.o.onChange?.(id);
-      throw e;
     } finally {
       this.seeing--;
       this.clearGrants();

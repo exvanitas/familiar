@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { callable, failureOf, initialState, next, offering, phaseOf, type LcEffect, type LcEvent, type LcState } from '../../src/mcp/wire/lifecycle.ts';
+import { callable, failureOf, initialState, next, noteOf, offering, phaseOf, type LcEffect, type LcEvent, type LcState } from '../../src/mcp/wire/lifecycle.ts';
 import { mutations } from '../../src/mutations.ts';
 import type * as Spec from './lifecycle.spec-types.ts';
 import { advance, alphabet, canon, checkState, checkTransition, CLAUSES, CONTROLS, CTX0, histFromState, initialHistory, stubMachine, type Control, type Ctx, type History, type Machine } from './lifecycle.spec-checks.ts';
@@ -83,7 +83,7 @@ export const THIS: Walked = {
   // The spec's `fenced` is the declared one (lifecycle.spec-types.ts): "Whether a Start is fenced by a process
   // that may still run". This repo's own `fenced()` is a different predicate (Stop's fence, for idle pings),
   // so the spec's is given its declared meaning here.
-  m: { callable, phaseOf, fenced: (s: LcState) => s.orphans.length > 0, offering, failureOf } as unknown as Machine,
+  m: { callable, phaseOf, fenced: (s: LcState) => s.orphans.length > 0, offering, failureOf, noteOf } as unknown as Machine,
   adapt: (e, s) => {
     if (e.t !== 'readmit') return e as unknown as LcEvent;
     const r = s.run;
@@ -393,9 +393,9 @@ describe('W with the spec checks', () => {
   // lc-old-run-events is W's alone (lifecycle.walk.test.ts): it widens only `started`, and the spec world can't
   // deliver an old run's `started`, since a pending native start always belongs to the current run (I2.one, I6).
   const SPEC_CONTROL_DEPTH = Number(process.env.FAMILIAR_LC_SPEC_CONTROL_DEPTH ?? 7);
-  // Three are not caught within the CI depth from these origins (W's own checks catch them in CI); their
-  // spec-check catch is the local deep run's (FAMILIAR_LC_SPEC_DEEP=1, deeper).
-  const DEEP = new Set(['lc-test-ok-on-refusal', 'lc-test-ok-after-stop', 'lc-failed-save-dropped']);
+  // Two are not caught within the CI depth from these origins (W's own checks catch them in CI); their
+  // spec-check catch is the local deep run's (FAMILIAR_LC_SPEC_DEEP=1, depth 8 from the initial state).
+  const DEEP = new Set(['lc-test-ok-on-refusal', 'lc-test-ok-after-stop']);
   for (const [mutation, where, from] of LC)
     it.skipIf(DEEP.has(mutation) && !process.env.FAMILIAR_LC_SPEC_DEEP)(`${mutation} is caught by the spec checks from ${from}, and its trace replays clean unmutated`, () => {
       const origin = from === 'initial' ? SPEC0() : specCheckpoints().find((k) => k.origin.name === from)!.origin;

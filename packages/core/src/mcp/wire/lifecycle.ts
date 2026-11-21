@@ -92,7 +92,10 @@ export interface Run {
   readonly firstGen: number;
   /** The unanswered list's words, kept through the relaunch grace. */
   readonly graceFailure?: Failure;
-  /** A later catalog write failed: its generation, kept until a retry lands (one retry). */
+  /** A later catalog write failed once: its generation, tried once more (6b.13). */
+  readonly retried?: number;
+  /** That generation failed again: marked unsaved, and shown (noteOf), until a write of it or a newer one
+      lands (6b.13). */
   readonly unsaved?: number;
   /** The first Stop's answer, once given: a later Stop of this run gets the same (4.6, I8). */
   readonly stopAnswer?: Reply;
@@ -261,6 +264,17 @@ export function fenced(s: LcState): boolean {
   if (!r || s.held) return true;
   if (r.step === 'closing') return !(r.cause === 'person-stop' && (__FAMILIAR_MUTATIONS__ && mutant('no-stop-fence')));
   return false;
+}
+
+/** 6b.13: the words shown beside a running server whose newest tool list couldn't be saved. */
+export const NOTE_UNSAVED = "Familiar couldn't save this server's latest tool list; it shows the list it saved before.";
+
+/** What Settings shows beside the phase while the run is current (any step, closing included): the newest
+    published catalog failed its write twice (6b.13). Nothing while its retry is due, nothing once a newer
+    catalog is published, nothing once the run has left. Never part of `failureOf`. */
+export function noteOf(s: LcState): string | undefined {
+  const r = s.run;
+  return r && r.unsaved !== undefined && r.unsaved === r.gen ? NOTE_UNSAVED : undefined;
 }
 
 /** The words a failed or stopped server shows. */
@@ -821,20 +835,28 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
   if (s.saving?.gen !== gen) return;
   s.saving = undefined;
   const r = s.run;
+  const first = !!r && r.firstSave === 'pending' && r.firstGen === gen;
+  // The first write's failure ends the run here (catalog-failed): the transition that enters closing issues
+  // no new save, so a newer catalog waiting behind it isn't saved (6b.13).
+  const ending = first && outcome === 'failed' && r!.step !== 'closing';
   if (s.dirty) {
     s.dirty = false;
-    if (r && r.gen > gen && r.step !== 'closing') tx.saveCatalog();
+    if (r && r.gen > gen && r.step !== 'closing' && !ending) tx.saveCatalog();
   }
-  const first = !!r && r.firstSave === 'pending' && r.firstGen === gen;
-  // A later catalog write that failed keeps its generation and is tried once more; a second failure is the
-  // owner's to report (the client shows it), and the generation stays marked unsaved.
-  if (r && !first && r.step !== 'closing') {
-    if (outcome === 'failed' && r.gen === gen && !s.saving && r.unsaved !== gen && !(__FAMILIAR_MUTATIONS__ && mutant('lc-failed-save-dropped'))) {
-      tx.setRun({ unsaved: gen });
+  // 6b.13: a later catalog write that fails keeps its generation and is tried once more (never for a closing
+  // run); a second failure marks it unsaved, which noteOf shows; the run goes on. The mark and its clearing
+  // apply in every step, closing included.
+  if (r && !first) {
+    if (outcome === 'failed' && r.step !== 'closing' && r.gen === gen && !s.saving && r.retried !== gen && !(__FAMILIAR_MUTATIONS__ && mutant('lc-failed-save-dropped'))) {
+      tx.setRun({ retried: gen });
       tx.saveCatalog();
       return;
     }
-    if (outcome !== 'failed' && r.unsaved !== undefined && r.unsaved <= gen) tx.setRun({ unsaved: undefined });
+    if (outcome === 'failed' && r.gen === gen && r.retried === gen) tx.setRun({ unsaved: gen });
+    if (outcome !== 'failed') {
+      if (r.unsaved !== undefined && r.unsaved <= gen) tx.setRun({ unsaved: undefined });
+      if (r.retried !== undefined && r.retried <= gen) tx.setRun({ retried: undefined });
+    }
   }
   if (!r || !first) return;
   tx.setRun({ firstSave: 'done' });

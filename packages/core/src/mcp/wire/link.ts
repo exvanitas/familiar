@@ -21,7 +21,7 @@ import { exitFailure, protocolFailure, remoteFailure, startFailure } from '../wo
 import { emptySlot, step, type Effect, type End, type ExchangeKind, type Input, type Slot } from './exchange.ts';
 import { frame, frameCall, LEGACY_VERSIONS, legacyVersion, MODERN_VERSION, type AdminMessage, type Era, type RpcId } from './framing.ts';
 import { HEADER_WORDS, paramHeaders, scanDeclarations, type HeaderDeclaration } from './headers.ts';
-import { BUSY_SLOT, callable, failureOf, fenced, offering, initialState, next, phaseOf, STOPPED_WORDS, type AdminOutcome, type LcEffect, type LcEvent, type LcState, type Mode, type Reply, type StartFacts, type Want } from './lifecycle.ts';
+import { BUSY_SLOT, callable, failureOf, fenced, noteOf, offering, initialState, next, phaseOf, STOPPED_WORDS, type AdminOutcome, type LcEffect, type LcEvent, type LcState, type Mode, type Reply, type StartFacts, type Want } from './lifecycle.ts';
 import { mutant } from '../../mutations.ts';
 import { callResult, cutText, EventStream, initializeResult, Invalid, listResult, MAX_HANDSHAKE_BYTES, MAX_MESSAGE_BYTES, parseMessage, resultText, type Inbound } from './parse.ts';
 
@@ -235,6 +235,10 @@ export class ServerLink {
   get failure(): Failure | undefined {
     return failureOf(this.lc);
   }
+  /** The machine's words beside a running server's phase (6b.13), if any. */
+  get note(): string | undefined {
+    return noteOf(this.lc);
+  }
   /** Set once cleanup the exe refused for good has left the slot held until a restart: the words. */
   get held(): Failure | undefined {
     return this.lc.held;
@@ -273,7 +277,7 @@ export class ServerLink {
 
   private drain(): void {
     this.draining = true;
-    const before = `${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}`;
+    const before = `${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}:${noteOf(this.lc) ?? ''}`;
     try {
       while (this.queue.length) {
         const ev = this.queue.shift()!;
@@ -290,7 +294,7 @@ export class ServerLink {
       this.draining = false;
     }
     for (const w of [...this.watchers]) w();
-    if (`${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}` !== before) this.events.changed?.();
+    if (`${phaseOf(this.lc)}:${failureOf(this.lc)?.words ?? ''}:${noteOf(this.lc) ?? ''}` !== before) this.events.changed?.();
   }
 
   /**

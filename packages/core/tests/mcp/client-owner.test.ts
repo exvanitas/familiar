@@ -588,3 +588,51 @@ describe("5.4: a server's limits apply from the next start", () => {
     expect(delays).not.toContain(60_000);
   });
 });
+
+describe("6b.13: a later tool list that couldn't be saved, as the machine marks it", () => {
+  it('no words after a first failure while its retry is due; words after the second; gone once a newer list saves', async () => {
+    const base = memorySettingsStore();
+    // Each catalog write waits for the test's word: true lands it, false loses it.
+    let hold = false;
+    const pending: ((ok: boolean) => void)[] = [];
+    const store: SettingsStore = {
+      ...base,
+      putIf: async (key, record, guard) => {
+        if (!hold) return base.putIf(key, record, guard);
+        const ok = await new Promise<boolean>((r) => pending.push(r));
+        if (!ok) throw new Error('The disk is full.');
+        return base.putIf(key, record, guard);
+      }
+    };
+    let listed = 0;
+    const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'echo', description: `the echo tool, version ${++listed}`, inputSchema: { type: 'object', properties: {} } }] } })] : []));
+    const client = await clientOf(store, fp.port);
+    await client.add({ setup: local('l1'), problems: [] });
+    expect((await client.start('l1')).kind).toBe('ready');
+    const notice = () => fp.emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) });
+    const write = async () => {
+      const end = Date.now() + 5_000;
+      while (!pending.length) {
+        if (Date.now() > end) throw new Error(`no catalog write came: ${JSON.stringify(fp.writes.map((w) => w.method))}`);
+        await tick();
+      }
+      return pending.shift()!;
+    };
+    hold = true;
+    notice();
+    (await write())(false);
+    // The retry is due: nothing is shown yet.
+    const retry = await write();
+    expect(client.get('l1')!.unsaved).toBeUndefined();
+    retry(false);
+    await tick(20);
+    expect(client.get('l1')!.unsaved).toBe("Familiar couldn't save this server's latest tool list; it shows the list it saved before.");
+    expect(client.get('l1')!.failure).toBeUndefined();
+    // A newer list, saved: the words go.
+    notice();
+    (await write())(true);
+    await tick(20);
+    expect(client.get('l1')!.unsaved).toBeUndefined();
+    await client.stop('l1');
+  });
+});

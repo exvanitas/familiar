@@ -75,6 +75,10 @@ export class ServerRuntime {
   get failure(): Failure | undefined {
     return this.link.failure;
   }
+  /** The machine's words beside the phase while the run is current (6b.13). */
+  get note(): string | undefined {
+    return this.link.note;
+  }
   /** The run's catalog while Ready. */
   get tools(): readonly ListedTool[] {
     return this.phase === 'ready' ? (this.link.current?.tools ?? []) : [];

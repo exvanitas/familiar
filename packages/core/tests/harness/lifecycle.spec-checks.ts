@@ -23,6 +23,8 @@ export interface Machine {
   fenced(s: LcState): boolean;
   offering(s: LcState): boolean;
   failureOf(s: LcState): Failure | undefined;
+  /** The note Settings shows beside a running server (6b.13): today only the unsaved latest tool list. */
+  noteOf(s: LcState): string | undefined;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -71,13 +73,19 @@ export interface History {
   readmit: string[];                                // runs awaiting the readmit facts
   graceWords: { run: string; words: string }[];     // the unanswered list's words, for grace's end
   reported: string[];                               // runs that got report-ended
+  savingRun?: string;                               // the run whose catalog write is in flight
+  saveFails: { gen: number; count: number }[];      // failures per generation of later writes (6b.13)
+  /** A save asked for and deferred (6b.13 "in its turn"): the run's newest generation settled (Ready entered) while
+      a write was in flight, and that generation hasn't been saved since. */
+  askedFor?: { run: string; gen: number };
+  unsaved?: { run: string; gen: number };           // the last generation a later write failed twice for (6b.13); kept once superseded
 }
 
 export function initialHistory(): History {
   return {
     runs: [], ids: [], armed: [], startPending: [], stopPending: [], stopIssued: [], alive: [], open: [], answered: [],
     stopReply: [], runPublish: [], firstSave: [], kept: [], fenced: [], exchange: [], slot: 'idle', remote: [], orphanWords: [],
-    listAnswered: [], stoppedBy: [], readmit: [], graceWords: [], reported: [],
+    listAnswered: [], stoppedBy: [], readmit: [], graceWords: [], reported: [], saveFails: [],
   };
 }
 
@@ -102,6 +110,12 @@ export const msrWords = (w: string) => /may still be (running|starting)/.test(w)
 export const msr = (h: History) => h.alive.length > 0 || h.startPending.length > 0;
 
 const keptOf = (h: History, run?: string) => h.kept.find((k) => k.run === run);
+/** 6b.13: the note shown with a server whose newest published generation is marked unsaved (exact words). */
+export const UNSAVED_NOTE = "Familiar couldn't save this server's latest tool list; it shows the list it saved before.";
+/** The same words, however punctuated, for the check that a failure never carries them. */
+export const UNSAVED_RE = /couldn.t save this server.s latest tool list/i;
+/** A later catalog write (a refresh's or a recovery's): not any run's first (6b.13). */
+const laterSave = (h: History, gen: number) => !h.firstSave.some((f) => f.gen === gen);
 const armedEntry = (h: History, id: number) => h.armed.find((a) => a.id === id);
 const wordsOf = (r: Reply): string | undefined => (r.kind === 'failed' ? r.failure.words : r.kind === 'refused' ? r.words : undefined);
 
@@ -337,7 +351,12 @@ export function advance(hist: History, prev: LcState, e: LcEvent, next: LcState,
       x.slot = e.idle ? 'idle' : 'busy';
       break;
     case 'saved':
-      if (x.saving === e.gen) x.saving = undefined;
+      if (x.saving === e.gen && e.outcome === 'failed' && laterSave(hist, e.gen)) {
+        const f = x.saveFails.find((y) => y.gen === e.gen);
+        if (f) f.count++; else x.saveFails.push({ gen: e.gen, count: 1 });
+        if ((f?.count ?? 1) >= 2 && x.savingRun !== undefined) x.unsaved = { run: x.savingRun, gen: e.gen };
+      }
+      if (x.saving === e.gen) { x.saving = undefined; x.savingRun = undefined; }
       for (const f of x.firstSave) if (f.gen === e.gen && f.outcome === undefined) f.outcome = e.outcome;
       break;
     case 'readmit': x.readmit = x.readmit.filter((s) => s !== e.run); break;
@@ -395,7 +414,9 @@ export function advance(hist: History, prev: LcState, e: LcEvent, next: LcState,
         break;
       case 'save':
         x.saving = f.gen;
+        x.savingRun = f.run;
         x.lastSave = f.gen;
+        if (x.askedFor && f.gen >= x.askedFor.gen) x.askedFor = undefined;
         if (!x.firstSave.some((s) => s.run === f.run)) x.firstSave.push({ run: f.run, gen: f.gen });
         break;
       case 'answer': {
@@ -440,6 +461,11 @@ export function advance(hist: History, prev: LcState, e: LcEvent, next: LcState,
     const words = e.t === 'stop-answered' && !e.ok ? STOP_REFUSED.words : e.t === 'deadline' ? STOP_UNCONFIRMED.words : '*';
     x.orphanWords.push({ process: r.native.process, words });
   }
+  // A settle (Ready entered from settling) while a write is in flight asks for the newest's save, deferred (6b.13).
+  if (r && n && r.id === n.id && r.step === 'settling' && n.step === 'ready' && hist.saving !== undefined && x.saving === hist.saving) {
+    const newest = x.runPublish.find((p) => p.run === n.id)?.last;
+    if (newest !== undefined && newest !== x.saving && !effects.some((f) => f.t === 'save' && f.gen === newest)) x.askedFor = { run: n.id, gen: newest };
+  }
   if (n && !x.runs.includes(n.id)) x.runs.push(n.id);
   if (n && n.where === 'remote' && !x.remote.includes(n.id)) x.remote.push(n.id);
 
@@ -457,6 +483,7 @@ function normalize(x: History): History {
     kept: byJson(x.kept), fenced: s(x.fenced), exchange: byJson(x.exchange), remote: s(x.remote), orphanWords: byJson(x.orphanWords),
     listAnswered: s(x.listAnswered),
     stoppedBy: s(x.stoppedBy), readmit: s(x.readmit), graceWords: byJson(x.graceWords), reported: s(x.reported),
+    saveFails: byJson(x.saveFails),
   };
 }
 
@@ -570,12 +597,16 @@ export function checkTransition(
   // own late outcome changes nothing.
   if (r && r.step === 'relaunch' && e.t === 'admin-done' && e.run === r.id && (!unchanged || effects.length)) v('I7.same', 'the list\'s late outcome changed a run waiting in relaunch');
 
+  // 6b.13: a later catalog write of the current, still-running run fails. The run goes on.
+  const laterFail = e.t === 'saved' && e.outcome === 'failed' && hist.saving === e.gen && laterSave(hist, e.gen)
+    && !!r && hist.savingRun === r.id && r.cause === undefined && r.step !== 'closing' && r.step !== 'relaunch' && !prev.held;
+
   // ---- Endings (the transition table: anything not listed is ignored) ----
   const recoveryEntry = !!r && !!n && r.id === n.id && n.purpose === 'recovery' && n.step === 'opening' && !(r.purpose === 'recovery' && r.step === 'opening');
   if (r && !admitted && !old && ex !== 'unknown' && !(e.t === 'deadline' && !liveDeadline(prev, e, hist))) {
     if (r.step !== 'closing') {
       const eo = endingOf(prev, e, hist);
-      if (ended && eo.k !== 'end' && !goOnMissed) v(e.t === 'call-ended' ? 'G18.call' : 'END.unlisted', `${e.t} ended run ${r.id} (from ${r.step}), which the table doesn't list`);
+      if (ended && eo.k !== 'end' && !goOnMissed && !laterFail) v(e.t === 'call-ended' ? 'G18.call' : 'END.unlisted', `${e.t} ended run ${r.id} (from ${r.step}), which the table doesn't list`);
       // Entering grace or a re-handshake instead of ending is reported by I7.grace and REC.once.
       if (!ended && eo.k === 'end' && n?.step !== 'grace' && n?.step !== 'relaunch' && !recoveryEntry) {
         v(recoveryEraEnd(r, e) ? 'ERA.recovery' : 'END.must', `${e.t} must end run ${r.id} from ${r.step} (${eo.causes.join('|')})`);
@@ -618,6 +649,28 @@ export function checkTransition(
       const strip = (x: LcState) => ({ ...x, saving: undefined, dirty: undefined, run: x.run ? { ...x.run, firstSave: undefined } : undefined });
       if (!same(strip(prev), strip(next)) || effects.some((f) => f.t !== 'save')) v('SAVED.late', `the catalog write of run ${fs.run}, which already ended or began closing, changed more than the save bookkeeping`);
     }
+  }
+  // 6b.13: a later write that fails keeps its generation and is tried once more; a second failure leaves it
+  // unsaved, with no third try. Only the first save's failure ends a run. That retry is due only while the failed
+  // generation is still the run's newest published one. Once a newer one is published, the failure retries
+  // nothing: a save of the newest is allowed there but not required (it comes "in its turn", at its settle, or
+  // here only if it was already asked for), and a save of the failed or any older generation is I11.newest's.
+  if (laterFail && e.t === 'saved') {
+    const tries = hist.saveFails.find((f) => f.gen === e.gen)?.count ?? 0;
+    const saves = effects.filter((f): f is Extract<LcEffect, { t: 'save' }> => f.t === 'save');
+    const newest = hist.runPublish.find((p) => p.run === r!.id)?.last;
+    if (ended || left) v('SAVE.goes-on', `run ${r!.id} ended on its later catalog write's failure (gen ${e.gen})`);
+    else if (newest !== e.gen) {
+      // Superseded: nothing more is due here, unless the newest's save was already asked for (History, never `dirty`).
+      const asked = hist.askedFor;
+      if (asked && asked.run === r!.id && asked.gen === newest && !saves.some((f) => f.gen === newest)) v('SAVE.turn', `gen ${newest} settled while gen ${e.gen} was in flight, and gen ${e.gen}'s failure didn't save it in its turn`);
+    }
+    else if (tries === 0 && saves.length !== 1) v('SAVE.retry', `the later catalog write of gen ${e.gen} failed and wasn't tried once more`);
+    else if (tries >= 1 && saves.some((f) => f.gen === e.gen)) v('SAVE.retry', `gen ${e.gen} failed twice and was tried a third time`);
+  }
+  // 6b.13: closing issues no new save; a write already in flight just settles.
+  for (const f of effects) {
+    if (f.t === 'save' && ((r && r.id === f.run && r.step === 'closing') || (n && n.id === f.run && n.step === 'closing'))) v('SAVE.closing', `save of gen ${f.gen} for run ${f.run}, which is closing`);
   }
   // report-ended
   {
@@ -944,6 +997,22 @@ export function checkState(s: LcState, m: Machine, h: History): string[] {
     if (quiet && h.open.length) v('I3.quiescent', `nothing pending, yet ${h.open.map((w) => w.token)} wait`);
   }
 
+  // 6b.13: the machine's own note. noteOf gives the unsaved words exactly while the run is current and its
+  // newest published generation is marked unsaved, and nothing otherwise: never with nothing marked (a first
+  // failure included, its retry still due), and not once a newer generation was published (and so not once it
+  // saved). failureOf never carries them.
+  {
+    const note = m.noteOf(s);
+    const newest = r ? h.runPublish.find((p) => p.run === r.id)?.last : undefined;
+    const want = !!h.unsaved && !!r && r.id === h.unsaved.run && newest === h.unsaved.gen;
+    if (want && note !== UNSAVED_NOTE) v('SAVE.unsaved', `gen ${h.unsaved!.gen} is marked unsaved, yet noteOf gives "${note ?? ''}"`);
+    if (!want && note !== undefined) {
+      if (h.unsaved) v('SAVE.note-cleared', `noteOf gives "${note}" though gen ${h.unsaved.gen}'s mark was superseded by a newer generation (or its run left)`);
+      else v('SAVE.note-none', `noteOf gives "${note}" with no generation marked unsaved`);
+    }
+    const f = m.failureOf(s);
+    if (f && (f.words === UNSAVED_NOTE || UNSAVED_RE.test(f.words))) v('P.failure-note', `failureOf carries the unsaved note "${f.words}"`);
+  }
   // Catalog writes (I11).
   if ((s.saving?.gen) !== h.saving) v('I11.mirror', `saving ${s.saving?.gen}, in flight ${h.saving}`);
   if (h.saving === undefined && r && !s.held && r.step === 'ready') {
@@ -1230,6 +1299,14 @@ export const CLAUSES: Record<string, string> = {
   'I11.one': 'M4.4: "At most one `save-catalog` is in flight (`catalog.saving`)."',
   'I11.newest': 'M7: "I11 as W checks it: at most one save in flight, and every save issued is for the newest catalog published"',
   'I11.mirror': 'M1: "catalog: { saving?: runId } // the catalog write in flight, if any"',
+  'SAVE.retry': 'M6b.13: "A later catalog write that fails (a refresh\'s or a recovery\'s, not the first) keeps its generation and is tried once more, one save at a time (I11)." "A newer publication supersedes an older unsaved generation, and is saved in its turn."',
+  'SAVE.unsaved': 'M6b.13: "A second failure leaves that generation marked unsaved". "`noteOf` returns \"Familiar couldn\'t save this server\'s latest tool list; it shows the list it saved before.\" while the run is current and its newest published generation is marked unsaved."',
+  'SAVE.note-none': 'M6b.13: "`noteOf` … returns nothing otherwise: not after the first failure (the retry is still due)". (Nothing marked unsaved, no note.)',
+  'SAVE.note-cleared': 'M6b.13: "`noteOf` returns … while the run is current and its newest published generation is marked unsaved. It returns nothing otherwise: … and not once a newer generation has saved."',
+  'P.failure-note': 'M6b.13: "It\'s a note beside a Ready server, not a failure, so `failureOf` doesn\'t carry it."',
+  'SAVE.turn': 'M6b.13: "\"In its turn\" is the newer generation\'s own save: at its settle, or in the failure\'s own transition if its save was already asked for while the failed one was in flight (I11\'s one-at-a-time rule)."',
+  'SAVE.closing': 'M6b.13: "Closing issues no new save, so it issues no retry."',
+  'SAVE.goes-on': 'M6b.13: "The run goes on in both cases: only the first save\'s failure ends a run (catalog-failed)."',
   'I11.owed': 'I11: "Once quiescent (no event pending), the catalog last saved is the one published". M4.4: "when that save settles, the machine saves the newest published catalog again"',
 };
 
@@ -1243,6 +1320,8 @@ export const stubMachine: Machine = {
   fenced: (s) => s.orphans.length > 0,
   offering: (s) => !!s.run && !s.held && phaseReadyRun(s.run) && s.run.published !== undefined,
   failureOf: (s) => s.held ?? (s.run ? undefined : s.after?.failed ? s.after.failure : undefined),
+  // The types show no state field for the mark, so the stub has none; controls set it by hand.
+  noteOf: () => undefined,
 };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1294,6 +1373,8 @@ export function histFromState(s: LcState, over: Partial<History> = {}, extraArme
     readmit: r?.step === 'relaunch' ? [r.id] : [],
     graceWords: r?.graceFailure ? [{ run: r.id, words: r.graceFailure.words }] : [],
     reported: [],
+    savingRun: s.saving?.run,
+    saveFails: [],
   };
   return normalize({ ...h, ...over });
 }
@@ -1592,6 +1673,60 @@ const B = {
       next: mkSt({ nextDeadline: 12, run: r({ firstSave: 'done' }) }), effects: [],
     };
   },
+  // 6b.13: a later catalog write (gen 2; the first was gen 1) fails, after `tries` earlier failures of it.
+  // `newer`: gen 3 was published while it saved, and supersedes it.
+  laterSaveFail: (tries: number, out: 'retry' | 'drop' | 'end', newer = false): Tr => {
+    const gen = newer ? 3 : 2;
+    const prev = mkSt({ nextGen: 4, saving: { run: R1, gen: 2 }, dirty: newer, run: mkRun({ gen }) });
+    const next = out === 'retry' ? mkSt({ nextGen: 4, saving: { run: R1, gen }, run: mkRun({ gen }) })
+      : out === 'drop' ? mkSt({ nextGen: 4, run: mkRun({ gen }) })
+      : mkSt({ nextGen: 4, nextDeadline: 11, run: closingRun({ cause: 'catalog-failed', gen }) });
+    const effects: LcEffect[] = out === 'retry' ? [{ t: 'save', run: R1, gen }]
+      : out === 'drop' ? [] : [{ t: 'end-live', run: R1 }, { t: 'native-stop', run: R1, process: P1 }, { t: 'arm', id: 10, which: 'stop' }];
+    return {
+      prev, e: { t: 'saved', gen: 2, outcome: 'failed' }, next, effects,
+      hist: histFromState(prev, { saveFails: tries ? [{ gen: 2, count: tries }] : [], lastSave: 2 }),
+    };
+  },
+  // 6b.13: gen 2 was marked unsaved; gen 3, published since, now saves
+  newerSaved: (): Tr => ({
+    prev: mkSt({ nextGen: 4, saving: { run: R1, gen: 3 }, run: mkRun({ gen: 3 }) }), e: { t: 'saved', gen: 3, outcome: 'saved' },
+    next: mkSt({ nextGen: 4, run: mkRun({ gen: 3 }) }), effects: [],
+    hist: histFromState(mkSt({ nextGen: 4, saving: { run: R1, gen: 3 }, run: mkRun({ gen: 3 }) }), { saveFails: [{ gen: 2, count: 2 }], unsaved: { run: R1, gen: 2 } }),
+  }),
+  // 6b.13, build9's trace 2: gen 2's first failure lands after gen 3 was published, while gen 3 is still settling
+  // (a refresh: notice, page, slot idle, notice, page). Nothing is due in that transition; `retryOld` retries gen 2.
+  supersededFail: (retryOld: boolean): Tr => {
+    const run = mkRun({ step: 'settling', purpose: 'refresh', gen: 3, changes: 2, published: 2, walk: { attempt: 0, page: 1, startedAt: 2, answered: true }, deadline: { which: 'list', id: 10 } });
+    const prev = mkSt({ nextDeadline: 11, nextGen: 4, slot: 'busy', saving: { run: R1, gen: 2 }, dirty: false, run });
+    return {
+      prev, e: { t: 'saved', gen: 2, outcome: 'failed' },
+      next: mkSt({ nextDeadline: 11, nextGen: 4, slot: 'busy', dirty: false, run, ...(retryOld ? { saving: { run: R1, gen: 2 } } : {}) }),
+      effects: retryOld ? [{ t: 'save', run: R1, gen: 2 }] : [],
+    };
+  },
+  // 6b.13: gen 3 settled (Ready entered) while gen 2 was in flight, so its save was asked for; a notice has since
+  // begun another refresh walk. Gen 2's first failure must save gen 3 in its turn (`save`), here.
+  askedTurn: (save: boolean): Tr => {
+    const run = mkRun({ step: 'walking', purpose: 'refresh', gen: 3, changes: 3, published: 2, walk: { attempt: 0, page: 1, startedAt: 3, answered: false }, inFlight: { kind: 'list', page: 1 }, deadline: { which: 'list', id: 10 } });
+    const prev = mkSt({ nextDeadline: 11, nextGen: 4, slot: 'busy', saving: { run: R1, gen: 2 }, run });
+    return {
+      prev, e: { t: 'saved', gen: 2, outcome: 'failed' },
+      next: mkSt({ nextDeadline: 11, nextGen: 4, slot: 'busy', run, ...(save ? { saving: { run: R1, gen: 3 } } : {}) }),
+      effects: save ? [{ t: 'save', run: R1, gen: 3 }] : [],
+      hist: histFromState(prev, { askedFor: { run: R1, gen: 3 } }),
+    };
+  },
+  // 6b.13, build9's trace 1: the retry of gen 2 fails while the run is closing (a Stop came after the first failure).
+  // The mark holds in every step: noteOf is due while the run is current. Closing issues no retry.
+  closingSecondFail: (): Tr => {
+    const prev = mkSt({ nextDeadline: 11, nextGen: 3, saving: { run: R1, gen: 2 }, waiters: [Wt('stop', 's')], run: closingRun({ gen: 2 }) });
+    return {
+      prev, e: { t: 'saved', gen: 2, outcome: 'failed' },
+      next: mkSt({ nextDeadline: 11, nextGen: 3, waiters: [Wt('stop', 's')], run: closingRun({ gen: 2 }) }), effects: [],
+      hist: histFromState(prev, { saveFails: [{ gen: 2, count: 1 }] }),
+    };
+  },
   // a Stop waiter on a Ready remote run, with a hand-set world (I8.bound, I3.quiescent)
   stopWaiterWorld: (armed: Armed[]): Tr => {
     const prev = mkSt({ waiters: [Wt('stop', 's')], run: mkRun({ ...REMOTE, dropped: 1 }) });
@@ -1688,6 +1823,32 @@ C('PHASE.after', B.readmitRefused(false), mod(B.readmitRefused(false), (t) => { 
 C('I3.kept', B.readmitRefused(true), mod(B.readmitRefused(true), (t) => { t.effects = [ans('a', failed(F('The server was turned off.')))]; }));
 C('END.report', B.readmitRefused(true), mod(B.readmitRefused(true), (t) => { t.effects.push({ t: 'ended', run: R1 }); }));
 C('PHASE.after-words', B.eraRefusal(), mod(B.eraRefusal(), (t) => { t.next.after.failure = OTHER; }));
+// 6b.13: a later catalog write that fails
+const NOTE = { noteOf: () => UNSAVED_NOTE };
+C('SAVE.retry', B.laterSaveFail(0, 'retry'), B.laterSaveFail(0, 'drop'));
+C('SAVE.retry', withM(B.laterSaveFail(1, 'drop'), NOTE), withM(B.laterSaveFail(1, 'retry'), NOTE));
+C('SAVE.unsaved', withM(B.laterSaveFail(1, 'drop'), NOTE), B.laterSaveFail(1, 'drop'));
+C('SAVE.unsaved', withM(B.laterSaveFail(1, 'drop'), NOTE), withM(B.laterSaveFail(1, 'drop'), { noteOf: () => "Familiar couldn't save this server's latest tool list." }));
+C('SAVE.goes-on', B.laterSaveFail(0, 'retry'), B.laterSaveFail(0, 'end'));
+C('SAVE.goes-on', withM(B.laterSaveFail(1, 'drop'), NOTE), withM(B.laterSaveFail(1, 'end'), NOTE));
+// the note never shows with nothing marked: just after a first failure (retry due), or on a plain first save
+C('SAVE.note-none', B.laterSaveFail(0, 'retry'), withM(B.laterSaveFail(0, 'retry'), NOTE));
+C('SAVE.note-none', B.savedReady(), withM(B.savedReady(), NOTE));
+// ...and is gone once a newer generation (published after the mark) has saved
+C('SAVE.note-cleared', B.newerSaved(), withM(B.newerSaved(), NOTE));
+// build9's trace 2: a failure after a newer publication retries nothing; retrying the older generation is I11.newest's
+C('I11.newest', B.supersededFail(false), B.supersededFail(true));
+// a newer generation's save asked for while the failed write was in flight comes in the failure's own transition
+C('SAVE.turn', B.askedTurn(true), B.askedTurn(false));
+// closing issues no new save (no retry): the write in flight just settles
+C('SAVE.closing', withM(B.closingSecondFail(), NOTE), withM(mod(B.closingSecondFail(), (t) => { t.effects = [{ t: 'save', run: R1, gen: 2 }]; t.next.saving = { run: R1, gen: 2 }; }), NOTE));
+// build9's trace 1: a second failure while closing still marks the generation unsaved
+C('SAVE.unsaved', withM(B.closingSecondFail(), NOTE), B.closingSecondFail());
+// failureOf never carries it
+C('P.failure-note', withM(B.laterSaveFail(1, 'drop'), NOTE), withM(B.laterSaveFail(1, 'drop'), { ...NOTE, failureOf: () => F(UNSAVED_NOTE) }));
+// a newer publication supersedes it: the retry saves the newer generation, and a second failure marks nothing
+ctl.push({ clause: 'SAVE.retry', good: true, ...B.laterSaveFail(0, 'retry', true) });
+ctl.push({ clause: 'SAVE.unsaved', good: true, ...B.laterSaveFail(1, 'retry', true) });
 // native, owner, orphans
 C('I2.stop-once', B.writeBound(), { ...B.writeBound(), hist: histFromState(B.writeBound().prev, { stopIssued: [R1] }) });
 C('I2.stop-target', B.writeBound(), mod(B.writeBound(), (t) => { t.effects[1].process = 'other:p'; }));

@@ -223,5 +223,7 @@ export declare function offering(s: LcState): boolean;
 export declare function fenced(s: LcState): boolean;
 /** The failure Settings shows beside Failed or Held, if any. */
 export declare function failureOf(s: LcState): Failure | undefined;
+/** The note Settings shows beside a running server, if any (6b.13): today only the unsaved latest tool list. Not a failure. */
+export declare function noteOf(s: LcState): string | undefined;
 /** The one transition function. */
 export declare function next(state: LcState, e: LcEvent): { readonly state: LcState; readonly effects: readonly LcEffect[] };

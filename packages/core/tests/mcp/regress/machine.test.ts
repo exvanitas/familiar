@@ -2,7 +2,7 @@
 // relaunch's old exchange ended, a late native start bounded, a failed later catalog write kept, an
 // orphan's own words, and a Stop during Test's cleanup. Each over the pure machine, with its mutation.
 import { describe, expect, it } from 'vitest';
-import { failureOf, initialState, next, phaseOf, SESSION_ENDED, START_TIMEOUT, STOP_UNCONFIRMED, STOPPED_EARLY, STOPPED_WORDS, type LcEffect, type LcEvent, type LcState } from '../../../src/mcp/wire/lifecycle.ts';
+import { failureOf, initialState, next, NOTE_UNSAVED, noteOf, phaseOf, SESSION_ENDED, START_TIMEOUT, STOP_UNCONFIRMED, STOPPED_EARLY, STOPPED_WORDS, type LcEffect, type LcEvent, type LcState } from '../../../src/mcp/wire/lifecycle.ts';
 import { ServerLink, LINK_LIMITS, type Target } from '../../../src/mcp/wire/link.ts';
 import type { ProcessEvent, ProcessPort } from '../../../src/mcp/process.ts';
 import { mutations } from '../../../src/mutations.ts';
@@ -153,11 +153,22 @@ describe('a later catalog write that fails', () => {
           return;
         }
         expect(g.last).toEqual([{ t: 'save', run: 's#1', gen: 2 }]);
-        expect(g.s.run?.unsaved).toBe(2);
-        // A second failure: no third try; the generation stays marked, and the client shows it.
+        // The retry is due: nothing shown yet (6b.13).
+        expect(g.s.run?.unsaved).toBeUndefined();
+        expect(noteOf(g.s)).toBeUndefined();
+        // A second failure: no third try; the generation is marked unsaved, and noteOf shows it, not failureOf.
         const again = run([(s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'failed' })], g.s);
         expect(again.last).toEqual([]);
         expect(again.s.run?.unsaved).toBe(2);
+        expect(noteOf(again.s)).toBe(NOTE_UNSAVED);
+        expect(failureOf(again.s)).toBeUndefined();
+        // A newer catalog published: nothing shown, even before it saves; once the run leaves, nothing.
+        const newer = run([cur((r) => ({ t: 'notice', run: r.id })), cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } }))], again.s);
+        expect(newer.s.run?.gen).toBe(3);
+        expect(noteOf(newer.s)).toBeUndefined();
+        const left = run([{ t: 'stop', token: 'k9' }, { t: 'exit', process: 'p1', failure: F }], again.s);
+        expect(left.s.run).toBeUndefined();
+        expect(noteOf(left.s)).toBeUndefined();
       }));
 });
 
@@ -200,6 +211,26 @@ describe('an exchange taken behind the fence is ended when the run finishes (6b.
     expect(ends(plain.all)).toHaveLength(1);
     const freed = run([start(), ...toReady, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'saved' }), { t: 'stop', token: 'k2' }, { t: 'slot', idle: false }, idle, { t: 'exit', process: 'p1', failure: F }]);
     expect(ends(freed.all)).toHaveLength(1);
+  });
+});
+
+describe("a later write's second failure while the run is closing (6b.13, build9's trace 1)", () => {
+  it('marks the generation unsaved and shows it while the run is current; no new save is issued', () => {
+    const g = run([start(), ...toReady, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'saved' }), cur((r) => ({ t: 'notice', run: r.id })), cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } })), idle, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'failed' }), { t: 'stop', token: 'k2' }, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'failed' })]);
+    expect(g.s.run?.step).toBe('closing');
+    expect(g.s.run?.unsaved).toBe(2);
+    expect(noteOf(g.s)).toBe(NOTE_UNSAVED);
+    expect(g.last.filter((x) => x.t === 'save')).toEqual([]);
+  });
+});
+
+describe('the first catalog write fails while a newer one waits behind it (6b.13, closing issues no new save)', () => {
+  it('the run ends catalog-failed, and the waiting write is not issued', () => {
+    const g = run([start(), cur((r) => ({ t: 'started', run: r.id, ok: true, process: 'p1' })), cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'ok' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } })), idle, cur((r) => ({ t: 'notice', run: r.id })), cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } })), idle, { t: 'saved', gen: 1, outcome: 'failed' }]);
+    expect(g.s.run?.step).toBe('closing');
+    expect(g.s.run?.cause).toBe('catalog-failed');
+    expect(g.last.filter((x) => x.t === 'save')).toEqual([]);
+    expect(g.s.saving).toBeUndefined();
   });
 });
 
