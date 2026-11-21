@@ -92,6 +92,9 @@ export interface Run {
   readonly firstGen: number;
   /** The unanswered list's words, kept through the relaunch grace. */
   readonly graceFailure?: Failure;
+  /** The newest generation of this run whose write was issued (6b.13: each is written once, plus its one
+      retry; its settle writes nothing once a write of it went out). */
+  readonly written?: number;
   /** A later catalog write failed once: its generation, tried once more (6b.13). */
   readonly retried?: number;
   /** That generation failed again: marked unsaved, and shown (noteOf), until a write of it or a newer one
@@ -357,6 +360,7 @@ class Tx {
       return;
     }
     this.s.saving = { run: r.id, gen: r.gen };
+    this.setRun({ written: r.gen });
     this.emit({ t: 'save', run: r.id, gen: r.gen });
   }
 }
@@ -618,7 +622,8 @@ function settle(tx: Tx): void {
     return;
   }
   tx.disarm();
-  tx.saveCatalog();
+  // A generation the queued re-save already wrote (landed, failed or in flight) gets nothing more here (6b.13).
+  if (r.written === undefined || r.written < r.gen) tx.saveCatalog();
   if (beside && tx.s.slot === 'idle') refresh(tx);
 }
 

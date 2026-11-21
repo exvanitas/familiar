@@ -240,6 +240,28 @@ describe('the first catalog write fails while a newer one waits behind it (6b.13
   });
 });
 
+describe('each generation is written once, plus its one retry (6b.13)', () => {
+  it("a generation the queued re-save wrote early isn't written again at its own settle", () => {
+    const page: Ev = cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } }));
+    const g = run([
+      start('start', 'remote'),
+      cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'ok' } })), idle, page, idle,
+      { t: 'slot', idle: false }, cur((r) => ({ t: 'call-ended', run: r.id, end: 'session-ended' })), idle,
+      cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'ok' } })), idle, page, idle,
+      cur((r) => ({ t: 'notice', run: r.id })), page,
+      { t: 'saved', gen: 1, outcome: 'saved' },
+      { t: 'saved', gen: 3, outcome: 'failed' },
+      { t: 'saved', gen: 3, outcome: 'saved' }
+    ]);
+    expect(g.s.run?.gen).toBe(3);
+    expect(g.s.run?.step).toBe('settling');
+    const settle = run([idle], g.s);
+    expect(settle.s.run?.step).toBe('ready');
+    expect(settle.last.filter((x) => x.t === 'save')).toEqual([]);
+    expect(settle.s.saving).toBeUndefined();
+  });
+});
+
 describe("the relaunch ends the exited process's exchange", () => {
   const local: Target = { where: 'local', setup: { id: 's1', label: 'S', program: 'node', args: [], cwd: '.', env: [], secrets: [] } };
   for (const mutation of [undefined, 'lc-relaunch-keeps-exchange'] as const)

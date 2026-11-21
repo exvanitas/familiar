@@ -150,7 +150,7 @@ export function stepSpec(w: Walked, s: LcState, h: History, e: Spec.LcEvent): { 
  * check below compares the successors and verdicts of every pair this merges in an exact walk.
  */
 export function renumberedSpec(s: LcState, h: History, c: Ctx): string {
-  const GEN = new Set(['gen', 'firstGen', 'unsaved', 'saving', 'lastSave', 'lastPublish', 'last']);
+  const GEN = new Set(['gen', 'firstGen', 'retried', 'unsaved', 'written', 'saving', 'lastSave', 'lastPublish', 'last']);
   const DL = new Set(['saveBy', 'bound', 'deadline-id', 'ids']);
   const gens = new Set<number>([0]);
   const dls = new Set<number>();

@@ -286,8 +286,8 @@ function renumbered(s: LcState, c: Ctx): string {
   return `[${str(s)},${str(c)}]`;
 }
 /** The fields that hold a catalog generation, ranked together: the machine compares the marks (a later
-    write retried, or marked unsaved) with the generations. */
-const GEN_KEYS = new Set(['gen', 'firstGen', 'retried', 'unsaved']);
+    write retried or marked unsaved, the newest written) with the generations. */
+const GEN_KEYS = new Set(['gen', 'firstGen', 'retried', 'unsaved', 'written']);
 /** The counters that only mint fresh names, dropped from the renumbered form (top level only). */
 const DROPPED = new Set(['nextRun', 'nextDeadline', 'nextGen', 'tokens']);
 
@@ -527,7 +527,7 @@ describe('W for the run lifecycle', () => {
     expect(mark).toBe(x.run!.gen);
     const shift = (st: LcState, marks: boolean): LcState => {
       const r = st.run!;
-      return { ...st, nextGen: st.nextGen + 5, saving: st.saving && { ...st.saving, gen: st.saving.gen + 5 }, run: { ...r, gen: r.gen + 5, firstGen: r.firstGen + 5, ...(marks && r.retried !== undefined ? { retried: r.retried + 5 } : {}), ...(marks && r.unsaved !== undefined ? { unsaved: r.unsaved + 5 } : {}) } };
+      return { ...st, nextGen: st.nextGen + 5, saving: st.saving && { ...st.saving, gen: st.saving.gen + 5 }, run: { ...r, gen: r.gen + 5, firstGen: r.firstGen + 5, ...(marks && r.retried !== undefined ? { retried: r.retried + 5 } : {}), ...(marks && r.unsaved !== undefined ? { unsaved: r.unsaved + 5 } : {}), ...(r.written !== undefined ? { written: r.written + 5 } : {}) } };
     };
     const alike = shift(x, true);
     const unlike = shift(x, false);
