@@ -144,9 +144,24 @@ function exitOf(prev: LcState, e: LcEvent): 'run' | 'orphan' | 'unknown' | undef
 /** A deadline the world has armed for the current run (anything else is stale). */
 const liveDeadline = (prev: LcState, e: LcEvent, h: History) =>
   e.t === 'deadline' && h.armed.some((a) => a.id === e.id && a.run !== undefined && a.run === prev.run?.id);
-/** The relaunch's continuation: readmit ok in the relaunch step makes the new run. */
+/** 6b.11 (narrowed): turned off gates only an automatic start (4.1). A relaunch's readmit goes on when it is ok,
+    or, for a person's own Start or Test (mode start or test), when turned off is its only refusal: `off` with the
+    owner free and the setup unchanged. */
+function readmitGoesOn(r: Run, e: Extract<LcEvent, { t: 'readmit' }>): boolean {
+  return e.ok || (e.off === true && r.mode !== 'auto');
+}
+/** A readmit for the run waiting in relaunch that lets the relaunch go on (row 174, 6b.11). */
+const readmitPasses = (prev: LcState, e: LcEvent) =>
+  e.t === 'readmit' && !!prev.run && prev.run.step === 'relaunch' && e.run === prev.run.id && readmitGoesOn(prev.run, e);
+/** The relaunch's continuation: a passing readmit in the relaunch step makes the new run. */
 const isCont = (prev: LcState, e: LcEvent, next: LcState) =>
-  e.t === 'readmit' && e.ok && prev.run?.step === 'relaunch' && e.run === prev.run.id && !!next.run && next.run.id !== prev.run.id;
+  readmitPasses(prev, e) && !!next.run && next.run.id !== prev.run!.id;
+/** An exchange of this run still live in the world (6b.5, 6b.12): one holding the slot, or an admin exchange
+    awaiting its outcome that no end-live has ended. */
+const worldLive = (h: History, run: string) => h.live === run || h.exchange.some((x) => x.run === run && !x.ended);
+/** The person's own choice (no report-ended; Stopped unless something may still run): a person's Stop, Test's
+    own cleanup, and turned off, which only an automatic start's relaunch can meet (6b.11). */
+const ownChoice = (cause: Cause, mode: Mode) => cause === 'person-stop' || cause === 'test-done' || (cause === 'turned-off' && mode === 'auto');
 /** A live run ends now: it leaves the state or enters closing (not the relaunch's continuation). */
 function endsNow(prev: LcState, e: LcEvent, next: LcState): boolean {
   const r = prev.run, n = next.run;
@@ -267,9 +282,10 @@ export function endingOf(prev: LcState, e: LcEvent, h: History): Ending {
       return r.mode === 'test' ? END(['test-done'], '') : STAY;
     }
     case 'readmit':
-      if (e.run !== r.id || r.step !== 'relaunch' || e.ok) return STAY;
-      // 6b.11: turned off is the person's own choice; the other refusals fail in the readmit's words.
-      return e.off ? END(['turned-off'], e.words ?? '*') : END(['readmit-refused'], e.words ?? '*');
+      if (e.run !== r.id || r.step !== 'relaunch' || readmitGoesOn(r, e)) return STAY;
+      // 6b.11: an automatic start's turned off is the person's own choice; the other refusals fail in the
+      // readmit's words. A person's own Start or Test is not gated by turned off (readmitGoesOn).
+      return e.off && r.mode === 'auto' ? END(['turned-off'], e.words ?? '*') : END(['readmit-refused'], e.words ?? '*');
     default:
       return STAY;
   }
@@ -533,6 +549,10 @@ export function checkTransition(
     if (hist.runs.includes(n.id)) v('ADMIT.fresh-id', `run id ${n.id} was used before`);
     if (n.era !== 'modern') v('ERA.new', 'the relaunched run must be modern');
   }
+  // Row 174 and 6b.11 (narrowed): a readmit that passes makes the relaunched run; for a person's own Start or
+  // Test that holds even when the server is turned off. Ending or keeping the run instead is reported here.
+  const goOnMissed = readmitPasses(prev, e) && !cont;
+  if (goOnMissed) v('I7.go-on', `the readmit for ${r!.id} (mode ${r!.mode}${e.t === 'readmit' && e.off ? ', turned off' : ''}) passes, yet no relaunched run was made`);
   if (n && n.step === 'grace' && !(r && r.id === n.id && r.step === 'grace')) {
     const ok = !!r && r.id === n.id && r.step === 'walking' && e.t === 'admin-done' && e.run === r.id && e.outcome.k === 'unanswered' && graceEligible(r, hist);
     if (!ok) v('I7.grace', 'grace entered without an unanswered list on a modern, local, first, unkilled, never-answered start');
@@ -555,7 +575,7 @@ export function checkTransition(
   if (r && !admitted && !old && ex !== 'unknown' && !(e.t === 'deadline' && !liveDeadline(prev, e, hist))) {
     if (r.step !== 'closing') {
       const eo = endingOf(prev, e, hist);
-      if (ended && eo.k !== 'end') v(e.t === 'call-ended' ? 'G18.call' : 'END.unlisted', `${e.t} ended run ${r.id} (from ${r.step}), which the table doesn't list`);
+      if (ended && eo.k !== 'end' && !goOnMissed) v(e.t === 'call-ended' ? 'G18.call' : 'END.unlisted', `${e.t} ended run ${r.id} (from ${r.step}), which the table doesn't list`);
       // Entering grace or a re-handshake instead of ending is reported by I7.grace and REC.once.
       if (!ended && eo.k === 'end' && n?.step !== 'grace' && n?.step !== 'relaunch' && !recoveryEntry) {
         v(recoveryEraEnd(r, e) ? 'ERA.recovery' : 'END.must', `${e.t} must end run ${r.id} from ${r.step} (${eo.causes.join('|')})`);
@@ -569,12 +589,14 @@ export function checkTransition(
   }
   if (r && n && r.id === n.id && r.cause !== undefined && n.cause !== r.cause) v('END.cause-kept', `the kept cause changed from ${r.cause} to ${n.cause}`);
 
-  // end-live, the fence (6b.5): when a run's process exits, or the run ends, begins closing or is replaced,
-  // an exchange of that run still live in the world is ended in that same transition.
+  // end-live, the fence (6b.5, 6b.12): when a run's process exits, or the run ends, begins closing or is
+  // replaced, an exchange of that run still live in the world is ended in that same transition. A closing run
+  // that leaves is a run ending (left), so an exchange taken after closing began is ended there too.
   const fenceMoment = ended || left || cont || ex === 'run';
-  if (r && !admitted && fenceMoment && hist.live === r.id && !effects.some((f) => f.t === 'end-live' && f.run === r.id)) v('END.live', `run ${r.id}'s live exchange wasn't ended when ${e.t} ${ex === 'run' ? 'ended its process' : 'ended or closed the run'}`);
+  if (r && !admitted && fenceMoment && worldLive(hist, r.id) && !effects.some((f) => f.t === 'end-live' && f.run === r.id)) v('END.live', `run ${r.id}'s live exchange wasn't ended when ${e.t} ${ex === 'run' ? 'ended its process' : 'ended or closed the run'}`);
   for (const f of effects) {
-    if (f.t === 'end-live' && (!r || f.run !== r.id || !fenceMoment || hist.fenced.includes(f.run) || count('end-live') > 1)) v('END.live-once', `end-live for ${f.run} outside its run's ending, or twice`);
+    // 6b.12: a run already fenced gets end-live again only for an exchange live since (taken after closing began).
+    if (f.t === 'end-live' && (!r || f.run !== r.id || !fenceMoment || (hist.fenced.includes(f.run) && !worldLive(hist, f.run)) || count('end-live') > 1)) v('END.live-once', `end-live for ${f.run} outside its run's ending, or twice`);
   }
   // 6b.2 and 6b.3: Start waiters, and Test waiters but for Test's own cleanup, are answered at once when
   // their run enters closing or ends.
@@ -607,8 +629,8 @@ export function checkTransition(
       const k = keptOf(h2, r.id);
       if (k) {
         const has = h2.reported.includes(r.id);
-        if (!['person-stop', 'turned-off', 'test-done', 'held'].includes(k.cause) && !has) v('END.report', `run ${r.id} ended (${k.cause}) without report-ended`);
-        if ((k.cause === 'person-stop' || k.cause === 'turned-off' || k.cause === 'test-done') && has) v('END.report', `run ${r.id} ended by the person (${k.cause}), yet report-ended`);
+        if (!(ownChoice(k.cause, r.mode) || k.cause === 'held') && !has) v('END.report', `run ${r.id} ended (${k.cause}) without report-ended`);
+        if (ownChoice(k.cause, r.mode) && has) v('END.report', `run ${r.id} ended by the person (${k.cause}), yet report-ended`);
       }
     }
   }
@@ -617,7 +639,7 @@ export function checkTransition(
     const k = keptOf(h2, r.id);
     if (k) {
       const msrNow = msr(h2);
-      const failed = msrNow || !(k.cause === 'person-stop' || k.cause === 'turned-off' || k.cause === 'test-done' || r.mode === 'test');
+      const failed = msrNow || !(ownChoice(k.cause, r.mode) || r.mode === 'test');
       const ph = m.phaseOf(next);
       if (ph !== (failed ? 'failed' : 'stopped')) v('PHASE.after', `after ${k.cause}${msrNow ? ' (may still run)' : ''} the phase is ${ph}`);
       else if (failed) {
@@ -758,13 +780,14 @@ export function checkTransition(
       }
       if (e.t === 'exhausted') continue;
       const k = keptOf(h2, wrun);
-      if (!k) { v('I3.kept', `${tok} answered ${rep.kind} while its run hasn't ended`); continue; }
+      if (!k) { if (!goOnMissed) v('I3.kept', `${tok} answered ${rep.kind} while its run hasn't ended`); continue; }
       if (k.cause === 'held') continue;
       let ok: boolean;
       const msrW = words !== undefined && msrWords(words);
       const stopW = words !== undefined && /stopped/i.test(words);
       if (k.cause === 'person-stop') ok = kind === 'start' ? rep.kind === 'stopped' || (rep.kind === 'failed' && (msrW || stopW)) : rep.kind === 'failed' && (msrW || stopW);
-      else if (k.cause === 'turned-off') ok = kind === 'start' ? rep.kind === 'stopped' : rep.kind === 'failed' && (msrW || stopW);
+      // 6b.11: only an automatic start meets turned off, so only a Start waiter, answered stopped.
+      else if (k.cause === 'turned-off') ok = kind === 'start' && rep.kind === 'stopped';
       else if (k.cause === 'test-done') ok = rep.kind === 'failed';
       else if (k.cause === 'readmit-refused') ok = (rep.kind === 'failed' || rep.kind === 'refused') && (k.words === '*' || words === k.words);
       else ok = rep.kind === 'failed' && (k.words === '*' || words === k.words || (msrW && words!.startsWith(k.words)));
@@ -1160,17 +1183,17 @@ export const CLAUSES: Record<string, string> = {
   'END.must': 'M4.6: "**End(cause, words)** — the one way a run ends" and the rows that end a run (e.g. "| any running step | exit(p) | this run\'s, not asked | ended |", "| any running step | write-bound | — | ended |")',
   'END.cause': 'M1: "cause?: Cause // why it ended, once it has (rule 5)". M4.6: "| local, process alive | closing (stop pending), cause kept |"',
   'END.cause-kept': 'M4.6: "A waiter\'s words come from the run\'s kept cause, never from how the run happened to end."',
-  'END.live': 'M6b.5: "When a run\'s process exits, or a run ends or begins closing, any exchange of that run still live is ended (`end-live`) in that same transition. A relaunch is no exception."',
+  'END.live': 'M6b.5: "When a run\'s process exits, or a run ends or begins closing, any exchange of that run still live is ended (`end-live`) in that same transition. A relaunch is no exception." M6b.12: "When a run ends, any exchange of that run still live in the world is ended in that same transition (6b.5), even one taken after closing began."',
   'SLOT.world-idle': 'M6b.5: "Nothing new is admitted until the world\'s slot is idle."',
   'I9.start-at-once': 'M6b.2: "A Start waiter (mode start or auto) is answered at once when its run enters closing or ends. … It never waits on cleanup."',
   'I9.test-at-once': 'M6b.3: "A Test waiter is answered at once, like a Start, when its run enters closing for any cause but its own cleanup (test-done)."',
   'TEST.stop-cleanup': 'M6b.3: "A person\'s Stop during Test\'s cleanup answers Test at once, failed. There\'s still one native stop."',
   'SAVED.late': 'M6b.1: "If the deadline fires during the first catalog write, the run ends with cause deadline, in START_TIMEOUT\'s words, and a later `saved` for that run changes nothing more."',
   'ORPH.words': 'M6b.8: "The orphan keeps its stop outcome (refused or unconfirmed). Later Stops, Starts and Tests use its own words."',
-  'END.live-once': 'M3: "`end-live{run}` (Stop\'s fence: the live exchange of this run gets `terminal run-ended` in the same step)"',
-  'END.report': 'M4.6 End: "report-ended (if not person-asked)" M6b.11: turned off "ends the run as the person\'s own choice"',
+  'END.live-once': 'M3: "`end-live{run}` (Stop\'s fence: the live exchange of this run gets `terminal run-ended` in the same step)". M6b.12: "even one taken after closing began" (a second end-live only for an exchange live since the first)',
+  'END.report': 'M4.6 End: "report-ended (if not person-asked)" M6b.11: "An automatic start\'s relaunch (mode auto) whose readmit finds the server turned off ends the run as the person\'s own choice."',
   'END.release': 'M3: "`release-writes{run}` (an exit seen: the exchange\'s writes for that process end)". Appendix: "writes end only at the exit"',
-  'PHASE.after': 'M4.7: "the person\'s phase after Test is computed from the run\'s cause (`test-done` and a Test\'s own failure leave Stopped; a person\'s start that fails leaves Failed)". M4.6: "stop-answered refused | … phase failed", "deadline(stop) | … phase failed" M6b.11: "A relaunch\'s readmit that finds the server turned off … The phase is Stopped, as after a person\'s Stop. The readmit\'s other refusals (the owner busy, the setup changed) end Failed, in the readmit\'s words."',
+  'PHASE.after': 'M4.7: "the person\'s phase after Test is computed from the run\'s cause (`test-done` and a Test\'s own failure leave Stopped; a person\'s start that fails leaves Failed)". M4.6: "stop-answered refused | … phase failed", "deadline(stop) | … phase failed" M6b.11: "An automatic start\'s relaunch (mode auto) whose readmit finds the server turned off … The phase is Stopped, as after a person\'s Stop. The readmit\'s other refusals (the owner busy, the setup changed) end Failed, in the readmit\'s words."',
   'PHASE.after-words': 'M1: "failure?: Failure // what the person sees beside Failed (and Held)". D5.4: "the server goes to Failed with the reason and its last output"',
   'G18.call': 'I10: "G18 (a call\'s end ends that call only: call-ended rows never end the run except session and era)"',
   'G15.fence': 'I10: "G14 and G15 (no admit after the fence: no `admin` effect for a closing or ended run)"',
@@ -1181,6 +1204,7 @@ export const CLAUSES: Record<string, string> = {
   'I7.check': 'M4.3: "| grace | exit(p) | not killed | ended → relaunch check | readmit facts requested |". M6b.9: "In the same transition: … the relaunch check is made"',
   'I7.same': 'M6b.9: "The world\'s two signals can come in either order: the list ending unanswered first (through grace), or the exit first. Both lead to the same relaunch."',
   'ERA.recovery': 'M6b.10: "A recovery\'s re-handshake answered in the other era ends the run with session-ended, as an opening refusal during recovery does. The era is decided once, at the run\'s opening (G29)."',
+  'I7.go-on': 'M4.3: "| ended (relaunch pending) | readmit | ownerFree, setup unchanged, (auto ⇒ enabled) | new run #n+1, era modern, relaunched, launching |". M6b.11: "Turned off only gates automatic starts (4.1). The relaunch of a person\'s own Start or Test isn\'t gated by it: that readmit goes on, so long as the owner is free and the setup is unchanged."',
   'I7.readmit': 'M4.3: "| ended (relaunch pending) | readmit | ownerFree, setup unchanged, (auto ⇒ enabled) | new run #n+1, era modern, relaunched, launching | owner-hold; native-start; arm(start) |"',
   // held
   'EXH.answer': 'M4.6: "| any | exhausted | — | held; run ended | answer every waiter the restart words; failure = held words. A step waiting for the slot … is answered by this same transition |"',
@@ -1305,6 +1329,10 @@ const readyFirst = (p: Partial<Run> = {}) => mkRun({ walk: { attempt: 0, page: 1
 const closingRun = (p: Partial<Run> = {}) => mkRun({ step: 'closing', cause: 'person-stop', killed: true, native: { ...NATIVE_OK, stop: 'pending' }, deadline: { which: 'stop', id: 10 }, ...p });
 const A = Wt('start', 'a');
 
+/** The same state with its run in another mode (a Test's start waiters become Test waiters). */
+function inMode(s: LcState, mode: Mode): LcState {
+  return { ...s, run: s.run && { ...s.run, mode }, waiters: s.waiters.map((w) => (mode === 'test' && w.kind === 'start' ? { ...w, kind: 'test' as const } : w)) };
+}
 /** Deep copy, then let `f` change it (the controls' mutation). */
 function mod(t: Tr, f: (x: any) => void): Tr {
   const c: Tr = { ...JSON.parse(JSON.stringify({ ...t, m: undefined })), m: t.m };
@@ -1507,20 +1535,32 @@ const B = {
     next: mkSt({ nextDeadline: 11, slot: 'busy', after: { failed: true, failure: SESSION_ENDED } }),
     effects: [{ t: 'end-live', run: R1 }, { t: 'ended', run: R1 }],
   }),
-  // 6b.11: the readmit finds the server turned off, or another refusal
-  readmitRefused: (off: boolean): Tr => {
+  // 6b.11: the readmit finds the server turned off (an automatic start), or another refusal
+  readmitRefused: (off: boolean, mode: Mode = off ? 'auto' : 'start'): Tr => {
     const words = off ? 'The server was turned off.' : OWNER_WORDS;
     return {
-      prev: B.graceExit().next, e: { t: 'readmit', run: R1, ok: false, words, ...(off ? { off: true } : {}) },
+      prev: inMode(B.graceExit().next, mode), e: { t: 'readmit', run: R1, ok: false, words, ...(off ? { off: true } : {}) },
       next: mkSt({ nextDeadline: 12, slot: 'busy', after: off ? { failed: false } : { failed: true, failure: F(words, 'busy') } }),
       effects: off ? [ans('a', { kind: 'stopped' })] : [ans('a', failed(F(words, 'busy'))), { t: 'ended', run: R1 }],
     };
   },
-  readmitOk: (): Tr => ({
-    prev: B.graceExit().next, e: { t: 'readmit', run: R1, ok: true },
-    next: mkSt({ nextRun: 3, nextDeadline: 12, slot: 'busy', owner: 'start', waiters: [Wt('start', 'a', R2)], run: launching({ id: R2, era: 'modern', relaunched: true }) }),
+  readmitOk: (mode: Mode = 'start'): Tr => ({
+    prev: inMode(B.graceExit().next, mode), e: { t: 'readmit', run: R1, ok: true },
+    next: inMode(mkSt({ nextRun: 3, nextDeadline: 12, slot: 'busy', owner: 'start', waiters: [Wt('start', 'a', R2)], run: launching({ id: R2, era: 'modern', relaunched: true }) }), mode),
     effects: [{ t: 'owner-hold' }, { t: 'native-start', run: R2, era: 'modern' }],
   }),
+  // 6b.11 (narrowed): a person's own Start or Test relaunch whose readmit finds the server turned off goes on
+  readmitOffGoesOn: (mode: Mode): Tr => mod(B.readmitOk(mode), (t) => { t.e = { t: 'readmit', run: R1, ok: false, off: true, words: 'The server was turned off.' }; }),
+  // 6b.12: a closing run (fenced at its Stop) whose slot a ping took after closing began, then its exit
+  closingLiveExit: (endLive: boolean): Tr => {
+    const t = mod(B.exitClosing(), (x) => { x.prev.slot = 'busy'; x.next.slot = 'busy'; if (endLive) x.effects.push({ t: 'end-live', run: R1 }); });
+    return { ...t, hist: histFromState(t.prev, { live: R1, slot: 'busy' }) };
+  },
+  // 6b.12: a run ending while an admin exchange of it still awaits its outcome (hand-set world: no slot holder)
+  writeBoundExchange: (endLive: boolean): Tr => {
+    const t = mod(B.writeBound(), (x) => { if (!endLive) x.effects = x.effects.filter((f: LcEffect) => f.t !== 'end-live'); });
+    return { ...t, hist: histFromState(t.prev, { exchange: [{ run: R1, kind: 'list', page: 1 }] }) };
+  },
   relaunchStop: (): Tr => ({
     prev: B.graceExit().next, e: { t: 'stop', token: 's' },
     next: mkSt({ nextDeadline: 12, slot: 'busy', after: { failed: false } }),
@@ -1594,6 +1634,12 @@ C('ADMIT.only', { prev: mkSt({ slot: 'busy' }), e: { t: 'slot', idle: true }, ne
 });
 // relaunch
 C('I7.readmit', B.readmitOk(), mod(B.readmitOk(), (t) => { t.next.run.relaunched = false; }));
+// 6b.11 (narrowed): a person's own Start or Test relaunch isn't gated by turned off. Bad: ended for turned-off
+// as an automatic start's would be; ended failed; kept waiting in relaunch on a readmit that passes.
+C('I7.go-on', B.readmitOffGoesOn('start'), B.readmitRefused(true, 'start'));
+C('I7.go-on', B.readmitOffGoesOn('test'), mod(B.readmitRefused(true, 'test'), (t) => { t.effects = [ans('a', failed(F('The server was stopped before it finished starting.')))]; }));
+C('I7.go-on', B.readmitOffGoesOn('start'), mod(B.readmitRefused(true, 'start'), (t) => { t.next.after = { failed: true, failure: F('The server was turned off.') }; t.effects = [ans('a', failed(F('The server was turned off.'))), { t: 'ended', run: R1 }]; }));
+C('I7.go-on', B.readmitOk(), mod(B.readmitOk(), (t) => { t.next = JSON.parse(JSON.stringify(t.prev)); t.effects = []; }));
 C('I7.grace', B.graceEnter(), mod(B.graceEnter(), (t) => { t.prev.run.walk.answered = true; }));
 C('I7.relaunch', B.graceExit(), mod(B.graceEnter(), (t) => { t.next.run.step = 'relaunch'; t.next.run.deadline = { which: 'start', id: 10 }; t.next.nextDeadline = 11; t.effects = []; }));
 C('I7.check', B.graceExit(), mod(B.graceExit(), (t) => { t.effects = t.effects.filter((f: LcEffect) => f.t !== 'readmit-check'); }));
@@ -1622,6 +1668,9 @@ C('END.must', B.writeBound(), mod(B.writeBound(), (t) => { t.next = t.prev; t.ef
 C('END.cause', B.writeBound(), mod(B.writeBound(), (t) => { t.next.run.cause = 'person-stop'; }));
 C('END.cause-kept', B.closingStartedOk(), mod(B.closingStartedOk(), (t) => { t.next.run.cause = 'deadline'; }));
 C('END.live', B.graceExit(), mod(B.graceExit(), (t) => { t.effects = t.effects.filter((f: LcEffect) => f.t !== 'end-live'); }));
+// 6b.12: the ending transition ends an exchange live in the world, even one taken after closing began
+C('END.live', B.closingLiveExit(true), B.closingLiveExit(false));
+C('END.live', B.writeBoundExchange(true), B.writeBoundExchange(false));
 C('I9.start-at-once', B.launchingStop(), mod(B.launchingStop(), (t) => { t.effects = [t.effects[0]]; t.next.waiters = [A, Wt('stop', 's')]; }));
 C('I9.test-at-once', B.testStop(), mod(B.testStop(), (t) => { t.effects.pop(); t.next.waiters = [Wt('test', 't'), Wt('stop', 's')]; }));
 C('TEST.stop-cleanup', B.testCleanupStop(), mod(B.testCleanupStop(), (t) => { t.effects = []; t.next.waiters = [Wt('test', 't'), Wt('stop', 's')]; }));
@@ -1629,6 +1678,8 @@ C('SAVED.late', B.lateSaved(), mod(B.lateSaved(), (t) => { t.next.after = { fail
 C('ORPH.words', B.fenceStart(), mod(B.fenceStart(), (t) => { t.effects = [ans('b', failed(STOP_UNCONFIRMED))]; }));
 C('SLOT.world-idle', B.startedOk(), { ...B.startedOk(), hist: histFromState(B.startedOk().prev, { slot: 'busy' }) });
 C('END.live-once', B.callDone(), mod(B.callDone(), (t) => { t.effects = [{ t: 'end-live', run: R1 }]; }));
+// 6b.12 allows a second end-live only for an exchange live since the first
+C('END.live-once', B.exitClosing(), mod(B.exitClosing(), (t) => { t.effects.push({ t: 'end-live', run: R1 }); }));
 C('END.report', B.eraRefusal(), mod(B.eraRefusal(), (t) => { t.effects = [{ t: 'end-live', run: R1 }]; }));
 C('END.release', B.exitClosing(), mod(B.exitClosing(), (t) => { t.effects = t.effects.filter((f: LcEffect) => f.t !== 'release-writes'); }));
 C('PHASE.after', B.exitClosing(), mod(B.exitClosing(), (t) => { t.next.after = { failed: true, failure: WIRE_F }; }));

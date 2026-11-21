@@ -182,6 +182,27 @@ describe("a modern run's recovery answered in the legacy era (6b.10)", () => {
   });
 });
 
+describe('an exchange taken behind the fence is ended when the run finishes (6b.12)', () => {
+  const ends = (fx: readonly LcEffect[]) => fx.filter((x) => x.t === 'end-live');
+  for (const mutation of [undefined, 'lc-taken-not-ended'] as const)
+    it(`a ping that took the slot after Stop began is ended by the refused stop that ends the run${mutation ? ` (control: ${mutation} leaves it live)` : ''}`, () =>
+      withMutation(mutation, () => {
+        const g = run([start(), { t: 'stop', token: 'k2' }, cur((r) => ({ t: 'started', run: r.id, ok: true, process: 'p1' })), { t: 'slot', idle: false }, cur((r) => ({ t: 'stop-answered', run: r.id, ok: false }))]);
+        expect(g.s.run).toBeUndefined();
+        expect(ends(g.last)).toEqual(mutation ? [] : [{ t: 'end-live', run: 's#1' }]);
+      }));
+  it('and by the exit that ends it', () => {
+    const g = run([start(), ...toReady, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'saved' }), { t: 'stop', token: 'k2' }, { t: 'slot', idle: false }, { t: 'exit', process: 'p1', failure: F }]);
+    expect(ends(g.last)).toEqual([{ t: 'end-live', run: 's#1' }]);
+  });
+  it('no second end-live when nothing took the slot after the fence, or it was freed', () => {
+    const plain = run([start(), ...toReady, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'saved' }), { t: 'stop', token: 'k2' }, { t: 'exit', process: 'p1', failure: F }]);
+    expect(ends(plain.all)).toHaveLength(1);
+    const freed = run([start(), ...toReady, (s) => ({ t: 'saved', gen: s.saving!.gen, outcome: 'saved' }), { t: 'stop', token: 'k2' }, { t: 'slot', idle: false }, idle, { t: 'exit', process: 'p1', failure: F }]);
+    expect(ends(freed.all)).toHaveLength(1);
+  });
+});
+
 describe("the relaunch ends the exited process's exchange", () => {
   const local: Target = { where: 'local', setup: { id: 's1', label: 'S', program: 'node', args: [], cwd: '.', env: [], secrets: [] } };
   for (const mutation of [undefined, 'lc-relaunch-keeps-exchange'] as const)

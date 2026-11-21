@@ -7,10 +7,9 @@
 //
 // The one adapter: the readmit event. At 78d2a46 the driver decided the relaunch and fed `{ ok, words, off }`;
 // now the machine decides it from the facts read when it is due (`{ facts: { ownerFree, enabled, launch } }`).
-// Each spec readmit maps to the facts that give it: ok (all well), the owner busy, or turned off. "Turned
-// off" can only be the answer for an automatic start's run (4.3, row 174: "(auto ⇒ enabled)"); for any other
-// mode those facts relaunch, so the spec's `off` event isn't offered there. The checks see the spec's event.
-// And a slot taken while the run is closing isn't offered: behind Stop's fence nothing is admitted.
+// Each spec readmit maps to the facts that give it: ok (all well), the owner busy, or turned off (enabled
+// false), for whatever run it names. The checks see the spec's event. The adapter filters nothing: every
+// event of the spec's alphabet is given to the machine as it is.
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
@@ -86,14 +85,11 @@ export const THIS: Walked = {
   // so the spec's is given its declared meaning here.
   m: { callable, phaseOf, fenced: (s: LcState) => s.orphans.length > 0, offering, failureOf } as unknown as Machine,
   adapt: (e, s) => {
-    // A run behind its fence admits nothing: no idle ping or call takes the slot once it is closing (the
-    // driver admits an idle ping only while not fenced, and callable() is false there).
-    if (e.t === 'slot' && !e.idle && s.run?.step === 'closing') return undefined;
     if (e.t !== 'readmit') return e as unknown as LcEvent;
     const r = s.run;
     const launch = r?.launch ?? '';
     if (e.ok) return { t: 'readmit', run: e.run, facts: { ownerFree: true, enabled: true, launch } };
-    if (e.off) return r?.mode === 'auto' && r.id === e.run ? { t: 'readmit', run: e.run, facts: { ownerFree: true, enabled: false, launch } } : undefined;
+    if (e.off) return { t: 'readmit', run: e.run, facts: { ownerFree: true, enabled: false, launch } };
     return { t: 'readmit', run: e.run, facts: { ownerFree: false, ...(e.words !== undefined ? { ownerWords: e.words } : {}), enabled: true, launch } };
   }
 };
@@ -318,7 +314,8 @@ describe('W with the spec checks', () => {
     ['lc-test-ok-after-stop', 'local', 'initial'],
     ['lc-failed-save-dropped', 'local', 'local Ready'],
     ['lc-relaunch-keeps-exchange', 'local', 'initial'],
-    ['lc-start-waits-cleanup', 'local', 'initial']
+    ['lc-start-waits-cleanup', 'local', 'initial'],
+    ['lc-taken-not-ended', 'local', 'initial']
   ];
   const SPEC_CONTROL_DEPTH = Number(process.env.FAMILIAR_LC_SPEC_CONTROL_DEPTH ?? 7);
   // Four are not caught within the CI depth from these origins (W's own checks catch them in CI); their

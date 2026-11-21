@@ -96,6 +96,9 @@ export interface Run {
   readonly unsaved?: number;
   /** The first Stop's answer, once given: a later Stop of this run gets the same (4.6, I8). */
   readonly stopAnswer?: Reply;
+  /** An exchange took the slot after this run's live exchange was ended (behind Stop's fence, or while the
+      relaunch waits), and holds it still: ended when the run finishes or is replaced (6b.12). */
+  readonly taken?: boolean;
 
 }
 export interface Waiter {
@@ -466,6 +469,7 @@ function stop(tx: Tx, token: string): void {
     // The relaunch is cancelled: its process already exited, and a readmit that comes later is for an
     // ended run.
     for (const w of s.waiters.filter((x) => x.run === r.id)) tx.answer(w.token, w.kind === 'test' ? { kind: 'failed', failure: STOPPED_EARLY } : { kind: 'stopped' });
+    endTaken(tx);
     tx.disarm();
     if ((__FAMILIAR_MUTATIONS__ && mutant('lc-readmit-after-stop'))) s.zombie = r.id;
     s.run = undefined;
@@ -565,10 +569,13 @@ function relaunchable(r: Run): boolean {
 
 function slot(tx: Tx, idle: boolean): void {
   if (!idle) {
+    const held = tx.run;
+    if (held && tx.s.slot === 'idle' && (held.step === 'closing' || held.step === 'relaunch')) tx.setRun({ taken: true });
     tx.s.slot = 'busy';
     return;
   }
   tx.s.slot = 'idle';
+  if (tx.run?.taken) tx.setRun({ taken: undefined });
   const r = tx.run;
   if (!r || tx.s.held) return;
   if (r.want) return tx.issue();
@@ -857,6 +864,7 @@ function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
   // Turned off meanwhile (an automatic start's relaunch): Stopped, as it was asked.
   if (r.mode === 'auto' && !f.enabled) return finish(tx, 'done', 'turned-off', { kind: 'exited', words: 'It is turned off.' });
   if (f.launch !== r.launch) return finish(tx, 'done', 'readmit-refused', { kind: 'busy', words: 'The setup changed. Press Start again.' });
+  endTaken(tx);
   const id = `${s.id}#${++s.nextRun}`;
   // The admission's own deadline carries over: the relaunch gets no fresh budget.
   s.run = { ...emptyRun(id, 'local', r.mode, r.launch), era: 'modern', relaunched: true, step: 'launching', native: { start: 'pending', stop: 'none', exited: false }, ...(r.deadline ? { deadline: r.deadline } : {}), ...(r.saveBy !== undefined ? { saveBy: r.saveBy } : {}) };
@@ -926,6 +934,13 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
   finish(tx, 'done');
 }
 
+/** 6b.12: an exchange that took the slot after the run's live exchange was ended is ended as the run
+    finishes or is replaced (the first end-live already ended everything before it). */
+function endTaken(tx: Tx): void {
+  const r = tx.run;
+  if (r?.taken && !(__FAMILIAR_MUTATIONS__ && mutant('lc-taken-not-ended'))) tx.emit({ t: 'end-live', run: r.id });
+}
+
 /**
  * The run is over for Familiar. `refused`: the exe refused the stop; `unconfirmed`: the stop deadline
  * outran the exit. In both the process may still run: it stays as an orphan, fencing the next Start, and
@@ -934,6 +949,7 @@ function end(tx: Tx, cause: Cause, failure: Failure): void {
 function finish(tx: Tx, how: 'done' | 'refused' | 'unconfirmed', causeNow?: Cause, failureNow?: Failure): void {
   const s = tx.s;
   const r = s.run!;
+  endTaken(tx);
   tx.disarm();
   const cause = r.cause ?? causeNow ?? 'exit';
   const failure = r.failure ?? failureNow ?? { kind: 'exited', words: STOPPED_WORDS };
