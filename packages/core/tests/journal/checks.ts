@@ -73,9 +73,12 @@ export const CHECKS: Record<string, Check> = {
       expect(s.end).toMatchObject({ status: 'asks', question: { kind: 'rerun' } });
       expect(s.asksBefore).toBe(0);
       expect(s.startsBefore).toBe(1);
+      // The grant is a real one, for a tool bound to consent: no card, first call or rerun.
+      expect(s.cardsBefore).toBe(0);
       // Run again: the person's answer. Now it runs, under its grant, without a card.
       expect(s.rerun).toMatchObject({ status: 'answered' });
       expect(s.startsAfter).toBe(2);
+      expect(s.cardsAfter).toBe(0);
     }
   },
   'server-skip': {

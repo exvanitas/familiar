@@ -77,7 +77,8 @@ function runOf(r: WireRun, x: NativeRec): number {
 function readyBefore(r: WireRun, x: NativeRec): boolean {
   const s = admittedStarts(r, x.server)[runOf(r, x) - 1];
   if (!s) return false;
-  const reply = r.evidence.find((y) => y.what === (s.what === 'start' ? 'started' : 'tested') && y.server === s.server && y.seq > s.seq);
+  // Its own reply, by the action's token (a Test's by order, one at a time).
+  const reply = r.evidence.find((y) => y.what === (s.what === 'start' ? 'started' : 'tested') && y.server === s.server && y.seq > s.seq && (s.what !== 'start' || evidenceControls.startsByOrder || y.token === s.token));
   return !!reply && reply.seq < x.seq && !reply.failure && (reply.report?.ok ?? true);
 }
 
@@ -244,7 +245,8 @@ export const H2: Check = (r) => {
       }
       // A Stop refused (another one under way, or not running) stopped nothing; one answered "may still be
       // running" (the exe refused, or Stop's deadline came first) claims no exit.
-      if (answered.failure === 'refused' || epoch === undefined || /may still be running/.test(answered.words ?? '')) continue;
+      // Only a Stop that answered stopped claims an exit (its structured outcome, not its words).
+      if (answered.stopOutcome !== 'stopped' || epoch === undefined) continue;
       const exit = r.exe.exits.find((t) => t.epoch === epoch);
       if (!exit || exit.step > answered.step) problems.push(`H2: a local Stop answered at step ${answered.step}, before its process exited${exit ? ` at ${exit.step}` : ''}`);
     }
@@ -297,6 +299,12 @@ export const H3: Check = (r) => {
     // something else (S1).
     const given = yes.grant !== undefined ? [...r.evidence].reverse().find((e) => e.what === 'grant' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < yes.seq) : undefined;
     if (yes.grant !== undefined && (!given || given.grant !== yes.grant)) problems.push(`H3: ${t} went out under a grant the person never gave for that version of ${yes.tool}`);
+    // A grant stands only while every listing between it and the handoff shows the tool as granted:
+    // A, then B, then A again in between is a change, and the call should have asked.
+    if (given) {
+      const granted = listedAt(r, x.server, given.step + 1, yes.tool!);
+      if (listingsBetween(r, x.server, given.step, x.start, yes.tool!).some((d) => d !== granted)) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which changed after it was given`);
+    }
     const card = given ?? r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
     const before = listedAt(r, x.server, card.step, yes.tool!);
     const now = listedAt(r, x.server, x.start, yes.tool!);
@@ -327,6 +335,21 @@ function staleCatalogCalls(r: WireRun): string[] {
 
 /** The harness's own reading of a server's catalog: the tool's definition in the last first page of a
     tools/list answer that reached the client before `step`. */
+/** Every listing of the tool the server answered in (from, to): its definitions, in order. */
+function listingsBetween(r: WireRun, server: string, from: number, to: number, tool: string): (string | undefined)[] {
+  const out: { at: number; def: string | undefined }[] = [];
+  for (const x of r.exe.log) {
+    if (x.server !== server || x.body?.method !== 'tools/list' || x.body.params?.cursor !== undefined || !x.plan) continue;
+    const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : r.exe.responded.get(`${x.epoch}:${x.body.id}`);
+    if (at === undefined || at <= from || at >= to) continue;
+    const res = x.plan.messages.find((m) => m.id === x.body!.id && m.result)?.result;
+    if (!res) continue;
+    const def = res.tools?.find((d: any) => d.name === tool);
+    out.push({ at, def: def === undefined ? undefined : canonical(def) });
+  }
+  return out.sort((a, b) => a.at - b.at).map((x) => x.def);
+}
+
 function listedAt(r: WireRun, server: string, step: number, tool: string): string | undefined {
   let found: { at: number; def: string | undefined } | undefined;
   for (const x of r.exe.log) {
@@ -426,33 +449,15 @@ export const H11: Check = (r) => {
       const text = typeof v === 'string' ? v : String(v);
       const plain = typeof v !== 'string' || (v !== '' && v === v.trim() && /^[\x20-\x7e\t]*$/.test(v) && !(v.startsWith('=?base64?') && v.endsWith('?=')));
       const expected = plain ? text : `=?base64?${Buffer.from(text, 'utf8').toString('base64')}?=`;
-      if (header !== expected) problems.push(`H11: Mcp-Param-${d.name} is "${String(header).slice(0, 30)}", the body says "${text.slice(0, 30)}"`);
-    }
-  }
-  // A value that can't be mirrored faithfully (a lone surrogate) or past 8 KiB once encoded makes no request:
-  // every argument the tool's listed schema declares, whatever its name, not one argument by name.
-  const schemaOf = (server: string | undefined, tool: string) => {
-    for (const y of [...recs, ...r.exe.log.filter((z) => z.kind !== 'post')].reverse()) {
-      if (y.server !== addressOf(server) || y.body?.method !== 'tools/list' || !y.plan) continue;
-      const def = (y.plan.messages.find((m) => m.result?.tools)?.result.tools as any[] | undefined)?.find((t) => t.name === tool);
-      if (def) return def.inputSchema;
-    }
-    return undefined;
-  };
-  for (const e of r.evidence) {
-    if (e.what !== 'yes' || !String(e.tool).startsWith('mirror')) continue;
-    for (const d of declared(schemaOf(e.server, String(e.tool)))) {
-      let v: any = e.args;
-      for (const k of d.path) v = v !== null && typeof v === 'object' && Object.hasOwn(v, k) ? v[k] : undefined;
-      if (v === undefined || v === null) continue;
-      const text = typeof v === 'string' ? v : String(v);
+      // A value that can't be mirrored faithfully (a lone surrogate), or whose whole header line passes 8 KiB
+      // once encoded (its name and separator included, as the native bound counts it), makes no request:
+      // every declared argument of every modern call, against the catalog in force at its handoff.
       const lone = typeof v === 'string' && /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(v);
-      // The client's own rule: plain visible ASCII goes as it is; anything else is the base64 sentinel.
-      const plain = typeof v !== 'string' || (v !== '' && v === v.trim() && /^[\x20-\x7e\t]*$/.test(v) && !(v.startsWith('=?base64?') && v.endsWith('?=')));
-      // The whole header line, as the native 8 KiB bound counts it: its name and separator included.
-      const tooLong = Buffer.byteLength(`Mcp-Param-${d.name}: ${plain ? text : `=?base64?${Buffer.from(text, 'utf8').toString('base64')}?=`}`) > 8 * 1024;
-      // Only a modern remote run mirrors: elsewhere the value goes in the body alone.
-      if ((lone || tooLong) && recs.some((x) => isCall(x.body) && tokenOf(x.body) === e.token && modernRun(x))) problems.push(`H11: ${e.token}'s ${d.name} can't be mirrored, and a request went out`);
+      if (lone || Buffer.byteLength(`Mcp-Param-${d.name}: ${expected}`) > 8 * 1024) {
+        problems.push(`H11: ${tokenOf(b)}'s ${d.name} can't be mirrored, and a request went out`);
+        continue;
+      }
+      if (header !== expected) problems.push(`H11: Mcp-Param-${d.name} is "${String(header).slice(0, 30)}", the body says "${text.slice(0, 30)}"`);
     }
   }
   // A $ref inside a schema's data (default, examples) is data, never a position: mirror3 stays offered.
@@ -543,7 +548,9 @@ export const H13: Check = (r) => {
     const carried = r.server.pings.filter((q) => q.on === p.on && r.exe.pingDelivered.has(q.id)).map((q) => [q.id, r.exe.pingDelivered.get(q.id)! * 1000] as [string, number]);
     if (/too many pings/.test(words(tokenOf(carrier.body))) && floodAt(r, carried, at * 1000, handed)) continue;
     const responded = r.exe.responded.get(`${carrier.epoch}:${carrier.body?.id}`);
-    const draining = (responded !== undefined && responded < at) || r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method === 'notifications/cancelled' && y.start <= at);
+    // Draining: the carrier's own response came, or its own cancel was written (matched by its request id, not
+    // any cancel on that process).
+    const draining = (responded !== undefined && responded < at) || r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method === 'notifications/cancelled' && String(y.body.params?.requestId) === String(carrier.body?.id) && y.start <= at);
     const blocked = r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.start <= at && (y.end ?? Infinity) > at);
     // Another exchange live on the same run when an idle ping comes: it waits for no one, so it's departure 2.
     const busyElsewhere = p.id.startsWith('i') && r.exe.log.some((y) => y.kind === 'write' && y.epoch === carrier.epoch && y.body?.method && y.body.id !== undefined && y.start <= at && (r.exe.responded.get(`${y.epoch}:${y.body.id}`) ?? Infinity) >= at);

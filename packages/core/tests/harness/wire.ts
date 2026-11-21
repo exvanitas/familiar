@@ -80,6 +80,8 @@ export interface Mode {
   readonly hold: boolean;
   /** Each answer in one chunk (S2: a ping in the same chunk as the final reply). */
   readonly oneChunk: boolean;
+  /** A call's answer begins with a message the client's parser rejects (no `jsonrpc`), then its pings. */
+  readonly invalidFirst?: boolean;
   /** A list_changed ahead of the first tools/list answer of each session, its variant flipped (S14). */
   readonly changeOnList: boolean;
   /** How often a cancelled request's helper is held, for any time (H4). */
@@ -273,6 +275,8 @@ export class ScriptedServer {
       if (this.lastId !== undefined && this.lastId !== body.id && this.r() < m.staleId) msgs.push({ jsonrpc: '2.0', id: this.lastId, result: { content: [{ type: 'text', text: 'stale' }], ...complete } });
       this.lastId = body.id;
       const n = m.pings === 40 ? 40 : m.pings;
+      // A message the client's parser rejects, ahead of the pings (S37): the exchange ends there.
+      if (m.invalidFirst && !modernReq) msgs.push({ method: 'notes/garbage', params: { note: 'no jsonrpc member' } } as Msg);
       if (!modernReq) for (let i = 0; i < n; i++) msgs.push(this.ping(on));
       if (!modernReq && this.r() < m.listChanged) {
         if (!m.reorder) this.variant = this.variant === 'a' ? 'b' : 'a';
@@ -599,7 +603,11 @@ export class FakeExe {
             const whole = plan && (plan.sse || (st as any).holdMsgs) && bounds ? bounds.filter((b) => b <= sent).length : 0;
             // Never past the stream's own terminal message: one delivered after it in the same chunk came after
             // the client's end, not before it. A stream with no final response (`final` -1) has no such bound.
-            const terminal = plan && !(st as any).holdMsgs && plan.final !== undefined && (plan.final >= 0 || evidenceControls.finalSentinel) ? plan.final : Infinity;
+            // The client's actual terminal position: the final response, or the first message its parser
+            // rejects (not JSON-RPC 2.0), whichever comes first.
+            const rejected = plan && !(st as any).holdMsgs && !evidenceControls.finalOnly ? plan.messages.findIndex((m) => !m || typeof m !== 'object' || (m as { jsonrpc?: unknown }).jsonrpc !== '2.0') : -1;
+            const final = plan && !(st as any).holdMsgs && plan.final !== undefined && (plan.final >= 0 || evidenceControls.finalSentinel) ? plan.final : Infinity;
+            const terminal = rejected >= 0 ? Math.min(rejected, final) : final;
             rec.endedAt = this.sched.step * 1000 + Math.min(whole, terminal);
           }
           // The exe may refuse a net_cancel and keep the request alive: once per request, as a passing fault.
@@ -665,7 +673,8 @@ export class FakeExe {
       const p = live.get(run)!;
       try {
         const m = JSON.parse(line);
-        if (m.id !== undefined && ('result' in m || 'error' in m)) this.responded.set(`${this.epoch}:${m.id}`, this.sched.step);
+        // Keyed by the process that sent it, never by whichever process started last.
+        if (m.id !== undefined && ('result' in m || 'error' in m)) this.responded.set(`${p.epoch}:${m.id}`, this.sched.step);
         if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
       } catch {
         /* not JSON */
@@ -808,7 +817,8 @@ export class FakeExe {
           } catch {
             body = undefined;
           }
-          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: this.epoch };
+          // The epoch of the process written to, never the newest one.
+          const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'write', server: 'local', method: 'WRITE', body, raw: text, headers: {}, start: this.sched.step, startAt: this.sched.now, delivered: new Map(), epoch: p?.epoch ?? this.epoch };
           this.log.push(rec);
           if (!p || p.exited) {
             rec.end = this.sched.step;
@@ -861,6 +871,8 @@ export interface Evidence {
   /** The scheduler's clock when it was noted, in ms. */
   readonly at?: number;
   readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant';
+  /** On a `stopped`: how the Stop ended, as its reply says. */
+  readonly stopOutcome?: 'stopped' | 'may-still-run' | 'refused' | 'failed';
   /** On a `test`: whether it reached the machine (Test from Stopped or Failed). */
   readonly reaches?: boolean;
   /** On a `yes` minted from a saved grant: the fingerprint it was given on (H3 holds the call to it). */
@@ -1074,8 +1086,15 @@ export class Driver {
   grantOwn(tool: string, id = 's1'): Promise<unknown> | undefined {
     const t = this.client.tools().find((x) => x.serverName === tool && x.server.id === id);
     if (!t) return undefined;
-    this.note({ what: 'grant', tool, server: id, grant: t.fingerprint });
-    return this.client.choose(id, tool, { policy: 'own', fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint });
+    // Noted once saved: a grant refused is no grant.
+    const step = this.sched.step;
+    return this.client.choose(id, tool, { policy: 'own', fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }).then(
+      () => {
+        const e = this.note({ what: 'grant', tool, server: id, grant: t.fingerprint });
+        (e as { step: number }).step = step;
+      },
+      () => undefined
+    );
   }
 
   /** A call under a saved "may run on its own", as the journal's gate would mint it. */
@@ -1104,14 +1123,17 @@ export class Driver {
   }
 
   /** Start; with `then`, an action in the same step as its answer (a call made the moment it says Ready). */
+  private starts = 0;
   start(id = 's1', then?: (ready: boolean) => void): void {
     const before = this.client.get(id)?.phase;
-    // Noted before the call (its sequence precedes anything the start sends), its admission read after.
-    const e = this.note({ what: 'start', server: id });
+    // Noted before the call (its sequence precedes anything the start sends), its admission read after. Its
+    // reply carries the same token: two Starts' replies are never confused.
+    const token = `start-${++this.starts}`;
+    const e = this.note({ what: 'start', server: id, token });
     const starting = this.client.start(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void starting.then((reply) => {
-      this.note({ what: 'started', server: id, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' });
+      this.note({ what: 'started', server: id, token, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}), ok: reply.kind === 'ready' });
       then?.(reply.kind === 'ready');
     });
   }
@@ -1123,7 +1145,9 @@ export class Driver {
     // answers at once, and is no answer to the first.
     const token = `stop-${++this.stops}`;
     this.note({ what: 'stop', server: id, token });
-    void this.client.stop(id).then((reply) => this.note({ what: 'stopped', server: id, token, ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}) }));
+    void this.client.stop(id).then((reply) =>
+      this.note({ what: 'stopped', server: id, token, stopOutcome: reply.kind === 'stopped' ? 'stopped' : reply.kind === 'refused' ? 'refused' : reply.kind === 'failed' && /may still be (running|starting)/.test(reply.failure.words) ? 'may-still-run' : 'failed', ...(reply.kind === 'failed' ? { failure: reply.failure.kind, words: reply.failure.words } : reply.kind === 'refused' ? { failure: 'refused', words: reply.words } : {}) })
+    );
   }
 
   /** Test, as Settings runs it: its report, with the tools it showed. */

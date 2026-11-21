@@ -105,6 +105,21 @@ describe('3.5: the x-mcp-header scan', () => {
       ];
       for (const c of cases) expect(scanDeclarations(c), JSON.stringify(c)).toMatchObject({ ok: false, reason: expect.stringMatching(/only on a property reached through "properties"/) });
     });
+    it('a declaration inside arrays of arrays is found, wherever it sits (control: arrays-one-deep misses it)', () => {
+      const decl = { properties: { b: { type: 'string', 'x-mcp-header': 'B' } } };
+      const cases = [
+        { type: 'object', properties: { a: { type: 'string' } }, 'x-annotation': [[decl]] },
+        { type: 'object', properties: { a: { type: 'string' } }, allOf: [[decl]] },
+        { type: 'object', properties: { a: { type: 'string' } }, 'x-annotation': [[[decl]]] }
+      ];
+      for (const c of cases) expect(scanDeclarations(c), JSON.stringify(c)).toMatchObject({ ok: false, reason: expect.stringMatching(/only on a property reached through "properties"/) });
+      mutations.set(['arrays-one-deep']);
+      try {
+        expect(scanDeclarations(cases[0])).toEqual({ ok: true, declarations: [] });
+      } finally {
+        mutations.clear();
+      }
+    });
     it('a $ref to a node that is no schema (a map of them) fails closed', () => {
       expect(scanDeclarations({ type: 'object', properties: { x: { type: 'string', 'x-mcp-header': 'X' }, y: { $ref: '#/properties' } } }).ok).toBe(false);
     });

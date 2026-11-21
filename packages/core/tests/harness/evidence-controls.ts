@@ -5,5 +5,9 @@ export const evidenceControls = {
   globalTests: false,
   globalStarts: false,
   /** The no-final sentinel (-1) taken as the stream's terminal index, as 6b40d2c's clamp did. */
-  finalSentinel: false
+  finalSentinel: false,
+  /** A Start's reply taken as the first one after it, by order (the old pairing), not by its token. */
+  startsByOrder: false,
+  /** The client's end taken at the final response only, never at the message its parser rejected. */
+  finalOnly: false
 };

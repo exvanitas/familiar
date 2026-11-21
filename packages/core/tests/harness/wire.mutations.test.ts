@@ -171,6 +171,44 @@ describe("the evidence's own controls", () => {
   }, 60_000);
 });
 
+describe('Start replies paired by token', () => {
+  it('two overlapping Starts, the refused one answered first (S36): clean by token; by order (the old pairing) H14 misreads the 404', async () => {
+    const s36 = SCHEDULES.find((s) => s.name.startsWith('S36'))!.options;
+    for (let seed = 1; seed <= 4; seed++) expect(PASS_CHECKS.H14!(await wireRun(seed, s36)), `seed ${seed}`).toEqual([]);
+    evidenceControls.startsByOrder = true;
+    try {
+      let flagged = 0;
+      for (let seed = 1; seed <= 4; seed++) if (PASS_CHECKS.H14!(await wireRun(seed, s36)).length) flagged++;
+      expect(flagged).toBeGreaterThan(0);
+    } finally {
+      evidenceControls.startsByOrder = false;
+    }
+  }, 60_000);
+});
+
+describe("H13 and the parser's own end", () => {
+  // One chunk: a message the parser rejects, then pings, then the final, its cancel refused. The client
+  // ended at the rejected message, so the pings after it are departure 2.
+  const mode = { where: 'remote', era: 'legacy', pings: 2, session404: 'none', redirect: 0, earlyEnd: 0, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0, invalidFirst: true } as Partial<Mode>;
+  it('pings after the rejected message are excused; taken at the final only (the old reading), H13 blames the client', async () => {
+    let witnessed = 0;
+    for (let seed = 1; seed <= 6; seed++) {
+      const r = await wireRun(seed, { mode });
+      if (r.exe.log.some((x) => x.refusals && x.delivered.size)) witnessed++;
+      expect(PASS_CHECKS.H13!(r), `seed ${seed}`).toEqual([]);
+    }
+    expect(witnessed).toBeGreaterThan(0);
+    evidenceControls.finalOnly = true;
+    try {
+      let flagged = 0;
+      for (let seed = 1; seed <= 6; seed++) if (PASS_CHECKS.H13!(await wireRun(seed, { mode })).length) flagged++;
+      expect(flagged).toBeGreaterThan(0);
+    } finally {
+      evidenceControls.finalOnly = false;
+    }
+  }, 120_000);
+});
+
 describe('H13 on a stream with no final response', () => {
   // One chunk, its cancel refused, and no final response (earlyEnd 1): a dropped pong must still fail H13.
   const mode = { where: 'remote', era: 'legacy', pings: 40, session404: 'none', redirect: 0, earlyEnd: 1, sse: 1, oneChunk: true, refuseCancel: 1, holdHelpers: 0 } as Partial<Mode>;

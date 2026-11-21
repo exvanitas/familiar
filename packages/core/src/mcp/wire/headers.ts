@@ -30,6 +30,15 @@ export function scanDeclarations(schema: unknown): ScanResult {
   const names = new Map<string, string>();
   let numberFault: string | undefined;
   const visit = (node: unknown, path: readonly string[], reachable: boolean): string | undefined => {
+    // An array at any depth is walked through, its items at the same reachability: a declaration nested in
+    // arrays of arrays is still found.
+    if (Array.isArray(node) && !(__FAMILIAR_MUTATIONS__ && mutant('arrays-one-deep'))) {
+      for (const [i, item] of node.entries()) {
+        const f = visit(item, [...path, `[${i}]`], reachable);
+        if (f) return f;
+      }
+      return undefined;
+    }
     if (node === null || typeof node !== 'object' || Array.isArray(node)) return undefined;
     const s = node as Record<string, unknown>;
     if ('x-mcp-header' in s) {

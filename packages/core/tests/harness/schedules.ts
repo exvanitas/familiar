@@ -253,6 +253,28 @@ const LIFECYCLE: Named[] = [
       const other = stopped?.server === 's1' ? 's2' : 's1';
       return stopped && r.exe.processStarts.some((t) => t.server === other) ? undefined : 'no Stop of one server beside the other started';
     }
+  },
+  {
+    // S36: two Starts in one step after a Stop, the second refused and answered first, then a 404 while
+    // Ready: H14 pairs each reply with its own Start, by token, and the recovery is judged on a Ready run.
+    name: 'S36 two overlapping Starts, then a 404 while Ready',
+    options: {
+      mode: { ...quiet, session404: 'once' },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.stop();
+          d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
+            d.start();
+            d.start();
+            d.when('ready again', () => d.client.get('s1')?.phase === 'ready' && d.idle(), () => d.call('echo'));
+          });
+        })
+    },
+    expect: (r) => {
+      const refused = r.evidence.filter((e) => e.what === 'started' && e.failure === 'refused').length;
+      if (!refused) return 'no refused Start';
+      return r.exe.log.some((x) => x.status === 404) ? undefined : 'no 404';
+    }
   }
 ];
 

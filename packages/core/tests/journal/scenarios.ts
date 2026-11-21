@@ -143,6 +143,9 @@ export function fakeTools(env: Env, hang: (name: string) => boolean, onRun?: (na
       description: "An MCP server's tool.",
       inputSchema: object({ q: { type: 'string' } }),
       kind: 'server',
+      // Bound to consent at the call, as a real server's wrapper is: the facts a card shows and a grant
+      // ("may run on its own") is checked against.
+      consent: { facts: (args: unknown) => ({ server: 'srv', tool: 'server_lookup', run: 'srv#1', launch: 'launch-1', fingerprint: 'fp-1', canonical: JSON.stringify(args), hash: 'h' }) },
       doing: (a: any) => `asking the server about ${a.q}`,
       async run(args: any) {
         start('server_lookup', args);
@@ -312,9 +315,10 @@ export const SCENARIOS: readonly Scenario[] = [
       const [question] = await j.questions();
       const asksBefore = env.counters.get('reissue-asked');
       const startsBefore = env.counters.get('starts:server_lookup');
+      const cardsBefore = env.counters.get('consent-asks');
       const turn = question ? await j.answer(question.id, true, 'rerun-1') : undefined;
       const rerun = turn ? await turn.wait() : undefined;
-      return { asksBefore, startsBefore, rerun, startsAfter: env.counters.get('starts:server_lookup') };
+      return { asksBefore, startsBefore, cardsBefore, rerun, startsAfter: env.counters.get('starts:server_lookup'), cardsAfter: env.counters.get('consent-asks') };
     },
     (env) => ({
       policy: { perTool: { server_lookup: 'own' } },
