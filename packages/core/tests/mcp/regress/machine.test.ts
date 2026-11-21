@@ -232,6 +232,12 @@ describe('the first catalog write fails while a newer one waits behind it (6b.13
     expect(g.last.filter((x) => x.t === 'save')).toEqual([]);
     expect(g.s.saving).toBeUndefined();
   });
+  it("and Test's own cleanup, entered as its first write lands, issues none either", () => {
+    const g = run([start('test'), cur((r) => ({ t: 'started', run: r.id, ok: true, process: 'p1' })), cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'legacy' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'ok' } })), idle, cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } })), idle, cur((r) => ({ t: 'notice', run: r.id })), cur((r) => ({ t: 'admin-done', run: r.id, outcome: { k: 'page', more: false, catalog: 'ok' } })), idle, { t: 'saved', gen: 1, outcome: 'saved' }]);
+    expect(g.s.run?.step).toBe('closing');
+    expect(g.s.run?.cause).toBe('test-done');
+    expect(g.last.filter((x) => x.t === 'save')).toEqual([]);
+  });
 });
 
 describe("the relaunch ends the exited process's exchange", () => {

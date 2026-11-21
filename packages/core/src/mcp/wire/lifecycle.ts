@@ -836,13 +836,15 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
   s.saving = undefined;
   const r = s.run;
   const first = !!r && r.firstSave === 'pending' && r.firstGen === gen;
-  // The first write's failure ends the run here (catalog-failed): the transition that enters closing issues
-  // no new save, so a newer catalog waiting behind it isn't saved (6b.13).
-  const ending = first && outcome === 'failed' && r!.step !== 'closing';
-  if (s.dirty) {
-    s.dirty = false;
-    if (r && r.gen > gen && r.step !== 'closing' && !ending) tx.saveCatalog();
-  }
+  // A newer catalog published while this write was in flight is saved at the end of this transition, and
+  // only if the run is still current and not closing then: the transition that enters closing (the first
+  // write's failure, or Test's own cleanup once it lands) issues no new save (6b.13).
+  const queued = s.dirty;
+  s.dirty = false;
+  const resave = (): void => {
+    const now = tx.s.run;
+    if (queued && r && now?.id === r.id && now.step !== 'closing' && now.gen > gen) tx.saveCatalog();
+  };
   // 6b.13: a later catalog write that fails keeps its generation and is tried once more (never for a closing
   // run); a second failure marks it unsaved, which noteOf shows; the run goes on. The mark and its clearing
   // apply in every step, closing included.
@@ -858,12 +860,13 @@ function saved(tx: Tx, gen: number, outcome: 'saved' | 'skipped' | 'failed'): vo
       if (r.retried !== undefined && r.retried <= gen) tx.setRun({ retried: undefined });
     }
   }
-  if (!r || !first) return;
+  if (!r || !first) return resave();
   tx.setRun({ firstSave: 'done' });
   // Already ending (a Stop, a crash): its waiters get the kept cause's words when it ends.
   if (r.step === 'closing') return;
   if (outcome === 'failed') return end(tx, 'catalog-failed', CATALOG_FAILED);
   answerReady(tx);
+  resave();
 }
 
 function readmit(tx: Tx, e: Extract<LcEvent, { t: 'readmit' }>): void {
