@@ -5,6 +5,8 @@
 // count is cross-checked against a walker that doesn't deduplicate. Each guard the machine has for a finding
 // has a named mutation; under it the walk must find a violating trace, and the same trace must pass on the
 // unmutated machine.
+import { createHash } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { callable, initialState, next, phaseOf, type LcEffect, type LcEvent, type LcState } from '../../src/mcp/wire/lifecycle.ts';
 import { mutations } from '../../src/mutations.ts';
@@ -197,37 +199,135 @@ interface WalkResult {
   transitions: number;
   depth: number;
   ms: number;
+  /** Whether the frontier emptied: every reachable state was expanded (the fixpoint). */
+  done: boolean;
+  frontier: number;
+  peakHeapMb: number;
   violation?: { trace: LcEvent[]; problems: string[] };
 }
 
-/** Breadth first over (state, ctx), exactly deduplicated by canonical form. */
-function walk(where: Where, maxDepth: number, stopAtFirst = true): WalkResult {
+/** Where a walk begins: the initial state, or a checkpoint a scripted trace reached through `next()`, with
+    the ctx that trace used up. */
+interface Origin {
+  readonly name: string;
+  readonly s: LcState;
+  readonly c: Ctx;
+  readonly trace: readonly LcEvent[];
+}
+const ORIGIN0 = (): Origin => ({ name: 'initial', s: initialState('s'), c: CTX0, trace: [] });
+
+/** A trace's events, kept as a chain to its parent: the frontier holds no copies of whole traces. */
+interface Step {
+  readonly e: LcEvent;
+  readonly up: Step | undefined;
+}
+const traceOf = (origin: Origin, step: Step | undefined): LcEvent[] => {
+  const out: LcEvent[] = [];
+  for (let x = step; x; x = x.up) out.push(x.e);
+  return [...origin.trace, ...out.reverse()];
+};
+
+/**
+ * The (state, ctx) pair with its names renumbered: tokens, run ids, processes and deadline ids by their order
+ * of first appearance in the canonical traversal (from 1, so the stale events' reserved `#0`, `p0` and
+ * deadline 0 stay apart), catalog generations by rank (the machine compares them by order), and the
+ * counters that only mint fresh names dropped. Two pairs alike up to such renaming have alike futures: the
+ * machine and the alphabet compare these names only for equality (generations for order), and mint fresh
+ * ones above all present.
+ */
+function renumbered(s: LcState, c: Ctx): string {
+  const gens = new Set<number>([0]);
+  const seeGen = (v: unknown, k?: string): void => {
+    if (v === null || typeof v !== 'object') {
+      if ((k === 'gen' || k === 'firstGen') && typeof v === 'number') gens.add(v);
+      return;
+    }
+    for (const kk in v as Record<string, unknown>) seeGen((v as Record<string, unknown>)[kk], kk);
+  };
+  seeGen(s);
+  const rank = new Map([...gens].sort((a, b) => a - b).map((g, i) => [g, i]));
+  const names = new Map<string, string>();
+  const counts: Record<string, number> = {};
+  const rename = (kind: string, v: string | number): string => {
+    const key = `${kind}:${v}`;
+    let out = names.get(key);
+    if (out === undefined) names.set(key, (out = `${kind}${(counts[kind] = (counts[kind] ?? 0) + 1)}`));
+    return out;
+  };
+  // One pass, in the canonical form's own order (keys sorted, undefined dropped), renaming as it goes.
+  const str = (v: unknown, k?: string): string => {
+    if (typeof v === 'string') {
+      if (/^k\d+$/.test(v)) return JSON.stringify(rename('k', v));
+      if (/^.+#\d+$/.test(v)) return JSON.stringify(rename('r', v));
+      if (/^p\d+$/.test(v)) return JSON.stringify(rename('p', v));
+      return JSON.stringify(v);
+    }
+    if (typeof v === 'number') {
+      if (k === 'gen' || k === 'firstGen') return String(rank.get(v));
+      if (k === 'saveBy' || k === 'deadline-id') return JSON.stringify(rename('d', v));
+      return String(v);
+    }
+    if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'undefined';
+    if (Array.isArray(v)) return `[${v.map((x) => str(x)).join(',')}]`;
+    const o = v as Record<string, unknown>;
+    // A deadline's id is a name; its kind isn't.
+    const isDeadline = 'which' in o && typeof o.id === 'number';
+    const parts: string[] = [];
+    for (const kk of Object.keys(o).sort()) {
+      if (o[kk] === undefined || (k === undefined && DROPPED.has(kk))) continue;
+      parts.push(`${JSON.stringify(kk)}:${str(o[kk], isDeadline && kk === 'id' ? 'deadline-id' : kk)}`);
+    }
+    return `{${parts.join(',')}}`;
+  };
+  return `[${str(s)},${str(c)}]`;
+}
+/** The counters that only mint fresh names, dropped from the renumbered form (top level only). */
+const DROPPED = new Set(['nextRun', 'nextDeadline', 'nextGen', 'tokens']);
+
+/** The walk's key for a state: its canonical form exactly, or (`digest`) that form's SHA-256, 32 bytes. */
+const keyOf = (v: unknown, digest: boolean): string => {
+  const text = typeof v === 'string' ? v : canonical(v);
+  return digest ? createHash('sha256').update(text).digest().toString('latin1') : text;
+};
+
+/**
+ * Breadth first over (state, ctx), exactly deduplicated: by canonical form, or by its SHA-256 for the
+ * unbounded walk (exact for our purpose: a collision is beyond reach). `maxDepth` Infinity walks to the
+ * fixpoint, unless `budgetMs` runs out first.
+ */
+function walk(where: Where, maxDepth: number, stopAtFirst = true, origin: Origin = ORIGIN0(), opts: { digest?: boolean; renumber?: boolean; budgetMs?: number; progress?: (r: WalkResult) => void } = {}): WalkResult {
   const t0 = performance.now();
-  const start = initialState('s');
-  const seen = new Set<string>([canonical([start, CTX0])]);
-  let frontier: { s: LcState; c: Ctx; trace: LcEvent[] }[] = [{ s: start, c: CTX0, trace: [] }];
+  const digest = !!opts.digest;
+  const form = (st: LcState, c: Ctx): unknown => (opts.renumber ? renumbered(st, c) : [st, c]);
+  const seen = new Set<string>([keyOf(form(origin.s, origin.c), digest)]);
+  let frontier: { s: LcState; c: Ctx; step: Step | undefined }[] = [{ s: origin.s, c: origin.c, step: undefined }];
   let transitions = 0;
   let depth = 0;
+  let peak = 0;
+  const result = (extra: Partial<WalkResult> = {}): WalkResult => ({ states: seen.size, transitions, depth, ms: performance.now() - t0, done: frontier.length === 0, frontier: frontier.length, peakHeapMb: Math.round(peak / 2 ** 20), ...extra });
   for (; depth < maxDepth && frontier.length; depth++) {
+    if (opts.budgetMs !== undefined && performance.now() - t0 > opts.budgetMs) return result();
     const nextFrontier: typeof frontier = [];
-    for (const { s, c, trace } of frontier) {
+    for (const { s, c, step } of frontier) {
       for (const [e, c2] of alphabet(s, c, where)) {
         transitions++;
         const out = next(s, e);
         const problems = check(s, e, out.state, out.effects);
         if (problems.length) {
-          const result = { states: seen.size, transitions, depth: depth + 1, ms: performance.now() - t0, violation: { trace: [...trace, e], problems } };
-          if (stopAtFirst) return result;
+          const found = result({ depth: depth + 1, violation: { trace: traceOf(origin, { e, up: step }), problems } });
+          if (stopAtFirst) return found;
         }
-        const key = canonical([out.state, c2]);
+        const key = keyOf(form(out.state, c2), digest);
         if (seen.has(key)) continue;
         seen.add(key);
-        nextFrontier.push({ s: out.state, c: c2, trace: [...trace, e] });
+        nextFrontier.push({ s: out.state, c: c2, step: { e, up: step } });
       }
     }
     frontier = nextFrontier;
+    peak = Math.max(peak, process.memoryUsage().heapUsed);
+    opts.progress?.(result({ depth: depth + 1 }));
   }
-  return { states: seen.size, transitions, depth, ms: performance.now() - t0 };
+  return result();
 }
 
 /** The same walk with no deduplication, counting the distinct states it reaches (the cross-check). */
@@ -240,6 +340,69 @@ function fullCount(where: Where, maxDepth: number): number {
   };
   go(initialState('s'), CTX0, 0);
   return distinct.size;
+}
+
+/* ---------- checkpoints: named states scripted traces reach through next() ---------- */
+
+type Pick = (e: LcEvent) => boolean;
+const is =
+  (t: LcEvent['t'], more: (e: any) => boolean = () => true): Pick =>
+  (e) =>
+    e.t === t && more(e);
+
+/** Drives `next()` from `from` by the alphabet's own events, the first that each pick matches, and names
+    where it lands; the ctx is the alphabet's, so the checkpoint's walk has what the trace left of each bound. */
+function drive(where: Where, name: string, picks: readonly Pick[], from: Origin = ORIGIN0()): Origin {
+  let { s, c } = from;
+  const trace = [...from.trace];
+  for (const [i, p] of picks.entries()) {
+    // The current run's events only: the alphabet's stale ones (an earlier run's) are never a checkpoint's.
+    // An exchange that has ended frees the slot first, as the exchange machine's own Idle would.
+    const find = () => alphabet(s, c, where).find(([e]) => (!('run' in e) || e.run === s.run?.id) && p(e));
+    let found = find();
+    if (!found && s.slot === 'busy' && !s.run?.inFlight) {
+      const out = next(s, { t: 'slot', idle: true });
+      trace.push({ t: 'slot', idle: true });
+      s = out.state;
+      found = find();
+    }
+    if (!found) throw new Error(`checkpoint ${name}: pick ${i} matches no event in ${s.run?.step ?? phaseOf(s)}`);
+    const [e, c2] = found;
+    const out = next(s, e);
+    const bad = check(s, e, out.state, out.effects);
+    if (bad.length) throw new Error(`checkpoint ${name}: ${bad.join('; ')}`);
+    trace.push(e);
+    s = out.state;
+    c = c2;
+  }
+  return { name, s, c, trace };
+}
+
+const page = (more: boolean) => is('admin-done', (e) => e.outcome.k === 'page' && e.outcome.more === more && (more || e.outcome.catalog === 'ok'));
+const startOk = is('start', (e) => e.mode === 'start' && e.facts.ownerFree);
+const idle = is('slot', (e) => e.idle);
+
+/** The named checkpoints, each with what it must be. */
+function checkpoints(): { origin: Origin; where: Where; holds: (s: LcState) => boolean }[] {
+  const saving = drive('local', 'local Ready, its save in flight', [startOk, is('started', (e) => e.ok), is('admin-done', (e) => e.outcome.k === 'legacy'), is('admin-done', (e) => e.outcome.k === 'ok'), page(false), idle]);
+  const ready = drive('local', 'local Ready', [is('saved', (e) => e.outcome === 'saved')], saving);
+  const refreshing = drive('local', 'refreshing', [is('notice')], ready);
+  const orphan = drive('local', 'closing after a refused stop, the orphan open', [is('stop'), is('stop-answered', (e) => !e.ok)], ready);
+  const run2 = drive('local', "run 2 launching after run 1's orphan exited", [(e: LcEvent) => e.t === 'exit' && orphan.s.orphans.some((o) => o.process === (e as any).process), startOk], orphan);
+  const relaunch = drive('local', 'relaunch pending', [startOk, is('started', (e) => e.ok), is('admin-done', (e) => e.outcome.k === 'modern-refusal'), is('admin-done', (e) => e.outcome.k === 'unanswered'), is('exit')]);
+  const rsaving = drive('remote', 'remote Ready, its save in flight', [startOk, is('admin-done', (e) => e.outcome.k === 'legacy'), is('admin-done', (e) => e.outcome.k === 'ok'), page(false), idle], { ...ORIGIN0() });
+  const rready = drive('remote', 'remote Ready', [is('saved', (e) => e.outcome === 'saved')], rsaving);
+  const recovering = drive('remote', 'remote recovering', [is('call-ended', (e) => e.end === 'session-ended')], rready);
+  return [
+    { origin: ready, where: 'local', holds: (s) => phaseOf(s) === 'ready' && !s.saving && callable(s) },
+    { origin: saving, where: 'local', holds: (s) => s.run?.step === 'ready' && !!s.saving },
+    { origin: refreshing, where: 'local', holds: (s) => !!s.run && s.run.purpose === 'refresh' && s.run.step !== 'ready' },
+    { origin: orphan, where: 'local', holds: (s) => s.orphans.length === 1 && !s.run },
+    { origin: relaunch, where: 'local', holds: (s) => s.run?.step === 'relaunch' },
+    { origin: run2, where: 'local', holds: (s) => s.run?.step === 'launching' && s.orphans.length === 0 && s.run.id !== ready.s.run?.id },
+    { origin: rready, where: 'remote', holds: (s) => phaseOf(s) === 'ready' && !s.saving && callable(s) },
+    { origin: recovering, where: 'remote', holds: (s) => s.run?.purpose === 'recovery' }
+  ];
 }
 
 /** Replays a trace on the machine as it is, and returns any invariant it breaks. */
@@ -273,6 +436,77 @@ describe('W for the run lifecycle', () => {
     }, 600_000);
   }
 
+  // The fixpoint, run locally as the close's evidence (FAMILIAR_LC_FIXPOINT=1): the same walk with no depth
+  // bound, keyed by the SHA-256 of the renumbered form, until the frontier is empty or about 30 minutes pass
+  // (FAMILIAR_LC_FIXPOINT=exact keys the plain canonical form; it doesn't finish in that time). Progress goes
+  // to FAMILIAR_LC_LOG. On the machine as of 22e6800 (unchanged since): local, the fixpoint at depth 41, 2,681,234 states, about 25
+  // minutes; remote at depth 48, 411,602 states, about 3 minutes.
+  const fixpointLog = (line: string) => {
+    if (process.env.FAMILIAR_LC_LOG) appendFileSync(process.env.FAMILIAR_LC_LOG, `${new Date().toISOString()} ${line}\n`);
+  };
+  const fmt = (label: string, r: WalkResult) => `${label}: ${r.done ? 'fixpoint' : 'STOPPED'} at depth ${r.depth}, ${r.states} states, ${r.transitions} transitions, frontier ${r.frontier}, ${Math.round(r.ms / 1000)} s, peak heap ${r.peakHeapMb} MB${r.violation ? `, VIOLATION ${r.violation.problems.join('; ')}` : ''}`;
+  for (const where of ['local', 'remote'] as const)
+    it.skipIf(!process.env.FAMILIAR_LC_FIXPOINT)(`holds I1 to I12 to the fixpoint, ${where}`, () => {
+      const renumber = process.env.FAMILIAR_LC_FIXPOINT !== 'exact';
+      const r = walk(where, Infinity, true, ORIGIN0(), { digest: true, renumber, budgetMs: 30 * 60_000, progress: (p) => fixpointLog(fmt(`progress ${where}${renumber ? ' renumbered' : ''}`, p)) });
+      fixpointLog(fmt(`FIXPOINT ${where}${renumber ? ' renumbered' : ''}`, r));
+      expect(r.violation, r.violation?.problems.join('; ')).toBeUndefined();
+      expect(r.done, `stopped at depth ${r.depth} with ${r.frontier} in the frontier`).toBe(true);
+    }, 40 * 60_000);
+
+  // The renumbered key (the fixpoint's) merges only pairs alike up to names: for every pair it merges in an
+  // exact walk to depth 7, both have the same successors (by renumbered key) and the same verdicts.
+  for (const where of ['local', 'remote'] as const)
+    it(`renumbering merges only states with alike futures, one step on, to depth 7, ${where}`, () => {
+      const exact = new Set<string>();
+      const reps = new Map<string, { s: LcState; c: Ctx }>();
+      const succ = (st: LcState, c: Ctx) =>
+        alphabet(st, c, where)
+          .map(([e, c2]) => {
+            const out = next(st, e);
+            return `${renumbered(out.state, c2)}|${check(st, e, out.state, out.effects).length}`;
+          })
+          .sort()
+          .join('\n');
+      let merged = 0;
+      let frontier: { s: LcState; c: Ctx }[] = [{ s: initialState('s'), c: CTX0 }];
+      for (let d = 0; d < 7; d++) {
+        const nf: typeof frontier = [];
+        for (const { s: st, c } of frontier)
+          for (const [e, c2] of alphabet(st, c, where)) {
+            const s2 = next(st, e).state;
+            const k = canonical([s2, c2]);
+            if (exact.has(k)) continue;
+            exact.add(k);
+            nf.push({ s: s2, c: c2 });
+            const rk = renumbered(s2, c2);
+            const rep = reps.get(rk);
+            if (!rep) reps.set(rk, { s: s2, c: c2 });
+            else {
+              merged++;
+              expect(succ(s2, c2), `merged unlike states: ${k.slice(0, 200)}`).toBe(succ(rep.s, rep.c));
+            }
+          }
+        frontier = nf;
+      }
+      if (process.env.FAMILIAR_VERBOSE) console.log(`LC-W renumbering ${where}: ${exact.size} exact states to depth 7, ${reps.size} renumbered, ${merged} merged pairs checked`);
+      expect(merged).toBeGreaterThan(0);
+    }, 600_000);
+
+  it('reaches each named checkpoint through next(), each the state it names', () => {
+    for (const k of checkpoints()) expect(k.holds(k.origin.s), k.origin.name).toBe(true);
+  });
+
+  // From each checkpoint, the same walk to the same depth, with the ctx its trace used up: what happens
+  // after Ready (a refresh then a Stop, a recovery then a Stop, a notice during the save then a refused
+  // stop) is walked as deep as the start is from the initial state.
+  for (const k of checkpoints())
+    it(`holds I1 to I12 over every trace to depth ${DEPTH} from ${k.origin.name}`, () => {
+      const r = walk(k.where, DEPTH, true, k.origin);
+      if (process.env.FAMILIAR_VERBOSE) console.log(`LC-W ${k.origin.name}: ${r.states} states, ${r.transitions} transitions, depth ${r.depth}, ${Math.round(r.ms)} ms`);
+      expect(r.violation, r.violation ? `${r.violation.problems.join('; ')} after ${r.violation.trace.map((e) => e.t).join(' > ')}` : '').toBeUndefined();
+    }, 600_000);
+
   // Each guard the machine keeps for a finding, broken: W finds a violating trace, and that trace passes
   // on the unmutated machine.
   const CONTROLS: { mutation: string; where: Where; finding: string }[] = [
@@ -295,12 +529,38 @@ describe('W for the run lifecycle', () => {
     { mutation: 'lc-era-on-recovery', where: 'remote', finding: 'r30 #5: a recovery changing the era' },
     { mutation: 'lc-crash-words-lost', where: 'local', finding: 'F05: a start answered stopped after a crash' }
   ];
+  // Where each control is caught: the initial state, or the named checkpoint (FAMILIAR_LC_CAUGHT=1 prints,
+  // for each control, every origin whose depth-8 walk catches it).
+  // The survey (depth 8) found each from these, among others; four are caught from no state but a
+  // checkpoint at that depth (lc-ready-stale, lc-refresh-dropped, lc-save-overlap, lc-era-on-recovery).
+  const CAUGHT_FROM: Record<string, string> = {
+    'lc-ready-before-idle': 'refreshing',
+    'lc-ready-stale': 'refreshing',
+    'lc-refresh-dropped': 'local Ready',
+    'lc-relaunch-after-kill': "run 2 launching after run 1's orphan exited",
+    'lc-relaunch-on-answer': "run 2 launching after run 1's orphan exited",
+    'lc-stopped-on-refusal': 'local Ready',
+    'lc-second-stop-stopped': 'closing after a refused stop, the orphan open',
+    'lc-test-ok-on-refusal': 'initial',
+    'lc-owner-held-on-stop': "run 2 launching after run 1's orphan exited",
+    'lc-no-stop-deadline': 'local Ready',
+    'lc-two-native-stops': 'local Ready',
+    'lc-old-run-events': "run 2 launching after run 1's orphan exited",
+    'lc-readmit-after-stop': 'relaunch pending',
+    'lc-start-beside-orphan': 'closing after a refused stop, the orphan open',
+    'lc-save-overlap': 'local Ready, its save in flight',
+    'lc-admit-after-fence': 'refreshing',
+    'lc-era-on-recovery': 'remote recovering',
+    'lc-crash-words-lost': 'local Ready, its save in flight'
+  };
   for (const c of CONTROLS) {
-    it(`${c.mutation} is caught (${c.finding}), and its trace passes unmutated`, () => {
+    it(`${c.mutation} is caught (${c.finding}) from ${CAUGHT_FROM[c.mutation] ?? 'initial'}, and its trace passes unmutated`, () => {
+      const name = CAUGHT_FROM[c.mutation] ?? 'initial';
+      const origin = name === 'initial' ? ORIGIN0() : checkpoints().find((k) => k.origin.name === name)!.origin;
       mutations.set([c.mutation]);
       let r: WalkResult;
       try {
-        r = walk(c.where, DEPTH);
+        r = walk(c.where, DEPTH, true, origin);
       } finally {
         mutations.clear();
       }
@@ -308,4 +568,23 @@ describe('W for the run lifecycle', () => {
       expect(replay(r.violation!.trace), 'the twin').toEqual([]);
     }, 600_000);
   }
+
+  it.skipIf(!process.env.FAMILIAR_LC_CAUGHT)('which origins catch each control, at depth 8', () => {
+    const origins = [{ origin: ORIGIN0(), where: undefined as Where | undefined }, ...checkpoints().map((k) => ({ origin: k.origin, where: k.where as Where | undefined }))];
+    for (const c of CONTROLS) {
+      const by: string[] = [];
+      for (const o of origins) {
+        if (o.where && o.where !== c.where) continue;
+        mutations.set([c.mutation]);
+        let r: WalkResult;
+        try {
+          r = walk(c.where, 8, true, o.origin);
+        } finally {
+          mutations.clear();
+        }
+        if (r.violation && !replay(r.violation.trace).length) by.push(`${o.origin.name} (${r.violation.trace.length - o.origin.trace.length})`);
+      }
+      fixpointLog(`CAUGHT ${c.mutation}: ${by.join(' | ') || 'none at depth 8'}`);
+    }
+  }, 3_600_000);
 });
