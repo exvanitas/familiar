@@ -805,6 +805,50 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S48: a grant, then the remote run fails (a modern server answers a call with an era refusal: no new
+    // handshake), Start again, and a call under the grant on the new run, which runs.
+    name: 'S48 a remote run that fails, then a grant used on the next run',
+    options: {
+      mode: { ...quiet, era: 'modern', callEraRefusal: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => void d.grantOwn('echo')?.then(() => {
+          d.call('slow');
+          d.when('failed', () => d.client.get('s1')?.phase === 'failed', () => {
+            d.start();
+            d.when('ready again', () => d.idle() && d.evidence.filter((e) => e.what === 'started' && e.ok).length >= 2, () => d.own('echo'));
+          });
+        }))
+    },
+    expect: (r) => {
+      if (!r.evidence.some((e) => e.what === 'phase' && e.phase === 'failed')) return 'the run never failed';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
+    // S49: a grant, then the local process exits by itself, Start again, and a call under the grant on the new
+    // run, which runs.
+    name: 'S49 a local process that exits by itself, then a grant used on the next run',
+    options: {
+      mode: { ...quiet, where: 'local', idlePings: 0 },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => void d.grantOwn('echo')?.then(() => {
+          d.sched.add({ label: 'act:exit', fire: () => d.exe.exitProcess?.('s1') });
+          d.when('exited', () => d.client.get('s1')?.phase === 'failed' || d.client.get('s1')?.phase === 'stopped', () => {
+            d.start();
+            d.when('ready again', () => d.idle() && d.exe.processStarts.length === 2, () => d.own('echo'));
+          });
+        }))
+    },
+    expect: (r) => {
+      if (!r.exe.exits.length) return 'the process never exited';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
     name: 'S40 a local modern-only server that exits after the refusal, relaunched',
