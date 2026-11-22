@@ -126,7 +126,10 @@ describe('3.5: the x-mcp-header scan', () => {
         { type: 'object', properties: { region: [x] } },
         { type: 'object', properties: { region: [[x]] } },
         { type: 'object', properties: { region: [x], alias: { $ref: '#/properties/region/0' } } },
-        { type: 'object', properties: { outer: { type: 'object', properties: { region: [{ type: 'object', properties: { inner: x } }] } } } }
+        { type: 'object', properties: { outer: { type: 'object', properties: { region: [{ type: 'object', properties: { inner: x } }] } } } },
+        // The properties map itself an array (r36 #4), at the root and nested.
+        { type: 'object', properties: [x] },
+        { type: 'object', properties: { outer: { type: 'object', properties: [[x]] } } }
       ];
       for (const c of cases) expect(scanDeclarations(c), JSON.stringify(c)).toMatchObject({ ok: false, reason: expect.stringMatching(/only on a property reached through "properties"/) });
       // The control: an array keeping its parent's reachability (array-keeps-reach, pass 5's walk) offers the

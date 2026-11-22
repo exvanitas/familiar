@@ -213,7 +213,7 @@ describe('T8: Test while running', () => {
     const { client, port, id } = await localServer();
     const before = port.written.length;
     const report = await client.test(id);
-    expect(report).toMatchObject({ ok: false, failure: { words: 'Stop the server to test it. Test never disturbs a running server.' } });
+    expect(report).toMatchObject({ ok: false, failure: { kind: 'busy', words: 'Stop the server to test it. Test never disturbs a running server.' } });
     expect(port.written.length).toBe(before);
     expect(client.get(id)?.phase).toBe('ready');
   }, 30_000);

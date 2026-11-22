@@ -88,6 +88,36 @@ describe('cleanup the exe refused', () => {
     expect(l.watchers.size).toBe(0);
   });
 
+  it("the test-only list() settles when a two-page refresh is held before it publishes (r36 #7)", async () => {
+    let refuse = false;
+    let lists = 0;
+    const net = fakeNet((b) => {
+      if (b.method === 'initialize') return json(initResult(b.id));
+      if (b.method === 'notifications/initialized') return { status: 202, chunks: [] };
+      if (b.method === 'tools/list') {
+        // The start's list is one page; the refresh's first page points to a second it never reaches.
+        if (++lists === 1) return json(listResult(b.id, ['look']));
+        return json({ jsonrpc: '2.0', id: b.id, result: { tools: [{ name: 'look', description: 'look', inputSchema: { type: 'object', properties: {} } }], nextCursor: 'c2' } });
+      }
+      return json(textResult(b.id, 'ok'));
+    });
+    const cancel = net.port.cancel.bind(net.port);
+    net.port.cancel = async (id) => {
+      if (refuse) throw Object.assign(new Error('nope'), { kind: 'failed' });
+      return cancel(id);
+    };
+    // Only the cancel's retries (1, 2, 4 s) come at once; no deadline ever fires, so nothing else drains.
+    const quick = { now: () => Date.now(), setTimer: (cb: () => void, ms: number) => { if (ms > 4000) return () => {}; const t = setTimeout(cb, 0); return () => clearTimeout(t); } };
+    const link = new ServerLink('s', { net: net.port }, quick, { ended: () => {} });
+    await link.start(remote, 'L');
+    refuse = true;
+    const r = await Promise.race([link.list(), sleep(3000).then(() => 'hung' as const)]);
+    expect(r).not.toBe('hung');
+    const l = link as unknown as { idle: unknown[]; watchers: Set<unknown> };
+    expect(l.idle.length).toBe(0);
+    expect(l.watchers.size).toBe(0);
+  });
+
   it('a rejected server_stop keeps the run\'s writes open until an exit is seen', async () => {
     const proc = fakeProcess((m) => (m.method === 'tools/call' ? 'hold' : m.method === 'initialize' ? [JSON.stringify(initResult(m.id))] : m.method === 'tools/list' ? [JSON.stringify(listResult(m.id, ['look']))] : []));
     let stopsTried = 0;

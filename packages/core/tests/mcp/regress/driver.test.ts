@@ -187,6 +187,27 @@ describe("a Test's report outlives no run (r35b #10)", () => {
   });
 });
 
+describe("a refused Test never takes a passing Test's report (r36 #6)", () => {
+  it('a second Test, refused during the first one\'s cleanup, then the exit in the same task: the first gets its tools', async () => {
+    const s = server();
+    let exit: (() => void) | undefined;
+    s.port.stop = (async (run: string) => {
+      exit = () => s.emits.get(run)!({ t: 'exit', code: 0 });
+    }) as ProcessPort['stop'];
+    const client = await open(s.port);
+    await client.add({ setup, problems: [] });
+    const first = client.test('l1');
+    for (let i = 0; i < 200 && !exit; i++) await sleep(2);
+    expect(exit).toBeDefined();
+    const second = client.test('l1');
+    exit!();
+    const [a, b] = await Promise.all([first, second]);
+    expect(b.ok).toBe(false);
+    expect(a.ok).toBe(true);
+    expect(a.ok && a.tools.length).toBe(1);
+  });
+});
+
 describe('an idle pong whose write delivers the exit (r35b #5)', () => {
   for (const mutation of [undefined, 'pong-busy-after-handoff'] as const)
     it(`both machines are Idle after it, and the next Start reaches its new process${mutation ? ` (control: ${mutation} leaves the lifecycle busy)` : ''}`, async () => {

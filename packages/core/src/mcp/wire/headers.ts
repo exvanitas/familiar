@@ -68,7 +68,9 @@ export function scanDeclarations(schema: unknown): ScanResult {
     // Every other position, whatever its keyword (named or not, draft-07's included), is walked too, and a
     // declaration found there is outside a chain of properties: the tool is invalid. Only data is skipped.
     for (const [k, sub] of Object.entries(s)) {
-      if (k === 'properties' || DATA.has(k) || sub === null || typeof sub !== 'object') continue;
+      // A properties map is walked above; one that is an array is no map (r36 #4), so it is walked here, and
+      // whatever it holds is outside a chain of properties.
+      if ((k === 'properties' && !Array.isArray(sub)) || DATA.has(k) || sub === null || typeof sub !== 'object') continue;
       const branches = Array.isArray(sub) ? sub : MAPS.has(k) || NAMED.has(k) ? Object.values(sub as Record<string, unknown>) : [sub];
       for (const b of branches) {
         const f = visit(b, [...path, `<${k}>`], false);
