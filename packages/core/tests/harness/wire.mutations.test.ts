@@ -769,6 +769,24 @@ describe("H3 and a catalog's live interval", () => {
   }, 60_000);
 });
 
+describe("a page's shape and cursor, as the reader checks them", () => {
+  // A page is a catalog page only if its tools are a list of objects and its cursor is absent, empty (the
+  // walk's end) or a string of at most 1 KiB: S38's last A page before the call given a numeric cursor, or
+  // tools that are an object, is no page; A's relist is no catalog, and the call fails H3, without throwing.
+  it('a numeric cursor or object-valued tools makes no page, and H3 reads it without throwing', async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (const bad of [{ nextCursor: 7 }, { tools: { echo: 1 } }]) {
+      for (let seed = 1; seed <= 4; seed++) {
+        const r = await wireRun(seed, s38);
+        const call = r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+        const page = r.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined && x.seq < call.seq).at(-1)!;
+        page.plan = { ...page.plan!, messages: page.plan!.messages.map((m) => (m.id === page.body!.id && m.result ? { ...m, result: { ...m.result, ...bad } } : m)) };
+        expect(PASS_CHECKS.H3!(r), `seed ${seed} ${JSON.stringify(bad)}`).not.toEqual([]);
+      }
+    }
+  }, 60_000);
+});
+
 describe('a delivered, valid response of the right kind and id', () => {
   // A page's response, and an opening's, count only when the parser accepts it: S38's last A response before
   // the call, changed to jsonrpc "1.0", is no page, so A's relist is no catalog and the call fails H3.

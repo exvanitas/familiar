@@ -141,6 +141,8 @@ export interface Mode {
   readonly replayListAnswer?: boolean;
   /** Local: each list answered twice, first with another definition of echo, then as scripted. */
   readonly doubleListAnswer?: boolean;
+  /** Each walk's last page carries `nextCursor: ""`, which ends the walk as no cursor does. */
+  readonly emptyFinalCursor?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -310,7 +312,7 @@ export class ScriptedServer {
     if (body.method === 'tools/list') {
       if (body.params?.cursor === undefined) this.lists = (this.lists ?? 0) + 1;
       const page = Number(body.params?.cursor ?? 0);
-      const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
+      const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : m.emptyFinalCursor ? { nextCursor: '' } : {};
       const listed = this.onPage(page);
       const answer = [{ jsonrpc: '2.0', id: body.id, result: { tools: m.reorder ? listed.map((t) => shuffled(t, this.r)) : listed, ...next, ...complete } }];
       // A notice after the page's final response, in its stream: the parser stopped at the final, so it is unread.

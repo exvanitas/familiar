@@ -791,6 +791,20 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S47: a server whose last page carries an empty cursor, which ends the walk: Ready, a grant and a call
+    // under it, which runs (H3 publishes the page the empty cursor ends).
+    name: 'S47 a last page with an empty cursor',
+    options: {
+      mode: { ...quiet, pages: 2, emptyFinalCursor: true },
+      schedule: (d) => d.when('ready', () => d.idle(), () => void d.grantOwn('echo')?.then(() => d.when('idle', () => d.idle(), () => d.own('echo'))))
+    },
+    expect: (r) => {
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
     name: 'S40 a local modern-only server that exits after the refusal, relaunched',

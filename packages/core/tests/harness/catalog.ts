@@ -44,16 +44,20 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
     // contents and its timing together (r40 #5).
     const res = x.kind === 'write' && !evidenceControls.scriptedPages ? exe.respondedMsg.get(`${x.epoch}:${x.body.id}`)?.result : x.plan && x.final !== undefined ? acceptedResponse(x.plan, x.body.id)?.result : undefined;
     const continues = cursor === undefined || (open !== undefined && open.epoch === x.epoch && open.next === cursor);
-    if (at === undefined || !res || !continues) {
+    // The page's shape, as the reader checks it (3.10): its tools a list of objects, its cursor absent or a
+    // string of at most 1 KiB; an empty cursor ends the walk as no cursor does. Any other is no page.
+    const cursorOk = res?.nextCursor === undefined || (typeof res.nextCursor === 'string' && new TextEncoder().encode(res.nextCursor).length <= 1024);
+    const toolsOk = Array.isArray(res?.tools) && res.tools.every((t: unknown) => t !== null && typeof t === 'object' && !Array.isArray(t));
+    if (at === undefined || !res || !continues || !cursorOk || !toolsOk) {
       open = undefined;
       continue;
     }
-    const tools = [...(cursor === undefined ? [] : open!.tools), ...((res.tools as any[] | undefined) ?? [])];
+    const tools = [...(cursor === undefined ? [] : open!.tools), ...(res.tools as any[])];
     // From the first page's write (its sequence, locally), to its last page's answer.
     const from = cursor === undefined ? (x.kind === 'write' ? x.seq : x.start) : open!.from;
     const noticed = (cursor === undefined ? false : open!.noticed) || noticedOnPage(x);
     const fromSeq = cursor === undefined ? x.seq : open!.fromSeq;
-    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, fromSeq, noticed };
+    if (typeof res.nextCursor === 'string' && res.nextCursor !== '') open = { epoch: x.epoch, next: res.nextCursor, tools, from, fromSeq, noticed };
     else {
       open = undefined;
       if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, atSeq: (x.kind === 'post' ? x.finalSeq : exe.respondedSeq.get(`${x.epoch}:${x.body.id}`)) ?? Infinity, fromSeq, epoch: x.epoch, tools, modern: modernRun(x) });
