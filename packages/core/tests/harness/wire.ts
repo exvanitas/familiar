@@ -139,6 +139,8 @@ export interface Mode {
   readonly trailingListNotice?: boolean;
   /** Local: after each call's answer, the last list answer again (a duplicate response for that request). */
   readonly replayListAnswer?: boolean;
+  /** Local: each list answered twice, first with another definition of echo, then as scripted. */
+  readonly doubleListAnswer?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -462,6 +464,8 @@ export class FakeExe {
   readonly responded = new Map<string, number>();
   /** Local: the same, as the global sequence, for order within a step. */
   readonly respondedSeq = new Map<string, number>();
+  /** Local: the accepted response itself, recorded with its time and sequence. */
+  readonly respondedMsg = new Map<string, Msg>();
   /** Local: when the client asked the exe to stop each process run, by epoch, and the handle it named. */
   readonly stopsAsked: { epoch: number; step: number; seq?: number; run?: string }[] = [];
   /** Local: when each process run exited, by epoch. */
@@ -757,6 +761,8 @@ export class FakeExe {
           if (written && !this.responded.has(key)) {
             this.responded.set(key, this.sched.step);
             this.respondedSeq.set(key, this.tick());
+            // The accepted response itself, with its timing: a page is read from it, never from the plan.
+            this.respondedMsg.set(key, m);
           }
         }
         if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
@@ -865,6 +871,12 @@ export class FakeExe {
           flush(run);
           this.sched.add({ label: `exit-after:${run}`, fire: () => this.sched.add({ label: `exit:${run}`, fire: () => exit(run, 0) }) });
           return;
+        }
+        // A server that answers a list twice: first with another definition of echo, then as scripted. The
+        // client takes the first response as the answer.
+        if (this.server.mode.doubleListAnswer && body.method === 'tools/list') {
+          const scripted = plan.messages.find((m) => m.id === body.id && m.result);
+          if (scripted) p.out.push(JSON.stringify({ ...scripted, result: { ...scripted.result, tools: scripted.result.tools.map((t: Msg) => (t.name === 'echo' ? { ...t, description: 'Echo, first.' } : t)) } }));
         }
         for (const m of plan.messages) p.out.push(JSON.stringify(m));
         // A server that repeats its last list answer after a call's answer: a duplicate response for that

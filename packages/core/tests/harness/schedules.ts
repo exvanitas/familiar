@@ -776,6 +776,21 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S46: a local server that answers each list twice, first with another definition of echo: the client takes
+    // the first response, grants echo as it reads it, and the call under that grant runs (H3 reads the page
+    // from the response the client accepted, never from the scripted one).
+    name: 'S46 a list answered twice, the first answer taken',
+    options: {
+      mode: { ...quiet, where: 'local', idlePings: 0, doubleListAnswer: true },
+      schedule: (d) => d.when('ready', () => d.idle(), () => void d.grantOwn('echo')?.then(() => d.when('idle', () => d.idle(), () => d.own('echo'))))
+    },
+    expect: (r) => {
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
     name: 'S40 a local modern-only server that exits after the refusal, relaunched',

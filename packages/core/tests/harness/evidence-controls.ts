@@ -11,5 +11,7 @@ export const evidenceControls = {
   /** The client's end taken at the final response only, never at the message its parser rejected. */
   finalOnly: false,
   /** Remote pages bound to the fake exe's global handshake epoch, not their own destination's (the old reading). */
-  globalHandshakes: false
+  globalHandshakes: false,
+  /** A local page read from the scripted plan, not the response the client accepted (the old reading). */
+  scriptedPages: false
 };

@@ -2,6 +2,7 @@
 // (checks.ts) and by the driver, which records with each grant the version the person's card showed.
 
 import { createHash } from 'node:crypto';
+import { evidenceControls } from './evidence-controls.ts';
 import { readPrefix } from './shape.ts';
 import type { FakeExe, NativeRec } from './wire.ts';
 
@@ -38,7 +39,9 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
     const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : exe.responded.get(`${x.epoch}:${x.body.id}`);
     // The page's own response as the parser accepted it: within the prefix it read, through the final or the
     // first message it rejects. Its completion and its cursor are read from that response alone.
-    const res = x.plan ? readPrefix(x.plan).find((m) => m.id === x.body!.id && m.result)?.result : undefined;
+    // Locally, the response the exe recorded as accepted for this request, with the time it was read: its
+    // contents and its timing together (r40 #5).
+    const res = x.kind === 'write' && !evidenceControls.scriptedPages ? exe.respondedMsg.get(`${x.epoch}:${x.body.id}`)?.result : x.plan ? readPrefix(x.plan).find((m) => m.id === x.body!.id && m.result)?.result : undefined;
     const continues = cursor === undefined || (open !== undefined && open.epoch === x.epoch && open.next === cursor);
     if (at === undefined || !res || !continues) {
       open = undefined;

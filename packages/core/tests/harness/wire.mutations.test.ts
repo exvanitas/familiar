@@ -769,6 +769,23 @@ describe("H3 and a catalog's live interval", () => {
   }, 60_000);
 });
 
+describe('a local page read from the response the client accepted', () => {
+  // S46: each list answered twice, the client taking the first; its grant and call are valid. Read from the
+  // scripted plan (the old reading), the page carries the second definition, and H3 flags the grant's call.
+  it('S46 is clean by the accepted response, and fails H3 by the scripted plan', async () => {
+    const s46 = SCHEDULES.find((s) => s.name.startsWith('S46'))!.options;
+    for (let seed = 1; seed <= 4; seed++) expect(PASS_CHECKS.H3!(await wireRun(seed, s46)), `seed ${seed}`).toEqual([]);
+    evidenceControls.scriptedPages = true;
+    try {
+      let flagged = 0;
+      for (let seed = 1; seed <= 4; seed++) if (PASS_CHECKS.H3!(await wireRun(seed, s46)).length) flagged++;
+      expect(flagged).toBeGreaterThan(0);
+    } finally {
+      evidenceControls.scriptedPages = false;
+    }
+  }, 60_000);
+});
+
 describe('handshake epochs per destination', () => {
   // S44: two modern remote servers' handshakes interleave; s1's grant and call are valid. With pages bound to the
   // exe's global epoch (the old reading), s1's listing falls into s2's epoch, reads as legacy, and H3 flags both.
