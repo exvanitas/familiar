@@ -420,14 +420,14 @@ describe("H3 and a walk a notice invalidated", () => {
 });
 
 describe("H3 and the version a grant was given for", () => {
-  // S38's grant, pressed while A was listed, then a call at A under it. The press carries the version the
-  // card showed, as the harness read it: recorded as B (a grant for B pressed while A was listed), the call
+  // S38's grant, written while A was listed, then a call at A under it. The grant carries the version the
+  // card showed, as the harness read it: recorded as B (a grant for B written while A was listed), the call
   // at A runs a version the grant wasn't for, and H3 flags it; recorded as A, the clean twin passes.
   it('a call at A under a grant for B fails H3; under a grant for A it passes', async () => {
     const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
     for (let seed = 1; seed <= 4; seed++) {
       const r = await wireRun(seed, s38);
-      const grant = r.evidence.find((e) => e.what === 'press')!;
+      const grant = r.evidence.find((e) => e.what === 'grant')!;
       expect(grant.def, `seed ${seed}`).toMatch(/"description":"Echo\."/);
       expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
       Object.assign(grant, { def: grant.def!.replace('"Echo."', '"Echo, changed."') });
@@ -437,8 +437,8 @@ describe("H3 and the version a grant was given for", () => {
 });
 
 describe("H3 and the person's latest act on a tool", () => {
-  // The effective choice at a handoff is the person's latest act before it, by when each was made: a press
-  // (once saved), or a take-back. S38's call at A runs under its grant for A.
+  // The effective choice at a handoff is the person's latest act before it: a grant, from when its write
+  // resolved ok, or a take-back, from when it was made. S38's call at A runs under its grant for A.
   const s38 = () => SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
   const callAtA = (r: WireRun) => r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
   it('a later saved grant for B: the call at A under the earlier grant for A fails H3', async () => {
@@ -447,17 +447,16 @@ describe("H3 and the person's latest act on a tool", () => {
       expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
       const grant = r.evidence.find((e) => e.what === 'grant')!;
       const at = callAtA(r).seq - 0.5;
-      const forB = { ...grant, token: 'press-9', def: grant.def!.replace('"Echo."', '"Echo, changed."'), grant: 'fp-B' };
-      r.evidence.push({ ...forB, what: 'press', seq: at - 0.25 }, { ...forB, what: 'grant', seq: at });
+      r.evidence.push({ ...grant, token: 'grant-9', def: grant.def!.replace('"Echo."', '"Echo, changed."'), grant: 'fp-B', seq: at });
       r.evidence.sort((a, b) => a.seq - b.seq);
       expect(PASS_CHECKS.H3!(r), `seed ${seed} a later grant for B`).not.toEqual([]);
     }
   }, 60_000);
-  it('an earlier take-back, then the grant pressed and saved: the call at A passes H3', async () => {
+  it('an earlier take-back, then the grant written: the call at A passes H3', async () => {
     for (let seed = 1; seed <= 4; seed++) {
       const r = await wireRun(seed, s38());
-      const press = r.evidence.find((e) => e.what === 'press')!;
-      r.evidence.push({ seq: press.seq - 0.5, step: press.step, what: 'revoke', tool: 'echo', server: 's1' });
+      const grant = r.evidence.find((e) => e.what === 'grant')!;
+      r.evidence.push({ seq: grant.seq - 0.5, step: grant.step, what: 'revoke', tool: 'echo', server: 's1' });
       r.evidence.sort((a, b) => a.seq - b.seq);
       expect(PASS_CHECKS.H3!(r), `seed ${seed}`).toEqual([]);
     }
@@ -465,17 +464,17 @@ describe("H3 and the person's latest act on a tool", () => {
 });
 
 describe("H3 and a grant's identity: its destination and setup", () => {
-  // S38's grant, press and decision moved to name s2, while the call's handoff went to s1's address: the
+  // S38's grant and decision moved to name s2, while the call's handoff went to s1's address: the
   // grant isn't for the server the call reached. Its setup changed alone: the decision isn't the grant's.
   it('evidence naming another server than the handoff, or another setup than the grant, fails H3', async () => {
     const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
     for (let seed = 1; seed <= 4; seed++) {
       const moved = await wireRun(seed, s38);
       expect(PASS_CHECKS.H3!(moved), `seed ${seed} clean`).toEqual([]);
-      for (const e of moved.evidence) if (e.what === 'press' || e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { server: 's2' });
+      for (const e of moved.evidence) if (e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { server: 's2' });
       expect(PASS_CHECKS.H3!(moved), `seed ${seed} s2`).not.toEqual([]);
       const setup = await wireRun(seed, s38);
-      Object.assign(setup.evidence.find((e) => e.what === 'press')!, { setup: 'another-setup' });
+      Object.assign(setup.evidence.find((e) => e.what === 'grant')!, { setup: 'another-setup' });
       expect(PASS_CHECKS.H3!(setup), `seed ${seed} setup`).not.toEqual([]);
     }
   }, 60_000);

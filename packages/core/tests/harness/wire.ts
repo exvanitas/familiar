@@ -938,7 +938,7 @@ export interface Evidence {
   readonly step: number;
   /** The scheduler's clock when it was noted, in ms. */
   readonly at?: number;
-  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'press' | 'grant';
+  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant';
   /** On a `stopped`: how the Stop ended, as its reply says. */
   readonly stopOutcome?: 'stopped' | 'may-still-run' | 'refused' | 'failed';
   /** On a `test`: whether it reached the machine (Test from Stopped or Failed). */
@@ -948,7 +948,7 @@ export interface Evidence {
   /** On a `grant`: the tool's definition as the harness read it when the person pressed (the card's own
       version), canonical; H3 holds a call under the grant to exactly this. */
   readonly def?: string;
-  /** On a `press`, `grant`, or a `yes` under a grant: the setup fingerprint the grant, or the decision, is for. */
+  /** On a `grant`, or a `yes` under a grant: the setup fingerprint the grant, or the decision, is for. */
   readonly setup?: string;
   /** Test's report: whether it listed, and the tool names it showed. */
   readonly report?: { readonly ok: boolean; readonly tools: readonly string[] };
@@ -1155,25 +1155,20 @@ export class Driver {
     }
   }
 
-  /** The person's "may run on its own" for a tool as it is listed now; H3 dates the grant by this step. */
-  private presses = 0;
+  /** "May run on its own" for a tool as it is listed now, written to the owner directly, as step 8's desk will
+      (step 7 ships no way to grant). H3 counts the grant from when its write resolved ok. */
+  private grants = 0;
   grantOwn(tool: string, id = 's1'): Promise<unknown> | undefined {
     const t = this.client.tools().find((x) => x.serverName === tool && x.server.id === id);
     if (!t) return undefined;
-    // Noted once saved: a grant refused is no grant. The version it is for is the card's, read now from the
-    // exe's log by the harness's own reading, never from the client's catalog.
+    // The version it is for is the card's, read now from the exe's log by the harness's own reading, never
+    // from the client's catalog. Noted once the write resolves ok: a grant refused is no grant.
     const step = this.sched.step;
     const def = catalogAt(this.exe, this.server.mode.where === 'remote' ? `addr-${id.slice(1)}` : id, Infinity, tool);
-    // The press, taken now, as the person presses (its place in order is now), with the card's own facts;
-    // then its save. Both noted: the press when made, the grant once its save resolves true, with the press's
-    // token, so H3 orders the act by its press.
-    const token = `press-${++this.presses}`;
-    const facts = { tool, server: id, token, grant: t.fingerprint, setup: t.setupFingerprint, ...(def !== undefined ? { def } : {}) };
-    const press = this.client.pressOwn({ server: id, tool, fingerprint: t.fingerprint, launch: t.setupFingerprint });
-    this.note({ what: 'press', ...facts });
-    return press.save().then(
-      (saved) => {
-        if (!saved) return;
+    const facts = { tool, server: id, token: `grant-${++this.grants}`, grant: t.fingerprint, setup: t.setupFingerprint, ...(def !== undefined ? { def } : {}) };
+    return this.client.owner.grant(id, tool, { fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }).then(
+      (r) => {
+        if (!r.ok) return;
         const e = this.note({ what: 'grant', ...facts });
         (e as { step: number }).step = step;
       },

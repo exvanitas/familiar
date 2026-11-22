@@ -294,9 +294,8 @@ export const H3: Check = (r) => {
     if (!x.raw?.includes(want) || x.body!.params?.name !== yes.tool) problems.push(`H3: the call for ${t} isn't, byte for byte, what its Yes showed: ${args.slice(0, 60)}`);
     if (used.has(t)) problems.push(`H3: the Yes for ${t} used twice`);
     used.add(t);
-    // The person's one effective choice for this tool at the handoff: their latest act before it, by when each
-    // was made. A press counts from its press, once its save resolved (before the handoff); a take-back from
-    // when it was made.
+    // The person's one effective choice for this tool at the handoff: their latest act before it. A grant counts
+    // from when its write to the owner resolved ok; a take-back from when it was made.
     // The evidence is bound to where the call went: the server it names is the handoff's own destination.
     const named = yes.server ?? 's1';
     if (destination(r, named) !== x.server) problems.push(`H3: ${t} went out to ${x.server}, its evidence names ${named}`);
@@ -305,10 +304,10 @@ export const H3: Check = (r) => {
     const now = listedAt(r, x.server, x.start, yes.tool!);
     if (yes.grant !== undefined) {
       // A call under "may run on its own": the effective choice is a grant, the one this decision names, and
-      // the server lists exactly the version that grant's card showed (the press carries the harness's own
+      // the server lists exactly the version that grant's card showed (the grant carries the harness's own
       // reading of it). Nothing in between matters: a tool that went A, B, A runs on its own again at A (the
       // owner's option A); any other version asks.
-      if (effective?.what !== 'press' || effective.grant !== yes.grant) {
+      if (effective?.what !== 'grant' || effective.grant !== yes.grant) {
         if (effective?.what !== 'revoke') problems.push(`H3: ${t} went out under a grant that isn't the person's choice for ${yes.tool} at its handoff`);
       } else if (effective.setup === undefined || effective.setup !== yes.setup) problems.push(`H3: ${t} went out under a grant for another setup than its decision's`);
       else if (effective.def === undefined || effective.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
@@ -327,12 +326,11 @@ export const H3: Check = (r) => {
     its setup's own id (local). */
 const destination = (r: WireRun, server: string) => (r.server.mode.where === 'remote' ? `addr-${server.slice(1)}` : server);
 
-/** The person's latest act on one server's tool before `before` (a sequence), by when each was made: a press
-    whose save resolved true before then, or a take-back. Undefined: no act. */
+/** The person's latest act on one server's tool before `before` (a sequence): a grant written to the owner,
+    counted from when its write resolved ok, or a take-back, from when it was made. Undefined: no act. */
 function latestAct(r: WireRun, server: string, tool: string, before: number): Evidence | undefined {
-  const saved = new Set(r.evidence.filter((e) => e.what === 'grant' && e.seq < before).map((e) => e.token));
   return r.evidence
-    .filter((e) => (e.server ?? 's1') === server && e.tool === tool && e.seq < before && ((e.what === 'press' && saved.has(e.token)) || e.what === 'revoke'))
+    .filter((e) => (e.server ?? 's1') === server && e.tool === tool && e.seq < before && (e.what === 'grant' || e.what === 'revoke'))
     .sort((a, b) => a.seq - b.seq)
     .at(-1);
 }
