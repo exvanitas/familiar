@@ -229,6 +229,9 @@ describe("H13 and the parser's own end", () => {
         const r = await wireRun(seed, { mode: mode(kind) });
         if (r.exe.log.some((x) => x.refusals && x.delivered.size)) witnessed++;
         expect(PASS_CHECKS.H13!(r), `seed ${seed}`).toEqual([]);
+        // The answer holds a message the parser rejects: the client's refusal of it is no valid answer
+        // read as invalid (H10), and every other check holds on the clean run too.
+        for (const [name, check] of Object.entries(PASS_CHECKS)) if (name !== 'H4' && name !== 'H5') expect(check(r), `seed ${seed} ${name}`).toEqual([]);
       }
       expect(witnessed).toBeGreaterThan(0);
       evidenceControls.finalOnly = true;

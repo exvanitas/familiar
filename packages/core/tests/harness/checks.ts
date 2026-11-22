@@ -2,7 +2,7 @@
 // own record and the driver's evidence log, never the client's state.
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
-import type { Evidence, NativeRec, WireRun } from './wire.ts';
+import { rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
 export type Check = (r: WireRun) => string[];
@@ -322,7 +322,10 @@ function staleCatalogCalls(r: WireRun): string[] {
   const problems: string[] = [];
   const recs = r.exe.log.filter((x) => x.kind === 'post');
   for (const c of recs) {
-    if (c.final === undefined || !c.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed')) continue;
+    // A notice the client read: one ahead of the first message its parser rejects (it reads nothing after).
+    const messages = c.plan?.messages ?? [];
+    const cut = messages.findIndex(rejectedByShape);
+    if (c.final === undefined || !messages.slice(0, cut < 0 ? undefined : cut).some((m) => m.method === 'notifications/tools/list_changed')) continue;
     const d = Math.floor(c.final / 1000);
     // The relist: a walk from page 1 started after the notification, complete (its last page back whole).
     const firstPage = recs.find((x) => x.server === c.server && x.epoch === c.epoch && x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.start >= d && !x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
@@ -398,11 +401,12 @@ function canonical(v: unknown): string {
 }
 
 /** Whether the server wrote a well-formed answer to this call: an event stream, or a JSON body with its one
-    message (an empty JSON body is the server's own invalid answer). */
+    message (an empty JSON body is the server's own invalid answer), and no message in it that 3.10's shape
+    rules reject (the harness's own reading): an answer holding one is the server's invalid answer too. */
 function wroteValid(r: WireRun, token: string): boolean {
   const rec = r.exe.log.find((x) => isCall(x.body) && tokenOf(x.body) === token);
   const exact = !rec?.contentType || rec.contentType === 'application/json' || rec.contentType === 'text/event-stream';
-  return !!rec?.plan && exact && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0);
+  return !!rec?.plan && exact && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0) && !rec.plan.messages.some(rejectedByShape);
 }
 
 /** H10: a late or stale response never reaches a caller: a call's result names its own token, and comes
