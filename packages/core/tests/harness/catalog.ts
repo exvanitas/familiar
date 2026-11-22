@@ -9,8 +9,8 @@ import type { FakeExe, NativeRec } from './wire.ts';
     handshake's epoch), each page the one the page before it pointed to. Its tools are every page's, and it
     counts from the step its last page reached the client. A walk cut off (a page unanswered, failed, or
     not reached) is no catalog, and the next first page begins a new one. */
-export function walks(exe: FakeExe, server: string): { at: number; tools: any[]; modern: boolean }[] {
-  const done: { at: number; tools: any[]; modern: boolean }[] = [];
+export function walks(exe: FakeExe, server: string): { at: number; atSeq: number; tools: any[]; modern: boolean }[] {
+  const done: { at: number; atSeq: number; tools: any[]; modern: boolean }[] = [];
   // A modern remote run, by the server's own record: its opening initialize, in that handshake epoch, was
   // refused -32022 (never by the client's own framing).
   const modernRun = (x: NativeRec) => x.kind === 'post' && exe.log.some((y) => y.kind === 'post' && y.server === x.server && y.epoch === x.epoch && y.body?.method === 'initialize' && !!y.plan?.messages.some((m) => m.error?.code === -32022));
@@ -41,7 +41,7 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[];
     if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, noticed };
     else {
       open = undefined;
-      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, tools, modern: modernRun(x) });
+      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, atSeq: (x.kind === 'post' ? x.finalSeq : exe.respondedSeq.get(`${x.epoch}:${x.body.id}`)) ?? Infinity, tools, modern: modernRun(x) });
     }
   }
   return done;
@@ -60,11 +60,13 @@ export const defIn = (w: { tools: any[]; modern?: boolean }, tool: string): stri
   return def === undefined ? undefined : canonical({ name: def.name, title: def.title ?? '', description: def.description ?? def.title ?? '', inputSchema: def.inputSchema ?? null, ...(w.modern ? { modern: true } : {}) });
 };
 
-/** The tool's definition in the last completed walk that reached the client before `step` (Infinity: every
-    walk that has reached it so far). */
-export function catalogAt(exe: FakeExe, server: string, step: number, tool: string): string | undefined {
-  let found: { at: number; tools: any[]; modern: boolean } | undefined;
-  for (const w of walks(exe, server)) if (w.at < step && (!found || w.at >= found.at)) found = w;
+/** The tool's definition in the last completed walk that reached the client before the sequence `seq`
+    (Infinity: every walk that has reached it so far). */
+export function catalogAt(exe: FakeExe, server: string, seq: number, tool: string): string | undefined {
+  // By the global sequence of each walk's publication (its last page's answer reaching the client), never by
+  // step: a walk published earlier in a handoff's own step was published before it.
+  let found: { atSeq: number; tools: any[]; modern: boolean } | undefined;
+  for (const w of walks(exe, server)) if (w.atSeq < seq && (!found || w.atSeq >= found.atSeq)) found = w;
   return found && defIn(found, tool);
 }
 

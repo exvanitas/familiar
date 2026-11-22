@@ -302,7 +302,7 @@ export const H3: Check = (r) => {
     if (destination(r, named) !== x.server) problems.push(`H3: ${t} went out to ${x.server}, its evidence names ${named}`);
     const effective = latestAct(r, named, yes.tool!, x.seq);
     if (effective?.what === 'revoke') problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
-    const now = listedAt(r, x.server, x.start, yes.tool!);
+    const now = listedAt(r, x.server, x.seq, yes.tool!);
     if (yes.grant !== undefined) {
       // A call under "may run on its own": the effective choice is a grant, the one this decision names, and
       // the server lists exactly the version that grant's card showed (the grant carries the harness's own
@@ -325,7 +325,7 @@ export const H3: Check = (r) => {
     // A Yes: the tool as the server last listed it before the card, and before the handoff. A change between
     // (a fingerprint change) means the Yes allowed something else (S1).
     const card = r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
-    if (listedAt(r, x.server, card.step, yes.tool!) !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
+    if (listedAt(r, x.server, card.seq, yes.tool!) !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
   }
   problems.push(...staleCatalogCalls(r));
   return problems.slice(0, 3);
@@ -377,9 +377,10 @@ function staleCatalogCalls(r: WireRun): string[] {
   return problems;
 }
 
-/** The tool's definition in the last completed walk that reached the client before `step`. */
-function listedAt(r: WireRun, server: string, step: number, tool: string): string | undefined {
-  return catalogAt(r.exe, server, step, tool);
+/** The tool's definition in the last completed walk published (its last page's answer reaching the client) before the
+    global sequence `seq`: a card's, or a native handoff's. */
+function listedAt(r: WireRun, server: string, seq: number, tool: string): string | undefined {
+  return catalogAt(r.exe, server, seq, tool);
 }
 
 /** Whether the server wrote a well-formed answer to this call: an event stream, or a JSON body with its one

@@ -537,6 +537,27 @@ describe("H3's tool identity and the run's setup", () => {
   }, 60_000);
 });
 
+describe('H3 and a publication in the handoff\'s own step', () => {
+  // S1 locally under ignore-fingerprint: the Yes for A goes out after B was published, and H3 flags it. With
+  // the handoff's record moved into B's publication step (its sequence still after B's answer), B was still
+  // published before the handoff: H3 must flag it the same way.
+  it('a stale Yes handed off in the step B was published, after it, fails H3', async () => {
+    const o = SCHEDULES.find((s) => s.name === 'S1 a fingerprint change while a card is shown, local')!.options;
+    let judged = 0;
+    for (let seed = 1; seed <= 8; seed++) {
+      const r = await wireRun(seed, { ...o, mutation: 'ignore-fingerprint' });
+      const call = r.exe.log.find((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo');
+      if (!call || !PASS_CHECKS.H3!(r).length) continue;
+      const pages = r.exe.log.filter((x) => x.body?.method === 'tools/list' && x.seq < call.seq);
+      const b = r.exe.responded.get(`${pages.at(-1)!.epoch}:${pages.at(-1)!.body!.id}`)!;
+      Object.assign(call, { start: b });
+      judged++;
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).not.toEqual([]);
+    }
+    expect(judged).toBeGreaterThan(0);
+  }, 60_000);
+});
+
 describe('H3 and a notice in the step of the walk it starts', () => {
   // S1 locally: an idle notice is read, and the refresh it starts goes out in that same step. The notice came
   // before the walk, so it doesn't invalidate it: B is published, and a Yes for A after it must fail H3 under

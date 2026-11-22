@@ -438,6 +438,8 @@ export interface NativeRec {
   /** Remote: the step each ping id on this stream was delivered, and when its final response was. */
   readonly delivered: Map<string, number>;
   final?: number;
+  /** Remote: the global sequence when its final response reached the client, for order within a step. */
+  finalSeq?: number;
   /** Remote epoch (a new one at each initialize), for H12 and H14. */
   epoch: number;
   status?: number;
@@ -626,7 +628,10 @@ export class FakeExe {
                   const m = plan.messages[0];
                   if (m.method === 'ping' && !st.rec.delivered.has(m.id)) st.rec.delivered.set(m.id, this.sched.step * 1000);
                   if (m.method === 'notifications/tools/list_changed') st.rec.changesDelivered = (st.rec.changesDelivered ?? 0) + 1;
-                  if (plan.final === 0 && st.rec.final === undefined) st.rec.final = this.sched.step * 1000;
+                  if (plan.final === 0 && st.rec.final === undefined) {
+                    st.rec.final = this.sched.step * 1000;
+                    st.rec.finalSeq = this.tick();
+                  }
                 }
                 return w.resolve(new Uint8Array(0));
               }
@@ -643,7 +648,10 @@ export class FakeExe {
                     (st as any).changesSeen.add(k);
                     st.rec.changesDelivered = (st.rec.changesDelivered ?? 0) + 1;
                   }
-                  if (!held && k === plan.final && st.rec.final === undefined) st.rec.final = this.sched.step * 1000 + k;
+                  if (!held && k === plan.final && st.rec.final === undefined) {
+                    st.rec.final = this.sched.step * 1000 + k;
+                    st.rec.finalSeq = this.tick();
+                  }
                 }
               });
               w.resolve(next);
