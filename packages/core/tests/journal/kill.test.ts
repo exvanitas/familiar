@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { CHECKS } from './checks.ts';
 import { killAndResume, nodeWorld } from './node-env.ts';
 import { CALL_MS_MAX } from '../../src/index.ts';
-import { lifeClocks, scenario, WRITE_WINDOW, writeWindowPath, writeWindowProblems } from './scenarios.ts';
+import { lifeClocks, scenario, timerApi, WRITE_WINDOW, writeWindowPath, writeWindowProblems } from './scenarios.ts';
 
 describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its connection torn down)', () => {
   for (const [name, check] of Object.entries(CHECKS)) {
@@ -21,9 +21,43 @@ describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its c
 // clock is advanced past that limit: the timer died with its life, so life 1's client writes nothing more to
 // its port (no cancel for the call it had under way).
 describe("server-reissue's life 1 client, after the kill", () => {
-  it('had a timer armed at the kill; its native timers are all cleared, and nothing it fires reaches the old port', async () => {
+  it('had a timer armed at the kill; each of its timeouts was cleared at the timer API, and nothing reaches the old port', async () => {
     const world = nodeWorld();
-    await killAndResume(scenario('server-reissue'), world);
+    // A spy on the underlying timer API: every timeout armed, and whether it was cleared or ran.
+    const live = new Map<unknown, 'armed' | 'cleared' | 'ran'>();
+    const { set, clear } = timerApi;
+    let killed = false;
+    let armedInLife1 = 0;
+    let stillArmedAtKill: unknown[] = ['not reached'];
+    timerApi.set = (callback, delayMs) => {
+      const real: unknown = set(() => {
+        if (live.get(real) === 'armed') live.set(real, 'ran');
+        callback();
+      }, delayMs);
+      live.set(real, 'armed');
+      return real;
+    };
+    timerApi.clear = (real) => {
+      if (live.get(real) === 'armed') live.set(real, 'cleared');
+      clear(real);
+    };
+    try {
+      const s = scenario('server-reissue');
+      await killAndResume({ name: s.name, run: async (env) => {
+        if (env.life === 2 && !killed) {
+          killed = true;
+          // Life 1 is killed: every timeout it armed has run or was cleared at the API by now.
+          armedInLife1 = live.size;
+          stillArmedAtKill = [...live].filter(([, fate]) => fate === 'armed').map(([real]) => real);
+        }
+        return s.run(env);
+      } }, world);
+    } finally {
+      timerApi.set = set;
+      timerApi.clear = clear;
+    }
+    expect(armedInLife1).toBeGreaterThan(0);
+    expect(stillArmedAtKill).toEqual([]);
     expect(world.counters.get('life1-timers-at-kill')).toBeGreaterThan(0);
     const life1 = lifeClocks.get(world.counters)!.get(1)!;
     // The native scheduler's own queue: every timer life 1 armed was cleared there, not only in the clock.

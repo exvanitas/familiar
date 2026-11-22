@@ -54,13 +54,20 @@ export function offsetClock(counters: Counters): JournalClock & { advance(ms: nu
 /** The native timers under a life's clock: real timeouts, each also kept in this scheduler's own queue until
     it fires or is cleared, so a control can see which are still armed and fire them all, independently of the
     clock's own bookkeeping. */
+/** The underlying timer API the native timers arm and clear their timeouts through: the platform's, unless a
+    control puts a spy in its place to see each timeout's fate at the API itself. */
+export const timerApi = {
+  set: (callback: () => void, delayMs: number): unknown => setTimeout(callback, delayMs),
+  clear: (real: unknown): void => clearTimeout(real as ReturnType<typeof setTimeout>)
+};
+
 export function nativeTimers(): { set(callback: () => void, delayMs: number): number; clear(handle: number): void; pending(): number; fireAll(): void } {
   let next = 0;
-  const queue = new Map<number, { callback: () => void; real: ReturnType<typeof setTimeout> }>();
+  const queue = new Map<number, { callback: () => void; real: unknown }>();
   return {
     set(callback, delayMs) {
       const handle = ++next;
-      const real = setTimeout(() => {
+      const real = timerApi.set(() => {
         if (queue.delete(handle)) callback();
       }, delayMs);
       queue.set(handle, { callback, real });
@@ -70,13 +77,13 @@ export function nativeTimers(): { set(callback: () => void, delayMs: number): nu
       const t = queue.get(handle);
       if (!t) return;
       queue.delete(handle);
-      clearTimeout(t.real);
+      timerApi.clear(t.real);
     },
     pending: () => queue.size,
     fireAll() {
       for (const [handle, t] of [...queue]) {
         queue.delete(handle);
-        clearTimeout(t.real);
+        timerApi.clear(t.real);
         t.callback();
       }
     }
