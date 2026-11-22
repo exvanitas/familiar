@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
-import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type ExchangeRecord, type Mode, type WireOptions } from './wire.ts';
+import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type ExchangeRecord, type Mode, type WireOptions, type WireRun } from './wire.ts';
 
 interface Control {
   readonly mutation: string;
@@ -403,18 +403,46 @@ describe("H3 and a walk a notice invalidated", () => {
 });
 
 describe("H3 and the version a grant was given for", () => {
-  // S38's grant, saved while A was listed, then a call at A under it. The grant evidence carries the version
-  // the card showed, as the harness read it: recorded as B (a grant for B saved while A was listed), the call
+  // S38's grant, pressed while A was listed, then a call at A under it. The press carries the version the
+  // card showed, as the harness read it: recorded as B (a grant for B pressed while A was listed), the call
   // at A runs a version the grant wasn't for, and H3 flags it; recorded as A, the clean twin passes.
   it('a call at A under a grant for B fails H3; under a grant for A it passes', async () => {
     const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
     for (let seed = 1; seed <= 4; seed++) {
       const r = await wireRun(seed, s38);
-      const grant = r.evidence.find((e) => e.what === 'grant')!;
+      const grant = r.evidence.find((e) => e.what === 'press')!;
       expect(grant.def, `seed ${seed}`).toMatch(/"description":"Echo\."/);
       expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
       Object.assign(grant, { def: grant.def!.replace('"Echo."', '"Echo, changed."') });
       expect(PASS_CHECKS.H3!(r), `seed ${seed} a grant for B`).toEqual(expect.arrayContaining([expect.stringMatching(/another version/)]));
+    }
+  }, 60_000);
+});
+
+describe("H3 and the person's latest act on a tool", () => {
+  // The effective choice at a handoff is the person's latest act before it, by when each was made: a press
+  // (once saved), or a take-back. S38's call at A runs under its grant for A.
+  const s38 = () => SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+  const callAtA = (r: WireRun) => r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+  it('a later saved grant for B: the call at A under the earlier grant for A fails H3', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38());
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const grant = r.evidence.find((e) => e.what === 'grant')!;
+      const at = callAtA(r).seq - 0.5;
+      const forB = { ...grant, token: 'press-9', def: grant.def!.replace('"Echo."', '"Echo, changed."'), grant: 'fp-B' };
+      r.evidence.push({ ...forB, what: 'press', seq: at - 0.25 }, { ...forB, what: 'grant', seq: at });
+      r.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} a later grant for B`).not.toEqual([]);
+    }
+  }, 60_000);
+  it('an earlier take-back, then the grant pressed and saved: the call at A passes H3', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38());
+      const press = r.evidence.find((e) => e.what === 'press')!;
+      r.evidence.push({ seq: press.seq - 0.5, step: press.step, what: 'revoke', tool: 'echo', server: 's1' });
+      r.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).toEqual([]);
     }
   }, 60_000);
 });

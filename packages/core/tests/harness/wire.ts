@@ -957,7 +957,7 @@ export interface Evidence {
   readonly step: number;
   /** The scheduler's clock when it was noted, in ms. */
   readonly at?: number;
-  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant';
+  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'press' | 'grant';
   /** On a `stopped`: how the Stop ended, as its reply says. */
   readonly stopOutcome?: 'stopped' | 'may-still-run' | 'refused' | 'failed';
   /** On a `test`: whether it reached the machine (Test from Stopped or Failed). */
@@ -1173,6 +1173,7 @@ export class Driver {
   }
 
   /** The person's "may run on its own" for a tool as it is listed now; H3 dates the grant by this step. */
+  private presses = 0;
   grantOwn(tool: string, id = 's1'): Promise<unknown> | undefined {
     const t = this.client.tools().find((x) => x.serverName === tool && x.server.id === id);
     if (!t) return undefined;
@@ -1181,12 +1182,16 @@ export class Driver {
     const step = this.sched.step;
     const def = catalogAt(this.exe, this.server.mode.where === 'remote' ? `addr-${id.slice(1)}` : id, Infinity, tool);
     // The press, taken now, as the person presses (its place in order is now), with the card's own facts;
-    // then its save.
+    // then its save. Both noted: the press when made, the grant once its save resolves true, with the press's
+    // token, so H3 orders the act by its press.
+    const token = `press-${++this.presses}`;
+    const facts = { tool, server: id, token, grant: t.fingerprint, ...(def !== undefined ? { def } : {}) };
     const press = this.client.pressOwn({ server: id, tool, fingerprint: t.fingerprint, launch: t.setupFingerprint });
+    this.note({ what: 'press', ...facts });
     return press.save().then(
       (saved) => {
         if (!saved) return;
-        const e = this.note({ what: 'grant', tool, server: id, grant: t.fingerprint, ...(def !== undefined ? { def } : {}) });
+        const e = this.note({ what: 'grant', ...facts });
         (e as { step: number }).step = step;
       },
       () => undefined

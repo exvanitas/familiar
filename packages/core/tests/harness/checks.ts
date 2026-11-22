@@ -294,19 +294,20 @@ export const H3: Check = (r) => {
     if (!x.raw?.includes(want) || x.body!.params?.name !== yes.tool) problems.push(`H3: the call for ${t} isn't, byte for byte, what its Yes showed: ${args.slice(0, 60)}`);
     if (used.has(t)) problems.push(`H3: the Yes for ${t} used twice`);
     used.add(t);
-    const revoked = r.evidence.find((e) => e.what === 'revoke' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < x.seq);
-    if (revoked) problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
+    // The person's one effective choice for this tool at the handoff: their latest act before it, by when each
+    // was made. A press counts from its press, once its save resolved (before the handoff); a take-back from
+    // when it was made.
+    const effective = latestAct(r, yes.server ?? 's1', yes.tool!, x.seq);
+    if (effective?.what === 'revoke') problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
     const now = listedAt(r, x.server, x.start, yes.tool!);
     if (yes.grant !== undefined) {
-      // A call under "may run on its own": the person saved that grant before it, for one exact version, and
-      // the server lists exactly that version at the handoff. Nothing in between matters: a tool that went
-      // A, B, A runs on its own again at A (the owner's option A); any other version asks.
-      const given = [...r.evidence].reverse().find((e) => e.what === 'grant' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < yes.seq && e.grant === yes.grant);
-      if (!given) problems.push(`H3: ${t} went out under a grant the person never gave for that version of ${yes.tool}`);
-      // The version the grant was given for is the card's own, as the harness read it when the person pressed
-      // (the grant evidence carries it), never the listing just after: a grant saved from a card the server has
-      // since moved on from is for the card's version.
-      else if (given.def === undefined || given.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
+      // A call under "may run on its own": the effective choice is a grant, the one this decision names, and
+      // the server lists exactly the version that grant's card showed (the press carries the harness's own
+      // reading of it). Nothing in between matters: a tool that went A, B, A runs on its own again at A (the
+      // owner's option A); any other version asks.
+      if (effective?.what !== 'press' || effective.grant !== yes.grant) {
+        if (effective?.what !== 'revoke') problems.push(`H3: ${t} went out under a grant that isn't the person's choice for ${yes.tool} at its handoff`);
+      } else if (effective.def === undefined || effective.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
       continue;
     }
     // A Yes: the tool as the server last listed it before the card, and before the handoff. A change between
@@ -317,6 +318,16 @@ export const H3: Check = (r) => {
   problems.push(...staleCatalogCalls(r));
   return problems.slice(0, 3);
 };
+
+/** The person's latest act on one server's tool before `before` (a sequence), by when each was made: a press
+    whose save resolved true before then, or a take-back. Undefined: no act. */
+function latestAct(r: WireRun, server: string, tool: string, before: number): Evidence | undefined {
+  const saved = new Set(r.evidence.filter((e) => e.what === 'grant' && e.seq < before).map((e) => e.token));
+  return r.evidence
+    .filter((e) => (e.server ?? 's1') === server && e.tool === tool && e.seq < before && ((e.what === 'press' && saved.has(e.token)) || e.what === 'revoke'))
+    .sort((a, b) => a.seq - b.seq)
+    .at(-1);
+}
 
 /** A list_changed delivered on a run makes its catalog stale: no call goes out on that run until a tools/list
     walked after it has come back whole (G26). The notification comes ahead of its stream's final message,
