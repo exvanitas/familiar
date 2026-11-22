@@ -34,3 +34,21 @@ export function readPrefix(plan: Plan): Msg[] {
   return ends.length ? plan.messages.slice(0, Math.min(...ends) + 1) : plan.messages;
 }
 
+
+/** The response an answer gave its request, as the client accepted it: the first message, in the prefix its
+    parser read, that the shape rules accept, carrying the request's id and a result or an error. Undefined:
+    none (the request got no valid answer). */
+export function acceptedResponse(plan: Plan, id: unknown): Msg | undefined {
+  return readPrefix(plan).find((m) => !rejectedByShape(m) && m.id === id && ('result' in m || 'error' in m));
+}
+
+/** The legacy versions Familiar speaks, and the modern one (3.2's opening). */
+const LEGACY = ['2024-10-07', '2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
+const MODERN = '2026-07-28';
+
+/** Whether an error makes the run modern (3.2): -32022, whose `data.supported` is a list of strings that names
+    2026-07-28 and no legacy version Familiar speaks. Any other -32022, or a malformed list, does not. */
+export function modernRefusal(error: Msg | undefined): boolean {
+  const supported = error?.data?.supported;
+  return error?.code === -32022 && Array.isArray(supported) && supported.every((v: unknown) => typeof v === 'string') && supported.includes(MODERN) && !supported.some((v: string) => LEGACY.includes(v));
+}

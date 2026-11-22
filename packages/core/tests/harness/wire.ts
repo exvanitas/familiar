@@ -758,7 +758,8 @@ export class FakeExe {
           // it, and a stale one read before the request (a server replaying an old id) is none.
           const key = `${p.epoch}:${m.id}`;
           const written = this.log.some((x) => x.kind === 'write' && x.epoch === p.epoch && x.body?.method !== undefined && x.body.id === m.id);
-          if (written && !this.responded.has(key)) {
+          // Only a response the parser accepts answers its request (the shape rules, 3.10).
+          if (written && !this.responded.has(key) && !rejectedByShape(m)) {
             this.responded.set(key, this.sched.step);
             this.respondedSeq.set(key, this.tick());
             // The accepted response itself, with its timing: a page is read from it, never from the plan.

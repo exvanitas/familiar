@@ -4,6 +4,7 @@
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import { createHash } from 'node:crypto';
 import { canonical, catalogAt, fingerprintIn, walks } from './catalog.ts';
+import { acceptedResponse, modernRefusal } from './shape.ts';
 import { readPrefix, rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
@@ -480,8 +481,9 @@ export const H11: Check = (r) => {
     // From that initialize's own accepted response (the first message the parser read with its id), as the
     // catalog reads a run's era: never another reply in the same answer.
     const opening = recs.find((y) => runOf(r, y) === runOf(r, x) && y.server === x.server && y.body?.method === 'initialize');
-    const answer = opening?.plan ? readPrefix(opening.plan).find((m) => m.id === opening.body!.id && ('result' in m || 'error' in m)) : undefined;
-    return answer?.error?.code === -32022;
+    // Delivered, valid, of the right kind and id, and a modern refusal by its own supported list.
+    const answer = opening?.plan && opening.final !== undefined ? acceptedResponse(opening.plan, opening.body!.id) : undefined;
+    return modernRefusal(answer?.error);
   };
   for (const x of recs) {
     if (!isCall(x.body) || !modernRun(x)) continue;

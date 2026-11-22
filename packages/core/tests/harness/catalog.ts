@@ -3,7 +3,7 @@
 
 import { createHash } from 'node:crypto';
 import { evidenceControls } from './evidence-controls.ts';
-import { readPrefix } from './shape.ts';
+import { acceptedResponse, modernRefusal, readPrefix } from './shape.ts';
 import type { FakeExe, NativeRec } from './wire.ts';
 
 /** The harness's own reading of a server's catalogs: every walk that completed, from its first page to a
@@ -19,9 +19,10 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
   const modernRun = (x: NativeRec) =>
     x.kind === 'post' &&
     exe.log.some((y) => {
-      if (y.kind !== 'post' || y.server !== x.server || y.epoch !== x.epoch || y.body?.method !== 'initialize' || !y.plan) return false;
-      const answer = readPrefix(y.plan).find((m) => m.id === y.body!.id && ('result' in m || 'error' in m));
-      return answer?.error?.code === -32022;
+      // Delivered (its final reached the client), valid, of the right kind and id, and a modern refusal by its
+      // own supported list.
+      if (y.kind !== 'post' || y.server !== x.server || y.epoch !== x.epoch || y.body?.method !== 'initialize' || !y.plan || y.final === undefined) return false;
+      return modernRefusal(acceptedResponse(y.plan, y.body.id)?.error);
     });
   let open: { epoch: number; next: string; tools: any[]; from: number; fromSeq: number; noticed: boolean } | undefined;
   // A notice of changed tools that reached the client during a walk invalidates it: the client walks again,
@@ -41,7 +42,7 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
     // first message it rejects. Its completion and its cursor are read from that response alone.
     // Locally, the response the exe recorded as accepted for this request, with the time it was read: its
     // contents and its timing together (r40 #5).
-    const res = x.kind === 'write' && !evidenceControls.scriptedPages ? exe.respondedMsg.get(`${x.epoch}:${x.body.id}`)?.result : x.plan ? readPrefix(x.plan).find((m) => m.id === x.body!.id && m.result)?.result : undefined;
+    const res = x.kind === 'write' && !evidenceControls.scriptedPages ? exe.respondedMsg.get(`${x.epoch}:${x.body.id}`)?.result : x.plan && x.final !== undefined ? acceptedResponse(x.plan, x.body.id)?.result : undefined;
     const continues = cursor === undefined || (open !== undefined && open.epoch === x.epoch && open.next === cursor);
     if (at === undefined || !res || !continues) {
       open = undefined;

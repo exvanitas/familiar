@@ -769,6 +769,39 @@ describe("H3 and a catalog's live interval", () => {
   }, 60_000);
 });
 
+describe('a delivered, valid response of the right kind and id', () => {
+  // A page's response, and an opening's, count only when the parser accepts it: S38's last A response before
+  // the call, changed to jsonrpc "1.0", is no page, so A's relist is no catalog and the call fails H3.
+  it("a list response the parser rejects is no page", async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38);
+      const call = r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+      const page = r.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined && x.seq < call.seq).at(-1)!;
+      page.plan = { ...page.plan!, messages: page.plan!.messages.map((m) => (m.id === page.body!.id ? { ...m, jsonrpc: '1.0' } : m)) };
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  // A legacy run stays legacy unless its opening's delivered, valid answer is a -32022 whose supported list
+  // names 2026-07-28 and no legacy version: S2's opening answer replaced by a malformed -32022 never
+  // delivered, or by a valid one listing a legacy version beside 2026-07-28, leaves H11 clean.
+  it('a malformed or undelivered -32022, or one listing a legacy version, makes no run modern', async () => {
+    const s2 = SCHEDULES.find((s) => s.name.startsWith('S2 '))!.options;
+    const refusal = (id: unknown, supported: unknown, jsonrpc = '2.0') => ({ jsonrpc, id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported } } });
+    for (let seed = 1; seed <= 4; seed++) {
+      const malformed = await wireRun(seed, s2);
+      for (const x of malformed.exe.log) if (x.body?.method === 'initialize' && x.plan) {
+        x.plan = { ...x.plan, messages: [refusal(x.body.id, ['2026-07-28'], '1.0')] };
+        delete x.final;
+      }
+      expect(PASS_CHECKS.H11!(malformed), `seed ${seed} malformed`).toEqual([]);
+      const mixed = await wireRun(seed, s2);
+      for (const x of mixed.exe.log) if (x.body?.method === 'initialize' && x.plan) x.plan = { ...x.plan, messages: [refusal(x.body.id, ['2025-11-25', '2026-07-28'])], final: 0 };
+      expect(PASS_CHECKS.H11!(mixed), `seed ${seed} a legacy version listed`).toEqual([]);
+    }
+  }, 60_000);
+});
+
 describe('a local page read from the response the client accepted', () => {
   // S46: each list answered twice, the client taking the first; its grant and call are valid. Read from the
   // scripted plan (the old reading), the page carries the second definition, and H3 flags the grant's call.
