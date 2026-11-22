@@ -23,7 +23,7 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const slowCalls = (port: NodeProcessPort) => port.written.filter(l => l.includes('"tools/call"') && l.includes('"name":"slow"')).length;
 
-async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice>; review?: boolean; grantOwn?: JournalOptions['grantOwn'] } = {}) {
+async function life(world: NodeWorld, store: SettingsStore, id: string | undefined, script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; choices?: () => Record<string, ToolChoice>; review?: boolean } = {}) {
   const port = nodeProcessPort();
   cleanups.push(() => port.closeAll());
   const client = await McpClient.open({ paths: testPaths, store, processes: port, net: nodeNetPort(), addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: systemClock });
@@ -45,7 +45,7 @@ async function life(world: NodeWorld, store: SettingsStore, id: string | undefin
 }
 
 /** A journal over the given wrappers: the tools a turn loop holds until it's opened again. */
-async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string; grantOwn?: JournalOptions['grantOwn'] } = {}) {
+async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: ModelRequest) => FakeReply, extra: { policy?: () => GatePolicy; ask?: (card: ConsentCard) => boolean | void; consent?: ConsentPort; storeName?: string } = {}) {
   const model = createFakeModel(script);
   const journal = await openJournal({
     store: await world.open(extra.storeName ?? 'mcp-kill'),
@@ -57,7 +57,6 @@ async function turnLoop(world: NodeWorld, tools: ServerTool[], script: (r: Model
     clock: systemClock,
     wake: { wakeAt: () => {} },
     consent: extra.consent ?? { ask: (card) => Promise.resolve(extra.ask?.(card) ?? true) },
-    ...(extra.grantOwn ? { grantOwn: extra.grantOwn } : {}),
     ...(extra.policy ? { policy: extra.policy } : {}),
     presence: { report: () => {} },
     persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
@@ -140,7 +139,7 @@ describe('a server tool in the turn loop', () => {
     let held: ServerTool[] = [];
     let client!: McpClient;
     const policy = () => client.policy(held);
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true, grantOwn: () => ({ save: async () => true }) });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true });
     held = one.tools;
     client = one.client;
     const echo = held.find(t => t.serverName === 'echo')!;
@@ -183,13 +182,13 @@ describe('a server tool in the turn loop', () => {
       mutations.set(mutation ? [mutation] : []);
       try {
         const c = await echoChat(`mcp-own-${mutation ?? 'twin'}`, true);
-        // The first call asks; its card offers "May run on its own", in words that say what it lets her do.
+        // The first call asks. Its card offers no "May run on its own" in step 7 (step 8 wires its press).
         await c.turn();
         expect(c.cards).toHaveLength(1);
-        expect(c.cards[0]!.own).toMatch(/whenever she decides to, without asking you, even when something a server said led her there/);
-        expect(buttonsOf(c.cards[0]!)).toEqual(['yes', 'own', 'skip']);
-        // The grant, for the card's own facts.
-        expect(await c.client.pressOwn(c.cards[0]!.facts!).save()).toBe(true);
+        expect(c.cards[0]!.own).toBeUndefined();
+        expect(buttonsOf(c.cards[0]!)).toEqual(['yes', 'skip']);
+        // The grant, for the card's own facts, written as step 8's press will write it.
+        expect(await c.client.owner.grant(c.echo.server.id, 'echo', { fingerprint: c.cards[0]!.facts!.fingerprint, setupFingerprint: c.cards[0]!.facts!.launch })).toEqual({ ok: true });
         await c.turn();
         expect(c.cards).toHaveLength(1);
         expect(c.calls()).toBe(2);
@@ -223,7 +222,7 @@ describe('a server tool in the turn loop', () => {
 
   it('"may run on its own" revoked: the next call asks at once', async () => {
     const c = await echoChat('mcp-own-revoke', true);
-    expect(await c.client.pressOwn({ server: c.echo.server.id, tool: 'echo', fingerprint: c.echo.fingerprint, launch: c.echo.setupFingerprint }).save()).toBe(true);
+    expect(await c.client.owner.grant(c.echo.server.id, 'echo', { fingerprint: c.echo.fingerprint, setupFingerprint: c.echo.setupFingerprint })).toEqual({ ok: true });
     await c.turn();
     expect(c.cards).toEqual([]);
     expect(c.calls()).toBe(1);

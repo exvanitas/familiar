@@ -619,9 +619,12 @@ export class Owner {
     if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) return no('"May run on its own" is saved only from a press on its card.');
     const problem = choiceProblem(serverId, tool, choice);
     if (problem) return no(problem);
-    // A take-back (ask, never) is let in while a change's cleanup is unfinished, as a catalog write is: it
-    // changes no setup and only tightens. Nothing else is (5.6; r37 #5).
-    const t = this.admit('choice', { start: choice !== undefined && (choice.policy === 'ask' || choice.policy === 'deny') });
+    // A take-back is let in while a change's cleanup is unfinished, as a catalog write is: it changes no setup
+    // and only tightens. Never always tightens; ask only over what isn't never already (ask over never would
+    // loosen it). Nothing else is let in (5.6; r37 #5, r38 #5).
+    const cur = this.choices()[choiceKey(serverId, tool)];
+    const tightens = choice !== undefined && (choice.policy === 'deny' || (choice.policy === 'ask' && cur?.policy !== 'deny'));
+    const t = this.admit('choice', { start: tightens });
     if (!('release' in t)) return t;
     try {
       const key = choiceKey(serverId, tool);
@@ -635,8 +638,9 @@ export class Owner {
 
 
   /**
-   * "May run on its own" for one exact version (5.6, option A): the one writer of a grant, for a press on its
-   * card (McpClient.pressOwn). Let in while a change's cleanup is unfinished: it changes no setup. Written
+   * "May run on its own" for one exact version (5.6, option A): the one writer of a grant. It has no caller in
+   * step 7: step 8's card desk issues the grant at the press. Let in while a change's cleanup is unfinished: it
+   * changes no setup. Written
    * only for a saved server, not being removed, checked in the same step as its admission, so a grant never
    * outlives its server (r37 #3).
    */
