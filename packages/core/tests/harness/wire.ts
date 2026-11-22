@@ -746,9 +746,11 @@ export class FakeExe {
         const m = JSON.parse(line);
         // Keyed by the process that sent it, never by whichever process started last.
         if (m.id !== undefined && ('result' in m || 'error' in m)) {
-          // The first response for a request is its answer: a duplicate later never moves it.
+          // The first response read after its request was written is its answer: a duplicate later never moves
+          // it, and a stale one read before the request (a server replaying an old id) is none.
           const key = `${p.epoch}:${m.id}`;
-          if (!this.responded.has(key)) {
+          const written = this.log.some((x) => x.kind === 'write' && x.epoch === p.epoch && x.body?.method !== undefined && x.body.id === m.id);
+          if (written && !this.responded.has(key)) {
             this.responded.set(key, this.sched.step);
             this.respondedSeq.set(key, this.tick());
           }
