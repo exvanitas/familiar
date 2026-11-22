@@ -65,6 +65,8 @@ const CONTROLS: Control[] = [
   // Under the named schedules.
   { mutation: 'slot-per-run', check: 'H1', named: 'S8' },
   { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1' },
+  // Locally the notice and the refresh it starts share a step: H3 orders them within it.
+  { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1 a fingerprint change while a card is shown, local' },
   // The changed tool on a walk's second page: H3's catalog is every page of a completed walk.
   { mutation: 'ignore-fingerprint', check: 'H3', named: 'S1 a fingerprint change while a card is shown, the tool on a later page' },
   { mutation: 'own-ignores-fingerprint', check: 'H3', named: 'S38' },
@@ -414,6 +416,24 @@ describe("H3 and the version a grant was given for", () => {
       Object.assign(grant, { def: grant.def!.replace('"Echo."', '"Echo, changed."') });
       expect(PASS_CHECKS.H3!(r), `seed ${seed} a grant for B`).toEqual(expect.arrayContaining([expect.stringMatching(/another version/)]));
     }
+  }, 60_000);
+});
+
+describe('H3 and a notice in the step of the walk it starts', () => {
+  // S1 locally: an idle notice is read, and the refresh it starts goes out in that same step. The notice came
+  // before the walk, so it doesn't invalidate it: B is published, and a Yes for A after it must fail H3 under
+  // ignore-fingerprint. Judged on every seed where notice and first page share their step.
+  it('ignore-fingerprint fails H3 on each seed whose notice and refresh share a step', async () => {
+    const o = SCHEDULES.find((s) => s.name === 'S1 a fingerprint change while a card is shown, local')!.options;
+    let same = 0;
+    for (let seed = 1; seed <= 8; seed++) {
+      const r = await wireRun(seed, { ...o, mutation: 'ignore-fingerprint' });
+      const refresh = r.exe.log.filter((x) => x.body?.method === 'tools/list')[1];
+      if (!refresh || !r.exe.noticesDelivered.some((n) => n.step === refresh.start)) continue;
+      same++;
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).not.toEqual([]);
+    }
+    expect(same).toBeGreaterThan(0);
   }, 60_000);
 });
 

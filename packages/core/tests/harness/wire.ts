@@ -127,6 +127,9 @@ export interface Mode {
   /** Legacy: one more message right after a call's final response (in its chunk, with oneChunk): a notice of
       changed tools, or one of 3.10's rejections. The client's parser stops at the final, so it reads neither. */
   readonly afterFinal?: 'notice' | keyof typeof INVALID;
+  /** Local: after each call's answer, a notice of changed tools on its own line, its variant flipped: an idle
+      notice, which starts the refresh in the very step it is read. */
+  readonly idleNotice?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -467,6 +470,8 @@ export class FakeExe {
   readonly build: 'prepass' | 'pass';
   /** Local: when each response line reached the client, by epoch and request id. */
   readonly responded = new Map<string, number>();
+  /** Local: the same, as the global sequence, for order within a step. */
+  readonly respondedSeq = new Map<string, number>();
   /** Local: when the client asked the exe to stop each process run, by epoch, and the handle it named. */
   readonly stopsAsked: { epoch: number; step: number; seq?: number; run?: string }[] = [];
   /** Local: when each process run exited, by epoch. */
@@ -480,7 +485,7 @@ export class FakeExe {
   /** Local: when each ping line reached the client. */
   readonly pingDelivered = new Map<string, number>();
   /** Local: when each notice of changed tools reached the client, by the process that sent it. */
-  readonly noticesDelivered: { epoch: number; step: number }[] = [];
+  readonly noticesDelivered: { epoch: number; step: number; seq: number }[] = [];
   /** The highest count of server requests open at once, detached helpers included (H5's witness). */
   peakServer = 0;
   /** Global sequence shared with the evidence log, for order within a step. */
@@ -746,9 +751,13 @@ export class FakeExe {
       try {
         const m = JSON.parse(line);
         // Keyed by the process that sent it, never by whichever process started last.
-        if (m.id !== undefined && ('result' in m || 'error' in m)) this.responded.set(`${p.epoch}:${m.id}`, this.sched.step);
+        if (m.id !== undefined && ('result' in m || 'error' in m)) {
+          this.responded.set(`${p.epoch}:${m.id}`, this.sched.step);
+          this.respondedSeq.set(`${p.epoch}:${m.id}`, this.tick());
+        }
         if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
-        if (m.method === 'notifications/tools/list_changed') this.noticesDelivered.push({ epoch: p.epoch, step: this.sched.step });
+        // Recorded before the client reads it: a walk the notice starts is written after it, by sequence.
+        if (m.method === 'notifications/tools/list_changed') this.noticesDelivered.push({ epoch: p.epoch, step: this.sched.step, seq: this.tick() });
       } catch {
         /* not JSON */
       }
@@ -854,6 +863,10 @@ export class FakeExe {
           return;
         }
         for (const m of plan.messages) p.out.push(JSON.stringify(m));
+        if (this.server.mode.idleNotice && body.method === 'tools/call') {
+          this.server.variant = this.server.variant === 'a' ? 'b' : 'a';
+          p.out.push(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
+        }
         if (this.server.mode.idlePings && this.sched.random() < this.server.mode.idlePings) {
           this.server.pings.push({ id: `i${w.rec.n}`, on: `w${w.rec.n}`, afterFinal: false });
           p.out.push(JSON.stringify({ jsonrpc: '2.0', id: `i${w.rec.n}`, method: 'ping' }));

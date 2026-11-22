@@ -15,7 +15,9 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[] 
   // and publishes only that retry. Remotely a notice comes on the walk's own pages (one exchange at a time);
   // locally on any line of its process, between its first page's write and its last page's answer.
   const noticedOnPage = (x: NativeRec) => (x.kind === 'post' ? (x.changesDelivered ?? 0) > 0 : !!x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
-  const noticedLocally = (epoch: number, from: number, to: number) => exe.noticesDelivered.some((n) => n.epoch === epoch && n.step >= from && n.step < to);
+  // Ordered by the global sequence, never by step: a notice read in the step a walk starts may be the very
+  // notice that started it (before its first write), and doesn't invalidate it.
+  const noticedLocally = (epoch: number, from: number, to: number) => exe.noticesDelivered.some((n) => n.epoch === epoch && n.seq > from && n.seq < to);
   for (const x of exe.log) {
     if (x.server !== server || x.body?.method !== 'tools/list') continue;
     const cursor = x.body.params?.cursor;
@@ -27,12 +29,13 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[] 
       continue;
     }
     const tools = [...(cursor === undefined ? [] : open!.tools), ...((res.tools as any[] | undefined) ?? [])];
-    const from = cursor === undefined ? x.start : open!.from;
+    // From the first page's write (its sequence, locally), to its last page's answer.
+    const from = cursor === undefined ? (x.kind === 'write' ? x.seq : x.start) : open!.from;
     const noticed = (cursor === undefined ? false : open!.noticed) || noticedOnPage(x);
     if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, noticed };
     else {
       open = undefined;
-      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, at))) done.push({ at, tools });
+      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, tools });
     }
   }
   return done;

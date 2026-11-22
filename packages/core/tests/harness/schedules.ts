@@ -593,6 +593,26 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S1 locally, with an idle notice after the call's answer: the refresh it starts goes out in the very step
+    // the notice is read, so H3 orders a notice against a walk within the step, not by step alone.
+    name: 'S1 a fingerprint change while a card is shown, local',
+    options: {
+      mode: { ...quiet, where: 'local', idleNotice: true },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          const card = d.card('echo')!;
+          d.call('slow');
+          const lists = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.end !== undefined && d.exe.responded.has(`${x.epoch}:${x.body.id}`)).length;
+          d.when('relisted', () => d.idle() && lists() >= 2, () => d.yes(card));
+        })
+    },
+    expect: (r) => {
+      const card = r.evidence.find((e) => e.what === 'card' && e.tool === 'echo');
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === card?.token)?.outcome;
+      return !card ? 'no card shown' : out?.kind !== 'error' || out.reason !== 'changed' ? `the F1 Yes came back ${JSON.stringify(out)}` : undefined;
+    }
+  },
+  {
     // S1 with the changed tool on the walk's second page: the catalog H3 reads is every page of a walk.
     name: 'S1 a fingerprint change while a card is shown, the tool on a later page',
     options: {
