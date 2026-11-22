@@ -873,6 +873,7 @@ export const HC: Check = (r) => {
     let readmitTake: { from: number; to: number } | undefined;
     // Each run replay shows on this server, from the record sequence its making event's effects followed.
     const born = new Map<string, number>();
+    const died = new Map<string, number>();
     const endLive: { run: string; i: number; seq: number }[] = [];
     for (let i = 0; i < records.length; i++) {
       const rec = records[i]!;
@@ -880,7 +881,12 @@ export const HC: Check = (r) => {
       // An event's effects are applied after the record before it and before its own.
       const after = i ? (records[i - 1]!.seq ?? 0) : -Infinity;
       // A run exists from the event that made it: its first admission comes while that event's effects apply.
-      if (rec.state.run && !born.has(rec.state.run.id)) born.set(rec.state.run.id, after);
+      // Before the first record there is no earlier one: the run then begins no earlier than the person's own
+      // action that made it (a Start's, or a Test's).
+      const lower = i ? after : rec.event.t === 'start' ? (actionOf.get(rec.event.token)?.seq ?? Infinity) : Infinity;
+      if (rec.state.run && !born.has(rec.state.run.id)) born.set(rec.state.run.id, lower);
+      // And it is over at the record whose state no longer holds it.
+      for (const [id] of born) if (rec.state.run?.id !== id && !died.has(id)) died.set(id, seq);
       const out = next(s, rec.event);
       s = out.state;
       const ev = rec.event;
@@ -961,7 +967,7 @@ export const HC: Check = (r) => {
     // Each admission is consumed by one end only: a second end on it is an end never admitted.
     const consumed = new Set<object>();
     // Each admission belongs to a run its server had when it was admitted.
-    for (const a of ex.filter((x) => x.t === 'admit')) if (!born.has(a.run) || a.seq <= born.get(a.run)!) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) admitted for run ${a.run}, which the server didn't have then`);
+    for (const a of ex.filter((x) => x.t === 'admit')) if (!born.has(a.run) || a.seq <= born.get(a.run)! || a.seq >= (died.get(a.run) ?? Infinity)) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) admitted for run ${a.run}, which the server didn't have then`);
     for (const e of ex.filter((x) => x.t === 'ended')) {
       const a = ex.find((y) => y.t === 'admit' && !consumed.has(y) && y.n === e.n && y.run === e.run && y.kind === e.kind && y.seq < e.seq);
       if (a) consumed.add(a);

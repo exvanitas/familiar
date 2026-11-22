@@ -373,6 +373,24 @@ describe("HC's replay matched to the independent records, effect by effect", () 
       expect(PASS_CHECKS.HC!(r), `seed ${seed}`).toEqual(expect.arrayContaining([expect.stringMatching(/s9/)]));
     }
   }, 60_000);
+  it("an admission and its end for S11's run after the run was over, or before its Start", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const after = await clean(seed, s('S11 Stop during a live local call'));
+      const ex = after.exchanges.get('s1') as ExchangeRecord[];
+      const admit = ex.find((x) => x.t === 'admit')!;
+      const end = ex.find((x) => x.t === 'ended' && x.n === admit.n)!;
+      const last = Math.max(...ex.map((x) => x.seq), ...after.lifecycle.get('s1')!.map((x) => x.seq ?? 0));
+      ex.push({ ...admit, n: 900, seq: last + 1 }, { ...end, n: 900, seq: last + 2 });
+      expect(PASS_CHECKS.HC!(after), `seed ${seed} after the run`).toEqual(expect.arrayContaining([expect.stringMatching(/exchange 900/)]));
+      const before = await clean(seed, s('S11 Stop during a live local call'));
+      const ex2 = before.exchanges.get('s1') as ExchangeRecord[];
+      const admit2 = ex2.find((x) => x.t === 'admit')!;
+      const end2 = ex2.find((x) => x.t === 'ended' && x.n === admit2.n)!;
+      const start = before.evidence.find((e) => e.what === 'start')!;
+      ex2.unshift({ ...admit2, n: 901, seq: start.seq - 0.6 }, { ...end2, n: 901, seq: start.seq - 0.3 });
+      expect(PASS_CHECKS.HC!(before), `seed ${seed} before the Start`).toEqual(expect.arrayContaining([expect.stringMatching(/exchange 901/)]));
+    }
+  }, 60_000);
   it('an admission and its end for a run its server never had: s9#1 beside S11', async () => {
     for (let seed = 1; seed <= 4; seed++) {
       const r = await clean(seed, s('S11 Stop during a live local call'));
