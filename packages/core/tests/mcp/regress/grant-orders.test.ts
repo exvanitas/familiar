@@ -89,7 +89,7 @@ async function run(steps: readonly Step[]) {
   await sleep(10);
   const record = ((await inner.get(OWNER_KEY))!.value as { choices: Record<string, { policy: string }> }).choices[KEY];
   const live = client.tools().find((t) => t.serverName === 'echo');
-  const gate = live ? client.policy([live]).perTool[live.name] : undefined;
+  const gate = live ? client.policy([live]).perTool?.[live.name] : undefined;
   return { steps, out, record, gate, live: live?.fingerprint === a.fingerprint };
 }
 
