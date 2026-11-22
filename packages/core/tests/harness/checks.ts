@@ -3,7 +3,7 @@
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import { createHash } from 'node:crypto';
-import { canonical, catalogAt, fingerprintAt } from './catalog.ts';
+import { canonical, catalogAt, fingerprintAt, walks } from './catalog.ts';
 import { readPrefix, rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
@@ -372,14 +372,15 @@ function staleCatalogCalls(r: WireRun): string[] {
   const recs = r.exe.log.filter((x) => x.kind === 'post');
   for (const c of recs) {
     // A notice the client read: one in the prefix its parser read, through the final response or the first
-    // message it rejects, whichever came first (it reads nothing after either).
-    if (c.final === undefined || !c.plan || !readPrefix(c.plan).some((m) => m.method === 'notifications/tools/list_changed')) continue;
-    const d = Math.floor(c.final / 1000);
-    // The relist: a walk from page 1 started after the notification, complete (its last page back whole).
-    const firstPage = recs.find((x) => x.server === c.server && x.epoch === c.epoch && x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.start >= d && !(x.plan && readPrefix(x.plan).some((m) => m.method === 'notifications/tools/list_changed')));
-    const lastPage = firstPage && recs.find((x) => x.server === c.server && x.seq >= firstPage.seq && x.body?.method === 'tools/list' && x.final !== undefined && !x.plan?.messages.some((m) => m.result?.nextCursor !== undefined));
-    const until = lastPage ? Math.floor(lastPage.final! / 1000) : Infinity;
-    const call = recs.find((x) => x.server === c.server && x.epoch === c.epoch && isCall(x.body) && x.start > d && x.start <= until);
+    // message it rejects, whichever came first (it reads nothing after either). It counts from when that
+    // stream's final reached the client, by sequence.
+    if (c.finalSeq === undefined || !c.plan || !readPrefix(c.plan).some((m) => m.method === 'notifications/tools/list_changed')) continue;
+    const noticed = c.finalSeq;
+    // The relist: the first catalog published on that run from a walk begun after the notice. Every
+    // comparison is by sequence, never by step: a handoff in the relist's step, after it, is on the relist.
+    const relist = walks(r.exe, c.server).filter((w) => w.epoch === c.epoch && w.fromSeq > noticed).sort((a, b) => a.atSeq - b.atSeq)[0];
+    const until = relist?.atSeq ?? Infinity;
+    const call = recs.find((x) => x.server === c.server && x.epoch === c.epoch && isCall(x.body) && x.seq > noticed && x.seq < until);
     if (call) problems.push(`H3: ${tokenOf(call.body)} went out on a catalog a list_changed had made stale`);
   }
   return problems;

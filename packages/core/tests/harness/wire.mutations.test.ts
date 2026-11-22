@@ -410,8 +410,9 @@ describe("HC's replay matched to the independent records, effect by effect", () 
 describe("H3 and a walk a notice invalidated", () => {
   // S39: a refresh page carries a notice and describes B; the client discards that walk and its retry
   // publishes A, so the call under A's grant is valid (the reading that counted every walk flagged it). With
-  // the retry erased from the record, the noticed walk is still no catalog: the last one is A's, and H3 is
-  // clean. Take the page's notice out too, and B is a catalog the client would have published: H3 flags it.
+  // the retry erased from the record, the noticed walk is still no catalog: the last one is A's, so H3 finds
+  // no other version at the handoff (only that no relist came after the notice). Take the page's notice out
+  // too, and B is a catalog the client would have published: H3 flags the version.
   it('the noticed walk is no catalog; the same walk without its notice is one, and H3 flags the call', async () => {
     const s39 = SCHEDULES.find((s) => s.name.startsWith('S39'))!.options;
     for (let seed = 1; seed <= 4; seed++) {
@@ -421,7 +422,7 @@ describe("H3 and a walk a notice invalidated", () => {
       const noticed = lists.findIndex((x) => (x.changesDelivered ?? 0) > 0);
       const retry = lists[noticed + 1]!;
       retry.plan = { ...retry.plan!, messages: [] };
-      expect(PASS_CHECKS.H3!(r), `seed ${seed} retry erased`).toEqual([]);
+      expect(PASS_CHECKS.H3!(r).filter((p) => !/made stale/.test(p)), `seed ${seed} retry erased`).toEqual([]);
       const page = lists[noticed]!;
       page.plan = { ...page.plan!, messages: page.plan!.messages.filter((m) => m.method !== 'notifications/tools/list_changed') };
       page.changesDelivered = 0;
@@ -626,6 +627,38 @@ describe('H3 and the setup of the run that received the handoff', () => {
       Object.assign(yes, { setup: original });
       expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/another setup than its run was launched from/)]));
     }
+  }, 60_000);
+});
+
+describe('H3 orders notices, publications and handoffs by sequence throughout', () => {
+  // S38: the call at A, valid on the relist after the slow call's notice, moved into that relist's own
+  // publication step (its sequence still after it): it is still on the relist, and H3 is clean.
+  it("a valid handoff in its relist's publication step, after it, is clean", async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38);
+      const call = r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+      const relist = r.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined && x.seq < call.seq).at(-1)!;
+      Object.assign(call, { start: Math.floor(relist.final! / 1000) });
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).toEqual([]);
+    }
+  }, 60_000);
+  // S1 locally under ignore-fingerprint, with the server repeating its last list answer after each call's: B's
+  // duplicate response, after the stale handoff, never moves B's publication, and H3 still flags the call.
+  it("a duplicate list response after the stale handoff leaves B's publication where it was", async () => {
+    const o = SCHEDULES.find((s) => s.name === 'S1 a fingerprint change while a card is shown, local')!.options;
+    let judged = 0;
+    for (let seed = 1; seed <= 8; seed++) {
+      const r = await wireRun(seed, { ...o, mode: { ...o.mode, replayListAnswer: true }, mutation: 'ignore-fingerprint' });
+      const call = r.exe.log.find((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo');
+      if (!call) continue;
+      judged++;
+      // The catalog the harness reads at the stale handoff is B's, published before it.
+      const atHandoff = walks(r.exe, call.server).filter((w) => w.atSeq < call.seq).sort((a, b) => a.atSeq - b.atSeq).at(-1);
+      expect(atHandoff?.tools.find((t: { name: string }) => t.name === 'echo')?.description, `seed ${seed}`).toBe('Echo, changed.');
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).toEqual(expect.arrayContaining([expect.stringMatching(/changed after its card was shown/)]));
+    }
+    expect(judged).toBeGreaterThan(0);
   }, 60_000);
 });
 

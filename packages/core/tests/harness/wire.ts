@@ -137,6 +137,8 @@ export interface Mode {
   readonly sameFingerprint?: 'annotations' | 'empty-title';
   /** Legacy: each list page's answer ends with a notice of changed tools after its final response, unread. */
   readonly trailingListNotice?: boolean;
+  /** Local: after each call's answer, the last list answer again (a duplicate response for that request). */
+  readonly replayListAnswer?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -726,7 +728,7 @@ export class FakeExe {
 
   processes(): ProcessPort {
     let runs = 0;
-    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; server: string; noticed?: boolean }>();
+    const live = new Map<string, { emit: (e: ProcessEvent) => void; out: string[]; flushing: boolean; exited: boolean; exiting?: boolean; writes: { rec: NativeRec; done: () => void; fail: (e: unknown) => void }[]; reading: boolean; taken: number; epoch: number; server: string; noticed?: boolean; lastList?: Msg }>();
     const flush = (run: string) => {
       const p = live.get(run)!;
       if (p.flushing || !p.out.length) return;
@@ -744,8 +746,12 @@ export class FakeExe {
         const m = JSON.parse(line);
         // Keyed by the process that sent it, never by whichever process started last.
         if (m.id !== undefined && ('result' in m || 'error' in m)) {
-          this.responded.set(`${p.epoch}:${m.id}`, this.sched.step);
-          this.respondedSeq.set(`${p.epoch}:${m.id}`, this.tick());
+          // The first response for a request is its answer: a duplicate later never moves it.
+          const key = `${p.epoch}:${m.id}`;
+          if (!this.responded.has(key)) {
+            this.responded.set(key, this.sched.step);
+            this.respondedSeq.set(key, this.tick());
+          }
         }
         if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
         // Recorded before the client reads it: a walk the notice starts is written after it, by sequence.
@@ -855,6 +861,10 @@ export class FakeExe {
           return;
         }
         for (const m of plan.messages) p.out.push(JSON.stringify(m));
+        // A server that repeats its last list answer after a call's answer: a duplicate response for that
+        // list's request, long after its first.
+        if (body.method === 'tools/list') p.lastList = plan.messages.find((m) => m.id === body.id && 'result' in m);
+        if (this.server.mode.replayListAnswer && body.method === 'tools/call' && p.lastList) p.out.push(JSON.stringify(p.lastList));
         if (this.server.mode.idleNotice && body.method === 'tools/call') {
           this.server.variant = this.server.variant === 'a' ? 'b' : 'a';
           p.out.push(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));

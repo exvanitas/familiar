@@ -10,8 +10,8 @@ import type { FakeExe, NativeRec } from './wire.ts';
     handshake's epoch), each page the one the page before it pointed to. Its tools are every page's, and it
     counts from the step its last page reached the client. A walk cut off (a page unanswered, failed, or
     not reached) is no catalog, and the next first page begins a new one. */
-export function walks(exe: FakeExe, server: string): { at: number; atSeq: number; tools: any[]; modern: boolean }[] {
-  const done: { at: number; atSeq: number; tools: any[]; modern: boolean }[] = [];
+export function walks(exe: FakeExe, server: string): { at: number; atSeq: number; fromSeq: number; epoch: number; tools: any[]; modern: boolean }[] {
+  const done: { at: number; atSeq: number; fromSeq: number; epoch: number; tools: any[]; modern: boolean }[] = [];
   // A modern remote run, by the server's own record: its opening initialize, in that handshake epoch, was
   // refused -32022 (never by the client's own framing).
   // Read from that initialize's own accepted response: the first message the parser read with its id.
@@ -22,7 +22,7 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
       const answer = readPrefix(y.plan).find((m) => m.id === y.body!.id && ('result' in m || 'error' in m));
       return answer?.error?.code === -32022;
     });
-  let open: { epoch: number; next: string; tools: any[]; from: number; noticed: boolean } | undefined;
+  let open: { epoch: number; next: string; tools: any[]; from: number; fromSeq: number; noticed: boolean } | undefined;
   // A notice of changed tools that reached the client during a walk invalidates it: the client walks again,
   // and publishes only that retry. Remotely a notice comes on the walk's own pages (one exchange at a time);
   // locally on any line of its process, between its first page's write and its last page's answer.
@@ -46,10 +46,11 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
     // From the first page's write (its sequence, locally), to its last page's answer.
     const from = cursor === undefined ? (x.kind === 'write' ? x.seq : x.start) : open!.from;
     const noticed = (cursor === undefined ? false : open!.noticed) || noticedOnPage(x);
-    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, noticed };
+    const fromSeq = cursor === undefined ? x.seq : open!.fromSeq;
+    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, fromSeq, noticed };
     else {
       open = undefined;
-      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, atSeq: (x.kind === 'post' ? x.finalSeq : exe.respondedSeq.get(`${x.epoch}:${x.body.id}`)) ?? Infinity, tools, modern: modernRun(x) });
+      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, atSeq: (x.kind === 'post' ? x.finalSeq : exe.respondedSeq.get(`${x.epoch}:${x.body.id}`)) ?? Infinity, fromSeq, epoch: x.epoch, tools, modern: modernRun(x) });
     }
   }
   return done;
