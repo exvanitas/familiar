@@ -5,6 +5,7 @@
 
 import { mutant, mutations } from '../../src/mutations.ts';
 import { evidenceControls } from './evidence-controls.ts';
+import { catalogAt } from './catalog.ts';
 import { McpClient } from '../../src/mcp/client.ts';
 import { mintDecision } from '../../src/mcp/decision.ts';
 import type { NetHead, NetPort, NetSpec } from '../../src/mcp/wire/link.ts';
@@ -925,6 +926,9 @@ export interface Evidence {
   readonly reaches?: boolean;
   /** On a `yes` minted from a saved grant: the fingerprint it was given on (H3 holds the call to it). */
   readonly grant?: string;
+  /** On a `grant`: the tool's definition as the harness read it when the person pressed (the card's own
+      version), canonical; H3 holds a call under the grant to exactly this. */
+  readonly def?: string;
   /** Test's report: whether it listed, and the tool names it showed. */
   readonly report?: { readonly ok: boolean; readonly tools: readonly string[] };
   /** The reply's own words (a refused Start's, say). */
@@ -1134,11 +1138,13 @@ export class Driver {
   grantOwn(tool: string, id = 's1'): Promise<unknown> | undefined {
     const t = this.client.tools().find((x) => x.serverName === tool && x.server.id === id);
     if (!t) return undefined;
-    // Noted once saved: a grant refused is no grant.
+    // Noted once saved: a grant refused is no grant. The version it is for is the card's, read now from the
+    // exe's log by the harness's own reading, never from the client's catalog.
     const step = this.sched.step;
+    const def = catalogAt(this.exe, this.server.mode.where === 'remote' ? `addr-${id.slice(1)}` : id, Infinity, tool);
     return this.client.choose(id, tool, { policy: 'own', fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }).then(
       () => {
-        const e = this.note({ what: 'grant', tool, server: id, grant: t.fingerprint });
+        const e = this.note({ what: 'grant', tool, server: id, grant: t.fingerprint, ...(def !== undefined ? { def } : {}) });
         (e as { step: number }).step = step;
       },
       () => undefined
