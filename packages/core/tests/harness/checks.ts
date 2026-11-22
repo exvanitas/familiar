@@ -444,8 +444,11 @@ export const H11: Check = (r) => {
   // A run is modern by the server's own record: its opening initialize was refused -32022. Never by the
   // client's own headers.
   const modernRun = (x: NativeRec) => {
+    // From that initialize's own accepted response (the first message the parser read with its id), as the
+    // catalog reads a run's era: never another reply in the same answer.
     const opening = recs.find((y) => runOf(r, y) === runOf(r, x) && y.server === x.server && y.body?.method === 'initialize');
-    return !!opening?.plan?.messages.some((m) => m.error?.code === -32022);
+    const answer = opening?.plan ? readPrefix(opening.plan).find((m) => m.id === opening.body!.id && ('result' in m || 'error' in m)) : undefined;
+    return answer?.error?.code === -32022;
   };
   for (const x of recs) {
     if (!isCall(x.body) || !modernRun(x)) continue;
