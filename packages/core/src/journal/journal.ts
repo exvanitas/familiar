@@ -161,14 +161,15 @@ export interface JournalOptions {
   readonly notifier: NotifierPort;
   readonly consent: ConsentPort;
   /**
-   * Saves a "may run on its own" grant for exactly these card facts, once the journal has checked the press
-   * was on the card showing now and its facts still hold. Without it, no card offers the button.
+   * "May run on its own" (5.6, option A): the press, taken the moment the journal sees it, before any await,
+   * so its place among the person's acts is when they made it; then saved, for exactly the card's facts, once
+   * the call goes ahead on the card showing now. Without it, no card offers the button.
    *
-   * The contract (step 8 wires it to `McpClient.choose` with `policy: 'own'`, which keeps it): it saves a
-   * grant for exactly these facts, the version the card showed, whatever the server lists by then; the grant
-   * holds only while the server lists that version (5.6, option A). It resolves false when the save fails.
+   * The contract (step 8 wires it to `McpClient.pressOwn`, which keeps it): the press is numbered when it is
+   * taken; `save` writes a grant for exactly these facts, the version the card showed, unless a take-back came
+   * after the press or the server is gone, and resolves whether it was saved.
    */
-  readonly grantOwn?: (facts: CardFacts) => Promise<boolean>;
+  readonly grantOwn?: (facts: CardFacts) => { save(): Promise<boolean> };
   readonly presence: PresencePort;
   readonly persona: { readonly id: string; readonly name: string; readonly instructions: string };
   readonly decider: DecisionPort;
@@ -563,8 +564,10 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         options.consent.ask(card, signal).then(resolve, () => resolve(false));
       });
       if (ok === 'closed') throw new Error('The journal closed while the card was open.');
+      // The press, taken now, as the person made it: before anything is awaited (r37 #1).
+      const press = ok === 'own' && card.facts && options.grantOwn ? options.grantOwn(card.facts) : undefined;
       // (The named mutation saves the grant before anything is checked: a press on a card already stale.)
-      if (ok === 'own' && card.facts && options.grantOwn && (__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) void options.grantOwn(card.facts).catch(() => false);
+      if (press && (__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) void press.save().catch(() => false);
       // The answer counts only for the presentation still current.
       const current = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
       if (current?.presentation !== card.presentation) return 'The card was answered after it was replaced, so nothing was sent.';
@@ -582,8 +585,8 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       }, ctx);
       // "May run on its own", pressed on the card showing now, whose facts still hold: the grant, for exactly
       // those facts. A grant that isn't saved is reported; the Yes to this call stands either way.
-      if (ok === 'own' && card.facts && options.grantOwn && !(__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) {
-        const saved = await options.grantOwn(card.facts).catch(() => false);
+      if (press && !(__FAMILIAR_MUTATIONS__ && mutant('own-on-stale-card'))) {
+        const saved = await press.save().catch(() => false);
         // The grant's outcome, on its own: the call's outcome is reported where the call ends, as any call's.
         if (!saved) report('own', 'The "may run on its own" choice was not saved. Familiar will ask about this tool again next time.');
       }

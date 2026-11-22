@@ -140,7 +140,7 @@ describe('a server tool in the turn loop', () => {
     let held: ServerTool[] = [];
     let client!: McpClient;
     const policy = () => client.policy(held);
-    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true, grantOwn: async () => true });
+    const one = await life(world, store, undefined, script, { policy, ask: (card) => { cards.push(card); return answer; }, storeName, review: true, grantOwn: () => ({ save: async () => true }) });
     held = one.tools;
     client = one.client;
     const echo = held.find(t => t.serverName === 'echo')!;
@@ -189,7 +189,7 @@ describe('a server tool in the turn loop', () => {
         expect(c.cards[0]!.own).toMatch(/whenever she decides to, without asking you, even when something a server said led her there/);
         expect(buttonsOf(c.cards[0]!)).toEqual(['yes', 'own', 'skip']);
         // The grant, for the card's own facts.
-        await c.client.choose(c.echo.server.id, 'echo', { policy: 'own', fingerprint: c.cards[0]!.facts!.fingerprint, setupFingerprint: c.cards[0]!.facts!.launch });
+        expect(await c.client.pressOwn(c.cards[0]!.facts!).save()).toBe(true);
         await c.turn();
         expect(c.cards).toHaveLength(1);
         expect(c.calls()).toBe(2);
@@ -223,7 +223,7 @@ describe('a server tool in the turn loop', () => {
 
   it('"may run on its own" revoked: the next call asks at once', async () => {
     const c = await echoChat('mcp-own-revoke', true);
-    await c.client.choose(c.echo.server.id, 'echo', { policy: 'own', fingerprint: c.echo.fingerprint, setupFingerprint: c.echo.setupFingerprint });
+    expect(await c.client.pressOwn({ server: c.echo.server.id, tool: 'echo', fingerprint: c.echo.fingerprint, launch: c.echo.setupFingerprint }).save()).toBe(true);
     await c.turn();
     expect(c.cards).toEqual([]);
     expect(c.calls()).toBe(1);

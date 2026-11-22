@@ -115,8 +115,11 @@ export class McpClient {
   private readonly runtimes = new Map<string, ServerRuntime>();
   /** Revokes that hold at once, whatever the owner is doing: "always" back to ask, or anything to never. */
   private readonly overlay = new Map<string, 'ask' | 'never'>();
-  /** How many revokes each key has had, so a choice clears only the revokes made before it. */
-  private readonly revokes = new Map<string, number>();
+  /** Every act of the person's on a tool's choice (a press, a take-back, a choice in Settings), numbered as
+      they make it: the latest act wins (5.6, option A). */
+  private acts = 0;
+  /** Each tool's latest take-back, by its act number. */
+  private readonly takenBack = new Map<string, number>();
   /** What each recent Test report showed, by the report's id: its server, and each tool's fingerprint by
       name. Mark reviewed binds to one of them. The newest few are kept. */
   private readonly reports = new Map<string, { readonly server: string; readonly shown: ReadonlyMap<string, string>; readonly listing: number }>();
@@ -318,12 +321,37 @@ export class McpClient {
    */
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
     const key = choiceKey(serverId, tool);
-    const before = this.revokes.get(key) ?? 0;
+    const order = ++this.acts;
+    // Only a press on its card saves "may run on its own" (pressOwn): never a choice made here (r37 #2).
+    if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) throw new Error('"May run on its own" is saved only from a press on its card.');
     // "May run on its own" is saved for exactly the version the card showed, from its own facts, whatever the
     // server lists now: it holds only while the server lists that version (5.6, option A).
-    const r = await this.owner.choose(serverId, tool, choice);
+    const r = __FAMILIAR_MUTATIONS__ && mutant('choose-own') && choice?.policy === 'own' ? await this.owner.grant(serverId, tool, { fingerprint: choice.fingerprint, setupFingerprint: choice.setupFingerprint }) : await this.owner.choose(serverId, tool, choice);
     if (!r.ok) throw new Error(r.words);
-    if ((this.revokes.get(key) ?? 0) === before) this.overlay.delete(key);
+    // A take-back made since this choice is the later act, and its overlay stays.
+    if ((this.takenBack.get(key) ?? 0) < order) this.overlay.delete(key);
+  }
+
+  /**
+   * The person pressed "may run on its own" on a server tool's card (5.6): the press, numbered now, when it
+   * is made, with the card's own facts. The journal takes it at the press, before any await, and saves it
+   * once the call goes ahead. The save writes nothing if a take-back came after the press (the latest act
+   * wins), or if the server is gone; it resolves whether the grant was saved.
+   */
+  pressOwn(facts: { readonly server: string; readonly tool: string; readonly fingerprint: string; readonly launch: string }): { save(): Promise<boolean> } {
+    const key = choiceKey(facts.server, facts.tool);
+    const pressed = ++this.acts;
+    return {
+      save: async () => {
+        // (The named mutation orders the press at its save instead: the old way, a step late.)
+        const order = __FAMILIAR_MUTATIONS__ && mutant('own-press-order-late') ? ++this.acts : pressed;
+        if ((this.takenBack.get(key) ?? 0) > order) return false;
+        const r = await this.owner.grant(facts.server, facts.tool, { fingerprint: facts.fingerprint, setupFingerprint: facts.launch }).catch((): Outcome => ({ ok: false, words: '' }));
+        if (!r.ok) return false;
+        if ((this.takenBack.get(key) ?? 0) < order) this.overlay.delete(key);
+        return true;
+      }
+    };
   }
 
   /**
@@ -335,14 +363,16 @@ export class McpClient {
   policy(wrappers: readonly ServerTool[]): GatePolicy {
     const choices = this.owner.choices();
     const perTool: Record<string, GateVerdict> = { ...toolPolicies(wrappers, choices) };
-    // "May run on its own" only while the server lists the tool exactly as granted: the grant against the live
-    // listing, never against a turn's own copy of the wrapper, which may be older (5.6, option A).
+    // "May run on its own" decided from the live listing: the wrapper names the server and tool, and the grant
+    // is compared with the version the server lists now, never with a turn's own copy of the wrapper, which
+    // may be older, in either direction (5.6, option A; r37 #4).
     const live = new Map(this.tools().map(t => [choiceKey(t.server.id, t.serverName), t]));
     for (const w of wrappers) {
-      if (perTool[w.name] !== 'own') continue;
       const key = choiceKey(w.server.id, w.serverName);
+      if (choices[key]?.policy !== 'own') continue;
       const now = (__FAMILIAR_MUTATIONS__ && mutant('own-on-wrapper-copy')) ? w : live.get(key);
-      if (!now || !this.ownNow(key, now.fingerprint, now.setupFingerprint)) delete perTool[w.name];
+      if (now && this.ownNow(key, now.fingerprint, now.setupFingerprint)) perTool[w.name] = 'own';
+      else delete perTool[w.name];
     }
     for (const [key, c] of Object.entries(choices)) {
       const tool = builtInTool(key);
@@ -378,7 +408,7 @@ export class McpClient {
    */
   async revoke(serverId: string, tool: string, to: 'ask' | 'never'): Promise<Outcome> {
     const key = choiceKey(serverId, tool);
-    this.revokes.set(key, (this.revokes.get(key) ?? 0) + 1);
+    this.takenBack.set(key, ++this.acts);
     if (this.overlay.get(key) !== 'never') this.overlay.set(key, to);
     const cur = this.owner.choices()[key];
     // Ask after never isn't a tightening: the saved never stands, and nothing is written. But only once

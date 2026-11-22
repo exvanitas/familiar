@@ -382,8 +382,9 @@ describe('5.1 and 5.5: a lost or revoked choice never loosens to run-without-ask
   it('a revoke the owner refuses holds for now and says it was not saved; a restart brings the saved choice back', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
-    // A grant already saved (the client grants only a version listed now; the server isn't running here).
-    await client.owner.choose('s1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 'l' });
+    // A grant already saved, for a saved server (it isn't running here).
+    await client.add({ setup: local('s1'), problems: [] });
+    expect(await client.owner.grant('s1', 'echo', { fingerprint: 'f', setupFingerprint: 'l' })).toEqual({ ok: true });
     const busy = client.owner.admit('other');
     if (!('release' in busy)) throw new Error('not admitted');
     const r = await client.revoke('s1', 'echo', 'ask');
@@ -536,6 +537,7 @@ describe('5.5: a revoke holds until the person chooses again', () => {
   it('a revoke to never, then a choice of allow that saves: the overlay goes and allow stands', async () => {
     const store = memorySettingsStore();
     const client = await clientOf(store, speakingPort().port);
+    await client.add({ setup: local('s1'), problems: [] });
     const noteAdd = { name: 'note_add', kind: 'effect' } as never;
     expect(await client.revoke(BUILT_IN, 'note_add', 'never')).toEqual({ ok: true });
     expect(gateFor('note_add', noteAdd, client.policy([]))).toBe('deny');

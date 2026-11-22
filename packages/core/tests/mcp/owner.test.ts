@@ -74,7 +74,7 @@ describe('5.1: one durable effect at a time', () => {
     expect(await owner.add(local('l1'))).toEqual({ ok: true });
     hold = true;
     const seen = owner.seen('l1', [{ name: 'echo', fingerprint: 'f1' }]);
-    const choice = owner.choose('l1', 'echo', { policy: 'own', fingerprint: 'f1', setupFingerprint: 'x' });
+    const choice = owner.grant('l1', 'echo', { fingerprint: 'f1', setupFingerprint: 'x' });
     await new Promise((r) => setTimeout(r, 5));
     hold = false;
     gates.splice(0).forEach((g) => g());
@@ -85,7 +85,7 @@ describe('5.1: one durable effect at a time', () => {
     // The other way round: the choice holds the owner, and the catalog write is skipped (re-derived at the
     // next listing), never a second write on the same revision.
     hold = true;
-    const second = owner.choose('l1', 'echo', { policy: 'own', fingerprint: 'f1', setupFingerprint: 'x' });
+    const second = owner.grant('l1', 'echo', { fingerprint: 'f1', setupFingerprint: 'x' });
     await new Promise((r) => setTimeout(r, 1));
     await owner.seen('l1', [{ name: 'echo', fingerprint: 'f2' }]);
     hold = false;
@@ -161,7 +161,9 @@ describe('5.1: one durable effect at a time', () => {
     const t = ports();
     const owner = await Owner.open(t.p);
     await owner.add(local('l1', ['TOKEN']));
-    await owner.choose('l1', 'echo', { policy: 'own', fingerprint: 'f', setupFingerprint: 's' });
+    await owner.grant('l1', 'echo', { fingerprint: 'f', setupFingerprint: 's' });
+    // A server whose id begins like l1's, so its choice must survive l1's removal.
+    await owner.add({ ...local('l10'), label: 'Other' });
     await owner.choose('l10', 'echo', { policy: 'deny', fingerprint: 'f', setupFingerprint: 's' });
     expect(await owner.remove('l1', async () => void t.log.push('stopped'))).toEqual({ ok: true });
     expect(t.log).toEqual(['stopped', 'forget l1', 'secret_delete server:l1:TOKEN']);

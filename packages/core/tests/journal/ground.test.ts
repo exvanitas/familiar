@@ -481,7 +481,7 @@ describe('5.6 and G12: no server tool runs without your Yes to that call, whatev
       wake: { wakeAt: () => {} },
       notifier: { notify: () => {} },
       consent: { ask: async (card) => { cards.push(card); return answer; } },
-      grantOwn: async () => true,
+      grantOwn: () => ({ save: async () => true }),
       presence: { report: () => {} },
       persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
       decider: { decide: async (event, context) => decideByRules(event, context) },

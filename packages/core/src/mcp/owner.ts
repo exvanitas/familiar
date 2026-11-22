@@ -615,14 +615,42 @@ export class Owner {
   }
 
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<Outcome> {
+    // A grant has its own writer, for a press on its card (grant): never a choice saved here (r37 #2).
+    if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) return no('"May run on its own" is saved only from a press on its card.');
     const problem = choiceProblem(serverId, tool, choice);
     if (problem) return no(problem);
-    // Let in while a change's cleanup is unfinished, as a catalog write is: a choice changes no setup (5.6).
-    const t = this.admit('choice', { start: true });
+    // A take-back (ask, never) is let in while a change's cleanup is unfinished, as a catalog write is: it
+    // changes no setup and only tightens. Nothing else is (5.6; r37 #5).
+    const t = this.admit('choice', { start: choice !== undefined && (choice.policy === 'ask' || choice.policy === 'deny') });
     if (!('release' in t)) return t;
     try {
       const key = choiceKey(serverId, tool);
+      // A choice for a server tool is written only for a saved server, not being removed (r37 #3).
+      if (choice && serverId !== BUILT_IN && (!this.server(serverId) || this.server(serverId)!.removing)) return no('That server is gone, so the choice was not saved.');
       return (await this.commit((d) => (choice ? (d.choices[key] = choice as unknown as JsonValue) : delete d.choices[key]))) ? ok : no('The choice was not saved.');
+    } finally {
+      t.release();
+    }
+  }
+
+
+  /**
+   * "May run on its own" for one exact version (5.6, option A): the one writer of a grant, for a press on its
+   * card (McpClient.pressOwn). Let in while a change's cleanup is unfinished: it changes no setup. Written
+   * only for a saved server, not being removed, checked in the same step as its admission, so a grant never
+   * outlives its server (r37 #3).
+   */
+  async grant(serverId: string, tool: string, version: { readonly fingerprint: string; readonly setupFingerprint: string }): Promise<Outcome> {
+    if (serverId === BUILT_IN) return no(ONLY_LISTED_WORDS);
+    if (!version.fingerprint || !version.setupFingerprint) return no('That grant names no version of the tool, so it was not saved.');
+    const t = this.admit('choice', { start: true });
+    if (!('release' in t)) return t;
+    try {
+      const s = this.server(serverId);
+      if ((!s || s.removing) && !(__FAMILIAR_MUTATIONS__ && mutant('grant-after-remove'))) return no('That server is gone, so the grant was not saved.');
+      const key = choiceKey(serverId, tool);
+      const choice: ToolChoice = { policy: 'own', fingerprint: version.fingerprint, setupFingerprint: version.setupFingerprint };
+      return (await this.commit((d) => void (d.choices[key] = choice as unknown as JsonValue))) ? ok : no('The choice was not saved.');
     } finally {
       t.release();
     }
