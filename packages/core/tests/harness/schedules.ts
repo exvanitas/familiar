@@ -644,6 +644,17 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
+    // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
+    name: 'S40 a local modern-only server that exits after the refusal, relaunched',
+    options: { mode: { ...quiet, where: 'local', era: 'modern', exitOnRefusal: true }, schedule: () => {} },
+    expect: (r) => {
+      const readmits = [...r.lifecycle.values()].flat().filter((x) => x.event.t === 'readmit').length;
+      const ready = r.evidence.find((e) => e.what === 'started')?.ok;
+      return r.exe.processStarts.length === 2 && readmits === 1 && ready ? undefined : `${r.exe.processStarts.length} process starts, ${readmits} readmits, Start ${ready ? 'ready' : 'not ready'}`;
+    }
+  },
+  {
     // S39: with A granted, a refresh whose page carries a notice of changed tools and describes B: the walk
     // is discarded and retried, and the retry publishes A again. The grant stands, and the call under it goes
     // out: H3 reads only the walks the client could publish, never one a notice invalidated.

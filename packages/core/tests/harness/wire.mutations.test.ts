@@ -336,6 +336,36 @@ describe("HC's replay matched to the independent records, effect by effect", () 
       expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
     }
   }, 60_000);
+  it('a reply under a server and token no action had: one for s9 appended to S36', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S36'));
+      const last = r.evidence.filter((e) => e.what === 'started').at(-1)!;
+      r.evidence.push({ ...last, seq: last.seq + 100_000, server: 's9', token: 'start-9' });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).toEqual(expect.arrayContaining([expect.stringMatching(/start-9/)]));
+    }
+  }, 60_000);
+  it("an exchange that ended twice on one admission: a call's end record duplicated", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const ex = r.exchanges.get('s1') as ExchangeRecord[];
+      const end = ex.find((x) => x.t === 'ended' && x.kind === 'call')!;
+      ex.push({ ...end, seq: Math.max(...ex.map((x) => x.seq)) + 1 });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a relaunch's reservation taken after its readmit-check: S40's moved past that transition", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S40'));
+      const recs = r.lifecycle.get('s1')!;
+      // The transition that requested readmission: the one that put the run in its relaunch step.
+      const check = recs.findIndex((x, i) => x.state.run?.step === 'relaunch' && recs[i - 1]?.state.run?.step !== 'relaunch');
+      const held = r.reservations.filter((x) => x.what === 'start').at(-1)!;
+      expect(held.seq, `seed ${seed}`).toBeLessThan(recs[check]!.seq!);
+      // Moved past that transition, still before the readmit event and the relaunch's native start.
+      Object.assign(held, { seq: (recs[check]!.seq! + recs[check + 1]!.seq!) / 2 });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
   it("an exchange's end with no admission: a call's admit record dropped", async () => {
     for (let seed = 1; seed <= 4; seed++) {
       const r = await clean(seed, s('S11 Stop during a live local call'));

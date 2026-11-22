@@ -121,6 +121,9 @@ export interface Mode {
   /** With more than one page: the echo tool (the one a list_changed changes) on the walk's last page, the
       rest on its first, so a catalog read from first pages alone never sees it. */
   readonly echoLast?: boolean;
+  /** Local, modern: the process exits right after refusing the legacy opening, so the client relaunches it
+      once, modern, under a relaunch's own owner reservation (3.9). */
+  readonly exitOnRefusal?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -197,8 +200,10 @@ export class ScriptedServer {
   private changedThisSession = -1;
   private changedSince = false;
   private readonly firstPages = new Map<number, number>();
-  /** Set once the server has answered in a way after which it exits (modernListExit). */
+  /** Set once the server has answered in a way after which it exits (modernListExit, exitOnRefusal). */
   exitAfter = false;
+  /** exitOnRefusal: the refusing process's list goes unanswered; its exit clears this. */
+  listUnanswered = false;
   private lists: number | undefined;
   /** Its tools' variant: a list_changed it sends changes the echo tool's description (S1). */
   variant = 'a';
@@ -231,6 +236,7 @@ export class ScriptedServer {
       if (m.era === 'legacy' && this.r() < m.initError) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32603, message: 'internal error' } }]);
       if (m.era === 'modern') {
         const refusal = { jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: [MODERN], requested: body.params?.protocolVersion } } };
+        if (m.exitOnRefusal && m.where === 'local') this.exitAfter = this.listUnanswered = true;
         return json([refusal], this.r() < 0.5 ? 400 : 200, { session: this.r() < 0.5 ? 'dead' : undefined } as Partial<Plan>);
       }
       this.session++;
@@ -270,6 +276,11 @@ export class ScriptedServer {
       const listed = { jsonrpc: '2.0', id: body.id, result: { tools: this.onPage(page), ...next } };
       this.variant = this.variant === 'a' ? 'b' : 'a';
       return { status: 200, sse: true, messages: [{ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }, listed], final: 1 };
+    }
+    // The list sent to the process that exits after its refusal (exitOnRefusal) gets no answer.
+    if (body.method === 'tools/list' && this.listUnanswered) {
+      this.listUnanswered = false;
+      return { status: 200, sse: false, messages: [], final: -1 };
     }
     if (body.method === 'tools/list' && m.modernListExit && modernReq) {
       this.exitAfter = true;
@@ -758,6 +769,7 @@ export class FakeExe {
       const p = live.get(run)!;
       if (p.exited) return;
       p.exited = true;
+      this.server.listUnanswered = false;
       this.exits.push({ epoch: p.epoch, step: this.sched.step });
       for (const w of p.writes.splice(0)) {
         w.rec.end ??= this.sched.step;
