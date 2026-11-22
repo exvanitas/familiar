@@ -370,6 +370,23 @@ describe("H3 and a walk a notice invalidated", () => {
   }, 60_000);
 });
 
+describe("H3 and the version a grant was given for", () => {
+  // S38's grant, saved while A was listed, then a call at A under it. The grant evidence carries the version
+  // the card showed, as the harness read it: recorded as B (a grant for B saved while A was listed), the call
+  // at A runs a version the grant wasn't for, and H3 flags it; recorded as A, the clean twin passes.
+  it('a call at A under a grant for B fails H3; under a grant for A it passes', async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38);
+      const grant = r.evidence.find((e) => e.what === 'grant')!;
+      expect(grant.def, `seed ${seed}`).toMatch(/"description":"Echo\."/);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      Object.assign(grant, { def: grant.def!.replace('"Echo."', '"Echo, changed."') });
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} a grant for B`).toEqual(expect.arrayContaining([expect.stringMatching(/another version/)]));
+    }
+  }, 60_000);
+});
+
 describe('the twin comparison itself', () => {
   it('counts two histories that differ only in one header as different', async () => {
     const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });
