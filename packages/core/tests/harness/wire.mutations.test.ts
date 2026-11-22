@@ -441,6 +441,7 @@ describe("H3 and the person's latest act on a tool", () => {
   // resolved ok, or a take-back, from when it was made. S38's call at A runs under its grant for A.
   const s38 = () => SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
   const callAtA = (r: WireRun) => r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+  const tokenOfCall = (x: { body?: Record<string, any> }) => String(x.body?.params?.arguments?.text ?? '');
   it('a later saved grant for B: the call at A under the earlier grant for A fails H3', async () => {
     for (let seed = 1; seed <= 4; seed++) {
       const r = await wireRun(seed, s38());
@@ -450,6 +451,20 @@ describe("H3 and the person's latest act on a tool", () => {
       r.evidence.push({ ...grant, token: 'grant-9', def: grant.def!.replace('"Echo."', '"Echo, changed."'), grant: 'fp-B', seq: at });
       r.evidence.sort((a, b) => a.seq - b.seq);
       expect(PASS_CHECKS.H3!(r), `seed ${seed} a later grant for B`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a grant written for another server and tool, or only after the decision was minted, fails H3", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const other = await wireRun(seed, s38());
+      for (const e of other.evidence) if (e.what === 'grant') Object.assign(e, { server: 's2', tool: 'mirror' });
+      expect(PASS_CHECKS.H3!(other), `seed ${seed} other identity`).not.toEqual([]);
+      const late = await wireRun(seed, s38());
+      const call = callAtA(late);
+      const yes = late.evidence.find((e) => e.what === 'yes' && e.token === tokenOfCall(call))!;
+      // The grant's write resolved between the decision's mint and its handoff: the decision had no grant.
+      for (const e of late.evidence) if (e.what === 'grant') Object.assign(e, { seq: (yes.seq + call.seq) / 2 });
+      late.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(late), `seed ${seed} after the mint`).not.toEqual([]);
     }
   }, 60_000);
   it('an earlier take-back, then the grant written: the call at A passes H3', async () => {

@@ -307,10 +307,14 @@ export const H3: Check = (r) => {
       // the server lists exactly the version that grant's card showed (the grant carries the harness's own
       // reading of it). Nothing in between matters: a tool that went A, B, A runs on its own again at A (the
       // owner's option A); any other version asks.
-      if (effective?.what !== 'grant' || effective.grant !== yes.grant) {
+      // The grant is matched by its full identity (server and tool by the replay, then its fingerprint and
+      // setup), and it is the effective choice both when the decision was minted and at the handoff.
+      const isTheGrant = (act: Evidence | undefined) => act?.what === 'grant' && act.grant === yes.grant && act.setup !== undefined && act.setup === yes.setup;
+      const atMint = latestAct(r, named, yes.tool!, yes.seq);
+      if (!isTheGrant(atMint)) problems.push(`H3: ${t} was minted under a grant that wasn't the person's choice for ${yes.tool} when it was minted`);
+      else if (!isTheGrant(effective)) {
         if (effective?.what !== 'revoke') problems.push(`H3: ${t} went out under a grant that isn't the person's choice for ${yes.tool} at its handoff`);
-      } else if (effective.setup === undefined || effective.setup !== yes.setup) problems.push(`H3: ${t} went out under a grant for another setup than its decision's`);
-      else if (effective.def === undefined || effective.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
+      } else if (effective!.def === undefined || effective!.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
       continue;
     }
     // A Yes: the tool as the server last listed it before the card, and before the handoff. A change between
