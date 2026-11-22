@@ -295,6 +295,13 @@ export const H3: Check = (r) => {
     if (!x.raw?.includes(want) || x.body!.params?.name !== yes.tool) problems.push(`H3: the call for ${t} isn't, byte for byte, what its Yes showed: ${args.slice(0, 60)}`);
     if (used.has(t)) problems.push(`H3: the Yes for ${t} used twice`);
     used.add(t);
+    // Whatever gave consent, the decision is minted before its handoff; an ordinary Yes answers a card shown
+    // before it.
+    if (!(yes.seq < x.seq)) problems.push(`H3: ${t} was handed off before its decision was minted`);
+    if (yes.grant === undefined) {
+      const shown = r.evidence.find((e) => e.what === 'card' && e.token === t);
+      if (!shown || !(shown.seq < yes.seq)) problems.push(`H3: ${t}'s Yes came with no card shown before it`);
+    }
     // The person's one effective choice for this tool at the handoff: their latest act before it. A grant counts
     // from when its write to the owner resolved ok; a take-back from when it was made.
     // The evidence is bound to where the call went: the server it names is the handoff's own destination.
@@ -319,7 +326,6 @@ export const H3: Check = (r) => {
       if (!launched || yes.setup !== launchFingerprint(launched)) problems.push(`H3: ${t} went out under a decision for another setup than its run was launched from`);
       // The decision was minted before its handoff, and at both points the server's accepted listing has the
       // very fingerprint the decision names, as the harness derives it from that listing itself.
-      if (!(yes.seq < x.seq)) problems.push(`H3: ${t} was handed off before its decision was minted`);
       for (const [when, at] of [['minted', yes.seq], ['handed off', x.seq]] as const) {
         const fp = liveFingerprintAt(r, x.server, at, yes.tool!);
         if (fp !== yes.grant) problems.push(`H3: ${t} was ${when} under fingerprint ${String(yes.grant).slice(0, 8)}, the listing then has ${String(fp).slice(0, 8)}`);

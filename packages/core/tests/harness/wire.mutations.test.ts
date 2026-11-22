@@ -704,6 +704,29 @@ describe('H3 and the setup a remote run was started from', () => {
   }, 60_000);
 });
 
+describe('H3 and the order of card, Yes and handoff', () => {
+  // Every decision is minted before its handoff, whatever gave consent, and an ordinary Yes answers a card shown
+  // before it. S38's slow call: its Yes moved after its handoff, or its card after its Yes, fails H3.
+  it("an ordinary Yes after its handoff, or before its card, fails H3", async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const late = await wireRun(seed, s38);
+      const call = late.exe.log.find((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'slow')!;
+      const token = String(call.body!.params.arguments.text);
+      Object.assign(late.evidence.find((e) => e.what === 'yes' && e.token === token)!, { seq: call.seq + 0.5 });
+      late.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(late), `seed ${seed} Yes after handoff`).not.toEqual([]);
+      const early = await wireRun(seed, s38);
+      const call2 = early.exe.log.find((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'slow')!;
+      const token2 = String(call2.body!.params.arguments.text);
+      const yes = early.evidence.find((e) => e.what === 'yes' && e.token === token2)!;
+      Object.assign(early.evidence.find((e) => e.what === 'card' && e.token === token2)!, { seq: yes.seq + 0.25 });
+      early.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(early), `seed ${seed} card after Yes`).not.toEqual([]);
+    }
+  }, 60_000);
+});
+
 describe("H3 and a catalog's live interval", () => {
   // A catalog is live from its publication until its run ends (a Stop, an exit, a new handshake) or a notice
   // of changed tools is read on that run, whichever comes first; a decision is judged by the catalog live at its
