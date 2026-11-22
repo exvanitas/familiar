@@ -9,5 +9,7 @@ export const evidenceControls = {
   /** A Start's reply taken as the first one after it, by order (the old pairing), not by its token. */
   startsByOrder: false,
   /** The client's end taken at the final response only, never at the message its parser rejected. */
-  finalOnly: false
+  finalOnly: false,
+  /** Remote pages bound to the fake exe's global handshake epoch, not their own destination's (the old reading). */
+  globalHandshakes: false
 };

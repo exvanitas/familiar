@@ -688,6 +688,23 @@ describe('H3 orders notices, publications and handoffs by sequence throughout', 
   }, 60_000);
 });
 
+describe('handshake epochs per destination', () => {
+  // S44: two modern remote servers' handshakes interleave; s1's grant and call are valid. With pages bound to the
+  // exe's global epoch (the old reading), s1's listing falls into s2's epoch, reads as legacy, and H3 flags both.
+  it("S44 is clean by each destination's own epoch, and fails H3 by the global one", async () => {
+    const s44 = SCHEDULES.find((s) => s.name.startsWith('S44'))!.options;
+    for (let seed = 1; seed <= 4; seed++) expect(PASS_CHECKS.H3!(await wireRun(seed, s44)), `seed ${seed}`).toEqual([]);
+    evidenceControls.globalHandshakes = true;
+    try {
+      let flagged = 0;
+      for (let seed = 1; seed <= 4; seed++) if (PASS_CHECKS.H3!(await wireRun(seed, s44)).length) flagged++;
+      expect(flagged).toBeGreaterThan(0);
+    } finally {
+      evidenceControls.globalHandshakes = false;
+    }
+  }, 60_000);
+});
+
 describe("H11 and the run's own opening", () => {
   // A run is modern by its own initialize's accepted response, as the catalog reads it: an unrelated -32022
   // appended after a legacy opening's successful answer leaves the run legacy, and its calls owe no modern

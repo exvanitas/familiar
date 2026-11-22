@@ -452,6 +452,8 @@ export class FakeExe {
   readonly log: NativeRec[] = [];
   private seq = 0;
   private epoch = 0;
+  /** Remote: each destination's current handshake epoch. */
+  private readonly handshakes = new Map<string, number>();
   private readonly sched: Scheduler;
   private readonly server: ScriptedServer;
   readonly redirectMode: boolean;
@@ -525,8 +527,10 @@ export class FakeExe {
         }
         const headers: Record<string, string> = {};
         for (const [k, v] of spec.headers) headers[k.toLowerCase()] = v;
-        if (parsed?.method === 'initialize') this.epoch++;
-        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, url: spec.url, method: spec.method, body: parsed, raw: text, headers, headerPairs: spec.headers.map(([k, v]) => [k, v] as const), start: this.sched.step, delivered: new Map(), epoch: this.epoch };
+        // Handshake epochs per destination: an initialize opens a new one for its own address only, so two
+        // servers' handshakes interleaved never move each other's pages (each page bound to its own opening).
+        if (parsed?.method === 'initialize') this.handshakes.set(spec.address, ++this.epoch);
+        const rec: NativeRec = { seq: this.tick(), n: this.log.length, kind: 'post', server: spec.address, url: spec.url, method: spec.method, body: parsed, raw: text, headers, headerPairs: spec.headers.map(([k, v]) => [k, v] as const), start: this.sched.step, delivered: new Map(), epoch: evidenceControls.globalHandshakes ? this.epoch : (this.handshakes.get(spec.address) ?? 0) };
         if (!this.admits('post')) {
           rec.refused = 'busy';
           rec.end = rec.terminated = this.sched.step;

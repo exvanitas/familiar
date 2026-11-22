@@ -735,6 +735,21 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S44: two modern remote servers starting together, their handshakes interleaved; a grant and a call under
+    // it on s1. Each page belongs to its own server's opening, so s1's listing is read as modern (H3).
+    name: 'S44 two modern remote servers starting together, a grant on one',
+    options: {
+      servers: 2,
+      mode: { ...quiet, era: 'modern' },
+      schedule: (d) => d.when('both ready', () => d.idle('s1') && d.idle('s2'), () => void d.grantOwn('echo', 's1')?.then(() => d.when('idle', () => d.idle('s1'), () => d.own('echo', {}, 's1'))))
+    },
+    expect: (r) => {
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
     name: 'S40 a local modern-only server that exits after the refusal, relaunched',
