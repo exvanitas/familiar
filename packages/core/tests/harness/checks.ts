@@ -824,12 +824,16 @@ export const HC: Check = (r) => {
     let holding: Omit<OwedReservation, 'released'> | undefined;
     // A relaunch asks the owner while its readmit-check is applied: the reservation is taken in that step.
     let readmitTake: { from: number; to: number } | undefined;
+    // Each run replay shows on this server, from the record sequence its making event's effects followed.
+    const born = new Map<string, number>();
     const endLive: { run: string; i: number; seq: number }[] = [];
     for (let i = 0; i < records.length; i++) {
       const rec = records[i]!;
       const seq = rec.seq ?? 0;
       // An event's effects are applied after the record before it and before its own.
       const after = i ? (records[i - 1]!.seq ?? 0) : -Infinity;
+      // A run exists from the event that made it: its first admission comes while that event's effects apply.
+      if (rec.state.run && !born.has(rec.state.run.id)) born.set(rec.state.run.id, after);
       const out = next(s, rec.event);
       s = out.state;
       const ev = rec.event;
@@ -909,6 +913,8 @@ export const HC: Check = (r) => {
     // And every exchange that ended was admitted, of the same run and kind, before its end: an idle pong too.
     // Each admission is consumed by one end only: a second end on it is an end never admitted.
     const consumed = new Set<object>();
+    // Each admission belongs to a run its server had when it was admitted.
+    for (const a of ex.filter((x) => x.t === 'admit')) if (!born.has(a.run) || a.seq <= born.get(a.run)!) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) admitted for run ${a.run}, which the server didn't have then`);
     for (const e of ex.filter((x) => x.t === 'ended')) {
       const a = ex.find((y) => y.t === 'admit' && !consumed.has(y) && y.n === e.n && y.run === e.run && y.kind === e.kind && y.seq < e.seq);
       if (a) consumed.add(a);
