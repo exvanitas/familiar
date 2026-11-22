@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { addressIdentity, BUSY_WORDS, Owner, REMOVED_ID_WORDS, OWNER_KEY, UNFINISHED_WORDS, WAITING_WORDS, type OwnerPorts } from '../../src/mcp/owner.ts';
 import type { ServerSetup } from '../../src/mcp/setup.ts';
+import { choiceKey, type ToolChoice } from '../../src/mcp/server-tools.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
 
 const local = (id: string, secrets: string[] = []): ServerSetup => ({ kind: 'local', id, label: 'Files', program: 'npx', args: ['-y', 'files@1.0.0'], cwd: 'C:\\work', env: [], secrets });
@@ -155,6 +156,16 @@ describe('5.1: one durable effect at a time', () => {
     expect(await owner.retry()).toEqual({ ok: true });
     expect(owner.mark).toBeUndefined();
     expect(t.log).toContain('secret_delete server:l1:TOKEN');
+  });
+
+  it('a choice is copied once, checked and saved as that copy: an object that reads one way and serializes another writes nothing else (r39 #1)', async () => {
+    const t = ports();
+    const owner = await Owner.open(t.p);
+    await owner.add(local('l1'));
+    // Reads as ask; would serialize as own.
+    const tricky = { policy: 'ask', fingerprint: 'f', setupFingerprint: 's', toJSON: () => ({ policy: 'own', fingerprint: 'f', setupFingerprint: 's' }) } as unknown as ToolChoice;
+    expect(await owner.choose('l1', 'echo', tricky)).toEqual({ ok: true });
+    expect(owner.choices()[choiceKey('l1', 'echo')]).toEqual({ policy: 'ask', fingerprint: 'f', setupFingerprint: 's' });
   });
 
   it('remove: stop awaited first, then a tombstone; its items done one by one; its choices go; the id and the key are never reused', async () => {

@@ -276,8 +276,29 @@ describe("a grant's writer and the gate (r37; the press itself moves to step 8, 
     // Over the saved never, Settings' ask would loosen it: refused. A take-back to ask leaves never standing,
     // and says so: ok, nothing written (r38 #5).
     await expect(again.choose('l1', 'echo', { policy: 'ask', fingerprint: a.fingerprint, setupFingerprint: a.setupFingerprint })).rejects.toThrow(/cleanup didn't finish/);
+    const rev = ((await w.store.get(OWNER_KEY))!.value as { rev: number }).rev;
     expect((await again.revoke('l1', 'echo', 'ask')).ok).toBe(true);
     expect(again.choices()[choiceKey('l1', 'echo')]).toMatchObject({ policy: 'deny' });
+    // That take-back wrote nothing: the record's revision is unchanged.
+    expect(((await w.store.get(OWNER_KEY))!.value as { rev: number }).rev).toBe(rev);
+  });
+
+  it("while a change's cleanup is unfinished, a Settings choice can't loosen a never held in memory (r39 #4)", async () => {
+    const w = await world();
+    const a = w.echo()!;
+    await w.client.stop('l1');
+    const rec = (await w.store.get(OWNER_KEY))!;
+    (rec.value as { mark?: unknown }).mark = { kind: 'remove', server: 'gone' };
+    await w.store.put(OWNER_KEY, rec);
+    const again = await w.reopen();
+    // A take-back to never whose write the busy owner refuses: never holds in memory only.
+    const busy = again.owner.admit('other', { start: true });
+    if (!('release' in busy)) throw new Error('not admitted');
+    expect((await again.revoke('l1', 'echo', 'never')).ok).toBe(false);
+    busy.release();
+    // Settings' ask would reopen it to asking: refused while the cleanup stands, and never still holds.
+    await expect(again.choose('l1', 'echo', { policy: 'ask', fingerprint: a.fingerprint, setupFingerprint: a.setupFingerprint })).rejects.toThrow(/cleanup didn't finish/);
+    expect((again as unknown as { overlay: Map<string, string> }).overlay.get(choiceKey('l1', 'echo'))).toBe('never');
   });
 });
 

@@ -555,10 +555,13 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
         options.consent.ask(card, signal).then(resolve, () => resolve(false));
       });
       if (ok === 'closed') throw new Error('The journal closed while the card was open.');
+      // Only a Yes is a Yes: an answer the card didn't offer (an adapter's 'own', which no card offers in step 7)
+      // is none (r39 #2).
+      const yes = ok === true;
       // The answer counts only for the presentation still current.
       const current = (await harness.snapshot(ConsentDoc, ctx))?.cards?.[id];
       if (current?.presentation !== card.presentation) return 'The card was answered after it was replaced, so nothing was sent.';
-      if (ok && bound) {
+      if (yes && bound) {
         const now = factsNow();
         if (!now || !sameFacts(now, card.facts!)) {
           facts = now;
@@ -568,9 +571,9 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       }
       await harness.commit(async (tx: any) => {
         const doc = await tx.doc(ConsentDoc);
-        if (doc.cards[id]?.presentation === card.presentation) doc.cards[id].answer = ok ? 'allow' : 'deny';
+        if (doc.cards[id]?.presentation === card.presentation) doc.cards[id].answer = yes ? 'allow' : 'deny';
       }, ctx);
-      return ok ? { allowedBy: 'asked', ...(card.facts ? { facts: card.facts } : {}) } : 'The person said no.';
+      return yes ? { allowedBy: 'asked', ...(card.facts ? { facts: card.facts } : {}) } : 'The person said no.';
     }
     return `${call.name} kept changing while you were asked, so nothing was sent.`;
   };
