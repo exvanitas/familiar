@@ -344,6 +344,23 @@ describe("HC's replay matched to the independent records, effect by effect", () 
   }, 60_000);
 });
 
+describe("H3 and a walk a notice invalidated", () => {
+  // S39: a refresh page carries a notice and describes B; the retry publishes A, and the call under A's grant
+  // is valid (the first-page-and-pages reading flagged it). The same page with its notice taken out is a walk
+  // the client would have published: B counts, and H3 flags the call.
+  it('the noticed walk is no catalog; the same walk without its notice is one, and H3 flags the call', async () => {
+    const s39 = SCHEDULES.find((s) => s.name.startsWith('S39'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s39);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const page = r.exe.log.find((x) => x.body?.method === 'tools/list' && (x.changesDelivered ?? 0) > 0)!;
+      page.plan = { ...page.plan!, messages: page.plan!.messages.filter((m) => m.method !== 'notifications/tools/list_changed') };
+      page.changesDelivered = 0;
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/changed after it was given/)]));
+    }
+  }, 60_000);
+});
+
 describe('the twin comparison itself', () => {
   it('counts two histories that differ only in one header as different', async () => {
     const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });

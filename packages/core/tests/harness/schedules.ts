@@ -638,6 +638,31 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S39: with A granted, a refresh whose page carries a notice of changed tools and describes B: the walk
+    // is discarded and retried, and the retry publishes A again. The grant stands, and the call under it goes
+    // out: H3 reads only the walks the client could publish, never one a notice invalidated.
+    name: 'S39 a notice on a refresh page, the retry back to the granted version',
+    options: {
+      mode: { ...quiet, listChanged: 1, changeOnList: true, changeOnListAt: 2 },
+      schedule: (d) => {
+        const firsts = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.final !== undefined).length;
+        d.when('ready', () => d.idle(), () => {
+          void d.grantOwn('echo')?.then(() => {
+            d.call('slow');
+            d.when('retried', () => d.idle() && firsts() >= 3, () => d.own('echo'));
+          });
+        });
+      }
+    },
+    expect: (r) => {
+      const noticed = r.exe.log.some((x) => x.body?.method === 'tools/list' && x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+      if (!noticed) return 'no notice on a refresh page';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant, after the retry published A, came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S2: a ping in the same chunk as the final reply: its pong is still handed off.
     name: 'S2 a ping in the same chunk as the final reply',
     options: { mode: { ...quiet, pingWithFinal: 1, oneChunk: true, sse: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },

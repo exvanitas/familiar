@@ -341,7 +341,12 @@ function staleCatalogCalls(r: WireRun): string[] {
     not reached) is no catalog, and the next first page begins a new one. */
 function walks(r: WireRun, server: string): { at: number; tools: any[] }[] {
   const done: { at: number; tools: any[] }[] = [];
-  let open: { epoch: number; next: string; tools: any[] } | undefined;
+  let open: { epoch: number; next: string; tools: any[]; from: number; noticed: boolean } | undefined;
+  // A notice of changed tools that reached the client during a walk invalidates it: the client walks again,
+  // and publishes only that retry. Remotely a notice comes on the walk's own pages (one exchange at a time);
+  // locally on any line of its process, between its first page's write and its last page's answer.
+  const noticedOnPage = (x: NativeRec) => (x.kind === 'post' ? (x.changesDelivered ?? 0) > 0 : !!x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+  const noticedLocally = (epoch: number, from: number, to: number) => r.exe.noticesDelivered.some((n) => n.epoch === epoch && n.step >= from && n.step < to);
   for (const x of r.exe.log) {
     if (x.server !== server || x.body?.method !== 'tools/list') continue;
     const cursor = x.body.params?.cursor;
@@ -353,10 +358,12 @@ function walks(r: WireRun, server: string): { at: number; tools: any[] }[] {
       continue;
     }
     const tools = [...(cursor === undefined ? [] : open!.tools), ...((res.tools as any[] | undefined) ?? [])];
-    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools };
+    const from = cursor === undefined ? x.start : open!.from;
+    const noticed = (cursor === undefined ? false : open!.noticed) || noticedOnPage(x);
+    if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, noticed };
     else {
       open = undefined;
-      done.push({ at, tools });
+      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, at))) done.push({ at, tools });
     }
   }
   return done;

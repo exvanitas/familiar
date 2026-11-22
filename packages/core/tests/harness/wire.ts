@@ -454,6 +454,8 @@ export class FakeExe {
   releaseStart?: () => void;
   /** Local: when each ping line reached the client. */
   readonly pingDelivered = new Map<string, number>();
+  /** Local: when each notice of changed tools reached the client, by the process that sent it. */
+  readonly noticesDelivered: { epoch: number; step: number }[] = [];
   /** The highest count of server requests open at once, detached helpers included (H5's witness). */
   peakServer = 0;
   /** Global sequence shared with the evidence log, for order within a step. */
@@ -721,6 +723,7 @@ export class FakeExe {
         // Keyed by the process that sent it, never by whichever process started last.
         if (m.id !== undefined && ('result' in m || 'error' in m)) this.responded.set(`${p.epoch}:${m.id}`, this.sched.step);
         if (m.method === 'ping') this.pingDelivered.set(String(m.id), this.sched.step);
+        if (m.method === 'notifications/tools/list_changed') this.noticesDelivered.push({ epoch: p.epoch, step: this.sched.step });
       } catch {
         /* not JSON */
       }
