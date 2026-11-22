@@ -541,11 +541,13 @@ export class ServerLink {
   /** Test: a start whose run, once listed, stops itself; ok only once that run has ended. */
   async test(target: Target, launch: string, facts: Partial<StartFacts> = {}, limits: LinkLimits = this.limits): Promise<{ readonly ok: true; readonly run: string; readonly tools: readonly ListedTool[]; readonly notOffered: readonly { readonly name: string; readonly reason: string }[] } | { readonly ok: false; readonly failure: Failure; readonly refused?: true }> {
     const r = await this.startReply(target, launch, 'test', facts, limits);
+    // Only a passing Test takes a report, and only its own run's (r36 #6).
     const report = r.kind === 'tested' ? this.delivered.get(r.run) : undefined;
-    this.delivered.clear();
+    if (r.kind === 'tested') this.delivered.delete(r.run);
     if (r.kind === 'tested') return { ok: true, run: r.run, tools: report?.tools ?? [], notOffered: report?.notOffered ?? [] };
     if (r.kind === 'failed') return { ok: false, failure: r.failure };
-    if (r.kind === 'refused') return { ok: false, failure: { kind: 'failed', words: r.words }, refused: true };
+    // A refusal is "not now": busy, in the machine's words (Test while running keeps the kind it had, r36 #8).
+    if (r.kind === 'refused') return { ok: false, failure: { kind: 'busy', words: r.words }, refused: true };
     return { ok: false, failure: { kind: 'failed', words: 'The server was stopped before it was ready.' } };
   }
 
@@ -590,7 +592,9 @@ export class ServerLink {
     // Then the slot Idle, or the link held, or the run over: one wait, settled and unregistered on whichever
     // comes first (r35b #16).
     await new Promise<void>((res) => {
-      if (!this.busy) return res();
+      // Already settled when the wait begins (the link held, or the run over, before it is installed): nothing
+      // is waited for (r36 #7).
+      if (!this.busy || this.lc.held || this.lc.run?.id !== id) return res();
       const finish = () => {
         this.watchers.delete(watch);
         const i = this.idle.indexOf(finish);
@@ -1194,6 +1198,8 @@ export class ServerLink {
   private idlePing(run: Wire, id: RpcId): void {
     const n = this.slot.next;
     this.pending.set(n, { n, kind: 'pong', run, body: frame({ kind: 'pong', id }, run.era, 'local'), done: () => {} });
+    // Recorded like every admission, so the conformance record pairs each pong's end with its admit (r36 #10).
+    this.events.exchange?.({ t: 'admit', n, run: run.id, kind: 'pong' });
     // As every admission: busy is both machines' before the port's write, so an exit the port delivers from
     // inside that write finds both busy, and its cleanup leaves both Idle (r35b #5).
     const late = __FAMILIAR_MUTATIONS__ && mutant('pong-busy-after-handoff');
