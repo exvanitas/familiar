@@ -180,6 +180,16 @@ describe('5.1: one durable effect at a time', () => {
     expect(owner.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
   });
 
+  it('a choice whose policy is no known one is refused, and a saved never stands (r41 #1)', async () => {
+    const t = ports();
+    const owner = await Owner.open(t.p);
+    await owner.add(local('l1'));
+    expect(await owner.choose('l1', 'echo', { policy: 'deny', fingerprint: 'f', setupFingerprint: 's' })).toEqual({ ok: true });
+    for (const policy of ['bogus', 'Allow', ''])
+      expect((await owner.choose('l1', 'echo', { policy, fingerprint: 'f', setupFingerprint: 's' } as unknown as ToolChoice)).ok).toBe(false);
+    expect(owner.choices()[choiceKey('l1', 'echo')]).toMatchObject({ policy: 'deny' });
+  });
+
   it("a grant's version is read once: a getter that changes between reads writes what was checked (r40 #2)", async () => {
     const t = ports();
     const owner = await Owner.open(t.p);

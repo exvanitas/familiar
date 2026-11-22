@@ -45,8 +45,9 @@ export function copyChoice(given: unknown): ToolChoice | undefined {
   const policy = g.policy;
   const fingerprint = g.fingerprint;
   const setupFingerprint = g.setupFingerprint;
-  if (typeof policy !== 'string' || typeof fingerprint !== 'string' || typeof setupFingerprint !== 'string') return undefined;
-  return { policy: policy as ToolChoice['policy'], fingerprint, setupFingerprint };
+  // The policy one of the four, as a stored choice must be to load (readChoice); anything else is malformed (r41 #1).
+  if ((policy !== 'allow' && policy !== 'ask' && policy !== 'deny' && policy !== 'own') || typeof fingerprint !== 'string' || typeof setupFingerprint !== 'string') return undefined;
+  return { policy, fingerprint, setupFingerprint };
 }
 const MALFORMED_WORDS = 'That choice is malformed, so it was not saved.';
 

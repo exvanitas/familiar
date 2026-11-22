@@ -1097,7 +1097,10 @@ From round 39 on, each review finding is classed by reach. These were reachable 
 **Reachable from a stored record (counted toward the close):**
 - r40 #2: a coerced malformed choice (my regression of r39 #1). Refused, never coerced (012ce08). Round 41 must show it gone.
 
+- r41 #1: a choice whose policy was a string but no known one was saved (failing closed, read as ask). A choice's policy must be one of the four, as a stored one must be to load.
+
 **In the test harness (H3, HC, H10, H11, H13 and the kill fixture):**
 - r39 #3 to #10, fixed by harness10 in 12a1f36 and cfeb1a0, merged at b9162bd;
 - r40 #3 to #11, fixed by harness10, merged at e6386f8;
+- r41 #2: H3's live span missed a run ending on its own (a local exit, a remote failure); fixed by harness10 after round 41;
 - each with its own control, per TRUTH-r39.md and TRUTH-r40.md.
