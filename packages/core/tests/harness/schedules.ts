@@ -681,13 +681,13 @@ export const SCHEDULES: Named[] = [
       return outs.length === 2 && outs.every((k) => k === 'result') ? undefined : `the two calls came back ${JSON.stringify(outs)}`;
     }
   })),
-  {
-    // S42: "may run on its own" for echo, then a relist that changes only its annotations (readOnlyHint), none
-    // of the fields its fingerprint covers: the same tool, so the call under the grant runs unasked (H3 holds
-    // a grant to those fields, never the whole listing).
-    name: 'S42 a relist that changes only annotations',
+  ...(['annotations', 'empty-title'] as const).map((same): Named => ({
+    // S42: "may run on its own" for echo, then a relist that changes it only where its fingerprint doesn't look
+    // (its annotations, or its title from omitted to empty): the same tool, so the call under the grant runs
+    // unasked (H3 holds a grant to the fingerprint's fields and normalization, never the whole listing).
+    name: same === 'annotations' ? 'S42 a relist that changes only annotations' : 'S42 a relist that changes only an omitted title to an empty one',
     options: {
-      mode: { ...quiet, listChanged: 1, annotationsOnly: true },
+      mode: { ...quiet, listChanged: 1, sameFingerprint: same },
       schedule: (d) => {
         const firsts = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined).length;
         d.when('ready', () => d.idle(), () => {
@@ -701,9 +701,9 @@ export const SCHEDULES: Named[] = [
     expect: (r) => {
       const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
       const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
-      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant after an annotations-only relist came back ${JSON.stringify(out)}`;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant after a relist its fingerprint doesn't see came back ${JSON.stringify(out)}`;
     }
-  },
+  })),
   {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).

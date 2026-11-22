@@ -9,8 +9,11 @@ import type { FakeExe, NativeRec } from './wire.ts';
     handshake's epoch), each page the one the page before it pointed to. Its tools are every page's, and it
     counts from the step its last page reached the client. A walk cut off (a page unanswered, failed, or
     not reached) is no catalog, and the next first page begins a new one. */
-export function walks(exe: FakeExe, server: string): { at: number; tools: any[] }[] {
-  const done: { at: number; tools: any[] }[] = [];
+export function walks(exe: FakeExe, server: string): { at: number; tools: any[]; modern: boolean }[] {
+  const done: { at: number; tools: any[]; modern: boolean }[] = [];
+  // A modern remote run, by the server's own record: its opening initialize, in that handshake epoch, was
+  // refused -32022 (never by the client's own framing).
+  const modernRun = (x: NativeRec) => x.kind === 'post' && exe.log.some((y) => y.kind === 'post' && y.server === x.server && y.epoch === x.epoch && y.body?.method === 'initialize' && !!y.plan?.messages.some((m) => m.error?.code === -32022));
   let open: { epoch: number; next: string; tools: any[]; from: number; noticed: boolean } | undefined;
   // A notice of changed tools that reached the client during a walk invalidates it: the client walks again,
   // and publishes only that retry. Remotely a notice comes on the walk's own pages (one exchange at a time);
@@ -38,7 +41,7 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[] 
     if (typeof res.nextCursor === 'string') open = { epoch: x.epoch, next: res.nextCursor, tools, from, noticed };
     else {
       open = undefined;
-      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, tools });
+      if (!noticed && !(x.kind === 'write' && noticedLocally(x.epoch, from, exe.respondedSeq.get(`${x.epoch}:${x.body.id}`) ?? Infinity))) done.push({ at, tools, modern: modernRun(x) });
     }
   }
   return done;
@@ -49,15 +52,18 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[] 
     when there's none) and input schema, in canonical form, so a relist in another key order (S23) is the same
     tool. The header declarations a modern remote run adds come from that schema, so they are covered with it;
     annotations, which the fingerprint leaves out, are not part of it. */
-export const defIn = (w: { tools: any[] }, tool: string): string | undefined => {
+export const defIn = (w: { tools: any[]; modern?: boolean }, tool: string): string | undefined => {
   const def = w.tools.find((d: any) => d.name === tool);
-  return def === undefined ? undefined : canonical({ name: def.name, title: def.title ?? null, description: def.description ?? def.title ?? null, inputSchema: def.inputSchema ?? null });
+  // As the fingerprint normalizes them: an omitted title is the empty one, an omitted description the title
+  // (or empty); and a modern remote run's listing is marked apart, its header declarations (none declared is
+  // an empty list) coming from the schema the identity already holds.
+  return def === undefined ? undefined : canonical({ name: def.name, title: def.title ?? '', description: def.description ?? def.title ?? '', inputSchema: def.inputSchema ?? null, ...(w.modern ? { modern: true } : {}) });
 };
 
 /** The tool's definition in the last completed walk that reached the client before `step` (Infinity: every
     walk that has reached it so far). */
 export function catalogAt(exe: FakeExe, server: string, step: number, tool: string): string | undefined {
-  let found: { at: number; tools: any[] } | undefined;
+  let found: { at: number; tools: any[]; modern: boolean } | undefined;
   for (const w of walks(exe, server)) if (w.at < step && (!found || w.at >= found.at)) found = w;
   return found && defIn(found, tool);
 }

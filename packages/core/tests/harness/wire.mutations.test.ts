@@ -4,6 +4,7 @@
 // failure lies at or after that step. A mutation with no such seed is a broken control and fails the build.
 import { describe, expect, it } from 'vitest';
 import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
+import { defIn } from './catalog.ts';
 import { SCHEDULES } from './schedules.ts';
 import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type ExchangeRecord, type Mode, type WireOptions, type WireRun } from './wire.ts';
 
@@ -509,6 +510,29 @@ describe('H3 and a notice after a list page\'s final response', () => {
       const msgs = last.plan!.messages;
       last.plan = { ...last.plan!, messages: [msgs.at(-1)!, ...msgs.slice(0, -1)], final: last.plan!.final + 1 };
       expect(PASS_CHECKS.H3!(r), `seed ${seed} read`).not.toEqual([]);
+    }
+  }, 60_000);
+});
+
+describe("H3's tool identity and the run's setup", () => {
+  // The harness's identity restates the fingerprint's own rules: an omitted title is the empty one, an omitted
+  // description is the title, and a modern remote listing is marked apart from a legacy one, even with no
+  // header declared.
+  it('reads omitted and empty titles alike, and a modern listing apart from a legacy one', () => {
+    const tool = { name: 'echo', description: 'Echo.', inputSchema: { type: 'object', properties: {} } };
+    expect(defIn({ tools: [tool] }, 'echo')).toBe(defIn({ tools: [{ ...tool, title: '' }] }, 'echo'));
+    expect(defIn({ tools: [{ name: 'echo', title: 'T', inputSchema: {} }] }, 'echo')).toBe(defIn({ tools: [{ name: 'echo', title: 'T', description: 'T', inputSchema: {} }] }, 'echo'));
+    expect(defIn({ tools: [tool], modern: true }, 'echo')).not.toBe(defIn({ tools: [tool] }, 'echo'));
+  });
+  // S38's grant and its decision both moved to one wrong setup: the run the call reached was launched from
+  // the setup the harness added, so H3 flags it.
+  it('a grant and decision for another setup than the run was launched from fail H3', async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      for (const e of r.evidence) if (e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { setup: 'another-setup' });
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).not.toEqual([]);
     }
   }, 60_000);
 });

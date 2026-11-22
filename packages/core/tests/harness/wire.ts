@@ -132,8 +132,9 @@ export interface Mode {
   /** Local: after each call's answer, a notice of changed tools on its own line, its variant flipped: an idle
       notice, which starts the refresh in the very step it is read. */
   readonly idleNotice?: boolean;
-  /** A list_changed changes only echo's annotations (readOnlyHint), none of the fields its fingerprint covers. */
-  readonly annotationsOnly?: boolean;
+  /** A list_changed changes echo in a way its fingerprint doesn't see: only its annotations (readOnlyHint), or
+      its title from omitted to empty (both are the empty title). */
+  readonly sameFingerprint?: 'annotations' | 'empty-title';
   /** Legacy: each list page's answer ends with a notice of changed tools after its final response, unread. */
   readonly trailingListNotice?: boolean;
 }
@@ -185,10 +186,12 @@ export interface Plan {
   readonly location?: string;
 }
 
-const tools = (era: Mode['era'], variant: string, annotationsOnly = false) => [
-  annotationsOnly
+const tools = (era: Mode['era'], variant: string, same?: Mode['sameFingerprint']) => [
+  same === 'annotations'
     ? { name: 'echo', description: 'Echo.', annotations: { readOnlyHint: variant !== 'a' }, inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }
-    : { name: 'echo', description: variant === 'a' ? 'Echo.' : 'Echo, changed.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
+    : same === 'empty-title'
+      ? { name: 'echo', description: 'Echo.', ...(variant === 'a' ? {} : { title: '' }), inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }
+      : { name: 'echo', description: variant === 'a' ? 'Echo.' : 'Echo, changed.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
   { name: 'slow', description: 'Slow.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
   ...(era !== 'legacy'
     ? [
@@ -229,7 +232,7 @@ export class ScriptedServer {
 
   /** The tools on one page of a walk: all on the first, unless echoLast puts echo on the last. */
   private onPage(page: number): Msg[] {
-    const all = tools(this.mode.era, this.variant, this.mode.annotationsOnly);
+    const all = tools(this.mode.era, this.variant, this.mode.sameFingerprint);
     if (!this.mode.echoLast || this.mode.pages < 2) return page === 0 ? all : [];
     return page === this.mode.pages - 1 ? all.filter((t) => t.name === 'echo') : page === 0 ? all.filter((t) => t.name !== 'echo') : [];
   }
@@ -1001,6 +1004,9 @@ export interface WireRun {
   readonly exchanges: ReadonlyMap<string, readonly ExchangeRecord[]>;
   /** Every owner reservation (HC's independent record). */
   readonly reservations: readonly Reservation[];
+  /** Each server's setup as the harness added it, with the address it was issued (remote): the run's own
+      launch facts, apart from anything the client reports. */
+  readonly setups: ReadonlyMap<string, Record<string, unknown>>;
   readonly sched: Scheduler;
   readonly exe: FakeExe;
   readonly server: ScriptedServer;
@@ -1039,6 +1045,7 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   const lifecycle = new Map<string, LcRecord[]>();
   const exchanges = new Map<string, ExchangeRecord[]>();
   const reservations: Reservation[] = [];
+  const setups = new Map<string, Record<string, unknown>>();
   const client = await McpClient.open({
     transition: (id, event, state, slot) => lifecycle.set(id, [...(lifecycle.get(id) ?? []), { event, state, ...slot, seq: next() }]),
     exchange: (id, e) => exchanges.set(id, [...(exchanges.get(id) ?? []), { ...e, seq: next() }]),
@@ -1068,6 +1075,8 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   const ids = Array.from({ length: options.servers ?? 1 }, (_, i) => `s${i + 1}`);
   for (const id of ids) {
     const setup = mode.where === 'remote' ? { kind: 'remote' as const, id, label: `Scripted ${id}`, url: `https://${id}.example/mcp`, transport: 'http' as const, headers: [] } : { kind: 'local' as const, id, label: `Scripted ${id}`, program: 'node', args: [], cwd: '/', env: [], secrets: [] };
+    // Addresses are issued in the order servers are added (addr-1 first).
+    setups.set(id, mode.where === 'remote' ? { ...setup, address: `addr-${addresses + 1}` } : setup);
     await client.add({ setup, problems: [] });
   }
   const d = new Driver(sched, client, evidence, next, exe, server, store);
@@ -1077,7 +1086,7 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   await sched.run(options.steps ?? 1500);
   if (options.mutation && firstHit === undefined && mutations.hits(options.mutation) > 0) firstHit = sched.step;
   mutations.clear();
-  return { sched, exe, server, evidence, firstHit, lifecycle, exchanges, reservations };
+  return { sched, exe, server, evidence, firstHit, lifecycle, exchanges, reservations, setups };
 }
 
 export class Driver {

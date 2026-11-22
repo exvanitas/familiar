@@ -2,6 +2,7 @@
 // own record and the driver's evidence log, never the client's state.
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
+import { createHash } from 'node:crypto';
 import { canonical, catalogAt } from './catalog.ts';
 import { readPrefix, rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
@@ -310,6 +311,10 @@ export const H3: Check = (r) => {
       // The grant is matched by its full identity (server and tool by the replay, then its fingerprint and
       // setup), and it is the effective choice both when the decision was minted and at the handoff.
       const isTheGrant = (act: Evidence | undefined) => act?.what === 'grant' && act.grant === yes.grant && act.setup !== undefined && act.setup === yes.setup;
+      // And the setup they name is the one the run the call reached was launched from, as the harness added
+      // it, fingerprinted by the harness's own reading.
+      const launched = r.setups.get(named);
+      if (!launched || yes.setup !== launchFingerprint(launched)) problems.push(`H3: ${t} went out under a decision for another setup than its run was launched from`);
       const atMint = latestAct(r, named, yes.tool!, yes.seq);
       if (!isTheGrant(atMint)) problems.push(`H3: ${t} was minted under a grant that wasn't the person's choice for ${yes.tool} when it was minted`);
       else if (!isTheGrant(effective)) {
@@ -325,6 +330,18 @@ export const H3: Check = (r) => {
   problems.push(...staleCatalogCalls(r));
   return problems.slice(0, 3);
 };
+
+/** The fingerprint of a setup's launch, restated here from what it binds (never imported): locally, the
+    program, its arguments, its folder, its environment (names upper-cased, sorted) and its secrets' names
+    (upper-cased, sorted); remotely, the address, its transport, its headers (names lower-cased, sorted), its
+    key's header and prefix, and the saved address id. SHA-256 over their canonical JSON, in hex. */
+function launchFingerprint(s: Record<string, any>): string {
+  const bound =
+    s.kind === 'local'
+      ? { kind: 'local', program: s.program, args: s.args, cwd: s.cwd, env: [...s.env].map(([k, v]: [string, string]) => [k.toUpperCase(), v]).sort(), secrets: [...s.secrets].map((n: string) => n.toUpperCase()).sort() }
+      : { kind: 'remote', url: s.url, transport: s.transport, headers: [...s.headers].map(([k, v]: [string, string]) => [k.toLowerCase(), v]).sort(), key: s.key ? { header: s.key.header.toLowerCase(), prefix: s.key.prefix } : null, address: s.address ?? null };
+  return createHash('sha256').update(canonical(bound)).digest('hex');
+}
 
 /** Where a server's calls go natively: its saved address (remote, issued in the order servers were added), or
     its setup's own id (local). */
