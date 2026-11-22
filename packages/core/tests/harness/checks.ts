@@ -3,7 +3,7 @@
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import { canonical, catalogAt } from './catalog.ts';
-import { rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
+import { readPrefix, rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
 export type Check = (r: WireRun) => string[];
@@ -325,10 +325,9 @@ function staleCatalogCalls(r: WireRun): string[] {
   const problems: string[] = [];
   const recs = r.exe.log.filter((x) => x.kind === 'post');
   for (const c of recs) {
-    // A notice the client read: one ahead of the first message its parser rejects (it reads nothing after).
-    const messages = c.plan?.messages ?? [];
-    const cut = messages.findIndex(rejectedByShape);
-    if (c.final === undefined || !messages.slice(0, cut < 0 ? undefined : cut).some((m) => m.method === 'notifications/tools/list_changed')) continue;
+    // A notice the client read: one in the prefix its parser read, through the final response or the first
+    // message it rejects, whichever came first (it reads nothing after either).
+    if (c.final === undefined || !c.plan || !readPrefix(c.plan).some((m) => m.method === 'notifications/tools/list_changed')) continue;
     const d = Math.floor(c.final / 1000);
     // The relist: a walk from page 1 started after the notification, complete (its last page back whole).
     const firstPage = recs.find((x) => x.server === c.server && x.epoch === c.epoch && x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.start >= d && !x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
@@ -351,7 +350,8 @@ function listedAt(r: WireRun, server: string, step: number, tool: string): strin
 function wroteValid(r: WireRun, token: string): boolean {
   const rec = r.exe.log.find((x) => isCall(x.body) && tokenOf(x.body) === token);
   const exact = !rec?.contentType || rec.contentType === 'application/json' || rec.contentType === 'text/event-stream';
-  return !!rec?.plan && exact && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0) && !rec.plan.messages.some(rejectedByShape);
+  // Judged on what the client's parser read: a malformed message after the final response is never read.
+  return !!rec?.plan && exact && rec.plan.status === 200 && (rec.plan.sse || rec.plan.messages.length > 0) && !readPrefix(rec.plan).some(rejectedByShape);
 }
 
 /** H10: a late or stale response never reaches a caller: a call's result names its own token, and comes

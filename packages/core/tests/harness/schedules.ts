@@ -643,6 +643,24 @@ export const SCHEDULES: Named[] = [
       return out(1)?.kind === 'result' ? undefined : `the call under a grant for A, at A again, came back ${JSON.stringify(out(1))}`;
     }
   },
+  ...(['notice', 'array-params'] as const).map((after): Named => ({
+    // S41: a call's final response, then in the same chunk a message the client never reads, its parser having
+    // stopped at the final: a notice of changed tools (no relist owed: the next call goes out), or a malformed
+    // message (the answer was valid, and comes back as a result).
+    name: `S41 ${after === 'notice' ? 'a notice' : 'a malformed message'} after the final response, in its chunk`,
+    options: {
+      mode: { ...quiet, sse: 1, oneChunk: true, afterFinal: after },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('echo');
+          d.when('answered', () => d.idle() && d.evidence.some((e) => e.what === 'outcome'), () => d.call('echo'));
+        })
+    },
+    expect: (r) => {
+      const outs = r.evidence.filter((e) => e.what === 'outcome').map((e) => e.outcome!.kind);
+      return outs.length === 2 && outs.every((k) => k === 'result') ? undefined : `the two calls came back ${JSON.stringify(outs)}`;
+    }
+  })),
   {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).

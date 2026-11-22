@@ -417,6 +417,36 @@ describe("H3 and the version a grant was given for", () => {
   }, 60_000);
 });
 
+describe("the client's read prefix: through its final response or its parser's rejection", () => {
+  const s41 = (prefix: string) => SCHEDULES.find((s) => s.name.startsWith(`S41 ${prefix}`))!.options;
+  // A notice after the final, in its chunk, was never read: the next call is no stale-catalog call. The same
+  // notice ahead of the final was read, and that call is one.
+  it('a notice after the final is unread (H3 clean); moved ahead of the final, H3 flags the next call', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s41('a notice'));
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const first = r.exe.log.find((x) => x.body?.method === 'tools/call')!;
+      const msgs = first.plan!.messages;
+      const notice = msgs.findIndex((m) => m.method === 'notifications/tools/list_changed');
+      const final = first.plan!.final;
+      const moved = [...msgs.slice(0, final), msgs[notice]!, ...msgs.slice(final, notice), ...msgs.slice(notice + 1)];
+      first.plan = { ...first.plan!, messages: moved, final: final + 1 };
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/made stale/)]));
+    }
+  }, 60_000);
+  // A malformed message after the final was never read: the answer was valid, so a "couldn't read" outcome for
+  // it is a valid answer read as invalid (H10). Clean, the call comes back as its result.
+  it("a malformed message after the final leaves the answer valid: a forged \"couldn't read\" fails H10", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s41('a malformed message'));
+      expect(PASS_CHECKS.H10!(r), `seed ${seed} clean`).toEqual([]);
+      const out = r.evidence.find((e) => e.what === 'outcome')!;
+      Object.assign(out, { outcome: { kind: 'error', reason: 'protocol', words: "Familiar couldn't read the server's answer." } });
+      expect(PASS_CHECKS.H10!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/read as invalid/)]));
+    }
+  }, 60_000);
+});
+
 describe('the twin comparison itself', () => {
   it('counts two histories that differ only in one header as different', async () => {
     const a = await wireRun(3, { mode: { where: 'remote', era: 'legacy', session404: 'none', redirect: 0 } });

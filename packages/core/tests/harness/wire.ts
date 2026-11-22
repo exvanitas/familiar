@@ -124,6 +124,9 @@ export interface Mode {
   /** Local, modern: the process exits right after refusing the legacy opening, so the client relaunches it
       once, modern, under a relaunch's own owner reservation (3.9). */
   readonly exitOnRefusal?: boolean;
+  /** Legacy: one more message right after a call's final response (in its chunk, with oneChunk): a notice of
+      changed tools, or one of 3.10's rejections. The client's parser stops at the final, so it reads neither. */
+  readonly afterFinal?: 'notice' | keyof typeof INVALID;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -312,6 +315,7 @@ export class ScriptedServer {
       if (modernReq && m.where === 'remote' && headerMismatch(body, headers, tools(m.era, this.variant))) return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32020, message: 'header mismatch' } }]);
       const result = modernReq && this.r() < m.inputRequired ? { resultType: 'input_required', inputRequests: {} } : { content: [{ type: 'text', text: `ran ${body.params?.name} ${text} — café ✓ 𝄞` }], ...complete };
       if (this.r() >= m.earlyEnd) msgs.push({ jsonrpc: '2.0', id: body.id, result });
+      if (m.afterFinal && !modernReq && msgs.some((x) => x.id === body.id)) msgs.push(m.afterFinal === 'notice' ? { jsonrpc: '2.0', method: 'notifications/tools/list_changed' } : (structuredClone(INVALID[m.afterFinal]) as Msg));
       if (!modernReq && this.r() < 0.1) msgs.push(this.ping(on, true));
       if (m.where === 'remote' && this.r() < m.redirect) return { status: this.r() < 0.5 ? 307 : 303, sse: false, messages: [], final: -1, location: '/elsewhere' };
       return { ...json(msgs), sse: m.where === 'local' ? false : msgs.length > 1 || this.r() < m.sse };
@@ -382,6 +386,15 @@ export function rejectedByShape(m: unknown): boolean {
   if (!('id' in m) || !id(m.id) || 'result' in m === 'error' in m) return true;
   if ('result' in m) return !object(m.result);
   return !object(m.error) || !Number.isInteger(m.error.code) || typeof m.error.message !== 'string';
+}
+
+/** The messages of an answer the client's parser read: up to and including the first of its final response
+    (the plan's `final`) or the first message 3.10's shape rules reject, whichever came first. It reads
+    nothing after either, so what follows in the same chunk is never the client's. */
+export function readPrefix(plan: Plan): Msg[] {
+  const rejected = plan.messages.findIndex(rejectedByShape);
+  const ends = [rejected, plan.final].filter((i) => i >= 0);
+  return ends.length ? plan.messages.slice(0, Math.min(...ends) + 1) : plan.messages;
 }
 
 /** Media types an answer may come with besides the two exact ones (oddMedia). */
