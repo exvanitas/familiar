@@ -21,32 +21,44 @@ describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its c
 // clock is advanced past that limit: the timer died with its life, so life 1's client writes nothing more to
 // its port (no cancel for the call it had under way).
 describe("server-reissue's life 1 client, after the kill", () => {
-  it('had a timer armed at the kill; each of its timeouts was cleared at the timer API, and nothing reaches the old port', async () => {
+  it('had a timer armed at the kill; each of its timeouts was cleared at the platform, and nothing reaches the old port', async () => {
     const world = nodeWorld();
-    // A spy on the underlying timer API: every timeout armed, and whether it was cleared or ran.
+    // A spy on the platform's own setTimeout and clearTimeout: each timeout the native timers arm (through
+    // timerApi, whatever it does), and whether the platform ran it or was asked to clear it.
     const live = new Map<unknown, 'armed' | 'cleared' | 'ran'>();
-    const { set, clear } = timerApi;
+    const platform = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
+    const set = timerApi.set;
+    let inApi = false;
     let killed = false;
     let armedInLife1 = 0;
     let stillArmedAtKill: unknown[] = ['not reached'];
     timerApi.set = (callback, delayMs) => {
-      const real: unknown = set(() => {
+      inApi = true;
+      try {
+        return set(callback, delayMs);
+      } finally {
+        inApi = false;
+      }
+    };
+    globalThis.setTimeout = ((callback: () => void, delayMs?: number, ...rest: unknown[]) => {
+      if (!inApi) return platform.setTimeout(callback, delayMs, ...rest);
+      const real: unknown = platform.setTimeout(() => {
         if (live.get(real) === 'armed') live.set(real, 'ran');
         callback();
       }, delayMs);
       live.set(real, 'armed');
       return real;
-    };
-    timerApi.clear = (real) => {
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((real: Parameters<typeof clearTimeout>[0]) => {
       if (live.get(real) === 'armed') live.set(real, 'cleared');
-      clear(real);
-    };
+      platform.clearTimeout(real);
+    }) as typeof clearTimeout;
     try {
       const s = scenario('server-reissue');
       await killAndResume({ name: s.name, run: async (env) => {
         if (env.life === 2 && !killed) {
           killed = true;
-          // Life 1 is killed: every timeout it armed has run or was cleared at the API by now.
+          // Life 1 is killed: every timeout it armed has run or was cleared at the platform by now.
           armedInLife1 = live.size;
           stillArmedAtKill = [...live].filter(([, fate]) => fate === 'armed').map(([real]) => real);
         }
@@ -54,7 +66,8 @@ describe("server-reissue's life 1 client, after the kill", () => {
       } }, world);
     } finally {
       timerApi.set = set;
-      timerApi.clear = clear;
+      globalThis.setTimeout = platform.setTimeout;
+      globalThis.clearTimeout = platform.clearTimeout;
     }
     expect(armedInLife1).toBeGreaterThan(0);
     expect(stillArmedAtKill).toEqual([]);
