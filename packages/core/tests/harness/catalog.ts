@@ -1,6 +1,7 @@
 // The harness's own reading of a server's catalog, from the fake exe's log alone: shared by the checks
 // (checks.ts) and by the driver, which records with each grant the version the person's card showed.
 
+import { readPrefix } from './shape.ts';
 import type { FakeExe, NativeRec } from './wire.ts';
 
 /** The harness's own reading of a server's catalogs: every walk that completed, from its first page to a
@@ -14,7 +15,9 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[] 
   // A notice of changed tools that reached the client during a walk invalidates it: the client walks again,
   // and publishes only that retry. Remotely a notice comes on the walk's own pages (one exchange at a time);
   // locally on any line of its process, between its first page's write and its last page's answer.
-  const noticedOnPage = (x: NativeRec) => (x.kind === 'post' ? (x.changesDelivered ?? 0) > 0 : !!x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+  // A notice on a page counts only if the client's parser read it: in the delivered prefix through the page's
+  // final response or its first rejected message, never one in the stream's bytes after (r38).
+  const noticedOnPage = (x: NativeRec) => !!x.plan && (x.kind !== 'post' || (x.changesDelivered ?? 0) > 0) && readPrefix(x.plan).some((m) => m.method === 'notifications/tools/list_changed');
   // Ordered by the global sequence, never by step: a notice read in the step a walk starts may be the very
   // notice that started it (before its first write), and doesn't invalidate it.
   const noticedLocally = (epoch: number, from: number, to: number) => exe.noticesDelivered.some((n) => n.epoch === epoch && n.seq > from && n.seq < to);

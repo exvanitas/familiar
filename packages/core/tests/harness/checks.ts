@@ -349,7 +349,7 @@ function staleCatalogCalls(r: WireRun): string[] {
     if (c.final === undefined || !c.plan || !readPrefix(c.plan).some((m) => m.method === 'notifications/tools/list_changed')) continue;
     const d = Math.floor(c.final / 1000);
     // The relist: a walk from page 1 started after the notification, complete (its last page back whole).
-    const firstPage = recs.find((x) => x.server === c.server && x.epoch === c.epoch && x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.start >= d && !x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+    const firstPage = recs.find((x) => x.server === c.server && x.epoch === c.epoch && x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.start >= d && !(x.plan && readPrefix(x.plan).some((m) => m.method === 'notifications/tools/list_changed')));
     const lastPage = firstPage && recs.find((x) => x.server === c.server && x.seq >= firstPage.seq && x.body?.method === 'tools/list' && x.final !== undefined && !x.plan?.messages.some((m) => m.result?.nextCursor !== undefined));
     const until = lastPage ? Math.floor(lastPage.final! / 1000) : Infinity;
     const call = recs.find((x) => x.server === c.server && x.epoch === c.epoch && isCall(x.body) && x.start > d && x.start <= until);

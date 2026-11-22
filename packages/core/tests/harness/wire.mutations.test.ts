@@ -481,6 +481,24 @@ describe("H3 and a grant's identity: its destination and setup", () => {
   }, 60_000);
 });
 
+describe('H3 and a notice after a list page\'s final response', () => {
+  // S38 with an unread notice after each list page's final: the catalogs stand, and the call at A under its
+  // grant is valid. The same notice moved ahead of the final on the last refresh's page is read: that walk is
+  // no catalog, B stands, and the call at A fails H3.
+  it('an unread trailing notice leaves the walk a catalog; moved ahead of its final, it discards it', async () => {
+    const o = SCHEDULES.find((s) => s.name.startsWith("S38 a granted tool on a later page changes and changes back, a notice"))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, o);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const callAtA = r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+      const last = r.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined && x.seq < callAtA.seq).at(-1)!;
+      const msgs = last.plan!.messages;
+      last.plan = { ...last.plan!, messages: [msgs.at(-1)!, ...msgs.slice(0, -1)], final: last.plan!.final + 1 };
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} read`).not.toEqual([]);
+    }
+  }, 60_000);
+});
+
 describe('H3 and a notice in the step of the walk it starts', () => {
   // S1 locally: an idle notice is read, and the refresh it starts goes out in that same step. The notice came
   // before the walk, so it doesn't invalidate it: B is published, and a Yes for A after it must fail H3 under

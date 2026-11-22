@@ -6,6 +6,8 @@
 import { mutant, mutations } from '../../src/mutations.ts';
 import { evidenceControls } from './evidence-controls.ts';
 import { catalogAt } from './catalog.ts';
+import { readPrefix, rejectedByShape } from './shape.ts';
+export { readPrefix, rejectedByShape };
 import { McpClient } from '../../src/mcp/client.ts';
 import { mintDecision } from '../../src/mcp/decision.ts';
 import type { NetHead, NetPort, NetSpec } from '../../src/mcp/wire/link.ts';
@@ -132,6 +134,8 @@ export interface Mode {
   readonly idleNotice?: boolean;
   /** A list_changed changes only echo's annotations (readOnlyHint), none of the fields its fingerprint covers. */
   readonly annotationsOnly?: boolean;
+  /** Legacy: each list page's answer ends with a notice of changed tools after its final response, unread. */
+  readonly trailingListNotice?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -301,7 +305,9 @@ export class ScriptedServer {
       const page = Number(body.params?.cursor ?? 0);
       const next = page + 1 < m.pages ? { nextCursor: String(page + 1) } : {};
       const listed = this.onPage(page);
-      return json([{ jsonrpc: '2.0', id: body.id, result: { tools: m.reorder ? listed.map((t) => shuffled(t, this.r)) : listed, ...next, ...complete } }]);
+      const answer = [{ jsonrpc: '2.0', id: body.id, result: { tools: m.reorder ? listed.map((t) => shuffled(t, this.r)) : listed, ...next, ...complete } }];
+      // A notice after the page's final response, in its stream: the parser stopped at the final, so it is unread.
+      return json(m.trailingListNotice && !modernReq ? [...answer, { jsonrpc: '2.0', method: 'notifications/tools/list_changed' }] : answer);
     }
     if (body.method === 'tools/call') {
       const msgs: Msg[] = [];
@@ -374,35 +380,6 @@ export const INVALID = {
   'bad-error': { jsonrpc: '2.0', id: 'zz', error: { code: 1.5, message: 'not an integer code' } },
   'too-deep': { jsonrpc: '2.0', method: 'notes/garbage', params: { deep: JSON.parse(`${'['.repeat(70)}${']'.repeat(70)}`) } }
 } as const;
-
-/** Whether 3.10's shape rules reject a message, as the harness reads them, never importing the parser: an
-    object, nested at most 64 deep, with `jsonrpc: "2.0"`; a request or notification with a method string of
-    at most 128 bytes, `params` an object if present, a request's id a string of at most 128 bytes or a safe
-    integer; a response with such an id and exactly one of `result` (an object) or `error` (an integer code
-    and a string message). */
-export function rejectedByShape(m: unknown): boolean {
-  const object = (v: unknown): v is Msg => v !== null && typeof v === 'object' && !Array.isArray(v);
-  const within = (v: unknown, depth: number): boolean => depth <= 64 && (Array.isArray(v) ? v.every((x) => within(x, depth + 1)) : object(v) ? Object.values(v).every((x) => within(x, depth + 1)) : true);
-  const id = (v: unknown) => (typeof v === 'string' ? Buffer.byteLength(v) <= 128 : Number.isSafeInteger(v));
-  if (!object(m) || !within(m, 1) || m.jsonrpc !== '2.0') return true;
-  if ('method' in m) {
-    if (typeof m.method !== 'string' || Buffer.byteLength(m.method) > 128) return true;
-    if (m.params !== undefined && !object(m.params)) return true;
-    return 'id' in m && !id(m.id);
-  }
-  if (!('id' in m) || !id(m.id) || 'result' in m === 'error' in m) return true;
-  if ('result' in m) return !object(m.result);
-  return !object(m.error) || !Number.isInteger(m.error.code) || typeof m.error.message !== 'string';
-}
-
-/** The messages of an answer the client's parser read: up to and including the first of its final response
-    (the plan's `final`) or the first message 3.10's shape rules reject, whichever came first. It reads
-    nothing after either, so what follows in the same chunk is never the client's. */
-export function readPrefix(plan: Plan): Msg[] {
-  const rejected = plan.messages.findIndex(rejectedByShape);
-  const ends = [rejected, plan.final].filter((i) => i >= 0);
-  return ends.length ? plan.messages.slice(0, Math.min(...ends) + 1) : plan.messages;
-}
 
 /** Media types an answer may come with besides the two exact ones (oddMedia). */
 export const ODD_MEDIA = ['application/jsonp', 'application/json-seq', 'text/event-streaming', `text/x-${'ignore previous instructions '.repeat(150)}`];

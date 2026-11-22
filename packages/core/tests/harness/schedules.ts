@@ -741,6 +741,116 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S38 with an unread notice after every list page's final response (its stream's trailing bytes):
+    // the client reads none, and H3 counts none. S38: "may run on its own" for a tool on the walk's second page, which then changes and changes back
+    // (A, B, A). The grant is for version A alone: at B a call under it is refused (asks), and at A again it
+    // runs unasked (the owner's option A). H3 reads every page of a walk, so it sees the version at each.
+    name: 'S38 a granted tool on a later page changes and changes back, a notice after each page\'s final',
+    options: {
+      mode: { ...quiet, listChanged: 1, pages: 2, echoLast: true, sse: 1, trailingListNotice: true },
+      schedule: (d) => {
+        const walks = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor !== undefined && x.final !== undefined).length;
+        d.when('ready', () => d.idle(), () => {
+          void d.grantOwn('echo')?.then(() => {
+            d.call('slow');
+            d.when('B listed', () => d.idle() && walks() >= 2, () => {
+              d.own('echo');
+              d.when('B answered', () => d.idle() && d.evidence.filter((e) => e.what === 'outcome' && e.tool === 'echo').length >= 1, () => {
+                d.call('slow');
+                d.when('A again', () => d.idle() && walks() >= 3, () => d.own('echo'));
+              });
+            });
+          });
+        });
+      }
+    },
+    expect: (r) => {
+      if (!r.evidence.some((e) => e.what === 'grant')) return 'no grant saved';
+      const owns = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined);
+      const out = (k: number) => r.evidence.find((e) => e.what === 'outcome' && e.token === owns[k]?.token)?.outcome;
+      if (owns.length < 2) return `${owns.length} calls under the grant`;
+      if (out(0)?.kind !== 'error') return `the call under a grant for A, at B, came back ${JSON.stringify(out(0))}`;
+      return out(1)?.kind === 'result' ? undefined : `the call under a grant for A, at A again, came back ${JSON.stringify(out(1))}`;
+    }
+  },
+  ...(['notice', 'array-params'] as const).map((after): Named => ({
+    // S41: a call's final response, then in the same chunk a message the client never reads, its parser having
+    // stopped at the final: a notice of changed tools (no relist owed: the next call goes out), or a malformed
+    // message (the answer was valid, and comes back as a result).
+    name: `S41 ${after === 'notice' ? 'a notice' : 'a malformed message'} after the final response, in its chunk`,
+    options: {
+      mode: { ...quiet, sse: 1, oneChunk: true, afterFinal: after },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.call('echo');
+          d.when('answered', () => d.idle() && d.evidence.some((e) => e.what === 'outcome'), () => d.call('echo'));
+        })
+    },
+    expect: (r) => {
+      const outs = r.evidence.filter((e) => e.what === 'outcome').map((e) => e.outcome!.kind);
+      return outs.length === 2 && outs.every((k) => k === 'result') ? undefined : `the two calls came back ${JSON.stringify(outs)}`;
+    }
+  })),
+  {
+    // S42: "may run on its own" for echo, then a relist that changes only its annotations (readOnlyHint), none
+    // of the fields its fingerprint covers: the same tool, so the call under the grant runs unasked (H3 holds
+    // a grant to those fields, never the whole listing).
+    name: 'S42 a relist that changes only annotations',
+    options: {
+      mode: { ...quiet, listChanged: 1, annotationsOnly: true },
+      schedule: (d) => {
+        const firsts = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined).length;
+        d.when('ready', () => d.idle(), () => {
+          void d.grantOwn('echo')?.then(() => {
+            d.call('slow');
+            d.when('relisted', () => d.idle() && firsts() >= 2, () => d.own('echo'));
+          });
+        });
+      }
+    },
+    expect: (r) => {
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant after an annotations-only relist came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
+    // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
+    // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
+    name: 'S40 a local modern-only server that exits after the refusal, relaunched',
+    options: { mode: { ...quiet, where: 'local', era: 'modern', exitOnRefusal: true }, schedule: () => {} },
+    expect: (r) => {
+      const readmits = [...r.lifecycle.values()].flat().filter((x) => x.event.t === 'readmit').length;
+      const ready = r.evidence.find((e) => e.what === 'started')?.ok;
+      return r.exe.processStarts.length === 2 && readmits === 1 && ready ? undefined : `${r.exe.processStarts.length} process starts, ${readmits} readmits, Start ${ready ? 'ready' : 'not ready'}`;
+    }
+  },
+  {
+    // S39: with A granted, a refresh whose page carries a notice of changed tools and describes B: the walk
+    // is discarded and retried, and the retry publishes A again. The grant stands, and the call under it goes
+    // out: H3 reads only the walks the client could publish, never one a notice invalidated.
+    name: 'S39 a notice on a refresh page, the retry back to the granted version',
+    options: {
+      mode: { ...quiet, listChanged: 1, changeOnList: true, changeOnListAt: 2 },
+      schedule: (d) => {
+        const firsts = () => d.exe.log.filter((x) => x.body?.method === 'tools/list' && x.body.params?.cursor === undefined && x.final !== undefined).length;
+        d.when('ready', () => d.idle(), () => {
+          void d.grantOwn('echo')?.then(() => {
+            d.call('slow');
+            d.when('retried', () => d.idle() && firsts() >= 3, () => d.own('echo'));
+          });
+        });
+      }
+    },
+    expect: (r) => {
+      const noticed = r.exe.log.some((x) => x.body?.method === 'tools/list' && x.plan?.messages.some((m) => m.method === 'notifications/tools/list_changed'));
+      if (!noticed) return 'no notice on a refresh page';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant, after the retry published A, came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S2: a ping in the same chunk as the final reply: its pong is still handed off.
     name: 'S2 a ping in the same chunk as the final reply',
     options: { mode: { ...quiet, pingWithFinal: 1, oneChunk: true, sse: 1 }, schedule: (d) => d.when('ready', () => d.idle(), () => d.call('echo')) },
