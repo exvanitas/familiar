@@ -21,11 +21,16 @@ describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its c
 // clock is advanced past that limit: the timer died with its life, so life 1's client writes nothing more to
 // its port (no cancel for the call it had under way).
 describe("server-reissue's life 1 client, after the kill", () => {
-  it('had a timer armed at the kill, and writes nothing once its clock passes the call limit', async () => {
+  it('had a timer armed at the kill; its native timers are all cleared, and nothing it fires reaches the old port', async () => {
     const world = nodeWorld();
     await killAndResume(scenario('server-reissue'), world);
     expect(world.counters.get('life1-timers-at-kill')).toBeGreaterThan(0);
-    lifeClocks.get(world.counters)!.get(1)!.advance(CALL_MS_MAX + 60_000);
+    const life1 = lifeClocks.get(world.counters)!.get(1)!;
+    // The native scheduler's own queue: every timer life 1 armed was cleared there, not only in the clock.
+    expect(life1.native.pending()).toBe(0);
+    // And whatever is left of either fires now: life 1's client writes nothing more.
+    life1.advance(CALL_MS_MAX + 60_000);
+    life1.native.fireAll();
     await new Promise((r) => setTimeout(r, 50));
     expect(world.counters.get('life1-writes-after-kill')).toBe(0);
   });

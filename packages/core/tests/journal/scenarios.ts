@@ -51,17 +51,50 @@ export function offsetClock(counters: Counters): JournalClock & { advance(ms: nu
   };
 }
 
-/** A clock for one life, with its own timer queue: each timer runs from a real timeout, or sooner when the
-    clock is advanced (`advance`, the controls' independent clock), unless it was cancelled. A simulated kill
-    cancels them all, as a closed page takes its timers with it; in Node a killed life's would go on firing
-    into the next (a real client's call timer, say, sending its cancel through the old life's port). */
-export function lifeClock(counters: Counters): Pick<JournalClock, 'now' | 'setTimer'> & { armed(): number; discard(): void; advance(ms: number): void } {
+/** The native timers under a life's clock: real timeouts, each also kept in this scheduler's own queue until
+    it fires or is cleared, so a control can see which are still armed and fire them all, independently of the
+    clock's own bookkeeping. */
+export function nativeTimers(): { set(callback: () => void, delayMs: number): number; clear(handle: number): void; pending(): number; fireAll(): void } {
+  let next = 0;
+  const queue = new Map<number, { callback: () => void; real: ReturnType<typeof setTimeout> }>();
+  return {
+    set(callback, delayMs) {
+      const handle = ++next;
+      const real = setTimeout(() => {
+        if (queue.delete(handle)) callback();
+      }, delayMs);
+      queue.set(handle, { callback, real });
+      return handle;
+    },
+    clear(handle) {
+      const t = queue.get(handle);
+      if (!t) return;
+      queue.delete(handle);
+      clearTimeout(t.real);
+    },
+    pending: () => queue.size,
+    fireAll() {
+      for (const [handle, t] of [...queue]) {
+        queue.delete(handle);
+        clearTimeout(t.real);
+        t.callback();
+      }
+    }
+  };
+}
+
+/** A clock for one life, over its own native timers: each timer runs when its native timer fires, or sooner
+    when the clock is advanced (`advance`), unless it was cancelled. A simulated kill cancels them all, the
+    native timers with them, as a closed page takes its timers along; in Node a killed life's would go on
+    firing into the next (a real client's call timer, say, sending its cancel through the old life's port). */
+export function lifeClock(counters: Counters, native = nativeTimers()): Pick<JournalClock, 'now' | 'setTimer'> & { armed(): number; discard(): void; advance(ms: number): void; native: ReturnType<typeof nativeTimers> } {
   const base = offsetClock(counters);
   let ahead = 0;
   const now = () => base.now() + ahead;
-  const timers = new Set<{ due: number; fire: () => void; real: ReturnType<typeof setTimeout> }>();
+  const timers = new Set<{ due: number; fire: () => void; handle: number }>();
   let dead = false;
   return {
+    native,
     now,
     setTimer: (callback, delayMs) => {
       if (dead) return () => {};
@@ -69,16 +102,16 @@ export function lifeClock(counters: Counters): Pick<JournalClock, 'now' | 'setTi
         due: now() + delayMs,
         fire: () => {
           if (!timers.delete(t)) return;
-          clearTimeout(t.real);
+          native.clear(t.handle);
           callback();
         },
-        real: undefined as unknown as ReturnType<typeof setTimeout>
+        handle: 0
       };
-      t.real = setTimeout(() => t.fire(), delayMs);
+      t.handle = native.set(() => t.fire(), delayMs);
       timers.add(t);
       return () => {
         timers.delete(t);
-        clearTimeout(t.real);
+        native.clear(t.handle);
       };
     },
     armed: () => timers.size,
@@ -86,7 +119,7 @@ export function lifeClock(counters: Counters): Pick<JournalClock, 'now' | 'setTi
       dead = true;
       for (const t of [...timers]) {
         timers.delete(t);
-        clearTimeout(t.real);
+        native.clear(t.handle);
       }
     },
     advance: (ms) => {
