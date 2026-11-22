@@ -590,27 +590,6 @@ describe("5.4: a server's limits apply from the next start", () => {
   });
 });
 
-describe('the change counters a server leaves behind (r35b #11)', () => {
-  it('a server that lists fresh tool names, over and over, leaves counters only for what is listed or granted', async () => {
-    let listed = 0;
-    const fp = fakeProcess((msg) => (msg.method === 'initialize' ? [JSON.stringify(initResult(msg.id))] : msg.method === 'tools/list' ? [JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: `tool${++listed}`, description: 'a tool', inputSchema: { type: 'object', properties: {} } }] } })] : []));
-    const client = await clientOf(memorySettingsStore(), fp.port);
-    await client.add({ setup: local('l1'), problems: [] });
-    expect((await client.start('l1')).kind).toBe('ready');
-    for (let i = 0; i < 30; i++) {
-      const was = listed;
-      fp.emit({ t: 'out', line: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) });
-      for (let j = 0; j < 200 && (listed === was || client.tools()[0]?.serverName !== `tool${listed}`); j++) await tick(2);
-    }
-    expect(listed).toBeGreaterThan(30);
-    const counters = (client as unknown as { changeCount: Map<string, number> }).changeCount;
-    expect(counters.size).toBeLessThanOrEqual(1);
-    await client.stop('l1');
-    await client.remove('l1');
-    expect(counters.size).toBe(0);
-  });
-});
-
 describe("6b.13: a later tool list that couldn't be saved, as the machine marks it", () => {
   // A write fails when the store throws, and when it refuses the write (its revision guard, r35b #3).
   for (const how of ['throws', 'refuses'] as const)

@@ -131,7 +131,7 @@ export interface Remark {
 
 /** The words on a server tool card's "May run on its own" button. */
 export function ownWords(tool: string, server: string): string {
-  return `May run on its own: Familiar will call ${tool} on ${server} whenever she decides to, without asking you, even when something a server said led her there. It holds only while the server lists the tool exactly as it does now: if that listing changes, Familiar asks again. You can take it back in Settings.`;
+  return `May run on its own: Familiar will call ${tool} on ${server} whenever she decides to, without asking you, even when something a server said led her there. It holds only for ${tool} exactly as ${server} lists it now: if it's listed any other way, Familiar asks. You can take it back in Settings.`;
 }
 
 /** What the decider sees that the loop doesn't know itself. */
@@ -164,11 +164,9 @@ export interface JournalOptions {
    * Saves a "may run on its own" grant for exactly these card facts, once the journal has checked the press
    * was on the card showing now and its facts still hold. Without it, no card offers the button.
    *
-   * The contract (step 8 wires it to `McpClient.choose` with `policy: 'own'`, which keeps it): it resolves
-   * false, saving nothing, unless the server lists the tool now with exactly that fingerprint and setup; and
-   * a listing that lands while the grant saves, lacking the tool or listing it otherwise, stops the grant
-   * as it lands (asks again at once, cleared durably once the owner is free), so the journal's own check
-   * before it can't be outrun.
+   * The contract (step 8 wires it to `McpClient.choose` with `policy: 'own'`, which keeps it): it saves a
+   * grant for exactly these facts, the version the card showed, whatever the server lists by then; the grant
+   * holds only while the server lists that version (5.6, option A). It resolves false when the save fails.
    */
   readonly grantOwn?: (facts: CardFacts) => Promise<boolean>;
   readonly presence: PresencePort;

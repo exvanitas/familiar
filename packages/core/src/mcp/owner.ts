@@ -216,8 +216,6 @@ export class Owner {
   /** The whole record couldn't be read: nothing loads, nothing is written. */
   readonly unreadable: boolean;
   private effect: { readonly what: string; readonly since: number } | undefined;
-  /** A grant's durable clear under way (clearChoice): cleanup, which a catalog write waits for. */
-  private cleaning: Promise<void> | undefined;
   /** The one reservation granted and not yet acknowledged (5.8): it holds the effect. */
   private reservation: { readonly id: string; readonly ref: string; readonly release: () => void } | undefined;
   private readonly ports: OwnerPorts;
@@ -294,11 +292,6 @@ export class Owner {
    * Admits one effect, synchronously, or refuses at once. While a mark is left unfinished, only Retry and
    * starts are admitted.
    */
-  /** The record's revision: it moves with every commit that lands, and with nothing else. */
-  get revision(): number {
-    return this.doc.rev;
-  }
-
   admit(what: string, options: { readonly start?: boolean } = {}): { readonly release: () => void } | Outcome {
     if (this.unreadable) return no("Familiar can't read its saved servers, so it changes nothing. Restart Familiar.");
     if (this.effect) return no(BUSY_WORDS);
@@ -342,9 +335,6 @@ export class Owner {
    * is unfinished, like a start: it changes no setup. A write the store refuses rejects, as one that fails.
    */
   async seen(id: string, tools: readonly SavedTool[], current: () => boolean = () => true): Promise<void> {
-    // Cleanup yields: a grant's clear holding the owner is waited for, never a reason to skip the list
-    // (r35b #12). Everything is checked again once it's done.
-    while (this.cleaning && !(__FAMILIAR_MUTATIONS__ && mutant('seen-skips-cleanup'))) await this.cleaning;
     const s = this.server(id);
     if (!s || s.removing || JSON.stringify(s.tools) === JSON.stringify(tools) || !current()) return;
     const t = this.admit('seen', { start: true });
@@ -355,13 +345,7 @@ export class Owner {
       const written = await this.commit((d) => {
         const cur = readServer(d.servers[id]);
         if (cur) d.servers[id] = { ...cur, tools } as unknown as JsonValue;
-        // A "may run on its own" grant for a tool listed now with another fingerprint is cleared in the same
-        // commit: the changed tool asks, and a grant is never revived by the tool changing back.
-        for (const t of tools) {
-          const key = choiceKey(id, t.name);
-          const c = readChoice(d.choices[key]);
-          if (c?.policy === 'own' && c.fingerprint !== t.fingerprint && !(__FAMILIAR_MUTATIONS__ && mutant('own-ignores-fingerprint'))) delete d.choices[key];
-        }
+        // A grant is the person's: no listing clears it (5.6, option A).
       });
       if (!written && !(__FAMILIAR_MUTATIONS__ && mutant('seen-refusal-saved'))) throw new Error('The tool list was not saved.');
     } finally {
@@ -633,7 +617,8 @@ export class Owner {
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<Outcome> {
     const problem = choiceProblem(serverId, tool, choice);
     if (problem) return no(problem);
-    const t = this.admit('choice');
+    // Let in while a change's cleanup is unfinished, as a catalog write is: a choice changes no setup (5.6).
+    const t = this.admit('choice', { start: true });
     if (!('release' in t)) return t;
     try {
       const key = choiceKey(serverId, tool);
@@ -643,21 +628,4 @@ export class Owner {
     }
   }
 
-  /** A grant that no longer holds, cleared from the record: cleanup only. A catalog write that comes while it
-      holds the owner waits for it instead of being skipped (5.6). */
-  async clearChoice(serverId: string, tool: string): Promise<Outcome> {
-    const t = this.admit('clear');
-    if (!('release' in t)) return t;
-    let done!: () => void;
-    const cleaning = new Promise<void>((r) => (done = r));
-    this.cleaning = cleaning;
-    try {
-      const key = choiceKey(serverId, tool);
-      return (await this.commit((d) => void delete d.choices[key])) ? ok : no('The choice was not saved.');
-    } finally {
-      if (this.cleaning === cleaning) this.cleaning = undefined;
-      t.release();
-      done();
-    }
-  }
 }

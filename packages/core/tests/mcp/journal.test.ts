@@ -178,8 +178,8 @@ describe('a server tool in the turn loop', () => {
     }
   });
 
-  it('"may run on its own": that one tool runs unasked for exactly its version and setup; a changed fingerprint clears it, and a revoke takes it back', async () => {
-    for (const mutation of [undefined, 'own-ignores-fingerprint'] as const) {
+  it('"may run on its own": that one tool runs unasked for exactly its version and setup; a changed fingerprint asks, the grant kept for its own version (option A)', async () => {
+    for (const mutation of [undefined, 'own-ignores-fingerprint', 'own-on-wrapper-copy'] as const) {
       mutations.set(mutation ? [mutation] : []);
       try {
         const c = await echoChat(`mcp-own-${mutation ?? 'twin'}`, true);
@@ -193,13 +193,20 @@ describe('a server tool in the turn loop', () => {
         await c.turn();
         expect(c.cards).toHaveLength(1);
         expect(c.calls()).toBe(2);
-        // The server changes echo: the grant is cleared with the catalog write, and the changed tool asks.
+        // The server changes echo: the changed tool asks, and the grant stays, for its own version only.
         await callWithYes(c.client, c.one.serverId, 'set_variant', { variant: 'b' });
         for (let i = 0; i < 300 && c.client.tools().find(t => t.serverName === 'echo')!.fingerprint === c.echo.fingerprint; i++) await sleep(10);
-        for (let i = 0; i < 300 && !mutation && c.client.choices()[choiceKey(c.echo.server.id, 'echo')]; i++) await sleep(10);
         await c.turn();
+        if (mutation === 'own-on-wrapper-copy') {
+          // The control: the gate read the turn's older copy of the wrapper, said own, and the handoff refused
+          // the changed tool: no card, and no call.
+          expect(c.cards).toHaveLength(1);
+          expect(c.calls()).toBe(2);
+          await c.one.journal.close();
+          continue;
+        }
         if (mutation === undefined) {
-          expect(c.client.choices()[choiceKey(c.echo.server.id, 'echo')]).toBeUndefined();
+          expect(c.client.choices()[choiceKey(c.echo.server.id, 'echo')]).toMatchObject({ policy: 'own', fingerprint: c.echo.fingerprint });
           expect(c.cards).toHaveLength(2);
           expect(c.cards[1]!.facts!.fingerprint).not.toBe(c.echo.fingerprint);
         } else {
