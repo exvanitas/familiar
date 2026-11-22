@@ -4,7 +4,7 @@
 // failure lies at or after that step. A mutation with no such seed is a broken control and fails the build.
 import { describe, expect, it } from 'vitest';
 import { evidenceControls, handoffHistory, launchFingerprint, PASS_CHECKS } from './checks.ts';
-import { defIn } from './catalog.ts';
+import { defIn, walks } from './catalog.ts';
 import { SCHEDULES } from './schedules.ts';
 import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type ExchangeRecord, type Mode, type WireOptions, type WireRun } from './wire.ts';
 
@@ -476,6 +476,30 @@ describe("H3 and the person's latest act on a tool", () => {
       for (const e of late.evidence) if (e.what === 'grant') Object.assign(e, { seq: (yes.seq + call.seq) / 2 });
       late.evidence.sort((a, b) => a.seq - b.seq);
       expect(PASS_CHECKS.H3!(late), `seed ${seed} after the mint`).not.toEqual([]);
+    }
+  }, 60_000);
+  it('a decision minted while B was listed, or after its handoff, or under a fingerprint A never had, fails H3', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const fresh = async () => {
+        const r = await wireRun(seed, s38());
+        const call = callAtA(r);
+        return { r, call, yes: r.evidence.find((e) => e.what === 'yes' && e.token === tokenOfCall(call))! };
+      };
+      // Minted in the interval B was published in, before A was listed again.
+      const inB = await fresh();
+      const published = walks(inB.r.exe, inB.call.server).map((w) => w.atSeq).filter((q) => q < inB.call.seq);
+      Object.assign(inB.yes, { seq: (published.at(-2)! + published.at(-1)!) / 2 });
+      inB.r.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(inB.r), `seed ${seed} minted at B`).not.toEqual([]);
+      // Minted after its own handoff.
+      const late = await fresh();
+      Object.assign(late.yes, { seq: late.call.seq + 0.5 });
+      late.r.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(late.r), `seed ${seed} minted late`).not.toEqual([]);
+      // The grant and the decision under one fingerprint the listing of A doesn't have.
+      const wrong = await fresh();
+      for (const e of wrong.r.evidence) if (e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { grant: 'fp-not-a' });
+      expect(PASS_CHECKS.H3!(wrong.r), `seed ${seed} wrong fingerprint`).not.toEqual([]);
     }
   }, 60_000);
   it('an earlier take-back, then the grant written: the call at A passes H3', async () => {

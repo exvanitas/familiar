@@ -3,7 +3,7 @@
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import { createHash } from 'node:crypto';
-import { canonical, catalogAt } from './catalog.ts';
+import { canonical, catalogAt, fingerprintAt } from './catalog.ts';
 import { readPrefix, rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
@@ -316,6 +316,13 @@ export const H3: Check = (r) => {
       // (the harness never edits a remote one). Fingerprinted by the harness's own reading.
       const launched = x.kind === 'write' ? r.exe.processStarts.find((p) => p.epoch === x.epoch)?.launch : r.setups.get(named);
       if (!launched || yes.setup !== launchFingerprint(launched)) problems.push(`H3: ${t} went out under a decision for another setup than its run was launched from`);
+      // The decision was minted before its handoff, and at both points the server's accepted listing has the
+      // very fingerprint the decision names, as the harness derives it from that listing itself.
+      if (!(yes.seq < x.seq)) problems.push(`H3: ${t} was handed off before its decision was minted`);
+      for (const [when, at] of [['minted', yes.seq], ['handed off', x.seq]] as const) {
+        const fp = fingerprintAt(r.exe, x.server, at, yes.tool!);
+        if (fp !== yes.grant) problems.push(`H3: ${t} was ${when} under fingerprint ${String(yes.grant).slice(0, 8)}, the listing then has ${String(fp).slice(0, 8)}`);
+      }
       const atMint = latestAct(r, named, yes.tool!, yes.seq);
       if (!isTheGrant(atMint)) problems.push(`H3: ${t} was minted under a grant that wasn't the person's choice for ${yes.tool} when it was minted`);
       else if (!isTheGrant(effective)) {

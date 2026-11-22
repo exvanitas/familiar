@@ -1,6 +1,7 @@
 // The harness's own reading of a server's catalog, from the fake exe's log alone: shared by the checks
 // (checks.ts) and by the driver, which records with each grant the version the person's card showed.
 
+import { createHash } from 'node:crypto';
 import { readPrefix } from './shape.ts';
 import type { FakeExe, NativeRec } from './wire.ts';
 
@@ -69,6 +70,35 @@ export const defIn = (w: { tools: any[]; modern?: boolean }, tool: string): stri
   const description = typeof def?.description === 'string' ? def.description : undefined;
   return def === undefined ? undefined : canonical({ name: def.name, title: title ?? '', description: description ?? title ?? '', inputSchema: def.inputSchema ?? null, ...(w.modern ? { modern: true } : {}) });
 };
+
+/** A tool's fingerprint as the harness derives it from a walk, restating 3.5 and 5.6 (never imported): SHA-256,
+    in hex, over the canonical JSON of its name, title (the empty one when absent), effective description (the
+    description, or the title when there's none) and input schema, and on a modern remote run its header
+    declarations (each one's path, header name and type, sorted by path, then header name; none declared is an
+    empty list, still unlike a legacy run's). A title or description that is no string is absent (3.10). */
+export function fingerprintIn(w: { tools: any[]; modern?: boolean }, tool: string): string | undefined {
+  const def = w.tools.find((d: any) => d.name === tool);
+  if (def === undefined) return undefined;
+  const title = typeof def.title === 'string' ? def.title : undefined;
+  const description = typeof def.description === 'string' ? def.description : undefined;
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const headers = w.modern ? declarations(def.inputSchema).sort((a, b) => cmp(a.path.join('\u0000'), b.path.join('\u0000')) || cmp(a.name, b.name)) : undefined;
+  return createHash('sha256').update(canonical({ name: def.name, title: title ?? '', description: description ?? title ?? '', inputSchema: def.inputSchema, ...(headers ? { modern: { headers } } : {}) })).digest('hex');
+}
+
+/** The header declarations of a schema: on properties reached from the root by `properties` alone (3.5). */
+function declarations(schema: any, path: string[] = []): { path: string[]; name: string; type: unknown }[] {
+  if (!schema || typeof schema !== 'object') return [];
+  const here = path.length && typeof schema['x-mcp-header'] === 'string' ? [{ path, name: schema['x-mcp-header'] as string, type: schema.type }] : [];
+  return [...here, ...Object.entries((schema.properties ?? {}) as Record<string, unknown>).flatMap(([k, v]) => declarations(v, [...path, k]))];
+}
+
+/** The tool's fingerprint in the last completed walk published before the sequence `seq`. */
+export function fingerprintAt(exe: FakeExe, server: string, seq: number, tool: string): string | undefined {
+  let found: { atSeq: number; tools: any[]; modern: boolean } | undefined;
+  for (const w of walks(exe, server)) if (w.atSeq < seq && (!found || w.atSeq >= found.atSeq)) found = w;
+  return found && fingerprintIn(found, tool);
+}
 
 /** The tool's definition in the last completed walk that reached the client before the sequence `seq`
     (Infinity: every walk that has reached it so far). */
