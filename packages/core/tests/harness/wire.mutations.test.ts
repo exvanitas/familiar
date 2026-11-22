@@ -3,7 +3,7 @@
 // first step where the switch changed behaviour. Since the twin's identical prefix passes, the mutant's
 // failure lies at or after that step. A mutation with no such seed is a broken control and fails the build.
 import { describe, expect, it } from 'vitest';
-import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
+import { evidenceControls, handoffHistory, launchFingerprint, PASS_CHECKS } from './checks.ts';
 import { defIn } from './catalog.ts';
 import { SCHEDULES } from './schedules.ts';
 import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type ExchangeRecord, type Mode, type WireOptions, type WireRun } from './wire.ts';
@@ -565,6 +565,26 @@ describe('H3 and a publication in the handoff\'s own step', () => {
       expect(PASS_CHECKS.H3!(r), `seed ${seed}`).not.toEqual([]);
     }
     expect(judged).toBeGreaterThan(0);
+  }, 60_000);
+});
+
+describe('H3 and the setup of the run that received the handoff', () => {
+  // S43: a grant and a call on each of two runs, the setup edited between them; both are clean. The second
+  // grant and its decision moved to the first run's setup, as the server was added, while the call went to the
+  // edited run: the old reading (the setup at the Add) took it, and H3 flags it.
+  it("a decision for the Add's setup handed to the edited run fails H3", async () => {
+    const s43 = SCHEDULES.find((s) => s.name.startsWith('S43'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s43);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const original = launchFingerprint(r.exe.processStarts[0]!.launch);
+      expect(original).not.toBe(launchFingerprint(r.exe.processStarts[1]!.launch));
+      const grant = r.evidence.filter((e) => e.what === 'grant').at(-1)!;
+      const yes = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1)!;
+      Object.assign(grant, { setup: original });
+      Object.assign(yes, { setup: original });
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/another setup than its run was launched from/)]));
+    }
   }, 60_000);
 });
 

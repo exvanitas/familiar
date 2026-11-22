@@ -705,6 +705,36 @@ export const SCHEDULES: Named[] = [
     }
   })),
   {
+    // S43: a grant and a call under it on a local server's first run; then the server stopped, its arguments
+    // edited, and started again, and a grant and a call on the new run. Each grant is for the setup its run was
+    // launched from, and both calls run (H3 reads the setup of the run that received each handoff).
+    name: 'S43 a local setup edited between runs, a grant on each',
+    options: {
+      mode: { ...quiet, where: 'local', idlePings: 0 },
+      schedule: (d) => {
+        const editAndRestart = (): void => {
+          d.stop();
+          d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
+            d.edit('s1', { args: ['--edited'] });
+            d.when('edited', () => d.evidence.some((e) => e.what === 'edited'), () => {
+              d.start();
+              d.when('ready again', () => d.idle() && d.exe.processStarts.length === 2, () => void d.grantOwn('echo')?.then(() => d.when('idle', () => d.idle(), () => d.own('echo'))));
+            });
+          });
+        };
+        d.when('ready', () => d.idle(), () => void d.grantOwn('echo')?.then(() => {
+          d.own('echo');
+          d.when('first answered', () => d.idle() && d.evidence.some((e) => e.what === 'outcome'), editAndRestart);
+        }));
+      }
+    },
+    expect: (r) => {
+      const owns = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined);
+      const outs = owns.map((o) => r.evidence.find((e) => e.what === 'outcome' && e.token === o.token)?.outcome?.kind);
+      return owns.length === 2 && outs.every((k) => k === 'result') ? undefined : `the calls under the two grants came back ${JSON.stringify(outs)}`;
+    }
+  },
+  {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
     name: 'S40 a local modern-only server that exits after the refusal, relaunched',

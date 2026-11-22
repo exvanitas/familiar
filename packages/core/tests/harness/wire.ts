@@ -464,7 +464,7 @@ export class FakeExe {
   readonly exits: { epoch: number; step: number }[] = [];
   /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2), and the
       handle the exe gave it. */
-  readonly processStarts: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number }[] = [];
+  readonly processStarts: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number; launch: Record<string, unknown> }[] = [];
   /** Holds the next process start's answer until `releaseStart()` (S11, Stop during a pending start). */
   holdNextStart = false;
   releaseStart?: () => void;
@@ -871,7 +871,9 @@ export class FakeExe {
         new Promise((resolve) => {
           const run = `p${++runs}`;
           this.epoch++;
-          const admitted: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id, run };
+          // With the launch facts the exe was handed for this process: what the run was launched from.
+          const launch = { kind: 'local', program: setup.program, args: [...setup.args], cwd: setup.cwd, env: setup.env.map(([k, v]) => [k, v]), secrets: [...setup.secrets] };
+          const admitted: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number; launch: Record<string, unknown> } = { epoch: this.epoch, seq: this.tick(), step: this.sched.step, server: setup.id, run, launch };
           this.processStarts.push(admitted);
           live.set(run, { emit: onEvent, out: [], flushing: false, exited: false, writes: [], reading: true, taken: 0, epoch: this.epoch, server: setup.id });
           const answer = () => this.sched.add({ label: `started:${run}`, fire: () => {
@@ -949,7 +951,7 @@ export interface Evidence {
   readonly step: number;
   /** The scheduler's clock when it was noted, in ms. */
   readonly at?: number;
-  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant';
+  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant' | 'edited';
   /** On a `stopped`: how the Stop ended, as its reply says. */
   readonly stopOutcome?: 'stopped' | 'may-still-run' | 'refused' | 'failed';
   /** On a `test`: whether it reached the machine (Test from Stopped or Failed). */
@@ -1088,6 +1090,8 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
     await client.add({ setup, problems: [] });
   }
   const d = new Driver(sched, client, evidence, next, exe, server, store);
+  // The driver's own copy: its edits change what it saves next, never the record of what was added.
+  d.setups = new Map(setups);
   for (const id of ids) sched.add({ label: `start:${id}`, fire: () => d.start(id) });
   if (options.schedule) options.schedule(d);
   else d.random(10);
@@ -1108,6 +1112,8 @@ export class Driver {
   readonly server: ScriptedServer;
 
   readonly store: HoldableStore;
+  /** The harness's own setups, as it added and edited them. */
+  setups = new Map<string, Record<string, unknown>>();
 
   constructor(sched: Scheduler, client: McpClient, evidence: Evidence[], tick: () => number, exe: FakeExe, server: ScriptedServer, store: HoldableStore) {
     this.store = store;
@@ -1307,6 +1313,17 @@ export class Driver {
       this.note({ what: 'revoke', tool, server: id });
     }
     void out.then((outcome) => this.note({ what: 'outcome', token, tool, outcome, server: id }));
+  }
+
+  /** An edit of a stopped server's setup, as Settings makes it (its arguments, say). */
+  edit(id: string, change: Record<string, unknown>): void {
+    void this.client.edit(id, { setup: { ...(this.setups.get(id) ?? {}), ...change } as never, problems: [] }).then(
+      () => {
+        this.setups.set(id, { ...(this.setups.get(id) ?? {}), ...change });
+        this.note({ what: 'edited', server: id });
+      },
+      () => undefined
+    );
   }
 
   stopCall(): void {

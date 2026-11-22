@@ -311,9 +311,10 @@ export const H3: Check = (r) => {
       // The grant is matched by its full identity (server and tool by the replay, then its fingerprint and
       // setup), and it is the effective choice both when the decision was minted and at the handoff.
       const isTheGrant = (act: Evidence | undefined) => act?.what === 'grant' && act.grant === yes.grant && act.setup !== undefined && act.setup === yes.setup;
-      // And the setup they name is the one the run the call reached was launched from, as the harness added
-      // it, fingerprinted by the harness's own reading.
-      const launched = r.setups.get(named);
+      // And the setup they name is the one the run that received the handoff was launched from: locally, the
+      // launch facts the exe was handed for that very process; remotely, the setup as the harness added it
+      // (the harness never edits a remote one). Fingerprinted by the harness's own reading.
+      const launched = x.kind === 'write' ? r.exe.processStarts.find((p) => p.epoch === x.epoch)?.launch : r.setups.get(named);
       if (!launched || yes.setup !== launchFingerprint(launched)) problems.push(`H3: ${t} went out under a decision for another setup than its run was launched from`);
       const atMint = latestAct(r, named, yes.tool!, yes.seq);
       if (!isTheGrant(atMint)) problems.push(`H3: ${t} was minted under a grant that wasn't the person's choice for ${yes.tool} when it was minted`);
@@ -335,7 +336,7 @@ export const H3: Check = (r) => {
     program, its arguments, its folder, its environment (names upper-cased, sorted) and its secrets' names
     (upper-cased, sorted); remotely, the address, its transport, its headers (names lower-cased, sorted), its
     key's header and prefix, and the saved address id. SHA-256 over their canonical JSON, in hex. */
-function launchFingerprint(s: Record<string, any>): string {
+export function launchFingerprint(s: Record<string, any>): string {
   const bound =
     s.kind === 'local'
       ? { kind: 'local', program: s.program, args: s.args, cwd: s.cwd, env: [...s.env].map(([k, v]: [string, string]) => [k.toUpperCase(), v]).sort(), secrets: [...s.secrets].map((n: string) => n.toUpperCase()).sort() }
