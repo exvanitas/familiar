@@ -361,7 +361,8 @@ async function grantedClient(env: Env) {
   const wrappers = client.tools();
   const lookup = wrappers.find((t) => t.serverName === 'server_lookup');
   if (!lookup) throw new Error('The server offers no server_lookup.');
-  if (env.life === 1) await client.choose('srv', 'server_lookup', { policy: 'own', fingerprint: lookup.fingerprint, setupFingerprint: lookup.setupFingerprint });
+  // The person's press on the tool's card, with the card's own facts, then its save.
+  if (env.life === 1 && !(await client.pressOwn({ server: 'srv', tool: 'server_lookup', fingerprint: lookup.fingerprint, launch: lookup.setupFingerprint }).save())) throw new Error('The grant was not saved.');
   return { client, clock, wrappers, name: lookup.name };
 }
 const answerTool = (r: ModelRequest): FakeReply => ({ text: `Done. (${lastText(r)})` });

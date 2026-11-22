@@ -1180,8 +1180,12 @@ export class Driver {
     // exe's log by the harness's own reading, never from the client's catalog.
     const step = this.sched.step;
     const def = catalogAt(this.exe, this.server.mode.where === 'remote' ? `addr-${id.slice(1)}` : id, Infinity, tool);
-    return this.client.choose(id, tool, { policy: 'own', fingerprint: t.fingerprint, setupFingerprint: t.setupFingerprint }).then(
-      () => {
+    // The press, taken now, as the person presses (its place in order is now), with the card's own facts;
+    // then its save.
+    const press = this.client.pressOwn({ server: id, tool, fingerprint: t.fingerprint, launch: t.setupFingerprint });
+    return press.save().then(
+      (saved) => {
+        if (!saved) return;
         const e = this.note({ what: 'grant', tool, server: id, grant: t.fingerprint, ...(def !== undefined ? { def } : {}) });
         (e as { step: number }).step = step;
       },
