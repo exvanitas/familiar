@@ -9,7 +9,7 @@
 import type { JournalClock } from '../journal/journal.ts';
 import type { SettingsStore } from '../settings/store.ts';
 import { canonicalArguments, markUsed, usable, type CardFacts, type ToolDecision } from './decision.ts';
-import { addressIdentity, BUILT_IN, modelName, Owner, type Outcome } from './owner.ts';
+import { addressIdentity, BUILT_IN, modelName, Owner, UNFINISHED_WORDS, type Outcome } from './owner.ts';
 export { BUILT_IN };
 import { mutant } from '../mutations.ts';
 import type { PathRules } from './native-rules.ts';
@@ -324,6 +324,9 @@ export class McpClient {
     const order = ++this.acts;
     // "May run on its own" is never a choice made here: step 8's press on its card is its one way in (r37 #2).
     if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) throw new Error('"May run on its own" is saved only from a press on its card.');
+    // While a change's cleanup is unfinished only a tightening is let in, judged against what holds now: a
+    // never held in memory (its write refused) is not loosened by a choice of ask (r39 #4).
+    if (this.owner.mark && this.overlay.get(key) === 'never' && choice?.policy !== 'deny') throw new Error(UNFINISHED_WORDS);
     // "May run on its own" is saved for exactly the version the card showed, from its own facts, whatever the
     // server lists now: it holds only while the server lists that version (5.6, option A).
     const r = __FAMILIAR_MUTATIONS__ && mutant('choose-own') && choice?.policy === 'own' ? await this.owner.grant(serverId, tool, { fingerprint: choice.fingerprint, setupFingerprint: choice.setupFingerprint }) : await this.owner.choose(serverId, tool, choice);

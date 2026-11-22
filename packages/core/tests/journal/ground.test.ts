@@ -447,7 +447,7 @@ void idle;
 /* ---------- 5.6: no server tool runs without your Yes ---------- */
 
 describe('5.6 and G12: no server tool runs without your Yes to that call, whatever a policy says (T9)', () => {
-  async function run(answer: boolean) {
+  async function run(answer: boolean | 'own') {
     const { IDBFactory } = await import('fake-indexeddb');
     const { openJournal, openJournalStore, decideByRules } = await import('../../src/index.ts');
     const { createFakeModel } = await import('../../src/testing/index.ts');
@@ -506,6 +506,12 @@ describe('5.6 and G12: no server tool runs without your Yes to that call, whatev
     const no = await run(false);
     expect(no.cards).toHaveLength(2);
     expect(no.ran).toEqual([]);
+  });
+
+  it("an answer the card didn't offer (an adapter's 'own', where no card offers it in step 7) is no Yes: nothing runs (r39 #2)", async () => {
+    const r = await run('own');
+    expect(r.cards).toHaveLength(2);
+    expect(r.ran).toEqual([]);
   });
 
   it('the control: the old "always" (server-always) runs it with no Yes to the call', async () => {

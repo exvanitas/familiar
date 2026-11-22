@@ -614,7 +614,10 @@ export class Owner {
     }
   }
 
-  async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<Outcome> {
+  async choose(serverId: string, tool: string, given: ToolChoice | undefined): Promise<Outcome> {
+    // The choice copied once, field by field, and only the copy is checked and saved: an object that reads one
+    // way and serializes another can't slip past the checks (r39 #1).
+    const choice: ToolChoice | undefined = given === undefined ? undefined : { policy: String(given.policy) as ToolChoice['policy'], fingerprint: String(given.fingerprint ?? ''), setupFingerprint: String(given.setupFingerprint ?? '') };
     // A grant has its own writer, for a press on its card (grant): never a choice saved here (r37 #2).
     if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) return no('"May run on its own" is saved only from a press on its card.');
     const problem = choiceProblem(serverId, tool, choice);
@@ -644,7 +647,9 @@ export class Owner {
    * only for a saved server, not being removed, checked in the same step as its admission, so a grant never
    * outlives its server (r37 #3).
    */
-  async grant(serverId: string, tool: string, version: { readonly fingerprint: string; readonly setupFingerprint: string }): Promise<Outcome> {
+  async grant(serverId: string, tool: string, given: { readonly fingerprint: string; readonly setupFingerprint: string }): Promise<Outcome> {
+    // Copied once, and only the copy is checked and written (r39 #1).
+    const version = { fingerprint: String(given.fingerprint ?? ''), setupFingerprint: String(given.setupFingerprint ?? '') };
     if (serverId === BUILT_IN) return no(ONLY_LISTED_WORDS);
     if (!version.fingerprint || !version.setupFingerprint) return no('That grant names no version of the tool, so it was not saved.');
     const t = this.admit('choice', { start: true });
