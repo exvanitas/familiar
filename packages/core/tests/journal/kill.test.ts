@@ -16,6 +16,17 @@ describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its c
 
 // server-reissue's grant is a real one, saved through the client and reloaded from its store: with the
 // grant lost on its way to life 2, in saving or in reloading, life 2 asks for a card, and the check fails.
+// Life 1's client has a call under way at the kill, its time limit armed: the kill takes that timer with it,
+// so nothing of life 1's client fires into life 2.
+describe("server-reissue's life 1 client, at the kill", () => {
+  it('has a timer armed before the kill, and none after it', async () => {
+    const world = nodeWorld();
+    await killAndResume(scenario('server-reissue'), world);
+    expect(world.counters.get('life1-timers-at-kill')).toBeGreaterThan(0);
+    expect(world.counters.get('life1-timers-after-kill')).toBe(0);
+  });
+});
+
 describe("server-reissue's grant, lost across the reopen (the controls)", () => {
   for (const fault of ['drop-grant-write', 'lose-grant'])
     it(`${fault}: the rerun asks, and the check fails`, async () => {

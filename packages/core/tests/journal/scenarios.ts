@@ -51,6 +51,36 @@ export function offsetClock(counters: Counters): JournalClock & { advance(ms: nu
   };
 }
 
+/** A clock for one life: the counters' offset clock, with every timer it arms kept, so a simulated kill can
+    discard them all. A closed page takes its timers with it; in Node a killed life's would go on firing into
+    the next (a real client's call timer, say, sending its cancel through the old life's port). */
+export function lifeClock(counters: Counters): Pick<JournalClock, 'now' | 'setTimer'> & { armed(): number; discard(): void } {
+  const base = offsetClock(counters);
+  const armed = new Set<() => void>();
+  let dead = false;
+  return {
+    now: base.now,
+    setTimer: (callback, delayMs, options) => {
+      if (dead) return () => {};
+      const cancel = (): void => {
+        armed.delete(cancel);
+        stop?.();
+      };
+      const stop = base.setTimer(() => {
+        armed.delete(cancel);
+        callback();
+      }, delayMs, options);
+      armed.add(cancel);
+      return cancel;
+    },
+    armed: () => armed.size,
+    discard: () => {
+      dead = true;
+      for (const cancel of [...armed]) cancel();
+    }
+  };
+}
+
 /** The fake note store: rows appended, so a write made twice would show as two rows. */
 export const NotesDoc = defineJournalDoc<{ notes: { step: string; text: string; token: string }[] }>('familiar.test-notes', () => ({ notes: [] }));
 
@@ -301,7 +331,8 @@ function lookupServer(env: Env): ProcessPort {
 /** The real client over the counters' store and the fake server, Ready; in life 1 the server is added and
     "may run on its own" saved for its tool, through the client, as Settings saves it. */
 async function grantedClient(env: Env) {
-  const client = await McpClient.open({ store: countersSettings(env), processes: lookupServer(env), net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock: offsetClock(env.counters), paths: posixPaths });
+  const clock = lifeClock(env.counters);
+  const client = await McpClient.open({ store: countersSettings(env), processes: lookupServer(env), net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock, paths: posixPaths });
   if (env.life === 1) await client.add({ setup: { kind: 'local', id: 'srv', label: 'Srv', program: '/usr/bin/srv', args: [], cwd: '/', env: [], secrets: [] }, problems: [] });
   const started = await client.start('srv');
   if (started.kind !== 'ready') throw new Error(`The server didn't start: ${JSON.stringify(started)}`);
@@ -309,7 +340,7 @@ async function grantedClient(env: Env) {
   const lookup = wrappers.find((t) => t.serverName === 'server_lookup');
   if (!lookup) throw new Error('The server offers no server_lookup.');
   if (env.life === 1) await client.choose('srv', 'server_lookup', { policy: 'own', fingerprint: lookup.fingerprint, setupFingerprint: lookup.setupFingerprint });
-  return { client, wrappers, name: lookup.name };
+  return { client, clock, wrappers, name: lookup.name };
 }
 const answerTool = (r: ModelRequest): FakeReply => ({ text: `Done. (${lastText(r)})` });
 
@@ -389,7 +420,7 @@ export const SCENARIOS: readonly Scenario[] = [
     name: 'server-reissue',
     async run(env) {
       const store = await env.openStore('server-reissue');
-      const { client, wrappers, name } = await grantedClient(env);
+      const { client, clock, wrappers, name } = await grantedClient(env);
       const { journal } = await openFor(env, store, {
         tools: (fakes) => [...fakes.filter((t) => t.name !== 'server_lookup'), ...wrappers],
         policyNow: () => client.policy(wrappers),
@@ -406,7 +437,14 @@ export const SCENARIOS: readonly Scenario[] = [
       if (env.life === 1) {
         void journal.send('Please do the thing.', 'turn-1');
         while (env.counters.get('hung:server_lookup') < 1) await sleep(10);
-        env.ready(() => journal.kill());
+        // The kill ends the life: the journal, and the client's timers with it (its call's time limit among
+        // them), as a closed page would.
+        env.ready(() => {
+          journal.kill();
+          env.counters.set('life1-timers-at-kill', clock.armed());
+          clock.discard();
+          env.counters.set('life1-timers-after-kill', clock.armed());
+        });
         return undefined;
       }
       const end = await journal.turn(await turnId(journal)).wait();
