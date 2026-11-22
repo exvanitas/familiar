@@ -762,6 +762,23 @@ describe("H3 and a catalog's live interval", () => {
       expect(PASS_CHECKS.H3!(r), `seed ${seed} minted while stopped`).not.toEqual([]);
     }
   }, 60_000);
+  // A run that ends without the person's Stop: S48's remote run fails, S49's local process exits by itself.
+  // The decision under the grant, its mint moved into the gap before the next Start, fails H3.
+  for (const [prefix, end] of [['S48', 'the failure'], ['S49', 'the exit']] as const)
+    it(`${prefix}'s mint moved into the gap after ${end} fails H3`, async () => {
+      const o = SCHEDULES.find((s) => s.name.startsWith(prefix))!.options;
+      for (let seed = 1; seed <= 4; seed++) {
+        const r = await wireRun(seed, o);
+        expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+        const yes = yesOf(r, 'echo');
+        const restart = r.evidence.filter((e) => e.what === 'start').at(-1)!;
+        const ended = prefix === 'S49' ? r.exe.exits[0]!.seq : r.evidence.find((e) => e.what === 'phase' && e.phase === 'failed')!.seq;
+        expect(ended, `seed ${seed}`).toBeLessThan(restart.seq);
+        Object.assign(yes, { seq: (ended + restart.seq) / 2 });
+        r.evidence.sort((a, b) => a.seq - b.seq);
+        expect(PASS_CHECKS.H3!(r), `seed ${seed} minted in the gap`).not.toEqual([]);
+      }
+    }, 60_000);
   it("S38's mint moved between the notice and the refresh it brings fails H3", async () => {
     const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
     for (let seed = 1; seed <= 4; seed++) {

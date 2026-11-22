@@ -389,7 +389,8 @@ function noticesRead(r: WireRun, server: string): { epoch: number; seq: number }
 const serverAt = (r: WireRun, destination: string) => (r.server.mode.where === 'remote' ? `s${destination.replace(/^addr-/, '')}` : destination);
 
 /** The tool's fingerprint in the catalog live at the sequence `seq`: the last walk published before it, unless
-    its run had ended by then (a Stop made, a stop asked of its process, a new handshake on its destination) or
+    its run had ended by then (a Stop made, a stop asked of its process, its process's exit, a new handshake on
+    its destination, or the server leaving Ready, failed or stopped, as the client showed it) or
     a notice of changed tools was read on that run after its publication. Undefined: no live catalog. */
 function liveFingerprintAt(r: WireRun, server: string, seq: number, tool: string): string | undefined {
   const w = walks(r.exe, server).filter((x) => x.atSeq < seq).sort((a, b) => a.atSeq - b.atSeq).at(-1);
@@ -398,6 +399,10 @@ function liveFingerprintAt(r: WireRun, server: string, seq: number, tool: string
   const ended =
     r.evidence.some((e) => e.what === 'stop' && (e.server ?? 's1') === serverAt(r, server) && within(e.seq)) ||
     r.exe.stopsAsked.some((t) => t.epoch === w.epoch && within(t.seq)) ||
+    // A local process that exited, by itself or not, by the exe's own record.
+    r.exe.exits.some((t) => t.epoch === w.epoch && within(t.seq)) ||
+    // A run that left Ready, a remote one that failed included, as the client showed it.
+    r.evidence.some((e) => e.what === 'phase' && (e.server ?? 's1') === serverAt(r, server) && (e.phase === 'stopping' || e.phase === 'stopped' || e.phase === 'failed') && within(e.seq)) ||
     r.exe.log.some((x) => x.kind === 'post' && x.server === server && x.body?.method === 'initialize' && within(x.seq));
   if (ended || noticesRead(r, server).some((n) => n.epoch === w.epoch && within(n.seq))) return undefined;
   return fingerprintIn(w, tool);

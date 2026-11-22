@@ -143,6 +143,8 @@ export interface Mode {
   readonly doubleListAnswer?: boolean;
   /** Each walk's last page carries `nextCursor: ""`, which ends the walk as no cursor does. */
   readonly emptyFinalCursor?: boolean;
+  /** Modern: the first call is answered -32022, an era refusal that ends the run, failed. */
+  readonly callEraRefusal?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -225,6 +227,7 @@ export class ScriptedServer {
   private readonly firstPages = new Map<number, number>();
   /** Set once the server has answered in a way after which it exits (modernListExit, exitOnRefusal). */
   exitAfter = false;
+  private refusedCall = false;
   /** exitOnRefusal: the refusing process's list goes unanswered; its exit clears this. */
   listUnanswered = false;
   private lists: number | undefined;
@@ -319,6 +322,11 @@ export class ScriptedServer {
       return json(m.trailingListNotice && !modernReq ? [...answer, { jsonrpc: '2.0', method: 'notifications/tools/list_changed' }] : answer);
     }
     if (body.method === 'tools/call') {
+      // A modern server that answers one call with an era refusal: the run ends, failed, with no new handshake.
+      if (m.callEraRefusal && modernReq && !this.refusedCall) {
+        this.refusedCall = true;
+        return json([{ jsonrpc: '2.0', id: body.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: ['2030-01-01'] } } }]);
+      }
       const msgs: Msg[] = [];
       if (this.lastId !== undefined && this.lastId !== body.id && this.r() < m.staleId) msgs.push({ jsonrpc: '2.0', id: this.lastId, result: { content: [{ type: 'text', text: 'stale' }], ...complete } });
       this.lastId = body.id;
@@ -471,7 +479,10 @@ export class FakeExe {
   /** Local: when the client asked the exe to stop each process run, by epoch, and the handle it named. */
   readonly stopsAsked: { epoch: number; step: number; seq?: number; run?: string }[] = [];
   /** Local: when each process run exited, by epoch. */
-  readonly exits: { epoch: number; step: number }[] = [];
+  readonly exits: { epoch: number; step: number; seq: number }[] = [];
+  /** Local: ends a setup's live process at once, as a process exiting on its own does (the harness's own
+      hand, never the client's). */
+  exitProcess?: (server: string) => void;
   /** Local: each process start the exe admitted, by epoch, whether or not any write followed (H2), and the
       handle the exe gave it. */
   readonly processStarts: { epoch: number; seq: number; step: number; server: string; run: string; answered?: number; launch: Record<string, unknown> }[] = [];
@@ -805,7 +816,7 @@ export class FakeExe {
       if (p.exited) return;
       p.exited = true;
       this.server.listUnanswered = false;
-      this.exits.push({ epoch: p.epoch, step: this.sched.step });
+      this.exits.push({ epoch: p.epoch, step: this.sched.step, seq: this.tick() });
       for (const w of p.writes.splice(0)) {
         w.rec.end ??= this.sched.step;
         w.rec.endAt ??= this.sched.now;
@@ -897,6 +908,9 @@ export class FakeExe {
         flush(run);
       } });
     };
+    this.exitProcess = (server) => {
+      for (const [run, p] of live) if (p.server === server && !p.exited) exit(run, 1);
+    };
     return {
       start: (setup: ProcessSetup, onEvent) =>
         new Promise((resolve) => {
@@ -982,7 +996,7 @@ export interface Evidence {
   readonly step: number;
   /** The scheduler's clock when it was noted, in ms. */
   readonly at?: number;
-  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant' | 'edited';
+  readonly what: 'card' | 'yes' | 'call' | 'outcome' | 'stop-call' | 'revoke' | 'stop' | 'stopped' | 'start' | 'started' | 'model' | 'test' | 'tested' | 'not-offered' | 'grant' | 'edited' | 'phase';
   /** On a `stopped`: how the Stop ended, as its reply says. */
   readonly stopOutcome?: 'stopped' | 'may-still-run' | 'refused' | 'failed';
   /** On a `test`: whether it reached the machine (Test from Stopped or Failed). */
@@ -992,6 +1006,8 @@ export interface Evidence {
   /** On a `grant`: the tool's definition as the harness read it when the person pressed (the card's own
       version), canonical; H3 holds a call under the grant to exactly this. */
   readonly def?: string;
+  /** On a `phase`: the server's phase as the client shows it, from this record on. */
+  readonly phase?: string;
   /** On a `start` or `test`: the setup in effect when it was made, as the harness last saved it. */
   readonly launch?: Record<string, unknown>;
   /** On a `grant`, or a `yes` under a grant: the setup fingerprint the grant, or the decision, is for. */
@@ -1089,7 +1105,12 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
   const exchanges = new Map<string, ExchangeRecord[]>();
   const reservations: Reservation[] = [];
   const setups = new Map<string, Record<string, unknown>>();
+  // Each server's phase as the client shows it, noted when it changes: a run's end (stopping, stopped,
+  // failed) is there whatever the person did.
+  const phases = new Map<string, string>();
+  let notePhase = (_id: string): void => {};
   const client = await McpClient.open({
+    onChange: (id) => notePhase(id),
     transition: (id, event, state, slot) => lifecycle.set(id, [...(lifecycle.get(id) ?? []), { event, state, ...slot, seq: next() }]),
     exchange: (id, e) => exchanges.set(id, [...(exchanges.get(id) ?? []), { ...e, seq: next() }]),
     store,
@@ -1101,6 +1122,12 @@ export async function wireRun(seed: number, options: WireOptions = {}): Promise<
     paths: { program: () => undefined, folder: () => undefined } as any,
     limits: { startMs: 60_000, listMs: 30_000 }
   });
+  notePhase = (id) => {
+    const phase = client.get(id)?.phase;
+    if (!phase || phases.get(id) === phase) return;
+    phases.set(id, phase);
+    evidence.push({ seq: next(), step: sched.step, at: sched.now, what: 'phase', server: id, phase });
+  };
   // Every reservation, recorded at the owner itself, with its release.
   const owner = client.owner;
   const admit = owner.admit.bind(owner);
