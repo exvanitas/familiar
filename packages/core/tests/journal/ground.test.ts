@@ -481,7 +481,6 @@ describe('5.6 and G12: no server tool runs without your Yes to that call, whatev
       wake: { wakeAt: () => {} },
       notifier: { notify: () => {} },
       consent: { ask: async (card) => { cards.push(card); return answer; } },
-      grantOwn: () => ({ save: async () => true }),
       presence: { report: () => {} },
       persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
       decider: { decide: async (event, context) => decideByRules(event, context) },
@@ -497,10 +496,11 @@ describe('5.6 and G12: no server tool runs without your Yes to that call, whatev
     return { cards, ran };
   }
 
-  it('each call shows its card, with "May run on its own" in plain words; a No sends nothing', async () => {
+  it('each call shows its card, with no "May run on its own" in step 7 (step 8 wires its press); a No sends nothing', async () => {
     const yes = await run(true);
     expect(yes.cards).toHaveLength(2);
-    expect(yes.cards[0]).toMatchObject({ facts: { server: 'srv', tool: 'look' }, own: expect.stringMatching(/May run on its own: Familiar will call srv__look on Weather whenever she decides to/) });
+    expect(yes.cards[0]).toMatchObject({ facts: { server: 'srv', tool: 'look' } });
+    expect(yes.cards[0]!.own).toBeUndefined();
     expect(yes.ran).toHaveLength(2);
     expect(yes.ran.every((d: any) => d.by === 'asked')).toBe(true);
     const no = await run(false);

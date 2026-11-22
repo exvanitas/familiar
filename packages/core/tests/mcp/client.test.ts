@@ -268,7 +268,7 @@ describe('the MCP client, local, against the fake server', () => {
     await expect(w.client.choose(id, 'echo', { ...always, policy: 'allow' })).rejects.toThrow(/no "always" for a server's tool/);
     const facts = w.client.facts(id, 'echo', { text: 'kept' })!;
     const signal = new AbortController().signal;
-    expect(await w.client.pressOwn({ server: id, tool: 'echo', fingerprint: always.fingerprint, launch: always.setupFingerprint }).save()).toBe(true);
+    expect(await w.client.owner.grant(id, 'echo', { fingerprint: always.fingerprint, setupFingerprint: always.setupFingerprint })).toEqual({ ok: true });
     // Kept: it goes.
     expect(await w.client.send(mintDecision(facts, 's1', 'own'), signal)).toMatchObject({ kind: 'result', text: 'kept' });
     // The choice taken back after the mint: refused at the send.
@@ -276,7 +276,7 @@ describe('the MCP client, local, against the fake server', () => {
     await w.client.choose(id, 'echo', undefined);
     expect(await w.client.send(d, signal)).toMatchObject({ kind: 'error', words: expect.stringMatching(/Your "may run on its own" for echo on this server no longer stands/) });
     // Withdrawn by the overlay: the same.
-    expect(await w.client.pressOwn({ server: id, tool: 'echo', fingerprint: always.fingerprint, launch: always.setupFingerprint }).save()).toBe(true);
+    expect(await w.client.owner.grant(id, 'echo', { fingerprint: always.fingerprint, setupFingerprint: always.setupFingerprint })).toEqual({ ok: true });
     w.client.revoke(id, 'echo', 'ask');
     expect(await w.client.send(mintDecision(facts, 's4', 'own'), signal)).toMatchObject({ kind: 'error' });
     expect(sentCalls(w.port, 'echo')).toBe(1);

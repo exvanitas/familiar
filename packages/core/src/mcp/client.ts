@@ -115,8 +115,8 @@ export class McpClient {
   private readonly runtimes = new Map<string, ServerRuntime>();
   /** Revokes that hold at once, whatever the owner is doing: "always" back to ask, or anything to never. */
   private readonly overlay = new Map<string, 'ask' | 'never'>();
-  /** Every act of the person's on a tool's choice (a press, a take-back, a choice in Settings), numbered as
-      they make it: the latest act wins (5.6, option A). */
+  /** Every act of the person's on a tool's choice (a take-back, a choice in Settings), numbered as they make
+      it: the latest act wins (5.6). Step 8's press joins them. */
   private acts = 0;
   /** Each tool's latest take-back, by its act number. */
   private readonly takenBack = new Map<string, number>();
@@ -322,7 +322,7 @@ export class McpClient {
   async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
     const key = choiceKey(serverId, tool);
     const order = ++this.acts;
-    // Only a press on its card saves "may run on its own" (pressOwn): never a choice made here (r37 #2).
+    // "May run on its own" is never a choice made here: step 8's press on its card is its one way in (r37 #2).
     if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) throw new Error('"May run on its own" is saved only from a press on its card.');
     // "May run on its own" is saved for exactly the version the card showed, from its own facts, whatever the
     // server lists now: it holds only while the server lists that version (5.6, option A).
@@ -330,28 +330,6 @@ export class McpClient {
     if (!r.ok) throw new Error(r.words);
     // A take-back made since this choice is the later act, and its overlay stays.
     if ((this.takenBack.get(key) ?? 0) < order) this.overlay.delete(key);
-  }
-
-  /**
-   * The person pressed "may run on its own" on a server tool's card (5.6): the press, numbered now, when it
-   * is made, with the card's own facts. The journal takes it at the press, before any await, and saves it
-   * once the call goes ahead. The save writes nothing if a take-back came after the press (the latest act
-   * wins), or if the server is gone; it resolves whether the grant was saved.
-   */
-  pressOwn(facts: { readonly server: string; readonly tool: string; readonly fingerprint: string; readonly launch: string }): { save(): Promise<boolean> } {
-    const key = choiceKey(facts.server, facts.tool);
-    const pressed = ++this.acts;
-    return {
-      save: async () => {
-        // (The named mutation orders the press at its save instead: the old way, a step late.)
-        const order = __FAMILIAR_MUTATIONS__ && mutant('own-press-order-late') ? ++this.acts : pressed;
-        if ((this.takenBack.get(key) ?? 0) > order) return false;
-        const r = await this.owner.grant(facts.server, facts.tool, { fingerprint: facts.fingerprint, setupFingerprint: facts.launch }).catch((): Outcome => ({ ok: false, words: '' }));
-        if (!r.ok) return false;
-        if ((this.takenBack.get(key) ?? 0) < order) this.overlay.delete(key);
-        return true;
-      }
-    };
   }
 
   /**
@@ -417,7 +395,8 @@ export class McpClient {
     // from whatever was committed, is a named mutation.)
     if (to === 'ask' && cur?.policy === 'deny') {
       if (__FAMILIAR_MUTATIONS__ && mutant('revoke-denied-shortcut')) return { ok: true };
-      const t = this.owner.admit('choice');
+      // A take-back is let in while a change's cleanup is unfinished, as every take-back is (r38 #5).
+      const t = this.owner.admit('choice', { start: true });
       if (!('release' in t)) return { ok: false, words: `${REVOKE_NOT_SAVED} ${t.ok ? '' : t.words}`.trim() };
       t.release();
       return { ok: true };

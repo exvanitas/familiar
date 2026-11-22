@@ -170,7 +170,7 @@ describe('T2: decisions at the handoff', () => {
     const note = client.tools().find((t) => t.serverName === 'add_note')!;
     // The revoke above saves itself in the background: wait for the owner.
     for (let i = 0; i < 100 && client.owner.busy; i++) await new Promise((r) => setTimeout(r, 10));
-    expect(await client.pressOwn({ server: id, tool: 'add_note', fingerprint: note.fingerprint, launch: note.setupFingerprint }).save()).toBe(true);
+    expect(await client.owner.grant(id, 'add_note', { fingerprint: note.fingerprint, setupFingerprint: note.setupFingerprint })).toEqual({ ok: true });
     expect((await client.send(yes(client, id, 'add_note', { text: 'w' }, 'own'), signal())).kind).toBe('result');
     expect(calls(port)).toBe(1);
     const d2 = yes(client, id, 'add_note', { text: 'x' }, 'own');

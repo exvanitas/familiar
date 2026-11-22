@@ -28,8 +28,8 @@ export interface CardDesk {
 
 const MAX_ID = 64;
 
-/** A "May run on its own" press answers the card `own`: the journal checks it was pressed on the card showing
-    now, with its facts still holding, and only then saves the grant for those facts (journal's `grantOwn`). */
+/** A "May run on its own" press answers the card `own`, offered only on a card that carries its words. No card
+    does in step 7: step 8 has the desk issue the grant at the press (5.6). */
 export function createCardDesk(): CardDesk {
   const pending = new Map<string, { readonly card: ConsentCard; readonly settle: (yes: boolean | 'own') => void }>();
   // For a named mutation only: the step each presentation was for.
