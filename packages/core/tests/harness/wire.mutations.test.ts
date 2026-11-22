@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { evidenceControls, handoffHistory, PASS_CHECKS } from './checks.ts';
 import { SCHEDULES } from './schedules.ts';
-import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type Mode, type WireOptions } from './wire.ts';
+import { INVALID, MIRROR_VECTORS, rejectedByShape, wireRun, type Driver, type ExchangeRecord, type Mode, type WireOptions } from './wire.ts';
 
 interface Control {
   readonly mutation: string;
@@ -314,6 +314,33 @@ describe("HC's replay matched to the independent records, effect by effect", () 
       forged++;
     }
     expect(forged).toBeGreaterThan(0);
+  }, 60_000);
+  it('a reply to no action at all: one under an unknown token appended to S36', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S36'));
+      const last = r.evidence.filter((e) => e.what === 'started').at(-1)!;
+      r.evidence.push({ ...last, seq: last.seq + 100_000, token: 'start-999' });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).toEqual(expect.arrayContaining([expect.stringMatching(/start-999/)]));
+    }
+  }, 60_000);
+  it("a reservation taken before the person's Start: the native start's reservation moved ahead of it", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const start = r.evidence.find((e) => e.what === 'start')!;
+      const t = r.exe.processStarts[0]!;
+      const held = r.reservations.find((x) => x.what === 'start' && x.seq < t.seq && (x.released ?? Infinity) > t.seq)!;
+      Object.assign(held, { seq: start.seq - 0.5 });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("an exchange's end with no admission: a call's admit record dropped", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const ex = r.exchanges.get('s1') as ExchangeRecord[];
+      const k = ex.findIndex((x) => x.t === 'admit' && x.kind === 'call');
+      ex.splice(k, 1);
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
   }, 60_000);
 });
 

@@ -779,6 +779,9 @@ function replyAgrees(action: 'start' | 'stop' | 'test', reply: Reply, e: Evidenc
 interface OwedReservation {
   readonly server: string;
   readonly i: number;
+  /** Taken after this record sequence (the person's action, or the start of the step that asked the owner
+      again for a relaunch) and before `seq`. */
+  readonly from: number;
   readonly seq: number;
   readonly released: { readonly after: number; readonly before: number } | 'open';
 }
@@ -818,6 +821,8 @@ export const HC: Check = (r) => {
     const usedReplies = new Set<Evidence>();
     const lastReply = new Map<string, number>();
     let holding: Omit<OwedReservation, 'released'> | undefined;
+    // A relaunch asks the owner while its readmit-check is applied: the reservation is taken in that step.
+    let readmitFrom: number | undefined;
     const endLive: { run: string; i: number; seq: number }[] = [];
     for (let i = 0; i < records.length; i++) {
       const rec = records[i]!;
@@ -829,6 +834,9 @@ export const HC: Check = (r) => {
       const ev = rec.event;
       // A reservation was taken for this event: its admission asked the owner, and the owner said yes.
       const takes = (ev.t === 'start' && ev.facts.record === 'ok' && ev.facts.ownerFree) || (ev.t === 'readmit' && ev.facts.ownerFree);
+      // No earlier than its own action: the person's Start (or Test), or the readmit-check that asked for it.
+      const from = ev.t === 'start' ? (actionOf.get(ev.token)?.seq ?? Infinity) : ev.t === 'readmit' ? (readmitFrom ?? Infinity) : Infinity;
+      if (ev.t === 'readmit') readmitFrom = undefined;
       let kept = false;
       for (const fx of out.effects) {
         if (fx.t === 'native-start') {
@@ -867,15 +875,16 @@ export const HC: Check = (r) => {
           if (!takes) problems.push(`HC: ${server}: event ${i} (${ev.t}) holds the owner, with no reservation taken for it`);
           else {
             kept = true;
-            holding = { server, i, seq };
+            holding = { server, i, from, seq };
           }
         } else if (fx.t === 'owner-release' && holding) {
           owed.push({ ...holding, released: { after, before: seq } });
           holding = undefined;
         } else if (fx.t === 'end-live') endLive.push({ run: fx.run, i, seq });
+        else if (fx.t === 'readmit-check') readmitFrom = after;
       }
       // Taken and not kept: released as the machine refused or answered the action, in its own step.
-      if (takes && !kept) owed.push({ server, i, seq, released: { after, before: seq } });
+      if (takes && !kept) owed.push({ server, i, from, seq, released: { after, before: seq } });
       if (problems.length < 3 && canonical(s) !== canonical(rec.state)) {
         problems.push(`HC: ${server}'s state after event ${i} (${rec.event.t}) isn't the machine's`);
         s = rec.state;
@@ -886,8 +895,8 @@ export const HC: Check = (r) => {
     // No port start or stop that replay didn't ask for, and no reply to an action replay never answered.
     for (const t of ported) if (!usedStarts.has(t)) problems.push(`HC: ${server}: the port started run ${t.epoch}, which no native-start asked for`);
     for (const t of r.exe.stopsAsked) if (epochs.has(t.epoch) && !usedStops.has(t)) problems.push(`HC: ${server}: the port stopped run ${t.epoch}, which no native-stop asked for`);
-    const tokens = new Set(actions.map((a) => a.token));
-    for (const e of r.evidence) if ((e.what === 'started' || e.what === 'stopped' || e.what === 'tested') && (e.server ?? 's1') === server && tokens.has(e.token) && !usedReplies.has(e)) problems.push(`HC: ${server}: a reply to ${e.token} that replay never answered`);
+    // Every reply the driver noted, whatever its token: one for no action at all is no answer either.
+    for (const e of r.evidence) if ((e.what === 'started' || e.what === 'stopped' || e.what === 'tested') && (e.server ?? 's1') === server && !usedReplies.has(e)) problems.push(`HC: ${server}: a reply to ${e.token ?? 'no token'} that replay never answered`);
     // Every exchange admitted for a run ends, by the exchange machine's own terminal step, once that run is
     // over; an end-live effect for a run with an exchange still open is followed by its end.
     const ex = r.exchanges.get(server) ?? [];
@@ -896,6 +905,8 @@ export const HC: Check = (r) => {
       const open = ex.filter((x) => x.t === 'admit' && x.run === e.run && x.seq < e.seq && !ex.some((y) => y.t === 'ended' && y.n === x.n && y.seq < e.seq));
       for (const o of open) if (!ex.some((y) => y.t === 'ended' && y.n === o.n && y.end === 'run-ended')) problems.push(`HC: ${server}: end-live for run ${e.run} at event ${e.i}, and its exchange ${o.n} (${o.kind}) didn't end as the run's end`);
     }
+    // And every exchange that ended was admitted, of the same run and kind, before its end: an idle pong too.
+    for (const e of ex.filter((x) => x.t === 'ended')) if (!ex.some((a) => a.t === 'admit' && a.n === e.n && a.run === e.run && a.kind === e.kind && a.seq < e.seq)) problems.push(`HC: ${server}: exchange ${e.n} (${e.kind}) of run ${e.run} ended, never admitted`);
     const current = s.run?.id;
     for (const a of ex.filter((x) => x.t === 'admit')) {
       const ended = ex.some((x) => x.t === 'ended' && x.n === a.n);
@@ -907,7 +918,7 @@ export const HC: Check = (r) => {
   const pool = r.reservations.filter((x) => x.what === 'start');
   const used = new Set<object>();
   for (const o of owed.sort((a, b) => a.seq - b.seq)) {
-    const m = pool.find((x) => !used.has(x) && x.seq < o.seq && (o.released === 'open' ? x.released === undefined : x.released !== undefined && x.released > o.released.after && x.released < o.released.before));
+    const m = pool.find((x) => !used.has(x) && x.seq > o.from && x.seq < o.seq && (o.released === 'open' ? x.released === undefined : x.released !== undefined && x.released > o.released.after && x.released < o.released.before));
     if (m) used.add(m);
     else problems.push(`HC: ${o.server}: event ${o.i} took the owner, and no reservation was ${o.released === 'open' ? 'still held' : 'released as replay releases it'}`);
   }
