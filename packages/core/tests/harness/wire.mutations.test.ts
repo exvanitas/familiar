@@ -688,6 +688,21 @@ describe('H3 orders notices, publications and handoffs by sequence throughout', 
   }, 60_000);
 });
 
+describe("H11 and the run's own opening", () => {
+  // A run is modern by its own initialize's accepted response, as the catalog reads it: an unrelated -32022
+  // appended after a legacy opening's successful answer leaves the run legacy, and its calls owe no modern
+  // headers.
+  it('an unrelated -32022 after a legacy opening leaves the run legacy for H11', async () => {
+    const s2 = SCHEDULES.find((s) => s.name.startsWith('S2 '))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s2);
+      expect(r.exe.log.some((x) => x.body?.method === 'tools/call'), `seed ${seed}`).toBe(true);
+      for (const x of r.exe.log) if (x.body?.method === 'initialize' && x.plan) x.plan = { ...x.plan, messages: [...x.plan.messages, { jsonrpc: '2.0', id: 'zz', error: { code: -32022, message: 'unrelated' } }] };
+      expect(PASS_CHECKS.H11!(r), `seed ${seed}`).toEqual([]);
+    }
+  }, 60_000);
+});
+
 describe('H3 and a notice in the step of the walk it starts', () => {
   // S1 locally: an idle notice is read, and the refresh it starts goes out in that same step. The notice came
   // before the walk, so it doesn't invalidate it: B is published, and a Yes for A after it must fail H3 under
