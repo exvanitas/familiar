@@ -130,6 +130,8 @@ export interface Mode {
   /** Local: after each call's answer, a notice of changed tools on its own line, its variant flipped: an idle
       notice, which starts the refresh in the very step it is read. */
   readonly idleNotice?: boolean;
+  /** A list_changed changes only echo's annotations (readOnlyHint), none of the fields its fingerprint covers. */
+  readonly annotationsOnly?: boolean;
 }
 
 export function modeOf(r: () => number, over: Partial<Mode> = {}): Mode {
@@ -179,8 +181,10 @@ export interface Plan {
   readonly location?: string;
 }
 
-const tools = (era: Mode['era'], variant: string) => [
-  { name: 'echo', description: variant === 'a' ? 'Echo.' : 'Echo, changed.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
+const tools = (era: Mode['era'], variant: string, annotationsOnly = false) => [
+  annotationsOnly
+    ? { name: 'echo', description: 'Echo.', annotations: { readOnlyHint: variant !== 'a' }, inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }
+    : { name: 'echo', description: variant === 'a' ? 'Echo.' : 'Echo, changed.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
   { name: 'slow', description: 'Slow.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
   ...(era !== 'legacy'
     ? [
@@ -221,7 +225,7 @@ export class ScriptedServer {
 
   /** The tools on one page of a walk: all on the first, unless echoLast puts echo on the last. */
   private onPage(page: number): Msg[] {
-    const all = tools(this.mode.era, this.variant);
+    const all = tools(this.mode.era, this.variant, this.mode.annotationsOnly);
     if (!this.mode.echoLast || this.mode.pages < 2) return page === 0 ? all : [];
     return page === this.mode.pages - 1 ? all.filter((t) => t.name === 'echo') : page === 0 ? all.filter((t) => t.name !== 'echo') : [];
   }
@@ -967,6 +971,8 @@ export interface Evidence {
   /** On a `grant`: the tool's definition as the harness read it when the person pressed (the card's own
       version), canonical; H3 holds a call under the grant to exactly this. */
   readonly def?: string;
+  /** On a `press`, `grant`, or a `yes` under a grant: the setup fingerprint the grant, or the decision, is for. */
+  readonly setup?: string;
   /** Test's report: whether it listed, and the tool names it showed. */
   readonly report?: { readonly ok: boolean; readonly tools: readonly string[] };
   /** The reply's own words (a refused Start's, say). */
@@ -1185,7 +1191,7 @@ export class Driver {
     // then its save. Both noted: the press when made, the grant once its save resolves true, with the press's
     // token, so H3 orders the act by its press.
     const token = `press-${++this.presses}`;
-    const facts = { tool, server: id, token, grant: t.fingerprint, ...(def !== undefined ? { def } : {}) };
+    const facts = { tool, server: id, token, grant: t.fingerprint, setup: t.setupFingerprint, ...(def !== undefined ? { def } : {}) };
     const press = this.client.pressOwn({ server: id, tool, fingerprint: t.fingerprint, launch: t.setupFingerprint });
     this.note({ what: 'press', ...facts });
     return press.save().then(
@@ -1206,7 +1212,7 @@ export class Driver {
     if (!facts) return void this.note({ what: 'not-offered', tool, server: id });
     const decision = mintDecision(facts, token, 'own');
     // A grant, not a Yes: H3 holds it to the grant's own fingerprint, not to a card.
-    this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id, grant: facts.fingerprint });
+    this.note({ what: 'yes', token, tool, body: facts.canonical, args, server: id, grant: facts.fingerprint, setup: facts.launch });
     this.note({ what: 'call', token, tool, server: id });
     void this.client.send(decision, new AbortController().signal).then((outcome) => this.note({ what: 'outcome', token, tool, outcome, server: id }));
   }

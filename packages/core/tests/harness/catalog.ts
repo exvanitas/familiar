@@ -41,11 +41,14 @@ export function walks(exe: FakeExe, server: string): { at: number; tools: any[] 
   return done;
 }
 
-/** A tool's definition in a walk, canonical, so a relist in another key order (S23) is the same tool, as
-    the fingerprint has it. */
+/** A tool's identity in a walk: the fields its fingerprint covers, as design 3.5 and 5.6 define them and
+    restated here (never imported): its name, title, effective description (the description, or the title
+    when there's none) and input schema, in canonical form, so a relist in another key order (S23) is the same
+    tool. The header declarations a modern remote run adds come from that schema, so they are covered with it;
+    annotations, which the fingerprint leaves out, are not part of it. */
 export const defIn = (w: { tools: any[] }, tool: string): string | undefined => {
   const def = w.tools.find((d: any) => d.name === tool);
-  return def === undefined ? undefined : canonical(def);
+  return def === undefined ? undefined : canonical({ name: def.name, title: def.title ?? null, description: def.description ?? def.title ?? null, inputSchema: def.inputSchema ?? null });
 };
 
 /** The tool's definition in the last completed walk that reached the client before `step` (Infinity: every

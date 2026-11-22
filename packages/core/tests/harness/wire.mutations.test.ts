@@ -447,6 +447,23 @@ describe("H3 and the person's latest act on a tool", () => {
   }, 60_000);
 });
 
+describe("H3 and a grant's identity: its destination and setup", () => {
+  // S38's grant, press and decision moved to name s2, while the call's handoff went to s1's address: the
+  // grant isn't for the server the call reached. Its setup changed alone: the decision isn't the grant's.
+  it('evidence naming another server than the handoff, or another setup than the grant, fails H3', async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const moved = await wireRun(seed, s38);
+      expect(PASS_CHECKS.H3!(moved), `seed ${seed} clean`).toEqual([]);
+      for (const e of moved.evidence) if (e.what === 'press' || e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { server: 's2' });
+      expect(PASS_CHECKS.H3!(moved), `seed ${seed} s2`).not.toEqual([]);
+      const setup = await wireRun(seed, s38);
+      Object.assign(setup.evidence.find((e) => e.what === 'press')!, { setup: 'another-setup' });
+      expect(PASS_CHECKS.H3!(setup), `seed ${seed} setup`).not.toEqual([]);
+    }
+  }, 60_000);
+});
+
 describe('H3 and a notice in the step of the walk it starts', () => {
   // S1 locally: an idle notice is read, and the refresh it starts goes out in that same step. The notice came
   // before the walk, so it doesn't invalidate it: B is published, and a Yes for A after it must fail H3 under

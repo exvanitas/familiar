@@ -297,7 +297,10 @@ export const H3: Check = (r) => {
     // The person's one effective choice for this tool at the handoff: their latest act before it, by when each
     // was made. A press counts from its press, once its save resolved (before the handoff); a take-back from
     // when it was made.
-    const effective = latestAct(r, yes.server ?? 's1', yes.tool!, x.seq);
+    // The evidence is bound to where the call went: the server it names is the handoff's own destination.
+    const named = yes.server ?? 's1';
+    if (destination(r, named) !== x.server) problems.push(`H3: ${t} went out to ${x.server}, its evidence names ${named}`);
+    const effective = latestAct(r, named, yes.tool!, x.seq);
     if (effective?.what === 'revoke') problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
     const now = listedAt(r, x.server, x.start, yes.tool!);
     if (yes.grant !== undefined) {
@@ -307,7 +310,8 @@ export const H3: Check = (r) => {
       // owner's option A); any other version asks.
       if (effective?.what !== 'press' || effective.grant !== yes.grant) {
         if (effective?.what !== 'revoke') problems.push(`H3: ${t} went out under a grant that isn't the person's choice for ${yes.tool} at its handoff`);
-      } else if (effective.def === undefined || effective.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
+      } else if (effective.setup === undefined || effective.setup !== yes.setup) problems.push(`H3: ${t} went out under a grant for another setup than its decision's`);
+      else if (effective.def === undefined || effective.def !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
       continue;
     }
     // A Yes: the tool as the server last listed it before the card, and before the handoff. A change between
@@ -318,6 +322,10 @@ export const H3: Check = (r) => {
   problems.push(...staleCatalogCalls(r));
   return problems.slice(0, 3);
 };
+
+/** Where a server's calls go natively: its saved address (remote, issued in the order servers were added), or
+    its setup's own id (local). */
+const destination = (r: WireRun, server: string) => (r.server.mode.where === 'remote' ? `addr-${server.slice(1)}` : server);
 
 /** The person's latest act on one server's tool before `before` (a sequence), by when each was made: a press
     whose save resolved true before then, or a take-back. Undefined: no act. */
