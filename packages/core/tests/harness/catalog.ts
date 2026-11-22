@@ -13,7 +13,14 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
   const done: { at: number; atSeq: number; tools: any[]; modern: boolean }[] = [];
   // A modern remote run, by the server's own record: its opening initialize, in that handshake epoch, was
   // refused -32022 (never by the client's own framing).
-  const modernRun = (x: NativeRec) => x.kind === 'post' && exe.log.some((y) => y.kind === 'post' && y.server === x.server && y.epoch === x.epoch && y.body?.method === 'initialize' && !!y.plan?.messages.some((m) => m.error?.code === -32022));
+  // Read from that initialize's own accepted response: the first message the parser read with its id.
+  const modernRun = (x: NativeRec) =>
+    x.kind === 'post' &&
+    exe.log.some((y) => {
+      if (y.kind !== 'post' || y.server !== x.server || y.epoch !== x.epoch || y.body?.method !== 'initialize' || !y.plan) return false;
+      const answer = readPrefix(y.plan).find((m) => m.id === y.body!.id && ('result' in m || 'error' in m));
+      return answer?.error?.code === -32022;
+    });
   let open: { epoch: number; next: string; tools: any[]; from: number; noticed: boolean } | undefined;
   // A notice of changed tools that reached the client during a walk invalidates it: the client walks again,
   // and publishes only that retry. Remotely a notice comes on the walk's own pages (one exchange at a time);
@@ -57,7 +64,10 @@ export const defIn = (w: { tools: any[]; modern?: boolean }, tool: string): stri
   // As the fingerprint normalizes them: an omitted title is the empty one, an omitted description the title
   // (or empty); and a modern remote run's listing is marked apart, its header declarations (none declared is
   // an empty list) coming from the schema the identity already holds.
-  return def === undefined ? undefined : canonical({ name: def.name, title: def.title ?? '', description: def.description ?? def.title ?? '', inputSchema: def.inputSchema ?? null, ...(w.modern ? { modern: true } : {}) });
+  // The reader keeps an optional title or description only when it is a string (3.10): any other is absent.
+  const title = typeof def?.title === 'string' ? def.title : undefined;
+  const description = typeof def?.description === 'string' ? def.description : undefined;
+  return def === undefined ? undefined : canonical({ name: def.name, title: title ?? '', description: description ?? title ?? '', inputSchema: def.inputSchema ?? null, ...(w.modern ? { modern: true } : {}) });
 };
 
 /** The tool's definition in the last completed walk that reached the client before the sequence `seq`

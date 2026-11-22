@@ -534,6 +534,23 @@ describe("H3's tool identity and the run's setup", () => {
     expect(defIn({ tools: [{ name: 'echo', title: 'T', inputSchema: {} }] }, 'echo')).toBe(defIn({ tools: [{ name: 'echo', title: 'T', description: 'T', inputSchema: {} }] }, 'echo'));
     expect(defIn({ tools: [tool], modern: true }, 'echo')).not.toBe(defIn({ tools: [tool] }, 'echo'));
   });
+  // The catalog reader keeps a title or description only when it is a string: any other value is absent.
+  it('reads a title or description that is no string as absent', () => {
+    const tool = { name: 'echo', inputSchema: { type: 'object', properties: {} } };
+    expect(defIn({ tools: [{ ...tool, description: 7 }] }, 'echo')).toBe(defIn({ tools: [tool] }, 'echo'));
+    expect(defIn({ tools: [{ ...tool, title: { t: 1 }, description: 'D' }] }, 'echo')).toBe(defIn({ tools: [{ ...tool, description: 'D' }] }, 'echo'));
+    expect(defIn({ tools: [{ ...tool, title: 'T', description: null }] }, 'echo')).toBe(defIn({ tools: [{ ...tool, title: 'T' }] }, 'echo'));
+  });
+  // A legacy run's era comes from its own accepted initialize response: an unrelated -32022 reply after it, in
+  // the same answer, leaves the run legacy, and S38's call under its grant stays valid.
+  it("an unrelated -32022 after a legacy initialize's answer leaves the run legacy", async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38);
+      for (const x of r.exe.log) if (x.body?.method === 'initialize' && x.plan) x.plan = { ...x.plan, messages: [...x.plan.messages, { jsonrpc: '2.0', id: 'zz', error: { code: -32022, message: 'unrelated' } }] };
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).toEqual([]);
+    }
+  }, 60_000);
   // S38's grant and its decision both moved to one wrong setup: the run the call reached was launched from
   // the setup the harness added, so H3 flags it.
   it('a grant and decision for another setup than the run was launched from fail H3', async () => {
