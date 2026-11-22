@@ -613,7 +613,8 @@ export const SCHEDULES: Named[] = [
   },
   {
     // S38: "may run on its own" for a tool on the walk's second page, which then changes and changes back
-    // (A, B, A): the grant no longer stands, so the call under it is refused (H3 reads every page of a walk).
+    // (A, B, A). The grant is for version A alone: at B a call under it is refused (asks), and at A again it
+    // runs unasked (the owner's option A). H3 reads every page of a walk, so it sees the version at each.
     name: 'S38 a granted tool on a later page changes and changes back',
     options: {
       mode: { ...quiet, listChanged: 1, pages: 2, echoLast: true },
@@ -623,8 +624,11 @@ export const SCHEDULES: Named[] = [
           void d.grantOwn('echo')?.then(() => {
             d.call('slow');
             d.when('B listed', () => d.idle() && walks() >= 2, () => {
-              d.call('slow');
-              d.when('A again', () => d.idle() && walks() >= 3, () => d.own('echo'));
+              d.own('echo');
+              d.when('B answered', () => d.idle() && d.evidence.filter((e) => e.what === 'outcome' && e.tool === 'echo').length >= 1, () => {
+                d.call('slow');
+                d.when('A again', () => d.idle() && walks() >= 3, () => d.own('echo'));
+              });
             });
           });
         });
@@ -632,9 +636,11 @@ export const SCHEDULES: Named[] = [
     },
     expect: (r) => {
       if (!r.evidence.some((e) => e.what === 'grant')) return 'no grant saved';
-      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
-      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
-      return !own ? 'no call under the grant' : out?.kind === 'error' ? undefined : `the call under a grant for A, after B, came back ${JSON.stringify(out)}`;
+      const owns = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined);
+      const out = (k: number) => r.evidence.find((e) => e.what === 'outcome' && e.token === owns[k]?.token)?.outcome;
+      if (owns.length < 2) return `${owns.length} calls under the grant`;
+      if (out(0)?.kind !== 'error') return `the call under a grant for A, at B, came back ${JSON.stringify(out(0))}`;
+      return out(1)?.kind === 'result' ? undefined : `the call under a grant for A, at A again, came back ${JSON.stringify(out(1))}`;
     }
   },
   {

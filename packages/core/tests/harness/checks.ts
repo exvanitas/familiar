@@ -295,21 +295,20 @@ export const H3: Check = (r) => {
     used.add(t);
     const revoked = r.evidence.find((e) => e.what === 'revoke' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < x.seq);
     if (revoked) problems.push(`H3: ${t} went out after a revoke of ${yes.tool}`);
-    // The tool as the server last listed it before the card (for a call under a grant, before the grant was
-    // given), and before the handoff: a change between (a fingerprint change) means the Yes allowed
-    // something else (S1).
-    const given = yes.grant !== undefined ? [...r.evidence].reverse().find((e) => e.what === 'grant' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < yes.seq) : undefined;
-    if (yes.grant !== undefined && (!given || given.grant !== yes.grant)) problems.push(`H3: ${t} went out under a grant the person never gave for that version of ${yes.tool}`);
-    // A grant stands only while every listing between it and the handoff shows the tool as granted:
-    // A, then B, then A again in between is a change, and the call should have asked.
-    if (given) {
-      const granted = listedAt(r, x.server, given.step + 1, yes.tool!);
-      if (listingsBetween(r, x.server, given.step, x.start, yes.tool!).some((d) => d !== granted)) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which changed after it was given`);
-    }
-    const card = given ?? r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
-    const before = listedAt(r, x.server, card.step, yes.tool!);
     const now = listedAt(r, x.server, x.start, yes.tool!);
-    if (before !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
+    if (yes.grant !== undefined) {
+      // A call under "may run on its own": the person saved that grant before it, for one exact version, and
+      // the server lists exactly that version at the handoff. Nothing in between matters: a tool that went
+      // A, B, A runs on its own again at A (the owner's option A); any other version asks.
+      const given = [...r.evidence].reverse().find((e) => e.what === 'grant' && e.tool === yes.tool && (e.server ?? 's1') === (yes.server ?? 's1') && e.seq < yes.seq && e.grant === yes.grant);
+      if (!given) problems.push(`H3: ${t} went out under a grant the person never gave for that version of ${yes.tool}`);
+      else if (listedAt(r, x.server, given.step + 1, yes.tool!) !== now) problems.push(`H3: ${t} went out under a grant for ${yes.tool}, which the server lists at another version at its handoff`);
+      continue;
+    }
+    // A Yes: the tool as the server last listed it before the card, and before the handoff. A change between
+    // (a fingerprint change) means the Yes allowed something else (S1).
+    const card = r.evidence.find((e) => e.what === 'card' && e.token === t) ?? yes;
+    if (listedAt(r, x.server, card.step, yes.tool!) !== now) problems.push(`H3: ${t} went out though ${yes.tool} changed after its card was shown`);
   }
   problems.push(...staleCatalogCalls(r));
   return problems.slice(0, 3);
@@ -378,14 +377,6 @@ const defIn = (w: { tools: any[] }, tool: string): string | undefined => {
   const def = w.tools.find((d: any) => d.name === tool);
   return def === undefined ? undefined : canonical(def);
 };
-
-/** Every completed listing of the tool that reached the client in (from, to): its definitions, in order. */
-function listingsBetween(r: WireRun, server: string, from: number, to: number, tool: string): (string | undefined)[] {
-  return walks(r, server)
-    .filter((w) => w.at > from && w.at < to)
-    .sort((a, b) => a.at - b.at)
-    .map((w) => defIn(w, tool));
-}
 
 /** The tool's definition in the last completed walk that reached the client before `step`. */
 function listedAt(r: WireRun, server: string, step: number, tool: string): string | undefined {

@@ -348,18 +348,24 @@ describe("HC's replay matched to the independent records, effect by effect", () 
 });
 
 describe("H3 and a walk a notice invalidated", () => {
-  // S39: a refresh page carries a notice and describes B; the retry publishes A, and the call under A's grant
-  // is valid (the first-page-and-pages reading flagged it). The same page with its notice taken out is a walk
-  // the client would have published: B counts, and H3 flags the call.
+  // S39: a refresh page carries a notice and describes B; the client discards that walk and its retry
+  // publishes A, so the call under A's grant is valid (the reading that counted every walk flagged it). With
+  // the retry erased from the record, the noticed walk is still no catalog: the last one is A's, and H3 is
+  // clean. Take the page's notice out too, and B is a catalog the client would have published: H3 flags it.
   it('the noticed walk is no catalog; the same walk without its notice is one, and H3 flags the call', async () => {
     const s39 = SCHEDULES.find((s) => s.name.startsWith('S39'))!.options;
     for (let seed = 1; seed <= 4; seed++) {
       const r = await wireRun(seed, s39);
       expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
-      const page = r.exe.log.find((x) => x.body?.method === 'tools/list' && (x.changesDelivered ?? 0) > 0)!;
+      const lists = r.exe.log.filter((x) => x.body?.method === 'tools/list');
+      const noticed = lists.findIndex((x) => (x.changesDelivered ?? 0) > 0);
+      const retry = lists[noticed + 1]!;
+      retry.plan = { ...retry.plan!, messages: [] };
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} retry erased`).toEqual([]);
+      const page = lists[noticed]!;
       page.plan = { ...page.plan!, messages: page.plan!.messages.filter((m) => m.method !== 'notifications/tools/list_changed') };
       page.changesDelivered = 0;
-      expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/changed after it was given/)]));
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} notice taken out`).toEqual(expect.arrayContaining([expect.stringMatching(/another version at its handoff/)]));
     }
   }, 60_000);
 });
