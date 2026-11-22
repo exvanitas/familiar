@@ -638,6 +638,8 @@ If either unverified item turns out true (certificate fetches outside the saved 
 
 The owner's record lives in core's settings store (`packages/core/src/settings/`), under `mcp.owner`, with its schema version. The store is a small key-value store on IndexedDB through core's strict wrapper, so every transaction is strict. A setup never holds a secret's value: secrets are in Credential Manager, put there by Settings (5.8).
 
+**Who Familiar defends against.** Untrusted, and checked at every boundary, failing closed: every MCP server and everything it sends; messages from other windows (5.7); the stored record as read back from disk (it may be old, damaged, or written by an older build); and the person's own actions, which are what consent binds. Trusted: Familiar's own code in the same process, which passes typed values. The core still copies each choice once, checks every field's type and refuses malformed input, so a mistake there fails closed. But code that crafts objects which change between reads is a bug in Familiar itself, not an attack the design defends against. Review findings are classed by this reach. A P1 reachable from the untrusted side holds the step open until a review round shows it gone; the rest are fixed test-first and listed in section 8's residuals. (The owner adopted this, 11-22.)
+
 ### 5.2 Ids, keys and tombstones
 
 Server ids are random and never reused. A removed server leaves a tombstone, which keeps each cleanup item (forget, each secret, the address) with a done flag. Each exe start retries the items not done, and completion, not age, shrinks the tombstone to its id and key. An add that reuses a removed server's id is refused: "A removed server had this id, and ids are never used again. Add it as a new server." (`REMOVED_ID_WORDS`). Any server-kind address no record owns is removed at start.
@@ -1081,3 +1083,21 @@ Each build reports seeds run, checks passed and mutations failed (every one with
 - **Defects the harness found**, both fixed in the build:
   - a pong counted as outstanding only until its head let one exchange hold 5 native requests. A pong now counts until its native end (3.7; `05cf3df`);
   - a local run that ended for a reported reason kept its process alive. A local run that ends now stops its process, and its writes end at the exit (3.9; `2082356`).
+
+### Residuals from the reviews
+
+From round 39 on, each review finding is classed by reach. These were reachable only by Familiar's own in-process code, or were in the test harness. Each is fixed test-first, with its control, and listed here so none is dropped quietly.
+
+**In-process (Familiar's own code):**
+- r39 #1: a choice object that reads one way and serializes another. The owner copies a choice once and checks and saves the copy (14254b2), with each field required to be a string (012ce08).
+- r39 #2: the consent port's `'own'` answer counting as a Yes. Only `true` is a Yes (14254b2), and the port answers a boolean (012ce08).
+- r40 #1: the client reading a choice twice. It copies it once at its entry (012ce08).
+- r40 #12: the port's type still offering `'own'` (012ce08).
+
+**Reachable from a stored record (counted toward the close):**
+- r40 #2: a coerced malformed choice (my regression of r39 #1). Refused, never coerced (012ce08). Round 41 must show it gone.
+
+**In the test harness (H3, HC, H10, H11, H13 and the kill fixture):**
+- r39 #3 to #10, fixed by harness10 in 12a1f36 and cfeb1a0, merged at b9162bd;
+- r40 #3 to #11, fixed by harness10, merged at e6386f8;
+- each with its own control, per TRUTH-r39.md and TRUTH-r40.md.
