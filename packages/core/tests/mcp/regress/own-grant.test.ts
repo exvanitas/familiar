@@ -283,6 +283,26 @@ describe("a grant's writer and the gate (r37; the press itself moves to step 8, 
     expect(((await w.store.get(OWNER_KEY))!.value as { rev: number }).rev).toBe(rev);
   });
 
+  it("a choice is read once at the client's entry: a getter that reads deny, then ask, can't loosen a never held in memory (r40 #1)", async () => {
+    const w = await world();
+    await w.client.stop('l1');
+    const rec = (await w.store.get(OWNER_KEY))!;
+    (rec.value as { mark?: unknown }).mark = { kind: 'remove', server: 'gone' };
+    await w.store.put(OWNER_KEY, rec);
+    const again = await w.reopen();
+    const busy = again.owner.admit('other', { start: true });
+    if (!('release' in busy)) throw new Error('not admitted');
+    expect((await again.revoke('l1', 'echo', 'never')).ok).toBe(false);
+    busy.release();
+    let reads = 0;
+    const tricky = { get policy() { return ++reads === 1 ? 'deny' : 'ask'; }, fingerprint: 'f', setupFingerprint: 's' } as unknown as Parameters<typeof again.choose>[2];
+    await again.choose('l1', 'echo', tricky).catch(() => undefined);
+    expect(reads).toBe(1);
+    // Whatever was read is what was checked and saved: never stands, in memory and in the record.
+    expect((again as unknown as { overlay: Map<string, string> }).overlay.get(choiceKey('l1', 'echo')) ?? again.choices()[choiceKey('l1', 'echo')]?.policy).toMatch(/never|deny/);
+    expect(again.choices()[choiceKey('l1', 'echo')]?.policy).not.toBe('ask');
+  });
+
   it("while a change's cleanup is unfinished, a Settings choice can't loosen a never held in memory (r39 #4)", async () => {
     const w = await world();
     const a = w.echo()!;

@@ -9,7 +9,7 @@
 import type { JournalClock } from '../journal/journal.ts';
 import type { SettingsStore } from '../settings/store.ts';
 import { canonicalArguments, markUsed, usable, type CardFacts, type ToolDecision } from './decision.ts';
-import { addressIdentity, BUILT_IN, modelName, Owner, UNFINISHED_WORDS, type Outcome } from './owner.ts';
+import { addressIdentity, BUILT_IN, copyChoice, modelName, Owner, UNFINISHED_WORDS, type Outcome } from './owner.ts';
 export { BUILT_IN };
 import { mutant } from '../mutations.ts';
 import type { PathRules } from './native-rules.ts';
@@ -319,8 +319,11 @@ export class McpClient {
    * it's saved it replaces a revoke made before it, so that key's overlay goes; a revoke made while it was
    * saving is newer, and stays.
    */
-  async choose(serverId: string, tool: string, choice: ToolChoice | undefined): Promise<void> {
+  async choose(serverId: string, tool: string, given: ToolChoice | undefined): Promise<void> {
     const key = choiceKey(serverId, tool);
+    // Read once, here: every check below and the owner's write see the same copy (r40 #1).
+    const choice = given === undefined ? undefined : copyChoice(given);
+    if (given !== undefined && !choice) throw new Error('That choice is malformed, so it was not saved.');
     const order = ++this.acts;
     // "May run on its own" is never a choice made here: step 8's press on its card is its one way in (r37 #2).
     if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) throw new Error('"May run on its own" is saved only from a press on its card.');

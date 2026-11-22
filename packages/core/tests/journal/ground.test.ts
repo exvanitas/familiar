@@ -480,7 +480,8 @@ describe('5.6 and G12: no server tool runs without your Yes to that call, whatev
       policy: () => ({ perTool: { srv__look: 'allow' } }),
       wake: { wakeAt: () => {} },
       notifier: { notify: () => {} },
-      consent: { ask: async (card) => { cards.push(card); return answer; } },
+      // An adapter answering 'own' is an invalid one: the port's answer is a boolean (r40 #12).
+      consent: { ask: async (card) => { cards.push(card); return answer as boolean; } },
       presence: { report: () => {} },
       persona: { id: 'olive', name: 'Olive', instructions: 'You are Olive.' },
       decider: { decide: async (event, context) => decideByRules(event, context) },

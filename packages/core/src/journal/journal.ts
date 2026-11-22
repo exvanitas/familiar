@@ -103,9 +103,10 @@ export interface ConsentCard {
 }
 
 export interface ConsentPort {
-  /** Shows the card and resolves with the person's answer: Yes, No, or "May run on its own" (`own`, a Yes
-      that also asks for the standing grant). After a restart the same card is asked again. */
-  ask(card: ConsentCard, signal?: AbortSignal): Promise<boolean | 'own'>;
+  /** Shows the card and resolves with the person's answer: Yes (true) or No. Only `true` is a Yes. No card
+      offers "May run on its own" in step 7; step 8 brings its press through the desk. After a restart the same
+      card is asked again. */
+  ask(card: ConsentCard, signal?: AbortSignal): Promise<boolean>;
 }
 
 export type { Question } from './view.ts';
@@ -549,7 +550,7 @@ async function openHeld(options: JournalOptions, owner: { release(): void }, ope
       }, ctx);
       // The wait observes the call's abort signal, so a close never hangs on an unanswered card. The card
       // stays in the journal, unanswered, and is asked again on the next open.
-      const ok = await new Promise<boolean | 'own' | 'closed'>((resolve) => {
+      const ok = await new Promise<boolean | 'closed'>((resolve) => {
         if (signal?.aborted) return resolve('closed');
         signal?.addEventListener('abort', () => resolve('closed'), { once: true });
         options.consent.ask(card, signal).then(resolve, () => resolve(false));

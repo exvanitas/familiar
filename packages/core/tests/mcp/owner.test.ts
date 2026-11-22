@@ -2,7 +2,7 @@
 // of each change with its one mark, the rollback, tombstones, repair in a fresh start, and failing closed.
 
 import { describe, expect, it } from 'vitest';
-import { addressIdentity, BUSY_WORDS, Owner, REMOVED_ID_WORDS, OWNER_KEY, UNFINISHED_WORDS, WAITING_WORDS, type OwnerPorts } from '../../src/mcp/owner.ts';
+import { addressIdentity, BUILT_IN, BUSY_WORDS, Owner, REMOVED_ID_WORDS, OWNER_KEY, UNFINISHED_WORDS, WAITING_WORDS, type OwnerPorts } from '../../src/mcp/owner.ts';
 import type { ServerSetup } from '../../src/mcp/setup.ts';
 import { choiceKey, type ToolChoice } from '../../src/mcp/server-tools.ts';
 import { memorySettingsStore, type SettingsStore } from '../../src/settings/store.ts';
@@ -166,6 +166,29 @@ describe('5.1: one durable effect at a time', () => {
     const tricky = { policy: 'ask', fingerprint: 'f', setupFingerprint: 's', toJSON: () => ({ policy: 'own', fingerprint: 'f', setupFingerprint: 's' }) } as unknown as ToolChoice;
     expect(await owner.choose('l1', 'echo', tricky)).toEqual({ ok: true });
     expect(owner.choices()[choiceKey('l1', 'echo')]).toEqual({ policy: 'ask', fingerprint: 'f', setupFingerprint: 's' });
+  });
+
+  it('a malformed choice is refused, never coerced, and the saved one stands (r40 #2)', async () => {
+    const t = ports();
+    const owner = await Owner.open(t.p);
+    await owner.add(local('l1'));
+    expect(await owner.choose(BUILT_IN, 'note_list', { policy: 'ask', fingerprint: '', setupFingerprint: '' })).toEqual({ ok: true });
+    const numeric = { policy: 'allow', fingerprint: 1, setupFingerprint: 2 } as unknown as ToolChoice;
+    expect((await owner.choose(BUILT_IN, 'note_list', numeric)).ok).toBe(false);
+    expect(owner.choices()[choiceKey(BUILT_IN, 'note_list')]).toMatchObject({ policy: 'ask' });
+    expect((await owner.grant('l1', 'echo', { fingerprint: 1, setupFingerprint: 's' } as never)).ok).toBe(false);
+    expect(owner.choices()[choiceKey('l1', 'echo')]).toBeUndefined();
+  });
+
+  it("a grant's version is read once: a getter that changes between reads writes what was checked (r40 #2)", async () => {
+    const t = ports();
+    const owner = await Owner.open(t.p);
+    await owner.add(local('l1'));
+    let reads = 0;
+    const version = { get fingerprint() { return ++reads === 1 ? 'f1' : 'f2'; }, setupFingerprint: 's' };
+    expect(await owner.grant('l1', 'echo', version)).toEqual({ ok: true });
+    expect(owner.choices()[choiceKey('l1', 'echo')]).toEqual({ policy: 'own', fingerprint: 'f1', setupFingerprint: 's' });
+    expect(reads).toBe(1);
   });
 
   it('remove: stop awaited first, then a tombstone; its items done one by one; its choices go; the id and the key are never reused', async () => {

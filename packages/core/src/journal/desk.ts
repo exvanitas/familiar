@@ -31,18 +31,18 @@ const MAX_ID = 64;
 /** A "May run on its own" press answers the card `own`, offered only on a card that carries its words. No card
     does in step 7: step 8 has the desk issue the grant at the press (5.6). */
 export function createCardDesk(): CardDesk {
-  const pending = new Map<string, { readonly card: ConsentCard; readonly settle: (yes: boolean | 'own') => void }>();
+  const pending = new Map<string, { readonly card: ConsentCard; readonly settle: (yes: boolean) => void }>();
   // For a named mutation only: the step each presentation was for.
   const stepOf = new Map<string, string>();
   return {
     port: {
       ask(card, signal) {
-        return new Promise<boolean | 'own'>((resolve) => {
+        return new Promise<boolean>((resolve) => {
           const p = card.presentation;
           // A card with no presentation id can't be answered from outside: it's never shown here.
           if (!p) return resolve(false);
           if (__FAMILIAR_MUTATIONS__) stepOf.set(p, card.id);
-          const settle = (yes: boolean | 'own') => {
+          const settle = (yes: boolean) => {
             if (pending.get(p)?.settle !== settle) return;
             pending.delete(p);
             resolve(yes);
@@ -65,7 +65,7 @@ export function createCardDesk(): CardDesk {
       const offered = (buttonsOf(entry.card) as readonly string[]).includes(button);
       const yes = offered && (button === 'yes' || button === 'own');
       const own = offered && button === 'own';
-      entry.settle(own ? 'own' : yes);
+      entry.settle(yes);
       return { kind: 'answered', yes, own };
     }
   };

@@ -35,7 +35,9 @@ describe('T10: card answers from another window (5.7)', () => {
     const withOwn = desk.port.ask(card('p4', { own: 'May run on its own.' }));
     expect(buttonsOf(card('p4', { own: 'May run on its own.' }))).toEqual(['yes', 'own', 'skip']);
     expect(desk.answer({ presentation: 'p4', button: 'own' })).toEqual({ kind: 'answered', yes: true, own: true });
-    expect(await withOwn).toBe('own');
+    // The port's answer is a boolean in step 7: the press is a Yes to this call; the desk's result still says
+    // own, for step 8's press to build on (r40 #12).
+    expect(await withOwn).toBe(true);
     // A card withdrawn (its call stopped) is gone: a late answer is nothing.
     const stop = new AbortController();
     const withdrawn = desk.port.ask(card('p5'), stop.signal);
