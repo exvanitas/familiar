@@ -3,7 +3,7 @@
 
 import { CONTRACT_DETACH_MS, CONTRACT_INTERIM_WRITE_MS, CONTRACT_SERVER_CAP } from './contract.ts';
 import { createHash } from 'node:crypto';
-import { canonical, catalogAt, fingerprintAt, walks } from './catalog.ts';
+import { canonical, catalogAt, fingerprintIn, walks } from './catalog.ts';
 import { readPrefix, rejectedByShape, type Evidence, type NativeRec, type WireRun } from './wire.ts';
 import { initialState, next, type LcEvent, type Reply } from '../../src/mcp/wire/lifecycle.ts';
 
@@ -321,7 +321,7 @@ export const H3: Check = (r) => {
       // very fingerprint the decision names, as the harness derives it from that listing itself.
       if (!(yes.seq < x.seq)) problems.push(`H3: ${t} was handed off before its decision was minted`);
       for (const [when, at] of [['minted', yes.seq], ['handed off', x.seq]] as const) {
-        const fp = fingerprintAt(r.exe, x.server, at, yes.tool!);
+        const fp = liveFingerprintAt(r, x.server, at, yes.tool!);
         if (fp !== yes.grant) problems.push(`H3: ${t} was ${when} under fingerprint ${String(yes.grant).slice(0, 8)}, the listing then has ${String(fp).slice(0, 8)}`);
       }
       const atMint = latestAct(r, named, yes.tool!, yes.seq);
@@ -368,23 +368,49 @@ function latestAct(r: WireRun, server: string, tool: string, before: number): Ev
 /** A list_changed delivered on a run makes its catalog stale: no call goes out on that run until a tools/list
     walked after it has come back whole (G26). The notification comes ahead of its stream's final message,
     so it was delivered by the step that message was. */
+/** Notices of changed tools the client read on a destination: remotely, one in the prefix a stream's parser
+    read, from when that stream's final reached the client; locally, each notice line, from when it was read.
+    By sequence, with the run (handshake or process epoch) each came on. */
+function noticesRead(r: WireRun, server: string): { epoch: number; seq: number }[] {
+  const remote = r.exe.log.filter((x) => x.kind === 'post' && x.server === server && x.finalSeq !== undefined && x.plan && readPrefix(x.plan).some((m) => m.method === 'notifications/tools/list_changed')).map((x) => ({ epoch: x.epoch, seq: x.finalSeq! }));
+  const epochs = new Set(r.exe.processStarts.filter((t) => t.server === server).map((t) => t.epoch));
+  const local = r.exe.noticesDelivered.filter((n) => epochs.has(n.epoch)).map((n) => ({ epoch: n.epoch, seq: n.seq }));
+  return [...remote, ...local];
+}
+
+/** The evidence's name for a destination: an address's server (issued in the order added), or the setup id. */
+const serverAt = (r: WireRun, destination: string) => (r.server.mode.where === 'remote' ? `s${destination.replace(/^addr-/, '')}` : destination);
+
+/** The tool's fingerprint in the catalog live at the sequence `seq`: the last walk published before it, unless
+    its run had ended by then (a Stop made, a stop asked of its process, a new handshake on its destination) or
+    a notice of changed tools was read on that run after its publication. Undefined: no live catalog. */
+function liveFingerprintAt(r: WireRun, server: string, seq: number, tool: string): string | undefined {
+  const w = walks(r.exe, server).filter((x) => x.atSeq < seq).sort((a, b) => a.atSeq - b.atSeq).at(-1);
+  if (!w) return undefined;
+  const within = (q: number | undefined) => q !== undefined && q > w.atSeq && q < seq;
+  const ended =
+    r.evidence.some((e) => e.what === 'stop' && (e.server ?? 's1') === serverAt(r, server) && within(e.seq)) ||
+    r.exe.stopsAsked.some((t) => t.epoch === w.epoch && within(t.seq)) ||
+    r.exe.log.some((x) => x.kind === 'post' && x.server === server && x.body?.method === 'initialize' && within(x.seq));
+  if (ended || noticesRead(r, server).some((n) => n.epoch === w.epoch && within(n.seq))) return undefined;
+  return fingerprintIn(w, tool);
+}
+
+/** A notice of changed tools read on a run makes its catalog stale: no call goes out on that run until a walk
+    begun after it has been published (G26). On both transports, by sequence throughout. */
 function staleCatalogCalls(r: WireRun): string[] {
   const problems: string[] = [];
-  const recs = r.exe.log.filter((x) => x.kind === 'post');
-  for (const c of recs) {
-    // A notice the client read: one in the prefix its parser read, through the final response or the first
-    // message it rejects, whichever came first (it reads nothing after either). It counts from when that
-    // stream's final reached the client, by sequence.
-    if (c.finalSeq === undefined || !c.plan || !readPrefix(c.plan).some((m) => m.method === 'notifications/tools/list_changed')) continue;
-    const noticed = c.finalSeq;
-    // The relist: the first catalog published on that run from a walk begun after the notice. Every
-    // comparison is by sequence, never by step: a handoff in the relist's step, after it, is on the relist.
-    const relist = walks(r.exe, c.server).filter((w) => w.epoch === c.epoch && w.fromSeq > noticed).sort((a, b) => a.atSeq - b.atSeq)[0];
-    const until = relist?.atSeq ?? Infinity;
-    const call = recs.find((x) => x.server === c.server && x.epoch === c.epoch && isCall(x.body) && x.seq > noticed && x.seq < until);
-    if (call) problems.push(`H3: ${tokenOf(call.body)} went out on a catalog a list_changed had made stale`);
+  const calls = r.exe.log.filter((x) => isCall(x.body) && !x.refused);
+  for (const server of new Set(calls.map((x) => x.server))) {
+    for (const n of noticesRead(r, server)) {
+      // The relist: the first catalog published on that run from a walk begun after the notice.
+      const relist = walks(r.exe, server).filter((w) => w.epoch === n.epoch && w.fromSeq > n.seq).sort((a, b) => a.atSeq - b.atSeq)[0];
+      const until = relist?.atSeq ?? Infinity;
+      const call = calls.find((x) => x.server === server && x.epoch === n.epoch && x.seq > n.seq && x.seq < until);
+      if (call) problems.push(`H3: ${tokenOf(call.body)} went out on a catalog a list_changed had made stale`);
+    }
   }
-  return problems;
+  return [...new Set(problems)];
 }
 
 /** The tool's definition in the last completed walk published (its last page's answer reaching the client) before the

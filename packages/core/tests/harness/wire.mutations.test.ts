@@ -410,9 +410,9 @@ describe("HC's replay matched to the independent records, effect by effect", () 
 describe("H3 and a walk a notice invalidated", () => {
   // S39: a refresh page carries a notice and describes B; the client discards that walk and its retry
   // publishes A, so the call under A's grant is valid (the reading that counted every walk flagged it). With
-  // the retry erased from the record, the noticed walk is still no catalog: the last one is A's, so H3 finds
-  // no other version at the handoff (only that no relist came after the notice). Take the page's notice out
-  // too, and B is a catalog the client would have published: H3 flags the version.
+  // the retry erased from the record, the noticed walk is still no catalog: H3 finds no catalog live after the
+  // notice (no relist came), never B. Take the page's notice out too, and B is a catalog the client would have
+  // published: H3 flags the version B carries.
   it('the noticed walk is no catalog; the same walk without its notice is one, and H3 flags the call', async () => {
     const s39 = SCHEDULES.find((s) => s.name.startsWith('S39'))!.options;
     for (let seed = 1; seed <= 4; seed++) {
@@ -422,11 +422,11 @@ describe("H3 and a walk a notice invalidated", () => {
       const noticed = lists.findIndex((x) => (x.changesDelivered ?? 0) > 0);
       const retry = lists[noticed + 1]!;
       retry.plan = { ...retry.plan!, messages: [] };
-      expect(PASS_CHECKS.H3!(r).filter((p) => !/made stale/.test(p)), `seed ${seed} retry erased`).toEqual([]);
+      expect(PASS_CHECKS.H3!(r).filter((p) => !/made stale|then has undefine/.test(p)), `seed ${seed} retry erased`).toEqual([]);
       const page = lists[noticed]!;
       page.plan = { ...page.plan!, messages: page.plan!.messages.filter((m) => m.method !== 'notifications/tools/list_changed') };
       page.changesDelivered = 0;
-      expect(PASS_CHECKS.H3!(r), `seed ${seed} notice taken out`).toEqual(expect.arrayContaining([expect.stringMatching(/another version at its handoff/)]));
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} notice taken out`).toEqual(expect.arrayContaining([expect.stringMatching(/another version at its handoff|then has (?!undefine)/)]));
     }
   }, 60_000);
 });
@@ -700,6 +700,48 @@ describe('H3 and the setup a remote run was started from', () => {
       const added = launchFingerprint(r.setups.get('s1')!);
       for (const e of r.evidence) if (e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { setup: added });
       expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/another setup than its run was launched from/)]));
+    }
+  }, 60_000);
+});
+
+describe("H3 and a catalog's live interval", () => {
+  // A catalog is live from its publication until its run ends (a Stop, an exit, a new handshake) or a notice
+  // of changed tools is read on that run, whichever comes first; a decision is judged by the catalog live at its
+  // mint and at its handoff.
+  const yesOf = (r: WireRun, tool: string) => r.evidence.filter((e) => e.what === 'yes' && e.tool === tool && e.grant !== undefined).at(-1)!;
+  it("S23's mint moved between the Stop's answer and the next Start fails H3", async () => {
+    const s23 = SCHEDULES.find((s) => s.name.startsWith('S23'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s23);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const stopped = r.evidence.find((e) => e.what === 'stopped')!;
+      const restart = r.evidence.filter((e) => e.what === 'start' && e.seq > stopped.seq)[0]!;
+      Object.assign(yesOf(r, 'mirror2'), { seq: (stopped.seq + restart.seq) / 2 });
+      r.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} minted while stopped`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("S38's mint moved between the notice and the refresh it brings fails H3", async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s38);
+      const yes = yesOf(r, 'echo');
+      const call = r.exe.log.find((x) => x.body?.method === 'tools/call' && x.body.params?.arguments?.text === yes.token)!;
+      // The last notice read before the call, and the refresh published after it.
+      const notice = r.exe.log.filter((x) => x.kind === 'post' && x.finalSeq !== undefined && x.finalSeq < call.seq && x.plan && x.body?.method === 'tools/call' && x.plan.messages.some((m) => m.method === 'notifications/tools/list_changed')).at(-1)!;
+      const refresh = walks(r.exe, call.server).find((w) => w.fromSeq > notice.finalSeq!)!;
+      Object.assign(yes, { seq: (notice.finalSeq! + refresh.atSeq) / 2 });
+      r.evidence.sort((a, b) => a.seq - b.seq);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} minted while stale`).not.toEqual([]);
+    }
+  }, 60_000);
+  it("a local notice read just before S43's handoff makes that call stale", async () => {
+    const s43 = SCHEDULES.find((s) => s.name.startsWith('S43'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s43);
+      const call = r.exe.log.filter((x) => x.kind === 'write' && x.body?.method === 'tools/call').at(-1)!;
+      r.exe.noticesDelivered.push({ epoch: call.epoch, step: call.start, seq: call.seq - 0.5 });
+      expect(PASS_CHECKS.H3!(r), `seed ${seed}`).toEqual(expect.arrayContaining([expect.stringMatching(/made stale/)]));
     }
   }, 60_000);
 });
