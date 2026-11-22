@@ -977,6 +977,8 @@ export interface Evidence {
   /** On a `grant`: the tool's definition as the harness read it when the person pressed (the card's own
       version), canonical; H3 holds a call under the grant to exactly this. */
   readonly def?: string;
+  /** On a `start` or `test`: the setup in effect when it was made, as the harness last saved it. */
+  readonly launch?: Record<string, unknown>;
   /** On a `grant`, or a `yes` under a grant: the setup fingerprint the grant, or the decision, is for. */
   readonly setup?: string;
   /** Test's report: whether it listed, and the tool names it showed. */
@@ -1247,7 +1249,8 @@ export class Driver {
     // Noted before the call (its sequence precedes anything the start sends), its admission read after. Its
     // reply carries the same token: two Starts' replies are never confused.
     const token = `start-${++this.starts}`;
-    const e = this.note({ what: 'start', server: id, token });
+    // With the setup in effect as the harness last saved it: what a run this Start admits is launched from.
+    const e = this.note({ what: 'start', server: id, token, ...this.launchOf(id) });
     const starting = this.client.start(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void starting.then((reply) => {
@@ -1275,7 +1278,7 @@ export class Driver {
     const before = this.client.get(id)?.phase;
     const token = `test-${++this.tests}`;
     // Every Test reaches the machine, which refuses one while a run is under way (G27, r35b #14).
-    const e = this.note({ what: 'test', server: id, token, reaches: true });
+    const e = this.note({ what: 'test', server: id, token, reaches: true, ...this.launchOf(id) });
     const testing = this.client.test(id);
     (e as { admitted?: boolean }).admitted = before !== 'starting' && this.client.get(id)?.phase === 'starting';
     void testing.then(
@@ -1329,6 +1332,12 @@ export class Driver {
       this.note({ what: 'revoke', tool, server: id });
     }
     void out.then((outcome) => this.note({ what: 'outcome', token, tool, outcome, server: id }));
+  }
+
+  /** The setup in effect for a server, as the harness added and edited it: a copy, for evidence. */
+  private launchOf(id: string): { launch?: Record<string, unknown> } {
+    const s = this.setups.get(id);
+    return s ? { launch: JSON.parse(JSON.stringify(s)) } : {};
   }
 
   /** An edit of a stopped server's setup, as Settings makes it (its arguments, say). */

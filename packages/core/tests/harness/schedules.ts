@@ -750,6 +750,32 @@ export const SCHEDULES: Named[] = [
     }
   },
   {
+    // S45: a remote server stopped, one of its headers edited, and started again; then a grant on the new run
+    // and a call under it. The grant is for the setup the run was started from, and the call runs (H3 reads the
+    // effective remote setup recorded at the run's own admitted Start).
+    name: 'S45 a remote header edited between runs, then a grant',
+    options: {
+      mode: { ...quiet },
+      schedule: (d) =>
+        d.when('ready', () => d.idle(), () => {
+          d.stop();
+          d.when('stopped', () => d.client.get('s1')?.phase === 'stopped', () => {
+            d.edit('s1', { headers: [['X-Team', 'blue']] });
+            d.when('edited', () => d.evidence.some((e) => e.what === 'edited'), () => {
+              d.start();
+              d.when('ready again', () => d.idle() && d.evidence.filter((e) => e.what === 'started' && e.ok).length >= 2, () => void d.grantOwn('echo')?.then(() => d.when('idle', () => d.idle(), () => d.own('echo'))));
+            });
+          });
+        })
+    },
+    expect: (r) => {
+      if (!r.evidence.some((e) => e.what === 'edited')) return 'the edit was refused';
+      const own = r.evidence.filter((e) => e.what === 'yes' && e.grant !== undefined).at(-1);
+      const out = r.evidence.find((e) => e.what === 'outcome' && e.token === own?.token)?.outcome;
+      return !own ? 'no call under the grant' : out?.kind === 'result' ? undefined : `the call under the grant came back ${JSON.stringify(out)}`;
+    }
+  },
+  {
     // S40: a local modern-only server that exits right after refusing the legacy opening: the client relaunches
     // it once, modern, under the reservation its readmit-check took, and the relaunch comes up Ready (HC).
     name: 'S40 a local modern-only server that exits after the refusal, relaunched',

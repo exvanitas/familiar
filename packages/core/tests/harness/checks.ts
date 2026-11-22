@@ -312,9 +312,10 @@ export const H3: Check = (r) => {
       // setup), and it is the effective choice both when the decision was minted and at the handoff.
       const isTheGrant = (act: Evidence | undefined) => act?.what === 'grant' && act.grant === yes.grant && act.setup !== undefined && act.setup === yes.setup;
       // And the setup they name is the one the run that received the handoff was launched from: locally, the
-      // launch facts the exe was handed for that very process; remotely, the setup as the harness added it
-      // (the harness never edits a remote one). Fingerprinted by the harness's own reading.
-      const launched = x.kind === 'write' ? r.exe.processStarts.find((p) => p.epoch === x.epoch)?.launch : r.setups.get(named);
+      // launch facts the exe was handed for that very process; remotely, the setup in effect at that run's own
+      // admitted Start, as the harness last saved it (an edit between runs counts). Fingerprinted by the
+      // harness's own reading.
+      const launched = x.kind === 'write' ? r.exe.processStarts.find((p) => p.epoch === x.epoch)?.launch : admittedStarts(r, x.server)[runOf(r, x) - 1]?.launch;
       if (!launched || yes.setup !== launchFingerprint(launched)) problems.push(`H3: ${t} went out under a decision for another setup than its run was launched from`);
       // The decision was minted before its handoff, and at both points the server's accepted listing has the
       // very fingerprint the decision names, as the harness derives it from that listing itself.

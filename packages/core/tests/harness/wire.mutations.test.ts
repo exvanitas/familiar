@@ -688,6 +688,22 @@ describe('H3 orders notices, publications and handoffs by sequence throughout', 
   }, 60_000);
 });
 
+describe('H3 and the setup a remote run was started from', () => {
+  // S45: a remote header edited between runs, a grant and a call on the new run, clean. The grant and its
+  // decision moved to the setup as the server was added (before the edit): the old reading (the Add) took
+  // them, and H3 flags them against the setup the run was started from.
+  it("a decision for the Add's remote setup, handed to the edited run, fails H3", async () => {
+    const s45 = SCHEDULES.find((s) => s.name.startsWith('S45'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await wireRun(seed, s45);
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} clean`).toEqual([]);
+      const added = launchFingerprint(r.setups.get('s1')!);
+      for (const e of r.evidence) if (e.what === 'grant' || (e.what === 'yes' && e.grant !== undefined)) Object.assign(e, { setup: added });
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} forged`).toEqual(expect.arrayContaining([expect.stringMatching(/another setup than its run was launched from/)]));
+    }
+  }, 60_000);
+});
+
 describe('handshake epochs per destination', () => {
   // S44: two modern remote servers' handshakes interleave; s1's grant and call are valid. With pages bound to the
   // exe's global epoch (the old reading), s1's listing falls into s2's epoch, reads as legacy, and H3 flags both.
