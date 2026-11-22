@@ -355,6 +355,23 @@ describe("HC's replay matched to the independent records, effect by effect", () 
       expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
     }
   }, 60_000);
+  it("an admission duplicated under one end: a call's admit record doubled", async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const ex = r.exchanges.get('s1') as ExchangeRecord[];
+      const k = ex.findIndex((x) => x.t === 'admit' && x.kind === 'call');
+      ex.splice(k + 1, 0, { ...ex[k]!, seq: ex[k]!.seq + 0.5 });
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).not.toEqual([]);
+    }
+  }, 60_000);
+  it('an exchange end under a server with no lifecycle record', async () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const r = await clean(seed, s('S11 Stop during a live local call'));
+      const end = r.exchanges.get('s1')!.find((x) => x.t === 'ended')!;
+      (r.exchanges as Map<string, ExchangeRecord[]>).set('s9', [{ ...end }]);
+      expect(PASS_CHECKS.HC!(r), `seed ${seed}`).toEqual(expect.arrayContaining([expect.stringMatching(/s9/)]));
+    }
+  }, 60_000);
   it("a relaunch's reservation taken after its readmit-check: S40's moved past that transition", async () => {
     for (let seed = 1; seed <= 4; seed++) {
       const r = await clean(seed, s('S40'));

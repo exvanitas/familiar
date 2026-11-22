@@ -779,7 +779,10 @@ export const HC: Check = (r) => {
   const owed: OwedReservation[] = [];
   // Every reply answered once, across every server's replay.
   const usedReplies = new Set<Evidence>();
-  for (const [server, records] of r.lifecycle) {
+  // Every server present in either record, the lifecycle's or the exchange machine's: an exchange of a
+  // server with no lifecycle record is accounted too.
+  for (const server of new Set([...r.lifecycle.keys(), ...r.exchanges.keys()])) {
+    const records = r.lifecycle.get(server) ?? [];
     let s = initialState(server);
     const actions = r.evidence.filter((e) => (e.server ?? 's1') === server && (e.what === 'start' || e.what === 'stop' || (e.what === 'test' && e.reaches)));
     const asked = records.filter((x) => x.event.t === 'start' || x.event.t === 'stop');
@@ -891,10 +894,14 @@ export const HC: Check = (r) => {
       if (a) consumed.add(a);
       else problems.push(`HC: ${server}: exchange ${e.n} (${e.kind}) of run ${e.run} ended, never admitted (or ended twice)`);
     }
+    // The final accounting by the consumed admissions: an admission no end consumed is open, and only the
+    // current run's may be; and an exchange number is admitted once.
     const current = s.run?.id;
+    const numbers = new Set<number>();
     for (const a of ex.filter((x) => x.t === 'admit')) {
-      const ended = ex.some((x) => x.t === 'ended' && x.n === a.n);
-      if (!ended && a.run !== current) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) of run ${a.run}, which is over, never ended`);
+      if (numbers.has(a.n)) problems.push(`HC: ${server}: exchange ${a.n} admitted twice`);
+      numbers.add(a.n);
+      if (!consumed.has(a) && a.run !== current) problems.push(`HC: ${server}: exchange ${a.n} (${a.kind}) of run ${a.run}, which is over, never ended`);
     }
   }
   // No reply replay never answered, on any server, under any token: one for a server with no record at all
