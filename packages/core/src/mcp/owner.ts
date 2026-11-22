@@ -36,6 +36,20 @@ export const NO_ALWAYS_WORDS = 'There\'s no "always" for a server\'s tool: every
 export const ONLY_LISTED_WORDS = 'Only Familiar\'s own notes and reminders run without asking. This tool asks every time.';
 
 /** Why a choice can't be saved, if it can't (5.6). */
+/** A choice as given, copied once, field by field: each field read once, and each a string, or the choice is
+    malformed (undefined). Nothing is coerced: what is checked and saved is exactly what was read (r39 #1,
+    r40 #2). */
+export function copyChoice(given: unknown): ToolChoice | undefined {
+  if (given === null || typeof given !== 'object') return undefined;
+  const g = given as Record<string, unknown>;
+  const policy = g.policy;
+  const fingerprint = g.fingerprint;
+  const setupFingerprint = g.setupFingerprint;
+  if (typeof policy !== 'string' || typeof fingerprint !== 'string' || typeof setupFingerprint !== 'string') return undefined;
+  return { policy: policy as ToolChoice['policy'], fingerprint, setupFingerprint };
+}
+const MALFORMED_WORDS = 'That choice is malformed, so it was not saved.';
+
 export function choiceProblem(serverId: string, tool: string, choice: ToolChoice | undefined): string | undefined {
   if (!choice) return undefined;
   if (serverId === BUILT_IN) {
@@ -616,8 +630,10 @@ export class Owner {
 
   async choose(serverId: string, tool: string, given: ToolChoice | undefined): Promise<Outcome> {
     // The choice copied once, field by field, and only the copy is checked and saved: an object that reads one
-    // way and serializes another can't slip past the checks (r39 #1).
-    const choice: ToolChoice | undefined = given === undefined ? undefined : { policy: String(given.policy) as ToolChoice['policy'], fingerprint: String(given.fingerprint ?? ''), setupFingerprint: String(given.setupFingerprint ?? '') };
+    // way and serializes another can't slip past the checks (r39 #1), and a malformed one is refused, never
+    // coerced (r40 #2).
+    const choice: ToolChoice | undefined = given === undefined ? undefined : copyChoice(given);
+    if (given !== undefined && !choice) return no(MALFORMED_WORDS);
     // A grant has its own writer, for a press on its card (grant): never a choice saved here (r37 #2).
     if (choice?.policy === 'own' && !(__FAMILIAR_MUTATIONS__ && mutant('choose-own'))) return no('"May run on its own" is saved only from a press on its card.');
     const problem = choiceProblem(serverId, tool, choice);
@@ -648,8 +664,11 @@ export class Owner {
    * outlives its server (r37 #3).
    */
   async grant(serverId: string, tool: string, given: { readonly fingerprint: string; readonly setupFingerprint: string }): Promise<Outcome> {
-    // Copied once, and only the copy is checked and written (r39 #1).
-    const version = { fingerprint: String(given.fingerprint ?? ''), setupFingerprint: String(given.setupFingerprint ?? '') };
+    // Copied once, each field read once and a string, and only the copy is checked and written (r39 #1, r40 #2).
+    const fingerprint: unknown = given?.fingerprint;
+    const setupFingerprint: unknown = given?.setupFingerprint;
+    if (typeof fingerprint !== 'string' || typeof setupFingerprint !== 'string') return no(MALFORMED_WORDS);
+    const version = { fingerprint, setupFingerprint };
     if (serverId === BUILT_IN) return no(ONLY_LISTED_WORDS);
     if (!version.fingerprint || !version.setupFingerprint) return no('That grant names no version of the tool, so it was not saved.');
     const t = this.admit('choice', { start: true });
