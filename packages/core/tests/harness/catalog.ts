@@ -36,7 +36,9 @@ export function walks(exe: FakeExe, server: string): { at: number; atSeq: number
     if (x.server !== server || x.body?.method !== 'tools/list') continue;
     const cursor = x.body.params?.cursor;
     const at = x.kind === 'post' ? (x.final === undefined ? undefined : Math.floor(x.final / 1000)) : exe.responded.get(`${x.epoch}:${x.body.id}`);
-    const res = x.plan?.messages.find((m) => m.id === x.body!.id && m.result)?.result;
+    // The page's own response as the parser accepted it: within the prefix it read, through the final or the
+    // first message it rejects. Its completion and its cursor are read from that response alone.
+    const res = x.plan ? readPrefix(x.plan).find((m) => m.id === x.body!.id && m.result)?.result : undefined;
     const continues = cursor === undefined || (open !== undefined && open.epoch === x.epoch && open.next === cursor);
     if (at === undefined || !res || !continues) {
       open = undefined;

@@ -531,6 +531,10 @@ describe("H3 and a grant's identity: its destination and setup", () => {
   }, 60_000);
 });
 
+/** echo's description in the catalog the harness reads just before a handoff. */
+const echoAt = (r: WireRun, call: { server: string; seq: number }) =>
+  walks(r.exe, call.server).filter((w) => w.atSeq < call.seq).sort((a, b) => a.atSeq - b.atSeq).at(-1)?.tools.find((t: { name: string }) => t.name === 'echo')?.description;
+
 describe('H3 and a notice after a list page\'s final response', () => {
   // S38 with an unread notice after each list page's final: the catalogs stand, and the call at A under its
   // grant is valid. The same notice moved ahead of the final on the last refresh's page is read: that walk is
@@ -543,8 +547,30 @@ describe('H3 and a notice after a list page\'s final response', () => {
       const callAtA = r.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
       const last = r.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined && x.seq < callAtA.seq).at(-1)!;
       const msgs = last.plan!.messages;
+      // Moved ahead of the final, and delivered: the client read it, so the walk is no catalog.
       last.plan = { ...last.plan!, messages: [msgs.at(-1)!, ...msgs.slice(0, -1)], final: last.plan!.final + 1 };
-      expect(PASS_CHECKS.H3!(r), `seed ${seed} read`).not.toEqual([]);
+      last.changesDelivered = 1;
+      // That is what discards A: the catalog the harness reads at the handoff is B's, and H3 flags the version.
+      expect(echoAt(r, callAtA), `seed ${seed} catalog`).toBe('Echo, changed.');
+      expect(PASS_CHECKS.H3!(r), `seed ${seed} read`).toEqual(expect.arrayContaining([expect.stringMatching(/another version at its handoff|the listing then has/)]));
+    }
+  }, 60_000);
+  // A page's completion and its cursor are read from the response the parser accepted: a malformed message
+  // ahead of A's result means the client never read that page (A's relist isn't a catalog, B stands), and a
+  // duplicate response after the final, carrying a cursor, is unread (A's relist stands, the call is valid).
+  it("a page with a malformed message before its result isn't a catalog; an unread reply with a cursor changes nothing", async () => {
+    const s38 = SCHEDULES.find((s) => s.name.startsWith('S38'))!.options;
+    for (let seed = 1; seed <= 4; seed++) {
+      const bad = await wireRun(seed, s38);
+      const call = bad.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+      const page = bad.exe.log.filter((x) => x.body?.method === 'tools/list' && x.final !== undefined && x.seq < call.seq).at(-1)!;
+      page.plan = { ...page.plan!, messages: [structuredClone(INVALID['array-params']), ...page.plan!.messages], final: page.plan!.final + 1 };
+      expect(echoAt(bad, call), `seed ${seed} malformed`).toBe('Echo, changed.');
+      expect(PASS_CHECKS.H3!(bad), `seed ${seed} malformed`).not.toEqual([]);
+      const dup = await wireRun(seed, s38);
+      const call2 = dup.exe.log.filter((x) => x.body?.method === 'tools/call' && x.body.params?.name === 'echo').at(-1)!;
+      for (const x of dup.exe.log) if (x.body?.method === 'tools/list' && x.plan && x.seq < call2.seq) x.plan = { ...x.plan, messages: [...x.plan.messages, { jsonrpc: '2.0', id: x.body.id, result: { tools: [], nextCursor: '9' } }] };
+      expect(PASS_CHECKS.H3!(dup), `seed ${seed} trailing cursor`).toEqual([]);
     }
   }, 60_000);
 });
