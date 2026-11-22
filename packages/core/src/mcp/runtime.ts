@@ -39,7 +39,7 @@ export class ServerRuntime {
   private readonly onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void;
   private readonly portLimits: Partial<LinkLimits> | undefined;
 
-  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void, onPublished: (tools: readonly ListedTool[], launch: string) => void, hooks: { readonly transition?: LinkEvents['transition']; readonly exchange?: LinkEvents['exchange'] } = {}) {
+  constructor(id: string, owner: Owner, ports: RuntimePorts, onChange: () => void, onListed: (tools: readonly ListedTool[], current: () => boolean, run: string) => Promise<void> | void, hooks: { readonly transition?: LinkEvents['transition']; readonly exchange?: LinkEvents['exchange'] } = {}) {
     this.id = id;
     this.owner = owner;
     this.onListed = onListed;
@@ -47,7 +47,6 @@ export class ServerRuntime {
     this.link = new ServerLink(id, { net: ports.net, processes: ports.processes }, ports.clock, {
       changed: onChange,
       ended: () => onChange(),
-      published: (_run, tools, launch) => onPublished(tools, launch),
       // The catalog write is an owner effect of its own (5.1); the start waits for it.
       listed: (run, tools) =>
         Promise.resolve(this.onListed(tools, () => this.link.current?.run === run, run)).then(
