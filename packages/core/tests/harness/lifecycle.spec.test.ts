@@ -528,10 +528,10 @@ describe('W with the spec checks', () => {
   // The full budgets, run locally (FAMILIAR_LC_SPEC_FIXPOINT=1) for about 40 minutes: keyed by the SHA-256 of
   // the renumbered form (FAMILIAR_LC_SPEC_FIXPOINT=exact: of the plain canonical form). It can't empty in that
   // time (the spec alphabet offers every outcome at every point under Ctx's eight budgets, which multiply the
-  // states far more than History does), so it asserts no violation only. At 7254177 with the 134-clause checks,
-  // no violation in 40 minutes each: local through depth 12 (1,911,897 states, 13,094,456 transitions, frontier
-  // 1,079,770); remote through depth 15 (1,683,128 states, 14,969,883 transitions, frontier 747,972); peak heap
-  // 3.7 GB.
+  // states far more than History does), so it asserts no violation only. At fe12c41 with the 135-clause checks
+  // (every start record offered), no violation in 40 minutes each: local through depth 11 (1,259,419 states,
+  // 13,451,944 transitions, frontier 491,487); remote through depth 14 (985,942 states, 12,828,168 transitions,
+  // frontier 422,715); peak heap 2.2 GB. (At 7254177, 134 clauses: local depth 12, remote depth 15.)
   for (const where of ['local', 'remote'] as const)
     it.skipIf(!process.env.FAMILIAR_LC_SPEC_FIXPOINT)(`the spec checks hold over the full budgets for 40 minutes, ${where}`, () => {
       const renumber = process.env.FAMILIAR_LC_SPEC_FIXPOINT !== 'exact';
@@ -546,14 +546,13 @@ describe('W with the spec checks', () => {
   // within those budgets: evidence of its own beside the bounded walk above. Each mutation the spec checks catch
   // in CI is run in it too, from the initial state, with two person actions (each is caught by depth 13).
   // FAMILIAR_LC_SPEC_PERSONS=2 is the opt-in fixpoint run: remote completes; local reports how far it got, a
-  // non-fixpoint. At 7254177 with the 134-clause checks:
-  // - persons 1: the fixpoint, no violation; local depth 25, 223,617 states, 1,475,004 transitions, 142 s;
-  //   remote depth 35, 29,700 states, 167,281 transitions, 17 s. It catches 19 of the 24 mutations and misses
-  //   five: lc-second-stop-stopped, lc-two-native-stops, lc-readmit-after-stop and lc-start-beside-orphan need a
-  //   second person action, lc-queue-outlives-run a second run.
-  // - persons 2: remote, the fixpoint, no violation, depth 42, 1,331,969 states, 11,478,938 transitions,
-  //   1,367 s; local doesn't empty in 40 minutes (no violation through depth 16, 2,020,489 states, frontier
-  //   720,206). All five persons 1 misses are caught here (depths 5, 4, 6, 5 and 13), twins clean.
+  // non-fixpoint. At fe12c41 with the 135-clause checks:
+  // - persons 1: the fixpoint, no violation; local depth 25, 208,657 states, 1,370,016 transitions, 106 s;
+  //   remote depth 35, 26,756 states, 148,913 transitions, 11 s. (At 7254177 it caught 19 of 24 mutations with
+  //   one person action; the five it missed need a second action or run.)
+  // - the mutation walks, two person actions: all 25 CI-caught mutations caught, at depth 13 at most, twins clean.
+  // - persons 2: remote, the fixpoint, no violation, depth 42, 1,131,889 states, 10,042,592 transitions,
+  //   1,159 s. (At 7254177 local didn't empty in 40 minutes: no violation through depth 16.)
   for (const where of ['local', 'remote'] as const)
     it.skipIf(!process.env.FAMILIAR_LC_SPEC_SMALL)(`the spec checks hold to the fixpoint of the small world, ${where}`, () => {
       const r = walkSpec(THIS, where, Infinity, { ...SPEC0(), c: SMALL_CTX }, { digest: true, renumber: true, budgetMs: 40 * 60_000, progress: (p) => fixLog(fmt(`spec small progress ${where} ${canon(SMALL_CTX)}`, p)) });
