@@ -4,7 +4,8 @@
 import { describe, expect, it } from 'vitest';
 import { CHECKS } from './checks.ts';
 import { killAndResume, nodeWorld } from './node-env.ts';
-import { scenario, WRITE_WINDOW, writeWindowPath, writeWindowProblems } from './scenarios.ts';
+import { CALL_MS_MAX } from '../../src/index.ts';
+import { lifeClocks, scenario, WRITE_WINDOW, writeWindowPath, writeWindowProblems } from './scenarios.ts';
 
 describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its connection torn down)', () => {
   for (const [name, check] of Object.entries(CHECKS)) {
@@ -16,14 +17,17 @@ describe('kill mid-step, then resume (Node, fake IndexedDB, the engine and its c
 
 // server-reissue's grant is a real one, saved through the client and reloaded from its store: with the
 // grant lost on its way to life 2, in saving or in reloading, life 2 asks for a card, and the check fails.
-// Life 1's client has a call under way at the kill, its time limit armed: the kill takes that timer with it,
-// so nothing of life 1's client fires into life 2.
-describe("server-reissue's life 1 client, at the kill", () => {
-  it('has a timer armed before the kill, and none after it', async () => {
+// Life 1's client has a call under way at the kill, its time limit armed. Once life 2 is done, life 1's own
+// clock is advanced past that limit: the timer died with its life, so life 1's client writes nothing more to
+// its port (no cancel for the call it had under way).
+describe("server-reissue's life 1 client, after the kill", () => {
+  it('had a timer armed at the kill, and writes nothing once its clock passes the call limit', async () => {
     const world = nodeWorld();
     await killAndResume(scenario('server-reissue'), world);
     expect(world.counters.get('life1-timers-at-kill')).toBeGreaterThan(0);
-    expect(world.counters.get('life1-timers-after-kill')).toBe(0);
+    lifeClocks.get(world.counters)!.get(1)!.advance(CALL_MS_MAX + 60_000);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(world.counters.get('life1-writes-after-kill')).toBe(0);
   });
 });
 

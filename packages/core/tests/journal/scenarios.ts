@@ -51,35 +51,53 @@ export function offsetClock(counters: Counters): JournalClock & { advance(ms: nu
   };
 }
 
-/** A clock for one life: the counters' offset clock, with every timer it arms kept, so a simulated kill can
-    discard them all. A closed page takes its timers with it; in Node a killed life's would go on firing into
-    the next (a real client's call timer, say, sending its cancel through the old life's port). */
-export function lifeClock(counters: Counters): Pick<JournalClock, 'now' | 'setTimer'> & { armed(): number; discard(): void } {
+/** A clock for one life, with its own timer queue: each timer runs from a real timeout, or sooner when the
+    clock is advanced (`advance`, the controls' independent clock), unless it was cancelled. A simulated kill
+    cancels them all, as a closed page takes its timers with it; in Node a killed life's would go on firing
+    into the next (a real client's call timer, say, sending its cancel through the old life's port). */
+export function lifeClock(counters: Counters): Pick<JournalClock, 'now' | 'setTimer'> & { armed(): number; discard(): void; advance(ms: number): void } {
   const base = offsetClock(counters);
-  const armed = new Set<() => void>();
+  let ahead = 0;
+  const now = () => base.now() + ahead;
+  const timers = new Set<{ due: number; fire: () => void; real: ReturnType<typeof setTimeout> }>();
   let dead = false;
   return {
-    now: base.now,
-    setTimer: (callback, delayMs, options) => {
+    now,
+    setTimer: (callback, delayMs) => {
       if (dead) return () => {};
-      const cancel = (): void => {
-        armed.delete(cancel);
-        stop?.();
+      const t = {
+        due: now() + delayMs,
+        fire: () => {
+          if (!timers.delete(t)) return;
+          clearTimeout(t.real);
+          callback();
+        },
+        real: undefined as unknown as ReturnType<typeof setTimeout>
       };
-      const stop = base.setTimer(() => {
-        armed.delete(cancel);
-        callback();
-      }, delayMs, options);
-      armed.add(cancel);
-      return cancel;
+      t.real = setTimeout(() => t.fire(), delayMs);
+      timers.add(t);
+      return () => {
+        timers.delete(t);
+        clearTimeout(t.real);
+      };
     },
-    armed: () => armed.size,
+    armed: () => timers.size,
     discard: () => {
       dead = true;
-      for (const cancel of [...armed]) cancel();
+      for (const t of [...timers]) {
+        timers.delete(t);
+        clearTimeout(t.real);
+      }
+    },
+    advance: (ms) => {
+      ahead += ms;
+      for (const t of [...timers].sort((a, b) => a.due - b.due)) if (t.due <= now()) t.fire();
     }
   };
 }
+
+/** Each life's client clock, by the counters that outlive the lives: the controls advance a killed life's. */
+export const lifeClocks = new WeakMap<Counters, Map<number, ReturnType<typeof lifeClock>>>();
 
 /** The fake note store: rows appended, so a write made twice would show as two rows. */
 export const NotesDoc = defineJournalDoc<{ notes: { step: string; text: string; token: string }[] }>('familiar.test-notes', () => ({ notes: [] }));
@@ -313,6 +331,8 @@ function lookupServer(env: Env): ProcessPort {
     },
     async write(_run, bytes) {
       const m = JSON.parse(new TextDecoder().decode(bytes));
+      // Anything life 1's client writes once its life was killed (a time limit's cancel, say).
+      if (env.life === 1 && env.counters.get('life1-killed')) env.counters.bump('life1-writes-after-kill');
       if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'srv' } } });
       else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'server_lookup', description: "An MCP server's tool.", inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'], additionalProperties: false } }] } });
       else if (m.method === 'tools/call') {
@@ -332,6 +352,8 @@ function lookupServer(env: Env): ProcessPort {
     "may run on its own" saved for its tool, through the client, as Settings saves it. */
 async function grantedClient(env: Env) {
   const clock = lifeClock(env.counters);
+  if (!lifeClocks.has(env.counters)) lifeClocks.set(env.counters, new Map());
+  lifeClocks.get(env.counters)!.set(env.life, clock);
   const client = await McpClient.open({ store: countersSettings(env), processes: lookupServer(env), net: {} as never, addresses: { add: async () => ({ id: 'a' }), remove: async () => {} }, secrets: { delete: async () => {} }, clock, paths: posixPaths });
   if (env.life === 1) await client.add({ setup: { kind: 'local', id: 'srv', label: 'Srv', program: '/usr/bin/srv', args: [], cwd: '/', env: [], secrets: [] }, problems: [] });
   const started = await client.start('srv');
@@ -443,7 +465,7 @@ export const SCENARIOS: readonly Scenario[] = [
           journal.kill();
           env.counters.set('life1-timers-at-kill', clock.armed());
           clock.discard();
-          env.counters.set('life1-timers-after-kill', clock.armed());
+          env.counters.set('life1-killed', 1);
         });
         return undefined;
       }
